@@ -60,7 +60,7 @@ show_header() {
   local ip port st clients
   IFS='|' read -r ip port st clients <<< "$s"
   echo -e "${B}╔══════════════════════════════════════════════╗${N}"
-  echo -e "${B}║${W}         AmneziaWG 2.0 Manager                ${B}║${N}"
+  echo -e "${B}║${W}        AmneziaWG 2.0 Manager                ${B}║${N}"
   echo -e "${B}╚══════════════════════════════════════════════╝${N}"
   echo -e "${B}  IP сервера : ${W}$ip${N}"
   echo -e "${B}  Порт       : ${W}$port${N}"
@@ -638,7 +638,21 @@ do_list_clients() {
       rx=$(awk "BEGIN {printf \"%.2f МБ\", $rx_raw/1048576}")
     elif [[ "$line" =~ ^AllowedIPs\ =\ (.+) ]]; then
       ip="${BASH_REMATCH[1]}"
-      echo -e "  ${W}$(printf '%2d' $i))${N} ${C}$(printf '%-15s' "${name:-безымянный}")${N}  IP: ${W}$(printf '%-20s' "$ip")${N}  ↑ $(printf '%-12s' "${tx:-—}")  ↓ ${rx:-—}"
+      local short_name
+      short_name="${name:-безымянный}"
+      short_name="${short_name:0:7}"
+      local tx_fmt rx_fmt
+      if awk "BEGIN {exit !($tx_raw >= 1073741824)}"; then
+        tx_fmt=$(awk "BEGIN {printf \"%.2f ГБ\", $tx_raw/1073741824}")
+      else
+        tx_fmt=$(awk "BEGIN {printf \"%.2f МБ\", $tx_raw/1048576}")
+      fi
+      if awk "BEGIN {exit !($rx_raw >= 1073741824)}"; then
+        rx_fmt=$(awk "BEGIN {printf \"%.2f ГБ\", $rx_raw/1073741824}")
+      else
+        rx_fmt=$(awk "BEGIN {printf \"%.2f МБ\", $rx_raw/1048576}")
+      fi
+      echo -e "  ${W}$(printf '%2d' $i))${N} ${C}$(printf '%-7s' "$short_name")${N}  IP: ${W}$(printf '%-20s' "$ip")${N}  ↑ $(printf '%-12s' "$tx_fmt")  ↓ $rx_fmt"
     fi
   done < "$SERVER_CONF"
 
