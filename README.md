@@ -227,7 +227,7 @@ MIT License
 
 <div align="center">
 Этот скрипт вдохновлён проектом  
-**[AmneziaWG Architect](https://architect.vai-rice.space/)** —  
+** [AmneziaWG Architect](https://architect.vai-rice.space/)** —  
 веб-генератором продвинутой обфускации для обхода DPI.  
 Идеи, профили мимикрии и подход к формированию I1‑I5 основаны на его архитектуре.
 
