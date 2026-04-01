@@ -1,5 +1,5 @@
 <div align="center">
-# **AWG Multi Script**
+**AWG Multi Script**
 
 <div align="center">
 
