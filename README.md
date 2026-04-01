@@ -131,7 +131,7 @@ sip.antisip.com, sip.voipbuster.com, sip.3cx.com
 
 ```
 ╔══════════════════════════════════════════════╗
-║        AmneziaWG Manager v4.2                ║
+║        AmneziaWG Manager v4.?                ║
 ║     С генератором мимикрии (QUIC/TLS/DTLS)   ║
 ╚══════════════════════════════════════════════╝
   IP сервера : 1.2.3.4
@@ -248,7 +248,7 @@ sip.antisip.com, sip.voipbuster.com, sip.3cx.com
 
 ---
 
-**AWG Multi Script v4.1** · MIT License
+**AWG Multi Script** · MIT License
 
 *Разработано для сообщества [AWG-Manager](https://t.me/awgmanager)*
 
