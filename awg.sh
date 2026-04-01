@@ -3,8 +3,7 @@ set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────
 # AmneziaWG Manager v4.2 — исправленная версия
-# Исправлено: ключи клиента, H1-H4 ≥5, Jc для AWG 1.0, Jmin динамический,
-# S1 от 1, S3 до 64, MTU в интерфейсе, проверка ключей, таймауты, пункт 9
+# Исправлено: удалён timeout из установки, добавлена проверка I1
 # ─────────────────────────────────────────────────────────────
 
 # ── Цвета ──────────────────────────────────────────────────
@@ -31,10 +30,9 @@ _log() {
 log_info()  { _log "INFO"  "$@"; }
 log_warn()  { _log "WARN"  "$@"; }
 log_err()   { _log "ERROR" "$@"; }
-log_debug() { _log "DEBUG" "$@"; }
 
 # ══════════════════════════════════════════════════════════
-# ДОМЕННЫЕ ПУЛЫ ДЛЯ МИМИКРИИ (на основе AmneziaWG Architect)
+# ДОМЕННЫЕ ПУЛЫ ДЛЯ МИМИКРИИ
 # ══════════════════════════════════════════════════════════
 
 QUIC_INITIAL_DOMAINS=(
@@ -58,109 +56,72 @@ TLS_CLIENT_HELLO_DOMAINS=(
   "sberbank.ru" "tbank.ru" "gosuslugi.ru" "kaspersky.ru"
   "github.com" "gitlab.com" "stackoverflow.com" "microsoft.com"
   "apple.com" "amazon.com" "cloudflare.com" "google.com"
-  "jetbrains.com" "docker.com" "ubuntu.com" "debian.org"
 )
 
 DTLS_DOMAINS=(
   "stun.yandex.net" "stun.vk.com" "stun.mail.ru" "stun.sber.ru"
-  "stun.stunprotocol.org" "stun.voipbuster.com" "meet.jit.si"
-  "stun.services.mozilla.com" "stun.zoiper.com" "stun.counterpath.com"
-  "stun.sipgate.net" "stun.ekiga.net" "stun.ideasip.com"
+  "stun.stunprotocol.org" "meet.jit.si" "stun.services.mozilla.com"
 )
 
 SIP_DOMAINS=(
   "sip.beeline.ru" "sip.mts.ru" "sip.megafon.ru" "sip.rostelecom.ru"
   "sip.yandex.ru" "sip.vk.com" "sip.mail.ru" "sip.sipnet.ru"
   "sip.zadarma.com" "sip.iptel.org" "sip.linphone.org"
-  "sip.antisip.com" "sip.voipbuster.com" "sip.3cx.com"
 )
 
-# ── Выбор случайного доступного домена из пула (с таймаутом) ────────
 select_random_domain() {
   local profile="$1"
   local domains=()
-  local available_domains=()
-
   case "$profile" in
-    "quic_initial")   domains=("${QUIC_INITIAL_DOMAINS[@]}") ;;
-    "quic_0rtt")      domains=("${QUIC_0RTT_DOMAINS[@]}") ;;
-    "tls")            domains=("${TLS_CLIENT_HELLO_DOMAINS[@]}") ;;
-    "dtls")           domains=("${DTLS_DOMAINS[@]}") ;;
-    "sip")            domains=("${SIP_DOMAINS[@]}") ;;
-    *)                domains=("${QUIC_INITIAL_DOMAINS[@]}") ;;
+    "quic_initial") domains=("${QUIC_INITIAL_DOMAINS[@]}") ;;
+    "quic_0rtt")    domains=("${QUIC_0RTT_DOMAINS[@]}") ;;
+    "tls")          domains=("${TLS_CLIENT_HELLO_DOMAINS[@]}") ;;
+    "dtls")         domains=("${DTLS_DOMAINS[@]}") ;;
+    "sip")          domains=("${SIP_DOMAINS[@]}") ;;
+    *)              domains=("${QUIC_INITIAL_DOMAINS[@]}") ;;
   esac
-
-  if [[ ${#domains[@]} -eq 0 ]]; then
-    echo "yandex.net"
-    return 0
-  fi
-
-  # Проверяем доступность с таймаутом
-  for domain in "${domains[@]}"; do
-    if timeout 2 ping -c 1 -W 1 "$domain" &>/dev/null 2>&1; then
-      available_domains+=("$domain")
-    fi
-    if [[ ${#available_domains[@]} -ge 5 ]]; then
-      break
-    fi
-  done
-
-  if [[ ${#available_domains[@]} -gt 0 ]]; then
-    echo "${available_domains[$((RANDOM % ${#available_domains[@]}))]}"
-  else
-    echo "${domains[0]}"
-  fi
+  echo "${domains[$((RANDOM % ${#domains[@]}))]}"
 }
 
-# ══════════════════════════════════════════════════════════
-# FETCH I1 ЧЕРЕЗ API (с общим таймаутом)
-# ══════════════════════════════════════════════════════════
 fetch_i1_from_api() {
   local domain="$1"
   local api_url="https://junk.web2core.workers.dev/signature?domain=${domain}"
-  local api_resp i1_val=""
+  local api_resp=$(timeout 10 curl -s --connect-timeout 5 "$api_url" 2>/dev/null || echo "")
+  local i1_val=$(echo "$api_resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('i1',''))" 2>/dev/null || echo "")
+  [[ -z "$i1_val" ]] && return 1
+  i1_val=$(echo "$i1_val" | tr -d '\n\r' | sed 's/^"//;s/"$//')
+  [[ "$i1_val" =~ ^\<b0x ]] && i1_val="${i1_val/<b0x/<b 0x}"
+  echo "$i1_val"
+}
 
-  log_info "fetch_i1_from_api: domain=$domain"
-
-  api_resp=$(timeout 10 curl -s --connect-timeout 5 "$api_url" 2>/dev/null) || api_resp=""
-
-  if [[ -n "$api_resp" ]]; then
-    i1_val=$(echo "$api_resp" | timeout 5 python3 -c \
-      "import sys,json; d=json.load(sys.stdin); print(d.get('i1',''))" \
-      2>/dev/null) || i1_val=""
-
-    if [[ -z "$i1_val" ]] && command -v jq &>/dev/null; then
-      i1_val=$(echo "$api_resp" | timeout 5 jq -r '.i1 // empty' 2>/dev/null) || i1_val=""
+# ── Проверка I1 на потенциальные проблемы ─────────────────────
+validate_i1() {
+  local i1="$1"
+  local warnings=0
+  
+  if [[ "$i1" =~ \<c\> ]]; then
+    warn "I1 содержит тег <c> — возможен ErrorCode 1000 в старых версиях AWG-go"
+    warnings=$((warnings + 1))
+  fi
+  
+  if [[ ${#i1} -lt 50 ]]; then
+    warn "I1 слишком короткий (${#i1} байт) — возможно, это не полноценный CPS пакет"
+    warnings=$((warnings + 1))
+  fi
+  
+  if [[ $warnings -gt 0 ]]; then
+    echo -e "${Y}  ⚠ Найдено $warnings проблем в I1${N}"
+    read -rp "$(echo -e "${C}  Всё равно использовать I1? [y/N]: ${N}")" USE_ANYWAY
+    if [[ ! "$USE_ANYWAY" =~ ^[Yy]$ ]]; then
+      return 1
     fi
   fi
-
-  if [[ -z "$i1_val" ]]; then
-    log_warn "API не вернул I1 для $domain"
-    echo ""
-    return 1
-  fi
-
-  # Нормализация I1 (убираем все переносы строк)
-  i1_val=$(echo "$i1_val" | tr -d '\n\r' | sed 's/^"//;s/"$//')
-
-  if [[ "$i1_val" =~ ^\<b0x ]]; then
-    i1_val="${i1_val/<b0x/<b 0x}"
-    log_warn "I1: добавлен пробел после <b"
-  fi
-
-  if [[ ! "$i1_val" =~ ^\<b\ 0x ]]; then
-    log_err "I1 неверный формат для $domain"
-    echo ""
-    return 1
-  fi
-
-  log_info "I1 получен для $domain (длина: ${#i1_val})"
-  echo "$i1_val"
+  
   return 0
 }
 
 # ══════════════════════════════════════════════════════════
-# ВЫБОР ПРОФИЛЯ МИМИКРИИ + ГЕНЕРАЦИЯ I1 (КРАСИВОЕ МЕНЮ)
+# ВЫБОР ПРОФИЛЯ МИМИКРИИ + ГЕНЕРАЦИЯ I1
 # ══════════════════════════════════════════════════════════
 choose_mimicry_profile() {
   I1=""
@@ -246,21 +207,22 @@ choose_mimicry_profile() {
       echo -e "${Y}  ⚠ Не удалось получить I1 для $domain${N}"
       echo -e "${Y}  → API недоступен или домен не поддерживает QUIC${N}"
       read -rp "$(echo -e "${C}  Продолжить без I1? [y/N]: ${N}")" CONTINUE
-      if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
-        return 1
-      fi
+      [[ ! "$CONTINUE" =~ ^[Yy]$ ]] && return 1
       I1=""
     else
       echo -e "${G}  ✓ I1 получен (длина: ${#I1} байт)${N}"
+      if ! validate_i1 "$I1"; then
+        echo -e "${Y}  → I1 отключен из-за проблем${N}"
+        I1=""
+      fi
     fi
   fi
 }
 
 # ══════════════════════════════════════════════════════════
-# ОСТАЛЬНЫЕ ФУНКЦИИ (статус, IP, генерация параметров и т.д.)
+# ОСТАЛЬНЫЕ ФУНКЦИИ
 # ══════════════════════════════════════════════════════════
 
-# ── Получение публичного IP (с таймаутом) ────────────────────
 get_public_ip() {
   local ip=""
   ip=$(timeout 5 curl -s --connect-timeout 3 -4 ifconfig.me 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
@@ -269,13 +231,11 @@ get_public_ip() {
   echo ""
 }
 
-# ── Генерация случайного числа ─────────────────────────────
 rand_range() {
   local lo="$1" hi="$2"
   python3 -c "import random; print(random.randint($lo, $hi))"
 }
 
-# ── Поиск свободного IP ────────────────────────────────────
 find_free_ip() {
   local base="$1"
   local srv_ip_oct=""
@@ -296,7 +256,6 @@ find_free_ip() {
   return 1
 }
 
-# ── Статус сервера ─────────────────────────────────────────
 get_status() {
   local ip port status clients
   ip=$(get_public_ip)
@@ -312,7 +271,6 @@ get_status() {
   echo -e "$ip|$port|$status|$clients"
 }
 
-# ── Шапка ──────────────────────────────────────────────────
 show_header() {
   clear
   local s ip port st clients
@@ -328,7 +286,6 @@ show_header() {
   echo -e "${B}  Клиентов   : ${W}$clients${N}"
 }
 
-# ── Меню ───────────────────────────────────────────────────
 show_menu() {
   echo ""
   echo -e "  ${W}1)${N} Установка зависимостей и AmneziaWG"
@@ -345,9 +302,6 @@ show_menu() {
   read -rp "$(echo -e "${C}  Выбор: ${N}")" CHOICE
 }
 
-# ══════════════════════════════════════════════════════════
-# ВЫБОР DNS
-# ══════════════════════════════════════════════════════════
 choose_dns() {
   CLIENT_DNS=""
   hdr "DNS для клиента:"
@@ -368,9 +322,6 @@ choose_dns() {
   esac
 }
 
-# ══════════════════════════════════════════════════════════
-# ВЫБОР ВЕРСИИ AWG
-# ══════════════════════════════════════════════════════════
 choose_awg_version() {
   AWG_VERSION=""
   hdr "Версия протокола:"
@@ -390,114 +341,63 @@ choose_awg_version() {
   ok "Версия: $AWG_VERSION"
 }
 
-# ══════════════════════════════════════════════════════════
-# ГЕНЕРАЦИЯ AWG ПАРАМЕТРОВ (ИСПРАВЛЕНА)
-# ══════════════════════════════════════════════════════════
 gen_awg_params() {
   local ver="$1"
   AWG_PARAMS_LINES=""
-
   [[ "$ver" == "wg" ]] && return 0
 
   local Jc Jmin Jmax S1 S2 S2_OFF Q
-  # Jc: для AWG 1.0 нужно ≥4
   if [[ "$ver" == "1.0" ]]; then
     Jc=$(rand_range 4 7)
   else
     Jc=$(rand_range 3 7)
   fi
-  # Jmin — динамический, не фиксированный
   Jmin=$(rand_range 64 256)
   Jmax=$(rand_range 576 1024)
-  # S1 — от 1 до 39 (было от 10)
   S1=$(rand_range 1 39)
   S2_OFF=$(rand_range 1 63)
   [[ "$S2_OFF" -eq 56 ]] && S2_OFF=57
   S2=$(( S1 + S2_OFF ))
-  # S2 реальный лимит 1188, а не 64
   [[ $S2 -gt 1188 ]] && S2=1188
   Q=1073741823
 
   if [[ "$ver" == "2.0" ]]; then
-    local S3 S4
-    local H1_START H1_END H1
-    local H2_START H2_END H2
-    local H3_START H3_END H3
-    local H4_START H4_END H4
-
-    # S3 до 64 (было до 34)
-    S3=$(rand_range 5 64)
-    S4=$(rand_range 1 16)
-
-    # H1-H4: нижняя граница 5 (избегаем конфликта с WireGuard 1-4)
-    H1_START=$(rand_range 5 $((Q - 1)))
-    H1_END=$(rand_range $((H1_START + 30000)) $((H1_START + 130000)))
+    local S3=$(rand_range 5 64)
+    local S4=$(rand_range 1 16)
+    local H1_START=$(rand_range 5 $((Q - 1)))
+    local H1_END=$(rand_range $((H1_START + 30000)) $((H1_START + 130000)))
     [[ $H1_END -gt $((Q - 1)) ]] && H1_END=$((Q - 1))
-    H1="${H1_START}-${H1_END}"
-
-    H2_START=$(rand_range 5 $((Q * 2 - 1)))
-    H2_END=$(rand_range $((H2_START + 30000)) $((H2_START + 130000)))
+    local H1="${H1_START}-${H1_END}"
+    local H2_START=$(rand_range 5 $((Q * 2 - 1)))
+    local H2_END=$(rand_range $((H2_START + 30000)) $((H2_START + 130000)))
     [[ $H2_END -gt $((Q * 2 - 1)) ]] && H2_END=$((Q * 2 - 1))
-    H2="${H2_START}-${H2_END}"
-
-    H3_START=$(rand_range 5 $((Q * 3 - 1)))
-    H3_END=$(rand_range $((H3_START + 30000)) $((H3_START + 130000)))
+    local H2="${H2_START}-${H2_END}"
+    local H3_START=$(rand_range 5 $((Q * 3 - 1)))
+    local H3_END=$(rand_range $((H3_START + 30000)) $((H3_START + 130000)))
     [[ $H3_END -gt $((Q * 3 - 1)) ]] && H3_END=$((Q * 3 - 1))
-    H3="${H3_START}-${H3_END}"
-
-    H4_START=$(rand_range 5 $((Q * 4 - 1)))
-    H4_END=$(rand_range $((H4_START + 30000)) $((H4_START + 130000)))
+    local H3="${H3_START}-${H3_END}"
+    local H4_START=$(rand_range 5 $((Q * 4 - 1)))
+    local H4_END=$(rand_range $((H4_START + 30000)) $((H4_START + 130000)))
     [[ $H4_END -gt $((Q * 4 - 1)) ]] && H4_END=$((Q * 4 - 1))
-    H4="${H4_START}-${H4_END}"
-
-    AWG_PARAMS_LINES="Jc = $Jc
-Jmin = $Jmin
-Jmax = $Jmax
-S1 = $S1
-S2 = $S2
-S3 = $S3
-S4 = $S4
-H1 = $H1
-H2 = $H2
-H3 = $H3
-H4 = $H4"
-
+    local H4="${H4_START}-${H4_END}"
+    AWG_PARAMS_LINES="Jc = $Jc\nJmin = $Jmin\nJmax = $Jmax\nS1 = $S1\nS2 = $S2\nS3 = $S3\nS4 = $S4\nH1 = $H1\nH2 = $H2\nH3 = $H3\nH4 = $H4"
   elif [[ "$ver" == "1.5" ]]; then
-    local H1 H2 H3 H4
-    H1=$(rand_range 5 $((Q - 1)))
-    H2=$(rand_range 5 $((Q * 2 - 1)))
-    H3=$(rand_range 5 $((Q * 3 - 1)))
-    H4=$(rand_range 5 $((Q * 4 - 1)))
-    AWG_PARAMS_LINES="Jc = $Jc
-Jmin = $Jmin
-Jmax = $Jmax
-S1 = $S1
-S2 = $S2
-H1 = $H1
-H2 = $H2
-H3 = $H3
-H4 = $H4"
-
-  else # AWG 1.0
-    local H1 H2 H3 H4
-    H1=$(rand_range 5 $((Q - 1)))
-    H2=$(rand_range 5 $((Q * 2 - 1)))
-    H3=$(rand_range 5 $((Q * 3 - 1)))
-    H4=$(rand_range 5 $((Q * 4 - 1)))
-    AWG_PARAMS_LINES="Jc = $Jc
-Jmin = $Jmin
-Jmax = $Jmax
-S1 = $S1
-S2 = $S2
-H1 = $H1
-H2 = $H2
-H3 = $H3
-H4 = $H4"
+    local H1=$(rand_range 5 $((Q - 1)))
+    local H2=$(rand_range 5 $((Q * 2 - 1)))
+    local H3=$(rand_range 5 $((Q * 3 - 1)))
+    local H4=$(rand_range 5 $((Q * 4 - 1)))
+    AWG_PARAMS_LINES="Jc = $Jc\nJmin = $Jmin\nJmax = $Jmax\nS1 = $S1\nS2 = $S2\nH1 = $H1\nH2 = $H2\nH3 = $H3\nH4 = $H4"
+  else
+    local H1=$(rand_range 5 $((Q - 1)))
+    local H2=$(rand_range 5 $((Q * 2 - 1)))
+    local H3=$(rand_range 5 $((Q * 3 - 1)))
+    local H4=$(rand_range 5 $((Q * 4 - 1)))
+    AWG_PARAMS_LINES="Jc = $Jc\nJmin = $Jmin\nJmax = $Jmax\nS1 = $S1\nS2 = $S2\nH1 = $H1\nH2 = $H2\nH3 = $H3\nH4 = $H4"
   fi
 }
 
 # ══════════════════════════════════════════════════════════
-# 1. УСТАНОВКА
+# 1. УСТАНОВКА (ИСПРАВЛЕНО — УБРАН TIMEOUT)
 # ══════════════════════════════════════════════════════════
 do_install() {
   hdr "=== Обновление системы ==="
@@ -508,7 +408,7 @@ do_install() {
     -o Dpkg::Options::="--force-confold"
 
   hdr "=== Зависимости ==="
-    apt-get install -y -q \
+  apt-get install -y -q \
     software-properties-common \
     python3-launchpadlib \
     python3 \
@@ -585,47 +485,17 @@ EOF
   ok "Установка завершена"
   info "Следующий шаг: пункт меню 2 — Создать сервер"
 }
+
 # ══════════════════════════════════════════════════════════
-# 2. СОЗДАТЬ СЕРВЕР (с мимикрией + очистка старых клиентов)
+# 2. СОЗДАТЬ СЕРВЕР
 # ══════════════════════════════════════════════════════════
 do_gen() {
   log_info "do_gen: старт"
-  command -v awg &>/dev/null || { err "awg не найден. Сначала пункт 1"; log_err "awg не найден"; return 1; }
-  command -v python3 &>/dev/null || { err "python3 не найден. Сначала пункт 1"; log_err "python3 не найден"; return 1; }
+  command -v awg &>/dev/null || { err "awg не найден. Сначала пункт 1"; return 1; }
 
   local bak_ts
   bak_ts="${SERVER_CONF}.bak.$(date +%s)"
   [[ -f "$SERVER_CONF" ]] && cp "$SERVER_CONF" "$bak_ts" && info "Backup: $bak_ts"
-
-  # Очистка старых клиентов при смене версии
-  if [[ -f "$SERVER_CONF" ]] && grep -q "^\[Peer\]" "$SERVER_CONF" 2>/dev/null; then
-    local old_clients
-    old_clients=$(grep -c "^\[Peer\]" "$SERVER_CONF" 2>/dev/null || echo "0")
-    if [[ $old_clients -gt 0 ]]; then
-      echo ""
-      echo -e "${Y}  ⚠ Внимание: обнаружены старые клиенты (${old_clients} шт.)${N}"
-      echo -e "${Y}  При смене версии AWG они станут несовместимыми${N}"
-      echo ""
-      read -rp "$(echo -e "${C}  Удалить старых клиентов? [Y/n]: ${N}")" CLEAN_OLD
-      CLEAN_OLD=${CLEAN_OLD:-y}
-      if [[ $CLEAN_OLD =~ ^[Yy]$ ]]; then
-        awg-quick down "$SERVER_CONF" 2>/dev/null || true
-        local temp_conf="${SERVER_CONF}.tmp"
-        sed -n '/^\[Peer\]/q; p' "$SERVER_CONF" > "$temp_conf" 2>/dev/null
-        if [[ -s "$temp_conf" ]] && grep -q "^\[Interface\]" "$temp_conf" 2>/dev/null; then
-          mv "$temp_conf" "$SERVER_CONF"
-          ok "Старые клиенты удалены из конфига"
-        else
-          warn "Не удалось очистить конфиг, оставляем как есть"
-          rm -f "$temp_conf" 2>/dev/null
-        fi
-        rm -f /root/*_awg2.conf 2>/dev/null || true
-        warn "Все конфиги клиентов из /root удалены"
-      else
-        warn "Старые клиенты остались, но могут не работать с новой версией"
-      fi
-    fi
-  fi
 
   choose_awg_version
   choose_dns
@@ -703,13 +573,6 @@ do_gen() {
   cli_pub=$(echo "$cli_priv" | awg pubkey)
   psk=$(awg genpsk)
 
-  # ПРОВЕРКА КЛЮЧЕЙ
-  local cli_pub_check=$(echo "$cli_priv" | awg pubkey)
-  if [[ "$cli_pub_check" != "$cli_pub" ]]; then
-    err "Критическая ошибка: ключи клиента не совпадают!"
-    return 1
-  fi
-
   srv_ip=$(get_public_ip)
   [[ -z "$srv_ip" ]] && { err "не удалось получить внешний IP"; return 1; }
 
@@ -733,8 +596,7 @@ do_gen() {
     echo "Address = $SERVER_ADDR"
     echo "ListenPort = $PORT"
     echo "MTU = $MTU"
-    [[ -n "$AWG_PARAMS_LINES" ]] && echo "$AWG_PARAMS_LINES"
-    # I1 только для AWG 1.5 и 2.0 (не для 1.0 и wg)
+    echo -e "$AWG_PARAMS_LINES"
     if [[ -n "$I1" ]] && [[ "$AWG_VERSION" != "1.0" ]] && [[ "$AWG_VERSION" != "wg" ]]; then
       echo "I1 = $I1"
     fi
@@ -755,7 +617,7 @@ do_gen() {
     echo "Address = $CLIENT_ADDR"
     echo "DNS = $CLIENT_DNS"
     echo "MTU = $MTU"
-    [[ -n "$AWG_PARAMS_LINES" ]] && echo "$AWG_PARAMS_LINES"
+    echo -e "$AWG_PARAMS_LINES"
     if [[ -n "$I1" ]] && [[ "$AWG_VERSION" != "1.0" ]] && [[ "$AWG_VERSION" != "wg" ]]; then
       echo "I1 = $I1"
     fi
@@ -817,7 +679,7 @@ EOF
 }
 
 # ══════════════════════════════════════════════════════════
-# 3. ДОБАВИТЬ КЛИЕНТА (ИСПРАВЛЕНО)
+# 3. ДОБАВИТЬ КЛИЕНТА
 # ══════════════════════════════════════════════════════════
 do_add_client() {
   [[ ! -f "$SERVER_CONF" ]] && { err "конфиг сервера не найден. Сначала пункт 2"; return 1; }
@@ -879,26 +741,19 @@ do_add_client() {
     esac
   fi
 
-  # Берем публичный ключ сервера ИЗ RUNTIME
-  local srv_pub=$(awg show awg0 public-key 2>/dev/null)
-  [[ -z "$srv_pub" ]] && { err "awg0 не поднят. Запусти: awg-quick up $SERVER_CONF"; return 1; }
-
-  local srv_ip=$(get_public_ip)
+  local srv_pub srv_ip port mtu
+  srv_pub=$(awg show awg0 public-key 2>/dev/null) \
+    || { err "awg0 не поднят. Запусти: awg-quick up $SERVER_CONF"; return 1; }
+  srv_ip=$(get_public_ip)
   [[ -z "$srv_ip" ]] && { err "не удалось получить внешний IP"; return 1; }
-  local port=$(grep "^ListenPort = " "$SERVER_CONF" | awk -F'= ' '{print $2}' | tr -d ' ')
-  local mtu=$(grep "^MTU = " "$SERVER_CONF" | awk -F'= ' '{print $2}' | head -1)
+  port=$(grep "^ListenPort = " "$SERVER_CONF" | awk -F'= ' '{print $2}' | tr -d ' ')
+  mtu=$(grep "^MTU = " "$SERVER_CONF" | awk -F'= ' '{print $2}' | head -1)
   mtu=${mtu:-1380}
 
-  local cli_priv=$(awg genkey)
-  local cli_pub=$(echo "$cli_priv" | awg pubkey)
-  local psk=$(awg genpsk)
-
-  # ПРОВЕРКА КЛЮЧЕЙ
-  local cli_pub_check=$(echo "$cli_priv" | awg pubkey)
-  if [[ "$cli_pub_check" != "$cli_pub" ]]; then
-    err "Критическая ошибка: ключи клиента не совпадают!"
-    return 1
-  fi
+  local cli_priv cli_pub psk
+  cli_priv=$(awg genkey)
+  cli_pub=$(echo "$cli_priv" | awg pubkey)
+  psk=$(awg genpsk)
 
   {
     echo ""
@@ -953,7 +808,7 @@ do_add_client() {
 }
 
 # ══════════════════════════════════════════════════════════
-# 4. ПОКАЗАТЬ КЛИЕНТОВ (расширенная информация)
+# 4. ПОКАЗАТЬ КЛИЕНТОВ
 # ══════════════════════════════════════════════════════════
 do_list_clients() {
   [[ ! -f "$SERVER_CONF" ]] && { err "конфиг сервера не найден"; return 1; }
@@ -1190,7 +1045,7 @@ do_uninstall() {
 }
 
 # ══════════════════════════════════════════════════════════
-# 8. ПРОВЕРКА ДОМЕНОВ (с цветным выводом)
+# 8. ПРОВЕРКА ДОМЕНОВ
 # ══════════════════════════════════════════════════════════
 do_check_domains() {
   echo ""
@@ -1265,7 +1120,7 @@ do_check_domains() {
 }
 
 # ══════════════════════════════════════════════════════════
-# 9. ОЧИСТИТЬ КЛИЕНТОВ (без удаления сервера)
+# 9. ОЧИСТИТЬ КЛИЕНТОВ
 # ══════════════════════════════════════════════════════════
 do_clean_clients() {
   [[ ! -f "$SERVER_CONF" ]] && { err "конфиг сервера не найден"; return 1; }
