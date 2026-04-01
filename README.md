@@ -1,3 +1,4 @@
+<div align="center">
 # AWG Multi Script
 
 <div align="center">
