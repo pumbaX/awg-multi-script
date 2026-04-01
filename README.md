@@ -1,6 +1,6 @@
 <div align="center">
 
-**AWG Multi Script**
+# **AWG Multi Script**
 
 **Универсальный менеджер AmneziaWG** — разверни VPN на VPS одной командой.<br>Обфускация, мимикрия, DPI-обход. WireGuard → AWG 2.0.
 
