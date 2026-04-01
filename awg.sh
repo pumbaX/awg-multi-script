@@ -909,53 +909,149 @@ do_add_client() {
 }
 
 # ══════════════════════════════════════════════════════════
-# 4. ПОКАЗАТЬ КЛИЕНТОВ
+# 4. ПОКАЗАТЬ КЛИЕНТОВ (расширенная информация)
 # ══════════════════════════════════════════════════════════
 do_list_clients() {
   [[ ! -f "$SERVER_CONF" ]] && { err "конфиг сервера не найден"; return 1; }
-  hdr "Клиенты:"
+  
+  echo ""
+  echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo -e "${W}                                    КЛИЕНТЫ${N}"
+  echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo ""
 
   local transfer_cache
   transfer_cache=$(awg show awg0 transfer 2>/dev/null || true)
+  
+  local handshake_cache
+  handshake_cache=$(awg show awg0 latest-handshakes 2>/dev/null || true)
+  
+  local endpoint_cache
+  endpoint_cache=$(awg show awg0 endpoints 2>/dev/null || true)
 
   local i=0
-  local name="" pubkey="" ip="" tx_raw=0 rx_raw=0
+  local name="" pubkey="" ip="" tx_raw=0 rx_raw=0 handshake_time="" endpoint=""
+  
   while IFS= read -r line; do
     if [[ "$line" =~ ^\[Peer\] ]]; then
+      # Выводим предыдущего клиента, если есть
+      if [[ $i -gt 0 ]] && [[ -n "$pubkey" ]]; then
+        _print_client_info "$i" "$name" "$ip" "$tx_raw" "$rx_raw" "$handshake_time" "$endpoint"
+      fi
       i=$((i+1))
-      name=""; pubkey=""; ip=""; tx_raw=0; rx_raw=0
+      name=""; pubkey=""; ip=""; tx_raw=0; rx_raw=0; handshake_time=""; endpoint=""
     elif [[ "$line" =~ ^#[[:space:]](.+) ]]; then
       name="${BASH_REMATCH[1]}"
     elif [[ "$line" =~ ^PublicKey[[:space:]]=[[:space:]](.+) ]]; then
       pubkey="${BASH_REMATCH[1]}"
+      # Получаем статистику
       local transfer_line
       transfer_line=$(echo "$transfer_cache" | grep -F "$pubkey" | head -1)
       tx_raw=$(echo "$transfer_line" | awk '{print $2}' 2>/dev/null || echo "0")
       rx_raw=$(echo "$transfer_line" | awk '{print $3}' 2>/dev/null || echo "0")
       tx_raw=${tx_raw:-0}
       rx_raw=${rx_raw:-0}
+      # Получаем время последнего handshake
+      local hs_line
+      hs_line=$(echo "$handshake_cache" | grep -F "$pubkey" | head -1)
+      handshake_time=$(echo "$hs_line" | awk '{print $2}' 2>/dev/null || echo "")
+      # Получаем endpoint
+      local ep_line
+      ep_line=$(echo "$endpoint_cache" | grep -F "$pubkey" | head -1)
+      endpoint=$(echo "$ep_line" | awk '{print $2}' 2>/dev/null || echo "")
     elif [[ "$line" =~ ^AllowedIPs[[:space:]]=[[:space:]](.+) ]]; then
       ip="${BASH_REMATCH[1]}"
-      local short_name tx_fmt rx_fmt
-      short_name="${name:-безымянный}"
-      short_name="${short_name:0:7}"
-      if (( tx_raw >= 1073741824 )); then
-        tx_fmt=$(echo "scale=2; $tx_raw/1073741824" | bc 2>/dev/null || echo "0")" ГБ"
-      else
-        tx_fmt=$(echo "scale=2; $tx_raw/1048576" | bc 2>/dev/null || echo "0")" МБ"
-      fi
-      if (( rx_raw >= 1073741824 )); then
-        rx_fmt=$(echo "scale=2; $rx_raw/1073741824" | bc 2>/dev/null || echo "0")" ГБ"
-      else
-        rx_fmt=$(echo "scale=2; $rx_raw/1048576" | bc 2>/dev/null || echo "0")" МБ"
-      fi
-      echo -e "  ${W}$(printf '%2d' $i))${N} ${C}$(printf '%-7s' "$short_name")${N}  IP: ${W}$(printf '%-20s' "$ip")${N}  ↑ $(printf '%-12s' "$tx_fmt")  ↓ $rx_fmt"
     fi
   done < "$SERVER_CONF"
+  
+  # Выводим последнего клиента
+  if [[ $i -gt 0 ]] && [[ -n "$pubkey" ]]; then
+    _print_client_info "$i" "$name" "$ip" "$tx_raw" "$rx_raw" "$handshake_time" "$endpoint"
+  fi
 
-  [[ $i -eq 0 ]] && warn "Клиентов нет"
+  if [[ $i -eq 0 ]]; then
+    echo -e "  ${Y}╔════════════════════════════════════════════════════════════════════════════╗${N}"
+    echo -e "  ${Y}║                         НЕТ АКТИВНЫХ КЛИЕНТОВ                              ║${N}"
+    echo -e "  ${Y}╚════════════════════════════════════════════════════════════════════════════╝${N}"
+  fi
+  
   echo ""
+  echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo -e "${C}  ↑ — выгрузка (от клиента), ↓ — загрузка (к клиенту)${N}"
+  echo -e "${C}  Подключение: если handshake не обновляется > 2 мин — клиент офлайн${N}"
+  echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo ""
+}
+
+# ── Вспомогательная функция для вывода информации о клиенте ──
+_print_client_info() {
+  local num="$1"
+  local name="$2"
+  local ip="$3"
+  local tx_raw="$4"
+  local rx_raw="$5"
+  local handshake_time="$6"
+  local endpoint="$7"
+  
+  # Форматируем имя
+  local display_name="${name:-безымянный}"
+  display_name="${display_name:0:15}"
+  
+  # Форматируем трафик
+  local tx_fmt rx_fmt
+  if (( tx_raw >= 1073741824 )); then
+    tx_fmt=$(echo "scale=2; $tx_raw/1073741824" | bc 2>/dev/null || echo "0")" ГБ"
+  elif (( tx_raw >= 1048576 )); then
+    tx_fmt=$(echo "scale=2; $tx_raw/1048576" | bc 2>/dev/null || echo "0")" МБ"
+  else
+    tx_fmt=$(echo "scale=0; $tx_raw/1024" | bc 2>/dev/null || echo "0")" КБ"
+  fi
+  
+  if (( rx_raw >= 1073741824 )); then
+    rx_fmt=$(echo "scale=2; $rx_raw/1073741824" | bc 2>/dev/null || echo "0")" ГБ"
+  elif (( rx_raw >= 1048576 )); then
+    rx_fmt=$(echo "scale=2; $rx_raw/1048576" | bc 2>/dev/null || echo "0")" МБ"
+  else
+    rx_fmt=$(echo "scale=0; $rx_raw/1024" | bc 2>/dev/null || echo "0")" КБ"
+  fi
+  
+  # Определяем статус подключения
+  local status_icon=""
+  local status_text=""
+  if [[ -n "$handshake_time" ]] && [[ "$handshake_time" != "0" ]]; then
+    local current_time=$(date +%s)
+    local last_hs=$handshake_time
+    local diff=$((current_time - last_hs))
+    if [[ $diff -lt 120 ]]; then
+      status_icon="${G}●${N}"
+      status_text="активен"
+    elif [[ $diff -lt 300 ]]; then
+      status_icon="${Y}◐${N}"
+      status_text="неактивен ($((diff/60)) мин)"
+    else
+      status_icon="${R}○${N}"
+      status_text="офлайн ($((diff/60)) мин)"
+    fi
+  else
+    status_icon="${R}○${N}"
+    status_text="нет подключения"
+  fi
+  
+  # Форматируем endpoint (обрезаем порт если нужно)
+  local endpoint_short=""
+  if [[ -n "$endpoint" ]]; then
+    endpoint_short="${endpoint%:*}"
+  fi
+  
+  # Выводим информацию
+  echo -e "  ${W}┌─ ${C}[${num}]${N} ${W}${display_name}${N}"
+  echo -e "  ${W}│${N}  IP:        ${W}$ip${N}"
+  echo -e "  ${W}│${N}  Трафик:    ↑ ${G}$tx_fmt${N}  ↓ ${C}$rx_fmt${N}"
+  echo -e "  ${W}│${N}  Статус:    $status_icon $status_text"
+  if [[ -n "$endpoint_short" ]]; then
+    echo -e "  ${W}│${N}  Endpoint:  ${Y}$endpoint_short${N}"
+  fi
+  echo -e "  ${W}└─────────────────────────────────────────────────────────────────────────${N}"
 }
 
 # ══════════════════════════════════════════════════════════
