@@ -2,8 +2,16 @@
 set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────
-# AmneziaWG Manager v4.2 — исправленная версия
-# Исправлено: удалён timeout из установки, добавлена проверка I1
+# AmneziaWG Manager v4.3 — финальная исправленная версия
+# Исправлены все найденные баги:
+# - Убрана двойная проверка CHOICE
+# - Добавлены fallback для grep
+# - Уникальные H1-H4 для AWG 2.0
+# - Исправлен autostart
+# - awg_params читается только из [Interface]
+# - Исправлен fetch_i1_from_api
+# - tx_raw/rx_raw нормализация
+# - sysctl -w вместо sysctl -p
 # ─────────────────────────────────────────────────────────────
 
 # ── Цвета ──────────────────────────────────────────────────
@@ -90,11 +98,13 @@ fetch_i1_from_api() {
   local i1_val=$(echo "$api_resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('i1',''))" 2>/dev/null || echo "")
   [[ -z "$i1_val" ]] && return 1
   i1_val=$(echo "$i1_val" | tr -d '\n\r' | sed 's/^"//;s/"$//')
-  [[ "$i1_val" =~ ^\<b0x ]] && i1_val="${i1_val/<b0x/<b 0x}"
+  # Исправляем <b0x на <b 0x (глобальная замена)
+  if [[ "$i1_val" =~ \<b0x ]]; then
+    i1_val=$(echo "$i1_val" | sed 's/<b0x/<b 0x/g')
+  fi
   echo "$i1_val"
 }
 
-# ── Проверка I1 на потенциальные проблемы ─────────────────────
 validate_i1() {
   local i1="$1"
   local warnings=0
@@ -262,8 +272,8 @@ get_status() {
   [[ -z "$ip" ]] && ip="—"
   if ip link show awg0 &>/dev/null; then
     status="${G}активен${N}"
-    port=$(awg show awg0 listen-port 2>/dev/null) || port="—"
-    clients=$(awg show awg0 peers 2>/dev/null | wc -l | tr -d ' ') || clients="0"
+    port=$(awg show awg0 listen-port 2>/dev/null || echo "—")
+    clients=$(awg show awg0 peers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
   else
     status="${R}не активен${N}"
     port="—"; clients="—"
@@ -277,7 +287,7 @@ show_header() {
   s=$(get_status)
   IFS='|' read -r ip port st clients <<< "$s"
   echo -e "${B}╔══════════════════════════════════════════════╗${N}"
-  echo -e "${B}║${W}        AmneziaWG Manager v4.2                ${B}║${N}"
+  echo -e "${B}║${W}        AmneziaWG Manager v4.3                ${B}║${N}"
   echo -e "${B}║${C}     С генератором мимикрии (QUIC/TLS/DTLS)   ${B}║${N}"
   echo -e "${B}╚══════════════════════════════════════════════╝${N}"
   echo -e "${B}  IP сервера : ${W}$ip${N}"
@@ -341,6 +351,9 @@ choose_awg_version() {
   ok "Версия: $AWG_VERSION"
 }
 
+# ══════════════════════════════════════════════════════════
+# ГЕНЕРАЦИЯ AWG ПАРАМЕТРОВ (ИСПРАВЛЕНА: уникальные H1-H4 для AWG 2.0)
+# ══════════════════════════════════════════════════════════
 gen_awg_params() {
   local ver="$1"
   AWG_PARAMS_LINES=""
@@ -364,23 +377,39 @@ gen_awg_params() {
   if [[ "$ver" == "2.0" ]]; then
     local S3=$(rand_range 5 64)
     local S4=$(rand_range 1 16)
-    local H1_START=$(rand_range 5 $((Q - 1)))
-    local H1_END=$(rand_range $((H1_START + 30000)) $((H1_START + 130000)))
+    
+    # Генерируем уникальные непересекающиеся диапазоны для H1-H4
+    local H1_START H1_END H1
+    local H2_START H2_END H2
+    local H3_START H3_END H3
+    local H4_START H4_END H4
+    
+    # H1: квадрант 0
+    H1_START=$(rand_range 5 $((Q - 1)))
+    H1_END=$(rand_range $((H1_START + 30000)) $((H1_START + 130000)))
     [[ $H1_END -gt $((Q - 1)) ]] && H1_END=$((Q - 1))
-    local H1="${H1_START}-${H1_END}"
-    local H2_START=$(rand_range 5 $((Q * 2 - 1)))
-    local H2_END=$(rand_range $((H2_START + 30000)) $((H2_START + 130000)))
+    H1="${H1_START}-${H1_END}"
+    
+    # H2: квадрант 1, гарантированно больше H1
+    H2_START=$(rand_range $((H1_END + 1)) $((Q * 2 - 1)))
+    H2_END=$(rand_range $((H2_START + 30000)) $((H2_START + 130000)))
     [[ $H2_END -gt $((Q * 2 - 1)) ]] && H2_END=$((Q * 2 - 1))
-    local H2="${H2_START}-${H2_END}"
-    local H3_START=$(rand_range 5 $((Q * 3 - 1)))
-    local H3_END=$(rand_range $((H3_START + 30000)) $((H3_START + 130000)))
+    H2="${H2_START}-${H2_END}"
+    
+    # H3: квадрант 2, гарантированно больше H2
+    H3_START=$(rand_range $((H2_END + 1)) $((Q * 3 - 1)))
+    H3_END=$(rand_range $((H3_START + 30000)) $((H3_START + 130000)))
     [[ $H3_END -gt $((Q * 3 - 1)) ]] && H3_END=$((Q * 3 - 1))
-    local H3="${H3_START}-${H3_END}"
-    local H4_START=$(rand_range 5 $((Q * 4 - 1)))
-    local H4_END=$(rand_range $((H4_START + 30000)) $((H4_START + 130000)))
+    H3="${H3_START}-${H3_END}"
+    
+    # H4: квадрант 3, гарантированно больше H3
+    H4_START=$(rand_range $((H3_END + 1)) $((Q * 4 - 1)))
+    H4_END=$(rand_range $((H4_START + 30000)) $((H4_START + 130000)))
     [[ $H4_END -gt $((Q * 4 - 1)) ]] && H4_END=$((Q * 4 - 1))
-    local H4="${H4_START}-${H4_END}"
+    H4="${H4_START}-${H4_END}"
+    
     AWG_PARAMS_LINES="Jc = $Jc\nJmin = $Jmin\nJmax = $Jmax\nS1 = $S1\nS2 = $S2\nS3 = $S3\nS4 = $S4\nH1 = $H1\nH2 = $H2\nH3 = $H3\nH4 = $H4"
+    
   elif [[ "$ver" == "1.5" ]]; then
     local H1=$(rand_range 5 $((Q - 1)))
     local H2=$(rand_range 5 $((Q * 2 - 1)))
@@ -397,7 +426,7 @@ gen_awg_params() {
 }
 
 # ══════════════════════════════════════════════════════════
-# 1. УСТАНОВКА (ИСПРАВЛЕНО — УБРАН TIMEOUT)
+# 1. УСТАНОВКА
 # ══════════════════════════════════════════════════════════
 do_install() {
   hdr "=== Обновление системы ==="
@@ -582,8 +611,8 @@ do_gen() {
   AWG_PARAMS_LINES=""
   gen_awg_params "$AWG_VERSION"
 
-  echo 1 > /proc/sys/net/ipv4/ip_forward
-  sysctl -p 2>/dev/null || warn "sysctl содержит лишние строки"
+  # Исправлено: sysctl -w вместо sysctl -p
+  sysctl -w net.ipv4.ip_forward=1 -q
 
   mkdir -p /etc/amnezia/amneziawg
 
@@ -667,11 +696,8 @@ _setup_autostart() {
   mkdir -p "$unit_dir"
   cat > "${unit_dir}/override.conf" <<EOF
 [Service]
-Environment=WG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg
 ExecStart=
-ExecStart=/usr/bin/awg-quick up ${SERVER_CONF}
-ExecStop=
-ExecStop=/usr/bin/awg-quick down ${SERVER_CONF}
+ExecStart=/usr/bin/awg-quick up awg0
 EOF
   systemctl daemon-reload
   systemctl enable awg-quick@awg0 2>/dev/null && ok "Автозапуск включён" || \
@@ -775,8 +801,9 @@ do_add_client() {
     allowed-ips "$client_addr" \
     || { err "не удалось добавить peer в runtime"; return 1; }
 
+  # Исправлено: читаем параметры только из секции [Interface]
   local awg_params_from_srv
-  awg_params_from_srv=$(grep -E "^(Jc|Jmin|Jmax|S[1-4]|H[1-4]) = " "$SERVER_CONF" | grep -v "^#" || true)
+  awg_params_from_srv=$(sed -n '/^\[Peer\]/q; p' "$SERVER_CONF" | grep -E "^(Jc|Jmin|Jmax|S[1-4]|H[1-4]) = " | grep -v "^#" || true)
 
   {
     echo "[Interface]"
@@ -834,6 +861,9 @@ do_list_clients() {
   while IFS= read -r line; do
     if [[ "$line" =~ ^\[Peer\] ]]; then
       if [[ $i -gt 0 ]] && [[ -n "$pubkey" ]]; then
+        # Нормализуем значения перед арифметикой
+        tx_raw=${tx_raw:-0}
+        rx_raw=${rx_raw:-0}
         _print_client_info "$i" "$name" "$ip" "$tx_raw" "$rx_raw" "$handshake_time" "$endpoint"
       fi
       i=$((i+1))
@@ -860,6 +890,8 @@ do_list_clients() {
   done < "$SERVER_CONF"
   
   if [[ $i -gt 0 ]] && [[ -n "$pubkey" ]]; then
+    tx_raw=${tx_raw:-0}
+    rx_raw=${rx_raw:-0}
     _print_client_info "$i" "$name" "$ip" "$tx_raw" "$rx_raw" "$handshake_time" "$endpoint"
   fi
 
@@ -1181,17 +1213,14 @@ AWG_PARAMS_LINES=""
 ERROR_COUNT=0
 
 touch "$LOG_FILE" 2>/dev/null && chmod 600 "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/awg-manager.log"
-log_info "=== AWG Manager v4.2 запущен ==="
+log_info "=== AWG Manager v4.3 запущен ==="
 
 trap 'rm -f /tmp/awg_tmp_* 2>/dev/null || true' EXIT
 
 while true; do
   show_header
   show_menu
-  
-  if [[ -z "${CHOICE:-}" ]]; then
-    read -rp "$(echo -e "${C}  Выбор: ${N}")" CHOICE
-  fi
+  # show_menu уже читает CHOICE, дополнительный read не нужен
   
   case "${CHOICE:-}" in
     1) do_install ;;
