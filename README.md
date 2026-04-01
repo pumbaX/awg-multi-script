@@ -250,6 +250,6 @@ sip.antisip.com, sip.voipbuster.com, sip.3cx.com
 
 **AWG Multi Script v4.1** · MIT License
 
-*Разработано для сообщества [AmneziaVPN](https://amnezia.org)*
+*Разработано для сообщества [AWG-Manager](https://t.me/awgmanager)*
 
 </div>
