@@ -225,6 +225,5 @@ MIT License
 
 <div align="center">
 AWG Multi Script — версия 4.1
-Разработано для сообщества AmneziaVPN
 
 </div>
