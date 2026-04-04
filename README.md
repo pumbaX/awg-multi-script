@@ -1,6 +1,6 @@
 <div align="center">
 
-# **awg2-installer**
+# **Awg2-installer**
 
 **Менеджер AmneziaWG 2.0** — разверни VPN на VPS одной командой.<br>
 Мимикрия под 10 протоколов, локальная генерация I1, бекап, DPI-обход.
@@ -283,7 +283,8 @@ sip.zadarma.com, sip.iptel.org, sip.linphone.org
 <br>
 
 ---
+*Разработано для сообщества [AWG-Manager](https://t.me/awgmanager)*
 
-**awg2-installer** · MIT License · [pumbaX](https://github.com/pumbaX)
+**awg2-installer** · MIT License · 
 
 </div>
