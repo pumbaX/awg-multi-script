@@ -71,19 +71,19 @@ sudo bash /tmp/awg2.sh
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│        Выбор типа I1                                         │
-│                                                              │
-│   1   QUIC Initial (RFC 9000)      — HTTP/3, лучший в 2026  │
-│   2   QUIC 0-RTT (Early Data)      — быстрый старт          │
-│   3   TLS 1.3 Client Hello         — HTTPS, макс. совм.     │
-│   4   Noise_IK (Standard)          — нативный AWG handshake │
-│   5   DTLS 1.3 Handshake           — WebRTC / STUN          │
-│   6   HTTP/3 Host Mimicry          — QPACK заголовки        │
-│   7   SIP (VoIP Signaling)         — SIP REGISTER пакет     │
-│   8   TLS → QUIC (Alt-Svc)        — TLS ClientHello + ALPN h3│
-│   9   QUIC Burst (Multi-packet)    — тройной QUIC Initial   │
-│  10   DNS Query (UDP 53)           — стандартный A-запрос   │
-│  11   Запросить через API          — junk.web2core.workers.dev│
+│        Выбор типа I1                                                    │
+│                                                                         │
+│   1   QUIC Initial (RFC 9000)      — HTTP/3, лучший в 2026              │
+│   2   QUIC 0-RTT (Early Data)      — быстрый старт                      │
+│   3   TLS 1.3 Client Hello         — HTTPS, макс. совм.                 │
+│   4   Noise_IK (Standard)          — нативный AWG handshake             │
+│   5   DTLS 1.3 Handshake           — WebRTC / STUN                      │
+│   6   HTTP/3 Host Mimicry          — QPACK заголовки                    │
+│   7   SIP (VoIP Signaling)         — SIP REGISTER пакет                 │
+│   8   TLS → QUIC (Alt-Svc)        — TLS ClientHello + ALPN h3          |
+│   9   QUIC Burst (Multi-packet)    — тройной QUIC Initial               │
+│  10   DNS Query (UDP 53)           — стандартный A-запрос               │
+│  11   Запросить через API          — junk.web2core.workers.dev          │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -102,16 +102,16 @@ sudo bash /tmp/awg2.sh
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  Профили мимикрии (быстрый выбор из пулов)               │
-│                                                          │
-│  1   QUIC Initial      — HTTP/3, CDN (лучший в 2026)    │
-│  2   QUIC 0-RTT        — Early Data, быстрый старт      │
-│  3   TLS 1.3           — HTTPS (макс. совместимость)    │
-│  4   DTLS 1.3          — WebRTC / STUN (видеозвонки)    │
-│  5   SIP               — VoIP (телефонные звонки)       │
-│  6   Случайный домен   — Из любого пула                 │
-│  7   Ручной ввод       — Свой домен + выбор типа I1     │
-│  8   Без имитации      — Только обфускация              │
+│  Профили мимикрии (быстрый выбор из пулов)                          │
+│                                                                     │
+│  1   QUIC Initial      — HTTP/3, CDN (лучший в 2026)                │
+│  2   QUIC 0-RTT        — Early Data, быстрый старт                  │
+│  3   TLS 1.3           — HTTPS (макс. совместимость)                │
+│  4   DTLS 1.3          — WebRTC / STUN (видеозвонки)                │
+│  5   SIP               — VoIP (телефонные звонки)                   │
+│  6   Случайный домен   — Из любого пула                             │
+│  7   Ручной ввод       — Свой домен + выбор типа I1                 │
+│  8   Без имитации      — Только обфускация                          │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -168,8 +168,8 @@ sip.zadarma.com, sip.iptel.org, sip.linphone.org
 
 ```
 ╔══════════════════════════════════════════════╗
-║        AmneziaWG Manager v5.0                ║
-║     AWG 2.0 only — QUIC/TLS/DTLS/SIP/DNS     ║
+║        AmneziaWG Manager v5.0                        ║
+║     AWG 2.0 only — QUIC/TLS/DTLS/SIP/DNS             ║
 ╚══════════════════════════════════════════════╝
   IP сервера : 1.2.3.4
   Порт       : 47300
