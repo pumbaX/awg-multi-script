@@ -798,7 +798,6 @@ EOF
   ssh_port=${ssh_port:-22}
   ufw allow "${ssh_port}/tcp" comment "SSH" || true
   ufw allow 80/tcp  comment "HTTP"  || true
-  ufw allow 443/tcp comment "HTTPS" || true
   sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
   ufw --force enable || true
   ufw status verbose
@@ -861,8 +860,7 @@ do_gen() {
   esac
 
   hdr "Порт сервера:"
-  echo -e "${Y}  Для QUIC/TLS мимикрии рекомендуется порт 443${N}"
-  read -rp "$(echo -e "${C}  Порт [51820 / 443 / r = случайный]: ${N}")" PORT
+  read -rp "$(echo -e "${C}  Порт [51820 / r = случайный]: ${N}")" PORT
   if [[ "${PORT:-}" == "r" || "${PORT:-}" == "R" ]]; then
     PORT=$(rand_range 30001 65535)
     ok "случайный порт: $PORT"
@@ -1230,8 +1228,9 @@ _print_client_info() {
   local status_icon=""
   local status_text=""
   if [[ -n "$handshake_time" ]] && [[ "$handshake_time" != "0" ]]; then
-    local current_time=$(date +%s)
-    local diff=$((current_time - handshake_time))
+    local current_time diff
+    current_time=$(date +%s)
+    diff=$((current_time - handshake_time))
     if [[ $diff -lt 120 ]]; then
       status_icon="${G}●${N}"
       status_text="активен"
@@ -1430,10 +1429,10 @@ do_check_domains() {
   echo -e "${G}  ✓ Доступно: $available из $total доменов${N}"
   
   if [[ $available -lt $total ]]; then
-    echo -e "${Y}  ⚠ Недоступные домены будут автоматически исключены из выбора${N}"
+    echo -e "${Y}  ⚠ Часть доменов недоступна — выбирай профиль мимикрии вручную${N}"
   fi
   
-  echo -e "${C}  → При генерации будут использованы только доступные домены${N}"
+  echo -e "${C}  → Результат проверки — справочный. Домен выбирается случайно из пула.${N}"
   echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo ""
 
