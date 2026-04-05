@@ -548,22 +548,31 @@ choose_mimicry_profile() {
       ;;
   esac
 
-  # Для профилей 1-6 и fallback: получаем I1 через API
+  # Для профилей 1-6 и fallback: API → локальная генерация как fallback
   if [[ "$PROFILE_CHOICE" != "8" ]] && [[ -n "$domain" ]]; then
     echo -e "${C}  → Запрос I1 для $domain...${N}"
-    I1=$(fetch_i1_from_api "$domain")
+    I1=$(fetch_i1_from_api "$domain") || I1=""
     if [[ -z "$I1" ]]; then
-      echo -e "${Y}  ⚠ Не удалось получить I1 для $domain${N}"
-      echo -e "${Y}  → API недоступен или домен не поддерживает QUIC${N}"
-      read -rp "$(echo -e "${C}  Продолжить без I1? [y/N]: ${N}")" CONTINUE
-      [[ ! "$CONTINUE" =~ ^[Yy]$ ]] && return 1
-      I1=""
-    else
-      echo -e "${G}  ✓ I1 получен (длина: ${#I1} байт)${N}"
-      if ! validate_i1 "$I1"; then
-        echo -e "${Y}  → I1 отключен из-за проблем${N}"
-        I1=""
+      echo -e "${Y}  ⚠ API недоступен — генерируем I1 локально${N}"
+      case "$MIMICRY_PROFILE" in
+        quic_initial) I1=$(_gen_i1_quic_initial "$domain") ;;
+        quic_0rtt)    I1=$(_gen_i1_quic_0rtt "$domain") ;;
+        tls)          I1=$(_gen_i1_tls13 "$domain") ;;
+        dtls)         I1=$(_gen_i1_dtls13 "$domain") ;;
+        sip)          I1=$(_gen_i1_sip "$domain") ;;
+        *)            I1=$(_gen_i1_quic_initial "$domain") ;;
+      esac
+      if [[ -n "$I1" ]]; then
+        echo -e "${G}  ✓ I1 сгенерирован локально (длина: ${#I1} байт)${N}"
+      else
+        warn "Не удалось сгенерировать I1"; I1=""
       fi
+    else
+      echo -e "${G}  ✓ I1 получен через API (длина: ${#I1} байт)${N}"
+    fi
+    if [[ -n "$I1" ]] && ! validate_i1 "$I1"; then
+      echo -e "${Y}  → I1 отключен из-за проблем${N}"
+      I1=""
     fi
   fi
 }
