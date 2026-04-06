@@ -123,109 +123,174 @@ select_random_domain() {
 
 # Единый Python генератор для всех профилей мимикрии
 _CPS_GENERATOR='
-import sys, random, re
+import sys, random, math
 
-def rnd(a,b): return random.randint(a,b)
-def rh(n): return "".join(f"{random.randint(0,255):02x}" for _ in range(max(0,n)))
-def hex_pad(v,bl): h=format(int(v),"x").zfill(bl*2); return h[-(bl*2):]
-def split_pad(n,tag="r"):
-    n=max(0,int(n))
-    if n==0: return ""
-    out=""
-    while n>1000: out+=f"<{tag} 1000>"; n-=1000
-    out+=f"<{tag} {n}>"; return out
-
-def calc_pad(hb,eb,mn,mx,mtu):
-    mp=max(0,mtu-hb-eb)
-    needed=max(0,min(mn,mtu)-(hb+eb))
-    jitter=max(0,min(mx-mn,20))
-    pad=needed+(rnd(0,jitter) if jitter>0 else 0)
-    return min(pad,mp)
-
-def mk_tls(host,mtu):
-    sni=min(2+2+2+1+2+len(host),64)
-    rl=rnd(300,550)
-    hl=rl-rnd(4,9)
-    h="160301"+hex_pad(rl,2)+"01"+hex_pad(hl,3)+"0303"+rh(32)
-    hb=len(h)//2
-    rlen=max(80, min(rnd(120,220), mtu-hb-sni-4))
-    return f"<b 0x{h}><rc {sni}>{split_pad(rlen)}<t>"
-
-def mk_quic(host,mtu):
-    dcid=rnd(8,20)
-    scid=rnd(0,20)
-    h=hex_pad(0xC0|rnd(0,3),1)+"00000001"+hex_pad(dcid,1)+rh(dcid)+hex_pad(scid,1)+rh(scid)
-    hb=len(h)//2
-    pad=max(80, min(rnd(120,220), mtu-hb-20))
-    return f"<b 0x{h}><rc {rnd(8,32)}><t>{split_pad(pad)}"
-
-def mk_dtls(host,mtu):
-    h="16fefd"+rh(10)+rh(32)
-    hb=len(h)//2
-    pad=max(80, min(rnd(120,220), mtu-hb-20))
-    return f"<b 0x{h}><rc {rnd(8,32)}><t>{split_pad(pad)}"
-
-def mk_sip(host,mtu):
-    hx="".join(f"{ord(c):02x}" for c in host)
-    h="524547495354455220736970"+"3a"+hx
-    hb=len(h)//2
-    pad=max(80, min(rnd(120,220), mtu-hb-20))
-    return f"<b 0x{h}><rc {rnd(12,40)}><t>{split_pad(pad)}"
-
-def mk_dns(host,mtu):
-    qn="".join(f"{len(l):02x}"+"".join(f"{ord(c):02x}" for c in l) for l in host.split("."))+"00"
-    h=rh(2)+"01000001000000000000"+qn+"00010001"
-    hb=len(h)//2
-    pad=max(80, min(rnd(120,220), mtu-hb-20))
-    return f"<b 0x{h}>{split_pad(pad)}<t>"
-
-profile=sys.argv[1]
-host=sys.argv[2]
-mtu=int(sys.argv[3]) if len(sys.argv)>3 else 1340
-
-fns={
-    "tls":mk_tls,
-    "dtls":mk_dtls,
-    "sip":mk_sip,
-    "dns":mk_dns,
-    "quic":mk_quic
+# Browser Fingerprint (BFP) как в оригинальном TS (профиль Chrome / Yandex Desktop)
+BFP = {
+    "qi": [1250, 1250],  # QUIC Initial всегда ровно 1250 байт
+    "q0": [1250, 1350],  # QUIC 0-RTT
+    "h3": [1250, 1350],  # HTTP/3 DATA
+    "tls": [512, 800],   # TLS Client Hello
+    "dtls": [1100, 1200] # DTLS
 }
 
-fn=fns.get(profile,mk_tls)
+def rnd(a, b): return random.randint(a, b)
+def rh(n): return "".join(f"{random.randint(0,255):02x}" for _ in range(max(0, n)))
+def hex_pad(v, bl): return format(int(v), f"0{bl*2}x")[-bl*2:]
+def align_128(n): return math.ceil(n / 128) * 128
 
-def mk_tls_variant(host, mtu, size_bias):
-    # size_bias управляет "размером" пакета (эмуляция стадий TLS)
-    sni = min(2+2+2+1+2+len(host), 64)
+def split_pad(n, tag="r"):
+    n = max(0, int(n))
+    if n == 0: return ""
+    out = ""
+    while n > 1000: 
+        out += f"<{tag} 1000>"
+        n -= 1000
+    out += f"<{tag} {n}>"
+    return out
 
-    rl = rnd(200 + size_bias, 400 + size_bias)
-    hl = rl - rnd(4, 9)
+def calc_padding(header_b, extra_b, fp_range, iv, mtu):
+    max_pad = max(0, mtu - header_b - extra_b)
+    if not fp_range:
+        return min(rnd(20, 80) * iv, 500, max_pad)
+    
+    c_mn, c_mx = min(fp_range[0], mtu), min(fp_range[1], mtu)
+    needed = max(0, c_mn - (header_b + extra_b))
+    jitter = max(0, min(c_mx - c_mn, c_mx - (header_b + extra_b) - needed, 20))
+    pad = needed + (rnd(0, jitter) if jitter > 0 else 0)
+    return min(pad, max_pad)
 
-    h = "160301" + hex_pad(rl, 2) + "01" + hex_pad(hl, 3) + "0303" + rh(32)
-    hb = len(h) // 2
+def mk_quic_initial(host, mtu, iv=2):
+    dcid, scid = rnd(8, 20), rnd(0, 20)
+    tlen = 0 if rnd(0, 1) == 0 else rnd(8, 32)
+    sni_rc = min(len(host) + rnd(0, 6), 64)
+    hx = hex_pad(0xc0 | rnd(0, 3), 1) + "00000001" + \
+         hex_pad(dcid, 1) + rh(dcid) + hex_pad(scid, 1) + rh(scid) + \
+         hex_pad(tlen, 1) + rh(tlen) + rh(4)
+    
+    # 4 байта overhead от тега <t>
+    pad = calc_padding(len(hx)//2, sni_rc + 4, BFP["qi"], iv, mtu)
+    return f"<b 0x{hx}><rc {sni_rc}><t>{split_pad(pad)}"
 
-    rlen = max(80, min(rnd(100 + size_bias, 180 + size_bias), mtu - hb - sni - 4))
+def mk_quic_0rtt(host, mtu, iv=2):
+    dcid, scid = rnd(8, 20), rnd(0, 20)
+    thint = min(len(host) + rnd(4, 16), 48)
+    hx = hex_pad(0xd0 | rnd(0, 3), 1) + "00000001" + \
+         hex_pad(dcid, 1) + rh(dcid) + hex_pad(scid, 1) + rh(scid) + rh(4)
+    
+    pad = calc_padding(len(hx)//2, thint + 4, BFP["q0"], iv, mtu)
+    return f"<b 0x{hx}><t>{split_pad(pad)}<rc {thint}>"
 
-    return f"<b 0x{h}><rc {rnd(12,28)}>{split_pad(rlen)}<t>"
+def mk_http3(host, mtu, iv=2):
+    ptypes = [0xc0, 0xc1, 0xc2, 0xc3, 0xe0, 0xe1, 0xe2]
+    dcid, scid = rnd(8, 20), rnd(0, 20)
+    sni_rc = min(len(host) + 9 + rnd(0, 6), 64)
+    hx = hex_pad(random.choice(ptypes), 1) + "00000001" + \
+         hex_pad(dcid, 1) + rh(dcid) + hex_pad(scid, 1) + rh(scid) + rh(4)
+    
+    pad = calc_padding(len(hx)//2, sni_rc + 4, BFP["h3"], iv, mtu)
+    return f"<b 0x{hx}><rc {sni_rc}>{split_pad(pad)}<t>"
 
+def mk_tls(host, mtu, iv=2):
+    sni_rc = min(2+2+2+1+2+len(host), 64)
+    base_len = rnd(BFP["tls"][0], BFP["tls"][1])
+    rec_len = align_128(base_len)
+    hs_len = rec_len - rnd(4, 9)
+    r_len = min(rnd(20, 60)*iv, 300, max(0, mtu - 44 - sni_rc - 4))
+    
+    hx = "160301" + hex_pad(rec_len, 2) + "01" + hex_pad(hs_len, 3) + "0303" + rh(32)
+    return f"<b 0x{hx}><rc {sni_rc}>{split_pad(r_len)}<t>"
 
-def mk_entropy(mtu):
-    size = rnd(60, 180)
-    return f"<b 0x{rh(rnd(8,16))}><rc {rnd(6,20)}><t>{split_pad(size)}"
+def mk_dtls(host, mtu, iv=2):
+    frag_len = rnd(100, 300)
+    sni_rc = min(len(host) + rnd(2, 8), 60)
+    hx = "16fefd" + hex_pad(rnd(0,255), 2) + rh(6) + hex_pad(frag_len, 2) + \
+         "01" + rh(6) + "fefd0000" + rh(4) + rh(32)
+    
+    pad = calc_padding(len(hx)//2, sni_rc + 4, BFP["dtls"], iv, mtu)
+    return f"<b 0x{hx}><rc {sni_rc}><t>{split_pad(pad)}"
 
+def mk_sip(host, mtu, iv=2):
+    hx = "5245474953544552207369703a" + "".join(f"{ord(c):02x}" for c in host) + "20" + rh(4)
+    rc_val = min(len(host) + rnd(8, 24)*iv, 150)
+    r_len = min(rnd(5, 30)*iv, 120, max(0, mtu - (len(hx)//2) - rc_val - 4))
+    return f"<b 0x{hx}><rc {rc_val}><t>{split_pad(r_len)}"
 
-# генерируем цепочку как реальный TLS клиент
-p1 = mk_tls_variant(host, mtu, 80)   # основной TLS (большой)
-p2 = mk_tls_variant(host, mtu, 20)   # похожий TLS
-p3 = mk_entropy(mtu)                 # шум
-p4 = mk_entropy(mtu)                 # шум
-p5 = mk_entropy(mtu)                 # шум
+def mk_dns(host, mtu, iv=2):
+    q_name = "".join(f"{len(l):02x}"+"".join(f"{ord(c):02x}" for c in l) for l in host.split(".")) + "00"
+    q_type = "0001" if iv % 2 == 0 else "001c"
+    hx = rh(2) + "01000001000000000000" + q_name + q_type + "0001"
+    
+    target_size = rnd(64, min(512, mtu - 20))
+    r_len = max(0, target_size - (len(hx)//2))
+    return f"<b 0x{hx}>" + (split_pad(min(r_len, 200)) if r_len > 0 else "") + "<t>"
 
-print(p1)
-print(p2)
-print(p3)
-print(p4)
-print(p5)
+def mk_entropy(mtu, idx, iv=2):
+    is_big = rnd(1, 10) > 6
+    base_len = rnd(200, 500) if is_big else rnd(4, 20)
+    r_len = min(base_len*iv, 500 if is_big else 60, max(0, mtu - 20 - 4))
+    
+    rc_len = rnd(4, 12)
+    t, r, rc = "<t>", split_pad(r_len), f"<rc {rc_len}>"
+    b = f"<b 0x{rh(rnd(4, 8*iv))}>" if iv >= 2 else ""
+    b2 = f"<b 0x{rh(rnd(2, 4))}>" if iv >= 3 else ""
+    
+    # Паттерны перестановки только поддерживаемых тегов
+    pats = [
+        b+r+t+rc, t+b+r+rc, rc+b+r+t, t+r+rc+b,
+        r+rc+b+t, b2+t+r+b+rc, b+rc+r+t+b2, b+b2+t+rc+r
+    ]
+    return pats[(idx + rnd(0, len(pats)-1)) % len(pats)] or "<r 10>"
+
+# --- Основная логика ---
+profile = sys.argv[1]
+host = sys.argv[2]
+mtu = int(sys.argv[3]) if len(sys.argv) > 3 else 1340
+iv = 2
+
+if profile == "quic":
+    print(mk_quic_initial(host, mtu, iv))
+    print(mk_quic_0rtt(host, mtu, iv))
+    print(mk_http3(host, mtu, iv))
+    print(mk_entropy(mtu, 3, iv))
+    print(mk_entropy(mtu, 4, iv))
+    
+elif profile == "tls":
+    print(mk_tls(host, mtu, iv))
+    print(mk_quic_initial(host, mtu, iv))
+    print(mk_entropy(mtu, 2, iv))
+    print(mk_entropy(mtu, 3, iv))
+    print(mk_entropy(mtu, 4, iv))
+    
+elif profile == "dtls":
+    print(mk_dtls(host, mtu, iv))
+    print(mk_entropy(mtu, 1, iv))
+    print(mk_entropy(mtu, 2, iv))
+    print(mk_entropy(mtu, 3, iv))
+    print(mk_entropy(mtu, 4, iv))
+    
+elif profile == "sip":
+    print(mk_sip(host, mtu, iv))
+    print(mk_entropy(mtu, 1, iv))
+    print(mk_entropy(mtu, 2, iv))
+    print(mk_entropy(mtu, 3, iv))
+    print(mk_entropy(mtu, 4, iv))
+    
+elif profile == "dns":
+    print(mk_dns(host, mtu, iv))
+    print(mk_dns(host, mtu, iv+1))
+    print(mk_dns(host, mtu, iv+2))
+    print(mk_entropy(mtu, 3, iv))
+    print(mk_entropy(mtu, 4, iv))
+    
+else:
+    print(mk_tls(host, mtu, iv))
+    print(mk_entropy(mtu, 1, iv))
+    print(mk_entropy(mtu, 2, iv))
+    print(mk_entropy(mtu, 3, iv))
+    print(mk_entropy(mtu, 4, iv))
 '
+
 # Генерация I1-I5 через Python
 gen_cps_i1() {
   local profile="$1"
@@ -233,6 +298,10 @@ gen_cps_i1() {
   local mtu="${3:-1340}"
   python3 -c "$_CPS_GENERATOR" "$profile" "$host" "$mtu"
 }
+
+# ══════════════════════════════════════════════════════════
+# ВЫБОР ТИПА I1 ПРИ РУЧНОМ ВВОДЕ ДОМЕНА
+# ══════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════
 # ВЫБОР ТИПА I1 ПРИ РУЧНОМ ВВОДЕ ДОМЕНА
