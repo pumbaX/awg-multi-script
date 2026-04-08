@@ -184,7 +184,7 @@ sip.zadarma.com, sip.iptel.org, sip.linphone.org
 
 ```
 ╔══════════════════════════════════════════════╗
-║        AmneziaWG Manager v5.0                        ║
+║        AmneziaWG Toolza v5.0                        ║
 ║     AWG 2.0 only — QUIC/TLS/DTLS/SIP/DNS             ║
 ╚══════════════════════════════════════════════╝
   IP сервера : 1.2.3.4
@@ -217,7 +217,7 @@ sip.zadarma.com, sip.iptel.org, sip.linphone.org
 | `awg0.conf` | Серверный конфиг |
 | `*_awg2.conf` | Все клиентские конфиги |
 | `awg_show_dump.txt` | Live-дамп `awg show awg0` |
-| `awg-manager.log` | Лог операций |
+| `awg-Toolza.log` | Лог операций |
 | `backup_meta.txt` | Метаданные (timestamp, hostname) |
 
 **Пункт 11** — показывает список бекапов с датой и количеством файлов, восстанавливает выбранный. Перед заменой текущий конфиг сохраняется как `.pre_restore`.
@@ -273,7 +273,7 @@ sip.zadarma.com, sip.iptel.org, sip.linphone.org
 | `/etc/amnezia/amneziawg/awg0.conf` | Серверный конфиг |
 | `/root/client1_awg2.conf` | Первый клиент |
 | `/root/<name>_awg2.conf` | Дополнительные клиенты |
-| `/var/log/awg-manager.log` | Лог операций |
+| `/var/log/awg-Toolza.log` | Лог операций |
 | `~/awg_backup/` | Директория бекапов |
 
 ---
@@ -299,7 +299,7 @@ sip.zadarma.com, sip.iptel.org, sip.linphone.org
 <br>
 
 ---
-*Разработано для сообщества [AWG-Manager](https://t.me/awgmanager)*
+*Разработано для сообщества [AWG-Toolza](https://t.me/awgToolza)*
 
 **awg2-toolza** · MIT License · 
 
