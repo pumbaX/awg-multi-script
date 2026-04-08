@@ -1045,49 +1045,56 @@ def detect(payload):
                 return ("dns", res)
 
     # 5) QUIC long header (form=1, fixed=1, type 0/1/2)
+    # Строгий детект: первый байт + ИЗВЕСТНАЯ version + DCID в Chrome-диапазоне
+    # Иначе скорее всего junk-пакет с случайным совпадением битов first byte
     first = payload[0]
     form = (first >> 7) & 1
     fixed = (first >> 6) & 1
     ptype = (first >> 4) & 3
     pn_len = (first & 3) + 1
-    if form == 1 and fixed == 1 and ptype != 3:
+    if form == 1 and fixed == 1 and ptype != 3 and len(payload) >= 7:
+        version = payload[1:5].hex()
+        known_versions = {
+            "00000001": "QUIC v1 (RFC 9000)",
+            "6b3343cf": "QUIC v2 (RFC 9369)",
+        }
+        dcid_len = payload[5]
+
+        # Строгая проверка перед тем как объявить пакет QUIC:
+        # - либо известная version
+        # - либо DCID длина в реалистичном диапазоне (1-20 по RFC 9000)
+        is_valid_quic = (version in known_versions) and (1 <= dcid_len <= 20)
+
+        if not is_valid_quic:
+            # Не QUIC — пропускаем, пусть анализатор смотрит следующий пакет
+            return (None, [])
+
         ok(f"Long header (first_byte=0x{first:02x})")
         ptype_names = {0: "Initial", 1: "0-RTT", 2: "Handshake"}
         ok(f"QUIC type: {ptype_names[ptype]} (bits={ptype:02b})")
         ok(f"PN length: {pn_len} байт")
-
-        version = payload[1:5].hex()
-        known = {
-            "00000001": "QUIC v1 (RFC 9000)",
-            "6b3343cf": "QUIC v2 (RFC 9369)",
-        }
-        if version in known:
-            ok(f"Version: 0x{version} ({known[version]})")
-        else:
-            info(f"Version: 0x{version} (нестандартная)")
+        ok(f"Version: 0x{version} ({known_versions[version]})")
 
         try:
-            dcid_len = payload[5]
             if dcid_len == 8:
                 ok("DCID length: 8 (Chrome-style)")
-            elif 1 <= dcid_len <= 20:
-                info(f"DCID length: {dcid_len}")
             else:
-                bad(f"DCID length: {dcid_len} (вне диапазона)")
-                return ("quic", res)
+                info(f"DCID length: {dcid_len}")
 
             off = 6 + dcid_len
+            if off >= len(payload):
+                return (None, [])
             scid_len = payload[off]
             if scid_len == 0:
                 ok("SCID length: 0 (Chrome-style клиент)")
             elif scid_len <= 20:
                 info(f"SCID length: {scid_len}")
             else:
-                bad(f"SCID length: {scid_len} (вне диапазона)")
-                return ("quic", res)
+                # SCID > 20 — не валидный, отбрасываем
+                return (None, [])
             off += 1 + scid_len
 
-            if ptype == 0:
+            if ptype == 0 and off < len(payload):
                 def rv(buf, pos):
                     b0 = buf[pos]; ln = 1 << (b0 >> 6); val = b0 & 0x3f
                     for i in range(1, ln): val = (val << 8) | buf[pos+i]
@@ -1098,17 +1105,18 @@ def detect(payload):
                 elif tok_len < 100:
                     info(f"Token Length: {tok_len}")
                 else:
-                    bad(f"Token Length: {tok_len} (подозрительно большой)")
-                    return ("quic", res)
+                    # Подозрительно большой Token — не валидный QUIC
+                    return (None, [])
                 off2 += tok_len
-                plen, off3 = rv(payload, off2)
-                expected_total = off3 + plen
-                actual = len(payload)
-                diff = abs(expected_total - actual)
-                if diff <= 4:
-                    ok(f"Payload Length varint: {plen} (Δ={diff})")
-                else:
-                    info(f"Payload Length varint: {plen}, UDP: {actual} (Δ={diff})")
+                if off2 < len(payload):
+                    plen, off3 = rv(payload, off2)
+                    expected_total = off3 + plen
+                    actual = len(payload)
+                    diff = abs(expected_total - actual)
+                    if diff <= 4:
+                        ok(f"Payload Length varint: {plen} (Δ={diff})")
+                    else:
+                        info(f"Payload Length varint: {plen}, UDP: {actual} (Δ={diff})")
         except Exception as e:
             info(f"Парсинг QUIC прерван: {type(e).__name__}")
         return ("quic", res)
@@ -2906,7 +2914,7 @@ while true; do
        echo -e "\n${G}  В путь! ${N}"
        echo -e "\n▓▒░ DPI ОТСТОЙ! ░▒▓"
        echo -e "<< НЕТ КОНТРОЛЮ! >>"
-       echo -e "<< VIVAT СВОБОДНЫЙ ИНТЕРНЕТ! >>\n"
+       echo -e "<< VIVAT СВОБОДНЫЙ ИНТЕРНЕТ!!! >>\n"
        exit 0 ;;
     *)
       warn "Неверный выбор"
