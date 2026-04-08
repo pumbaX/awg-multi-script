@@ -2911,7 +2911,7 @@ while true; do
    11) do_restore ;;
    12) do_sniff_test ;;
     0) log_info "Выход"
-       echo -e "\n${G}  В путь! ${N}"
+       echo -e "\n${G}  TG - https://t.me/awgToolza ${N}"
        echo -e "\n▓▒░ DPI ОТСТОЙ! ░▒▓"
        echo -e "<< НЕТ КОНТРОЛЮ! >>"
        echo -e "<< VIVAT СВОБОДНЫЙ ИНТЕРНЕТ!!! >>\n"
