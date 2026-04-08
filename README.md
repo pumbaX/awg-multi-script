@@ -1,16 +1,16 @@
 <div align="center">
 
-# **Awg2-Toolza**
+# **AmneziaWG Toolza**
 
-**Менеджер AmneziaWG 2.0** — разверни VPN на VPS одной командой.<br>
-Мимикрия под 10 протоколов, локальная генерация I1, бекап, DPI-обход.
+**Менеджер AmneziaWG 2.0** — VPN с DPI-обходом одной командой.<br>
+3 уровня обфускации, 5 профилей мимикрии, локальный CPS-генератор.
 
 <br>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
-[![Platform](https://img.shields.io/badge/Ubuntu-22.04%20%2F%2024.04-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
-[![Protocol](https://img.shields.io/badge/AWG-2.0%20only-00d4ff?style=flat-square)](#протокол)
-[![Version](https://img.shields.io/badge/version-5.0-00ff88?style=flat-square)](#)
+[![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
+[![Protocol](https://img.shields.io/badge/AWG-2.0%20only-00d4ff?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-5.1-00ff88?style=flat-square)](#)
 
 </div>
 
@@ -22,162 +22,85 @@
 sudo curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh -o /usr/local/bin/awg2 && sudo chmod +x /usr/local/bin/awg2 && sudo awg2
 ```
 
-# Запуск в любой момент
+Запуск в любой момент:
 ```bash
 sudo awg2
 ```
----
-
-**На кофе:** https://boosty.to/awgtoolza/donate
-
-Адрес USDT TRC20:
-TN2rQAsGNHQr8wnneKRD14UMX629D2Ca5q
-
-Адрес USDT ERC20:
-0x721845234eeC44e0a9BaE78402965828C1bc6c57
-
-Адрес USDT TON:
-UQCwj-RY2a4BH7sIDDeLb77XRaPDq0mb1FVwyC4UaOGbLMYy
-
-Адрес TON:
-UQCdQtJO4CF0Lyeb93X2zdeWeAcDJ-ieBC3AaL7LIqWfMBg3
-
-## Что это
-
-**awg2-toolza** — интерактивный bash-менеджер для развёртывания и управления AmneziaWG 2.0 VPN-сервером. Один скрипт закрывает весь цикл: установка, генерация сервера с мимикрией, управление клиентами, статистика трафика, бекап и восстановление, firewall.
-
-Версия 5.0 работает **только с AWG 2.0** — максимальный набор параметров обфускации, поддержка I1, диапазонные H1–H4.
 
 ---
 
-## Возможности
+## Что нового в 5.1
 
-| | Возможность | Детали |
-|---|---|---|
-| 🔧 | **Единый интерфейс** | 11 пунктов меню — установка, сервер, клиенты, бекап |
-| 🎭 | **Мимикрия трафика** | 10 типов I1: QUIC, TLS, DTLS, HTTP/3, SIP, DNS, Noise_IK и др. |
-| 🧬 | **Локальная генерация I1** | Пакеты собираются байт-в-байт на Python — без внешнего API |
-| 📡 | **API как fallback** | Опционально: получить I1 с `junk.web2core.workers.dev` |
-| 🔢 | **Автогенерация параметров** | Jc, Jmin, Jmax, S1–S4, непересекающиеся H1–H4 диапазоны |
-| 👥 | **Управление клиентами** | Добавление, статистика (↑↓), QR-коды, очистка |
-| 💾 | **Бекап / восстановление** | Полный бекап в `~/awg_backup/` с выбором точки восстановления |
-| 🔥 | **Firewall** | UFW + iptables NAT/FORWARD — автоматически |
-| 🌐 | **Проверка доменов** | Ping-тест пулов мимикрии с цветным выводом |
-| 🛡️ | **Защита от падений** | `set -euo pipefail`, все сетевые вызовы в `timeout` |
-| 🗑️ | **Полное удаление** | Пакеты, конфиги, правила firewall — одной командой |
+- ✅ **3 уровня обфускации** — базовый / +I1 / полный CPS chain
+- ✅ **Исправлен CPS-генератор** — все I-пакеты валидны (раньше Keenetic/Android вешались на handshake)
+- ✅ **Debian 12/13** — сборка amneziawg-tools из git, не только Ubuntu
+- ✅ **Случайная подсеть** `10.[10-55].[1-254].0/24` по умолчанию
+- ✅ **DPI-тест** (пункт 12) — захват CPS пакета и анализ через Wireshark dissector
+- ✅ **MTU override** для каждого клиента отдельно
 
 ---
 
-## Протокол
+## Требования
 
-Скрипт работает **только с AWG 2.0**. Это максимальная версия протокола:
-
-| Параметр | AWG 2.0 |
+| Параметр | Значение |
 |---|---|
-| Jc / Jmin / Jmax | ✅ |
-| S1 / S2 | ✅ |
-| S3 / S4 | ✅ |
-| H1–H4 | ✅ диапазоны (непересекающиеся по квадрантам) |
-| I1 | ✅ сервер + клиент |
+| ОС | Ubuntu 24.04 / 24.10 / 25.04 / 25.10 или Debian 12 / 13 |
+| Виртуализация | KVM (не OpenVZ / LXC) |
+| Сеть | Публичный IPv4 |
+| Права | root |
+| Python | 3.x |
 
 ---
 
-## Генерация I1
+## Уровни обфускации
 
-При ручном вводе домена (профиль **7**) доступен выбор типа пакета для мимикрии:
+При создании сервера (пункт 2) скрипт спрашивает уровень:
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│        Выбор типа I1                                                    │
-│                                                                         │
-│   1   QUIC Initial (RFC 9000)      — HTTP/3, лучший в 2026              │
-│   2   QUIC 0-RTT (Early Data)      — быстрый старт                      │
-│   3   TLS 1.3 Client Hello         — HTTPS, макс. совм.                 │
-│   4   Noise_IK (Standard)          — нативный AWG handshake             │
-│   5   DTLS 1.3 Handshake           — WebRTC / STUN                      │
-│   6   HTTP/3 Host Mimicry          — QPACK заголовки                    │
-│   7   SIP (VoIP Signaling)         — SIP REGISTER пакет                 │
-│   8   TLS → QUIC (Alt-Svc)        — TLS ClientHello + ALPN h3          |
-│   9   QUIC Burst (Multi-packet)    — тройной QUIC Initial               │
-│  10   DNS Query (UDP 53)           — стандартный A-запрос               │
-│  11   Запросить через API          — junk.web2core.workers.dev          │
-└──────────────────────────────────────────────────────────────┘
-```
+| Уровень | Параметры | Совместимость | DPI стойкость |
+|---|---|---|---|
+| **1. Базовый** | H ranges + S1-S4 + Jc junk | ✅ все клиенты | Высокая |
+| **2. +I1** | + один сигнатурный пакет (TLS/QUIC/DTLS/SIP/DNS) | ✅ современные | Очень высокая |
+| **3. Полный CPS** | + I2-I5 энтропийные пакеты | ⚠️ может ломать старые клиенты | Максимум |
 
-Каждый тип генерирует корректный байт-уровневый пакет на Python:
-- **TLS 1.3** — полный Record → Handshake → ClientHello → SNI Extension
-- **QUIC** — Long Header RFC 9000 с реальным DCID/SCID
-- **Noise_IK** — 148 байт: `type(4) + sender(4) + ephemeral(32) + enc_static(48) + enc_ts(28) + mac1(16) + mac2(16)`
-- **DNS** — wire format с корректным label encoding
-- **SIP** — валидный REGISTER запрос с branch/Call-ID
-
-> I1 в формате `<b 0x...>` — единственный корректный формат для AWG 2.0. Теги `<c>`, `<t>`, `<r>` не используются (вызывают ErrorCode 1000 в старых клиентах).
+**По умолчанию — уровень 1.** Этого хватает в 95% случаев включая ТСПУ в РФ. Поднимай выше только если базовый блокируется.
 
 ---
 
-## Профили мимикрии
+## Профили мимикрии (для уровней 2 и 3)
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Профили мимикрии (быстрый выбор из пулов)                          │
-│                                                                     │
-│  1   QUIC Initial      — HTTP/3, CDN (лучший в 2026)                │
-│  2   QUIC 0-RTT        — Early Data, быстрый старт                  │
-│  3   TLS 1.3           — HTTPS (макс. совместимость)                │
-│  4   DTLS 1.3          — WebRTC / STUN (видеозвонки)                │
-│  5   SIP               — VoIP (телефонные звонки)                   │
-│  6   Случайный домен   — Из любого пула                             │
-│  7   Ручной ввод       — Свой домен + выбор типа I1                 │
-│  8   Без имитации      — Только обфускация                          │
-└──────────────────────────────────────────────────────────┘
+1) TLS 1.3 Client Hello   — HTTPS (рекомендуется)
+2) DTLS 1.3 (WebRTC)      — видеозвонки
+3) SIP (VoIP)             — телефония
+4) QUIC / HTTP/3          — Chrome-like Initial
+5) Случайный профиль      — из любого пула с доменами
+6) Ручной ввод домена     — свой домен + выбор типа CPS
 ```
 
-Для профилей 1–6: скрипт выбирает случайный домен из пула и запрашивает I1 через API.  
-Для профиля 7: ручной домен + локальная генерация I1 любого из 10 типов.
+CPS-генератор собирает байт-валидные пакеты на Python:
+- **TLS 1.3** — Record → Handshake → ClientHello → SNI → ALPN → GREASE → X25519MLKEM768
+- **QUIC v1/v2** — Long Header RFC 9000/9369 с реальным DCID/SCID/Token
+- **DTLS** — record + ClientHello fragment
+- **SIP** — REGISTER с branch / Call-ID / Via
+- **DNS** — wire-format query
 
-<details>
-<summary><b>🌐 Доменные пулы — 50+ хостов</b></summary>
+> Все I-пакеты начинаются с тега `<b 0x...>` — критическое требование парсера amneziawg-go.
+> `<r>` режется на куски ≤999 байт для совместимости со старыми клиентами.
 
-<br>
+---
 
-**QUIC Initial (HTTP/3)**
-```
-yandex.net, yastatic.net, vk.com, mycdn.me, mail.ru, ozon.ru,
-wildberries.ru, wbstatic.net, sber.ru, tbank.ru, gosuslugi.ru,
-gcore.com, fastly.net, cloudfront.net, microsoft.com, icloud.com,
-github.com, cdn.jsdelivr.net, wikipedia.org, dropbox.com,
-steamstatic.com, spotify.com, akamaiedge.net, msedge.net, azureedge.net
-```
+## Доменные пулы
 
-**QUIC 0-RTT**
-```
-yandex.net, vk.com, mail.ru, ozon.ru, wildberries.ru, sber.ru,
-tbank.ru, gosuslugi.ru, gcore.com, fastly.net, cloudfront.net,
-microsoft.com, github.com, cdn.jsdelivr.net, wikipedia.org, spotify.com
-```
+| Профиль | Регион | Хосты |
+|---|---|---|
+| TLS | РФ | yandex.ru, vk.com, mail.ru, ozon.ru, sber.ru, gosuslugi.ru |
+| TLS | Мир | github.com, microsoft.com, cloudflare.com, apple.com |
+| QUIC | РФ | yastatic.net, mycdn.me, vk.com, mail.ru |
+| QUIC | Мир | google.com, youtube.com, cloudflare-quic.com, fastly.net |
+| DTLS | — | stun.yandex.net, stun.vk.com, stun.l.google.com, meet.jit.si |
+| SIP | — | sip.beeline.ru, sip.mts.ru, sip.megafon.ru, sip.linphone.org |
 
-**TLS 1.3 Client Hello**
-```
-yandex.ru, vk.com, mail.ru, ozon.ru, wildberries.ru, sberbank.ru,
-tbank.ru, gosuslugi.ru, kaspersky.ru, github.com, gitlab.com,
-stackoverflow.com, microsoft.com, apple.com, amazon.com,
-cloudflare.com, google.com
-```
-
-**DTLS 1.3 (WebRTC / STUN)**
-```
-stun.yandex.net, stun.vk.com, stun.mail.ru, stun.sber.ru,
-stun.stunprotocol.org, meet.jit.si, stun.services.mozilla.com
-```
-
-**SIP (VoIP)**
-```
-sip.beeline.ru, sip.mts.ru, sip.megafon.ru, sip.rostelecom.ru,
-sip.yandex.ru, sip.vk.com, sip.mail.ru, sip.sipnet.ru,
-sip.zadarma.com, sip.iptel.org, sip.linphone.org
-```
-
-</details>
+При создании сервера выбирается **регион** (РФ / Мир) — фильтрует пулы.
 
 ---
 
@@ -185,66 +108,97 @@ sip.zadarma.com, sip.iptel.org, sip.linphone.org
 
 ```
 ╔══════════════════════════════════════════════╗
-║        AmneziaWG Toolza v5.0                        ║
-║     AWG 2.0 only — QUIC/TLS/DTLS/SIP/DNS             ║
+║        AmneziaWG Toolza v5.1                 ║
+║   AWG 2.0 only — TLS/DTLS/SIP/DNS/QUIC       ║
 ╚══════════════════════════════════════════════╝
-  IP сервера : 1.2.3.4
-  Порт       : 47300
-  Интерфейс  : активен
+  IP сервера : 11.22.30.94
+  Порт       : 41300
+  Интерфейс  : ● активен
   Клиентов   : 2
 
   1)  Установка зависимостей и AmneziaWG
-  2)  Создать сервер + первый клиент (с мимикрией)
+  2)  Создать сервер + первый клиент
   3)  Добавить клиента
   4)  Показать клиентов
   5)  Показать QR клиента
   6)  Перезапустить awg0
   7)  Удалить всё
   8)  Проверить домены из пулов (ping)
-  9)  Очистить всех клиентов (без удаления сервера)
+  9)  Очистить всех клиентов
   10) Создать бекап (~/awg_backup/)
   11) Восстановить из бекапа
+  12) DPI тест (захват и анализ CPS пакета)
   0)  Выход
 ```
 
 ---
 
+## DPI тест (пункт 12)
+
+Захватывает первый большой UDP-пакет от выбранного клиента и парсит его через встроенный pcap-анализатор. Распознаёт:
+
+| Профиль | Маркеры | Verdict |
+|---|---|---|
+| **TLS** | Record `0x16 0301`, Handshake type `01` | √ TLS мимикрия работает |
+| **QUIC v1/v2** | Long header, fixed bit, version, DCID/SCID, Token, Length varint | √ QUIC мимикрия работает |
+| **DTLS** | Record `0x16 fefd/feff`, ClientHello | √ DTLS мимикрия работает |
+| **SIP** | 14 методов: INVITE, REGISTER, OPTIONS, MESSAGE, NOTIFY... | √ SIP мимикрия работает |
+| **DNS** | QR=0, qdcount, label encoding | √ DNS мимикрия работает |
+
+Показывает выбранного клиента **по имени файла + VPN IP**, а не голый endpoint:
+```
+Подключённых клиентов: 2
+1) phone_1i_awg2     10.45.12.2     33.224.32.48:2329
+2) laptop_awg2          10.45.12.3     66.22.75.22:22702
+```
+
+---
+
+## Параметры обфускации (AWG 2.0)
+
+| Параметр | Описание |
+|---|---|
+| **Jc / Jmin / Jmax** | Junk-train: количество и размер мусорных пакетов перед handshake |
+| **S1 / S2** | Padding для Init / Response пакетов |
+| **S3 / S4** | Padding для Cookie / Data пакетов (новое в 2.0) |
+| **H1-H4** | Диапазоны magic numbers (новое в 2.0) — каждый peer уникален |
+| **I1-I5** | Custom Protocol Signature пакеты — мимикрия под TLS/QUIC/DTLS/SIP/DNS |
+
+H1-H4 генерируются как **непересекающиеся диапазоны** по 4 квадрантам uint32 — гарантированно валидны для AWG 2.0.
+
+---
+
 ## Бекап и восстановление
 
-**Пункт 10** — создаёт папку `~/awg_backup/awg2_backup_YYYYMMDD_HHMMSS/` и сохраняет:
+**Пункт 10** — папка `~/awg_backup/awg2_backup_YYYYMMDD_HHMMSS/`:
 
 | Файл | Содержимое |
 |---|---|
 | `awg0.conf` | Серверный конфиг |
 | `*_awg2.conf` | Все клиентские конфиги |
-| `awg_show_dump.txt` | Live-дамп `awg show awg0` |
+| `awg_show_dump.txt` | Live дамп `awg show awg0` |
 | `awg-Toolza.log` | Лог операций |
-| `backup_meta.txt` | Метаданные (timestamp, hostname) |
+| `backup_meta.txt` | Метаданные |
 
-**Пункт 11** — показывает список бекапов с датой и количеством файлов, восстанавливает выбранный. Перед заменой текущий конфиг сохраняется как `.pre_restore`.
+**Пункт 11** — список бекапов с датой и количеством файлов, `.pre_restore` бекапит текущее перед заменой.
 
 ---
 
-## Статус клиентов
+## Статус клиентов (пункт 4)
 
 ```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
   ┌─ [1] phone
   │  IP:        10.102.0.2/32
   │  Трафик:    ↑ 14.76 МБ  ↓ 342.89 МБ
   │  Статус:    ● активен
-  │  Endpoint:  5.6.7.8
-  └─────────────────────────────────────────────────────
+  │  Endpoint:  15.6.17.18
+  └─────────────────────────────────────────
 
   ┌─ [2] laptop
   │  IP:        10.102.0.3/32
   │  Трафик:    ↑ 0 КБ  ↓ 0 КБ
   │  Статус:    ○ офлайн (15 мин)
-  └─────────────────────────────────────────────────────
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ↑ выгрузка (от клиента)   ↓ загрузка (к клиенту)
+  └─────────────────────────────────────────
 ```
 
 | Иконка | Статус |
@@ -255,53 +209,62 @@ sip.zadarma.com, sip.iptel.org, sip.linphone.org
 
 ---
 
-## Требования
-
-| Параметр | Значение |
-|---|---|
-| ОС | Ubuntu 22.04 / 24.04 |
-| Виртуализация | KVM (не OpenVZ / LXC) |
-| Сеть | Публичный IPv4 |
-| Права | root |
-| Python | 3.x (для генерации I1 и параметров) |
-
----
-
 ## Файлы
 
 | Путь | Назначение |
 |---|---|
 | `/etc/amnezia/amneziawg/awg0.conf` | Серверный конфиг |
-| `/root/client1_awg2.conf` | Первый клиент |
-| `/root/<name>_awg2.conf` | Дополнительные клиенты |
-| `/var/log/awg-Toolza.log` | Лог операций |
-| `~/awg_backup/` | Директория бекапов |
+| `/root/<name>_awg2.conf` | Клиентские конфиги |
+| `/var/log/awg-Toolza.log` | Лог |
+| `~/awg_backup/` | Бекапы |
+
+---
+
+## Подводные камни
+
+> ⚠️ **Endpoint = IP, не домен.** Доменное имя в `Endpoint = ` вызывает дедлок переподключения на Keenetic и других роутерах.
+
+> ⚠️ **MTU должен совпадать** между сервером и клиентом. По умолчанию 1380, для AWG 2.0 + CPS лучше 1320.
+
+> ⚠️ **I-параметры должны совпадать** между сервером и клиентом. После пересоздания сервера обязательно переимпортируй конфиг на всех клиентах — иначе handshake висит без ошибок в dmesg.
+
+> ⚠️ **AmneziaVPN < 4.8.12.7 не поддерживает AWG 2.0.** Обнови клиент до последней версии.
 
 ---
 
 ## Импорт на клиенте
 
-Используй **[AmneziaVPN](https://amnezia.org)**:
+[**AmneziaVPN**](https://amnezia.org) (Android / iOS / macOS / Windows / Linux):
+- **QR** — пункт меню `5`, сканируй с терминала
+- **Файл** — `Добавить туннель → Из файла` → передай `/root/<name>_awg2.conf`
 
-- **QR-код** — пункт меню `5`, сканируй прямо из терминала
-- **Файл** — «Добавить туннель → Из файла» → передай `/root/<name>_awg2.conf`
+[**Keenetic**](https://docs.amnezia.org/documentation/instructions/keenetic-os-awg) — KeeneticOS 4.x+ или AWG Manager на Entware
 
-> ⚠️ Endpoint в конфиге всегда указывается как IP-адрес, не домен — домен вызывает дедлок переподключения на Keenetic и других клиентах.
+---
+
+## Поддержать
+
+**Boosty:** https://boosty.to/awgtoolza/donate
+
+| Сеть | Адрес |
+|---|---|
+| USDT TRC20 | `TN2rQAsGNHQr8wnneKRD14UMX629D2Ca5q` |
+| USDT ERC20 | `0x721845234eeC44e0a9BaE78402965828C1bc6c57` |
+| USDT TON | `UQCwj-RY2a4BH7sIDDeLb77XRaPDq0mb1FVwyC4UaOGbLMYy` |
+| TON | `UQCdQtJO4CF0Lyeb93X2zdeWeAcDJ-ieBC3AaL7LIqWfMBg3` |
 
 ---
 
 <div align="center">
 
-## Благодарности
+Вдохновлено **[AmneziaWG Architect](https://architect.vai-rice.space/)** — веб-генератором обфускации.<br>
+Спасибо **Vadim-Khristenko** за оригинальную идею.
 
-Вдохновлено проектом **[AmneziaWG Architect](https://architect.vai-rice.space/)** —<br>
-веб-генератором продвинутой обфускации для обхода DPI.
 
 <br>
 
----
-*Разработано для сообщества [AWG-Toolza](https://t.me/awgToolza)*
+*Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**awg2-toolza** · MIT License · 
+**AmneziaWG Toolza** · MIT License
 
 </div>
