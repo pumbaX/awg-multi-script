@@ -76,8 +76,8 @@ sudo awg2
 
 ```
 ╔══════════════════════════════════════════════╗
-║        AmneziaWG Toolza v5.4                 ║
-║   AWG 2.0 only — TLS/DTLS/SIP/DNS/QUIC       ║
+║        AmneziaWG Toolza v5.4                         ║
+║   AWG 2.0 only — TLS/DTLS/SIP/DNS/QUIC               ║
 ╚══════════════════════════════════════════════╝
   IP сервера : 1.2.3.4
   Порт       : 47300
