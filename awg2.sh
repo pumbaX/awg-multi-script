@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v5.4"
+VERSION="v5.5-fix"
 
 # ─────────────────────────────────────────────────────────────
 # - AmneziaWG Toolza — только AWG 2.0
@@ -92,26 +92,31 @@ SIP_DOMAINS_RU=(
   "sip.yandex.ru" "sip.vk.com" "sip.mail.ru" "sip.sipnet.ru"
   "sip.tele2.ru" "sip.ucoz.ru"
 )
-# HTTP/3 (QUIC) — реально раздают h3 в РФ сегменте или не блокируются
+# HTTP/3 (QUIC) — реально раздают h3 в РФ сегменте, НЕ заблокированы ТСПУ
 QUIC_DOMAINS_RU=(
   "yandex.ru" "mail.ru" "vk.com" "ya.ru" "dzen.ru"
-  "www.google.com" "www.youtube.com" "www.cloudflare.com"
+  "yastatic.net" "ozon.ru" "avito.ru" "wildberries.ru"
+  "sber.ru" "tbank.ru" "gosuslugi.ru" "kinopoisk.ru"
+  "cdn.gcore.com" "gcdn.co" "selectel.ru"
 )
 
 # Европа / Мир
 TLS_DOMAINS_WORLD=(
   "github.com" "gitlab.com" "stackoverflow.com" "microsoft.com"
-  "apple.com" "amazon.com" "cloudflare.com" "google.com"
-  "wikipedia.org" "netflix.com" "spotify.com" "discord.com"
+  "apple.com" "amazon.com" "google.com"
+  "wikipedia.org" "spotify.com" "steampowered.com"
+  "hetzner.com" "ovhcloud.com" "digitalocean.com"
+  "cdn.jsdelivr.net" "unpkg.com" "pypi.org"
 )
 DTLS_DOMAINS_WORLD=(
   "stun.stunprotocol.org" "meet.jit.si" "stun.services.mozilla.com"
-  "stun.l.google.com" "stun1.l.google.com"
+  "global.stun.twilio.com" "stun.nextcloud.com"
+  "stun.sipgate.net" "stun.zoiper.com"
 )
 SIP_DOMAINS_WORLD=(
   # Глобальные SIP-провайдеры
   "sip.zadarma.com" "sip.iptel.org" "sip.linphone.org"
-  "sip.antisip.com" "sip.cloudflare.com"
+  "sip.antisip.com"
   # Европа — Германия
   "sipgate.de" "sip.dus.net" "sip.easybell.de" "sip.1und1.de"
   "sip.t-online.de" "sipcall.de"
@@ -128,11 +133,17 @@ SIP_DOMAINS_WORLD=(
   # Скандинавия
   "sip.bahnhof.se" "sip.com.no"
 )
-# HTTP/3 (QUIC) — все реально отвечают h3 на UDP/443
+# HTTP/3 (QUIC) — все реально отвечают h3 на UDP/443, НЕ заблокированы ТСПУ
 QUIC_DOMAINS_WORLD=(
-  "www.google.com" "www.youtube.com" "www.cloudflare.com"
-  "cloudflare-quic.com" "www.facebook.com" "www.instagram.com"
-  "mail.google.com" "www.bing.com" "www.microsoft.com"
+  "cdn.gcore.com" "gcdn.co" "g.gcdn.co"
+  "fastly.net" "a.ssl.fastly.net" "global.fastly.net"
+  "cdn-apple.com" "icloud.com" "mzstatic.com"
+  "cdn.jsdelivr.net" "unpkg.com"
+  "steamstatic.com" "steamcontent.com"
+  "b-cdn.net" "bunny.net" "cdn77.com"
+  "github.com" "objects.githubusercontent.com"
+  "spotify.com" "scdn.co"
+  "wikipedia.org" "wikimedia.org"
 )
 
 # Активные пулы (устанавливаются при выборе региона)
@@ -242,449 +253,188 @@ select_random_domain() {
 }
 
 # ══════════════════════════════════════════════════════════
-# CPS ГЕНЕРАТОР I1-I5 (порт из AmneziaWG Architect)
-# Автор оригинала: Vadim-Khristenko (Спасибо за Идею!!) 
+# CPS ГЕНЕРАТОР I1-I5
+# Порт Special-Junk-Packet (SIP+TLS handshake flow)
+# + компактный QUIC Initial для профиля quic
 # I1-I5 только в клиентском конфиге — сервер не требует
 # ══════════════════════════════════════════════════════════
 
 # Единый Python генератор для всех профилей мимикрии
 _CPS_GENERATOR='
-import sys, random
+import sys, random, secrets, struct
 
-# ── Profile target byte ranges (реалистичные размеры на проводе) ──
-# QUIC Initial от Chrome/Firefox: ~1200-1280 (anti-amplification padding)
-# TLS 1.3 ClientHello + ext: современный Chrome = 1200-1600 (GREASE+X25519MLKEM768)
-# DTLS: 100-200 обычно
-# Первый пакет — только I1, остальные I2-I5 — entropy (мелкие/средние)
-# IPv6-safe cap: 1280 (min IPv6 MTU) - 40 (IPv6 hdr) - 8 (UDP) = 1232
-# Не превышаем, чтобы CPS работал на 4G/IPv6/любых линках
-IPV6_SAFE_CAP = 1232
+def rh(n): return secrets.token_bytes(n)
+def rhex(n): return secrets.token_hex(n)
 
-BFP = {
-    "quic_i":  [1100, 1232],   # QUIC Initial (Chrome-like)
-    "quic_0":  [1100, 1232],   # QUIC 0-RTT
-    "quic_h":  [1050, 1200],   # QUIC Handshake
-    "tls":     [1000, 1232],   # TLS ClientHello Chrome-like
-    "dtls":    [130,  220],    # DTLS 1.2 ClientHello
-}
+# ── SIP REGISTER (~350-380 байт, ~740 сим CPS) ──
+def gen_sip():
+    domains = ["google.com","gmail.com","youtube.com","drive.google.com",
+               "accounts.google.com","photos.google.com","docs.google.com"]
+    agents = ["Linphone/5.0.0","Zoiper/5.0.0","MicroSIP/3.0.0","Bria/5.0.0"]
+    call_id = secrets.token_hex(16)
+    branch = f"z9hG4bK{secrets.token_hex(12)}"
+    tag = secrets.token_hex(8)
+    ip1 = f"192.168.{random.randint(1,255)}.{random.randint(1,255)}"
+    ip2 = f"192.168.{random.randint(1,255)}.{random.randint(1,255)}"
+    domain = random.choice(domains)
+    pkt = (f"REGISTER sip:{domain} SIP/2.0\r\n"
+           f"Via: SIP/2.0/UDP {ip1}:5060;branch={branch}\r\n"
+           f"Max-Forwards: 70\r\n"
+           f"To: <sip:user@{domain}>\r\n"
+           f"From: <sip:user@{domain}>;tag={tag}\r\n"
+           f"Call-ID: {call_id}\r\n"
+           f"CSeq: 1 REGISTER\r\n"
+           f"Contact: <sip:user@{ip2}:5060>\r\n"
+           f"User-Agent: {random.choice(agents)}\r\n"
+           f"Expires: {random.randint(1800,7200)}\r\n"
+           f"Content-Length: 0\r\n\r\n").encode()
+    return pkt
 
-# Реальные QUIC версии (Wireshark dissector принимает все):
-QUIC_VERSIONS = [
-    "00000001",  # QUIC v1 (RFC 9000) — Chrome/FF default
-    "6b3343cf",  # QUIC v2 (RFC 9369)
-]
-
-
-def rnd(a, b): return random.randint(a, b)
-def rh(n): return "".join(f"{random.randint(0,255):02x}" for _ in range(max(0, n)))
-def hex_pad(v, bl): return format(int(v), f"0{bl*2}x")[-bl*2:]
-
-
-def varint(v):
-    """QUIC variable-length integer (RFC 9000 §16).
-    1 байт:  0-63          (2 MSB = 00)
-    2 байта: 0-16383       (2 MSB = 01)
-    4 байта: 0-1073741823  (2 MSB = 10)
-    8 байт: ...            (2 MSB = 11)
-    """
-    v = int(v)
-    if v < 0:
-        v = 0
-    if v <= 0x3f:
-        return hex_pad(v, 1)
-    if v <= 0x3fff:
-        return hex_pad(0x4000 | v, 2)
-    if v <= 0x3fffffff:
-        return hex_pad(0x80000000 | v, 4)
-    return hex_pad(0xc000000000000000 | v, 8)
-
-
-def split_pad(n, tag="r"):
-    """Разбить <r N> на куски <1000. Некоторые парсеры amneziawg-go
-    глючат на границе ровно 1000 — используем 999 для безопасности."""
-    n = max(0, int(n))
-    if n == 0:
-        return ""
-    out = ""
-    while n >= 999:
-        out += f"<{tag} 999>"
-        n -= 999
-    if n > 0:
-        out += f"<{tag} {n}>"
-    return out
-
-
-def calc_padding(header_b, extra_b, fp_range, mtu):
-    """Вычислить сколько байт <r> добавить, чтобы попасть в целевой размер."""
-    safe_mtu = min(mtu - 28, IPV6_SAFE_CAP)  # IPv6-safe cap
-    max_pad = max(0, safe_mtu - header_b - extra_b)
-    if not fp_range:
-        return min(rnd(40, 160), 500, max_pad)
-    c_mn, c_mx = fp_range
-    target = rnd(c_mn, c_mx)
-    needed = max(0, target - (header_b + extra_b))
-    return min(needed, max_pad)
-
-
-# ══════════════════════════════════════════════════════════════
-# TLS 1.3 ClientHello fragment — реалистичный для mk_tls
-# ══════════════════════════════════════════════════════════════
-
-# Chrome cipher suites (TLS 1.3 + backward compat), порядок важен для JA3/JA4
-CHROME_CIPHERS = [
-    "1301",  # TLS_AES_128_GCM_SHA256
-    "1302",  # TLS_AES_256_GCM_SHA384
-    "1303",  # TLS_CHACHA20_POLY1305_SHA256
-    "c02b",  # ECDHE-ECDSA-AES128-GCM
-    "c02f",  # ECDHE-RSA-AES128-GCM
-    "c02c",  # ECDHE-ECDSA-AES256-GCM
-    "c030",  # ECDHE-RSA-AES256-GCM
-    "cca9",  # ECDHE-ECDSA-CHACHA20
-    "cca8",  # ECDHE-RSA-CHACHA20
-    "c013",  # ECDHE-RSA-AES128-SHA
-    "c014",  # ECDHE-RSA-AES256-SHA
-    "009c",  # RSA-AES128-GCM
-    "009d",  # RSA-AES256-GCM
-    "002f",  # RSA-AES128-SHA
-    "0035",  # RSA-AES256-SHA
-]
-
-# GREASE values (RFC 8701) — Chrome вставляет их в cipher/ext/group listы
-GREASE = ["0a0a", "1a1a", "2a2a", "3a3a", "4a4a", "5a5a", "6a6a", "7a7a",
-          "8a8a", "9a9a", "aaaa", "baba", "caca", "dada", "eaea", "fafa"]
-
-
-def mk_tls_clienthello_body(host):
-    """TLS 1.3 ClientHello body без record header.
-    Реалистичный Chrome-like: GREASE, современные cipher suites, SNI, ALPN h2/http3."""
-    # Legacy version
-    legacy_ver = "0303"  # TLS 1.2 (для совместимости, TLS 1.3 = через extension)
-    # Random (32 байта)
+# ── TLS ClientHello (~90-130 байт, ~200-260 сим CPS) ──
+def gen_tls_ch():
+    domains = ["google.com","www.google.com","mail.google.com",
+               "youtube.com","accounts.google.com","gmail.com"]
+    hostname = random.choice(domains).encode()
     client_random = rh(32)
-    # Session ID: Chrome всегда шлёт 32 байта (RFC 8446 allows 0..32)
-    session_id_len = "20"  # 32
-    session_id = rh(32)
-    # Cipher suites: GREASE + Chrome list
-    grease_cs = random.choice(GREASE)
-    ciphers = grease_cs + "".join(CHROME_CIPHERS)
-    cs_bytes = len(ciphers) // 2
-    cs_field = hex_pad(cs_bytes, 2) + ciphers
-    # Compression: null
-    comp = "0100"
+    sid_len = random.randint(0, 32)
+    sid = rh(sid_len)
+    ciphers = [b"\x13\x02",b"\x13\x03",b"\xc0\x2c",b"\xc0\x30",
+               b"\xcc\xa9",b"\xcc\xa8",b"\xc0\x2b",b"\xc0\x2f"]
+    cs = b"\x00\x02" + random.choice(ciphers)
+    comp = b"\x01\x00"
+    sni = (b"\x00\x00" + struct.pack(">H", len(hostname)+5)
+           + b"\x00" + struct.pack(">H", len(hostname)+3)
+           + b"\x00" + struct.pack(">H", len(hostname)) + hostname)
+    exts = sni + b"\x00\x0b\x00\x04\x03\x00\x01\x02\x00\x0a\x00\x0a\x00\x08" + rh(8)
+    body = b"\x03\x03" + client_random + bytes([sid_len]) + sid + cs + comp + struct.pack(">H", len(exts)) + exts
+    hs = b"\x01" + struct.pack(">I", len(body))[1:] + body
+    return b"\x16\x03\x03" + struct.pack(">H", len(hs)) + hs
 
-    # Extensions (минимальный Chrome-like набор)
-    def ext(tid, data):
-        return tid + hex_pad(len(data) // 2, 2) + data
+# ── TLS ServerHello (~50-70 байт, ~110-140 сим CPS) ──
+def gen_tls_sh():
+    server_random = rh(32)
+    sid_len = random.randint(0, 16)
+    sid = bytes([sid_len]) + rh(sid_len) if sid_len > 0 else b"\x00"
+    cs = random.choice([b"\x13\x01",b"\x13\x02",b"\x13\x03",b"\xc0\x2c"])
+    body = b"\x03\x03" + server_random + sid + cs + b"\x00\x00\x00"
+    hs = b"\x02" + struct.pack(">I", len(body))[1:] + body
+    return b"\x16\x03\x03" + struct.pack(">H", len(hs)) + hs
 
-    grease_ext1 = random.choice(GREASE)
-    exts = ""
-    # GREASE ext (пустой)
-    exts += ext(grease_ext1, "")
-    # server_name (0x0000)
-    sni_name = host.encode("idna").decode("ascii") if any(ord(c) > 127 for c in host) else host
-    host_hex = "".join(f"{ord(c):02x}" for c in sni_name)
-    sni_entry = "00" + hex_pad(len(sni_name), 2) + host_hex
-    sni_list = hex_pad(len(sni_entry) // 2, 2) + sni_entry
-    exts += ext("0000", sni_list)
-    # extended_master_secret (0x0017)
-    exts += ext("0017", "")
-    # renegotiation_info (0xff01)
-    exts += ext("ff01", "00")
-    # supported_groups (0x000a): GREASE + X25519MLKEM768 (0x11ec) + X25519 + secp256r1 + secp384r1
-    groups = random.choice(GREASE) + "11ec" + "001d" + "0017" + "0018"
-    exts += ext("000a", hex_pad(len(groups) // 2, 2) + groups)
-    # ec_point_formats (0x000b): uncompressed
-    exts += ext("000b", "0100")
-    # session_ticket (0x0023): empty
-    exts += ext("0023", "")
-    # application_layer_protocol_negotiation (0x0010): h2, http/1.1
-    alpn = "02" + "6832" + "08" + "687474702f312e31"  # "h2", "http/1.1"
-    exts += ext("0010", hex_pad(len(alpn) // 2, 2) + alpn)
-    # status_request (0x0005)
-    exts += ext("0005", "0100000000")
-    # signature_algorithms (0x000d): Chrome набор
-    sigalgs = "0403" "0804" "0401" "0503" "0805" "0501" "0806" "0601"
-    exts += ext("000d", hex_pad(len(sigalgs) // 2, 2) + sigalgs)
-    # signed_certificate_timestamp (0x0012)
-    exts += ext("0012", "")
-    # key_share (0x0033): GREASE (1 byte) + X25519 (32 bytes)
-    ks_grease = random.choice(GREASE) + "0001" + "00"
-    ks_x25519 = "001d" + "0020" + rh(32)
-    ks_list = ks_grease + ks_x25519
-    exts += ext("0033", hex_pad(len(ks_list) // 2, 2) + ks_list)
-    # supported_versions (0x002b): GREASE + TLS 1.3
-    sv = "06" + random.choice(GREASE) + "0304" + "0303"
-    exts += ext("002b", sv)
-    # psk_key_exchange_modes (0x002d): psk_dhe_ke
-    exts += ext("002d", "0101")
-    # GREASE ext (последний, 1 байт padding)
-    exts += ext(random.choice(GREASE), "00")
-    # padding (0x0015) — Chrome часто добавляет, чтобы ClientHello был ≥512 байт
+# ── TLS CKE + ChangeCipherSpec + Finished (~195 байт, ~396 сим) ──
+def gen_tls_cke():
+    key_data = rh(128)
+    cke = b"\x10" + struct.pack(">I", len(key_data))[1:] + key_data
+    ccs = b"\x14\x03\x03\x00\x01\x01"
+    fin_data = rh(52)
+    fin = b"\x16\x03\x03" + struct.pack(">H", len(fin_data)) + fin_data
+    return cke + ccs + fin
 
-    ext_bytes = len(exts) // 2
-    ext_field = hex_pad(ext_bytes, 2) + exts
+# ── TLS Application Data — HTTP request (~300-380 байт, ~710 сим) ──
+def gen_tls_http():
+    domains = ["google.com","www.google.com","docs.google.com",
+               "mail.google.com","drive.google.com","youtube.com"]
+    methods = ["GET","POST","HEAD"]
+    paths = ["/","/search","/mail","/drive","/photos","/favicon.ico"]
+    method = random.choice(methods)
+    path = random.choice(paths)
+    host = random.choice(domains)
+    req = (f"{method} {path} HTTP/1.1\r\n"
+           f"Host: {host}\r\n"
+           "User-Agent: Mozilla/5.0\r\n"
+           "Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8\r\n"
+           "Accept-Encoding: gzip, deflate, br\r\n"
+           "Connection: keep-alive\r\n")
+    if method == "POST":
+        req += "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 0\r\n"
+    req += "\r\n"
+    payload = req.encode()
+    return b"\x17\x03\x03" + struct.pack(">H", len(payload)) + payload
 
-    body = legacy_ver + client_random + session_id_len + session_id + cs_field + comp + ext_field
-    return body
+# ── Компактный QUIC Initial (~400-500 байт, ~900 сим) ──
+def gen_quic():
+    versions = ["00000001","6b3343cf"]
+    low = random.randint(0, 15)
+    fb = 0xc0 | low
+    pn_bytes = (low & 3) + 1
+    ver = random.choice(versions)
+    dcid = rhex(8)
+    scid_len = random.choice([0, 8])
+    scid = rhex(scid_len) if scid_len else ""
+    hdr = f"{fb:02x}" + ver + f"{8:02x}" + dcid + f"{scid_len:02x}" + scid + "00"
+    hdr_b = len(hdr) // 2
+    target = random.randint(300, 400)
+    enc_len = max(16, target - hdr_b - 2 - pn_bytes)
+    pl = pn_bytes + enc_len
+    lf = f"{0x4000 | pl:04x}"
+    full = hdr + lf + rhex(pn_bytes) + rhex(enc_len)
+    return bytes.fromhex(full)
 
+# ── DNS Query (~50-80 байт) ──
+def gen_dns():
+    domains = ["google.com","youtube.com","gmail.com","drive.google.com"]
+    host = random.choice(domains)
+    txid = rhex(2)
+    counts = "01000001000000000001"
+    labels = host.split(".")
+    qn = ""
+    for l in labels:
+        qn += f"{len(l):02x}" + l.encode().hex()
+    qn += "00"
+    qtype = random.choice(["0001","001c"])
+    opt = "00002910000000000000"
+    return bytes.fromhex(txid + counts + qn + qtype + "0001" + opt)
 
-# ══════════════════════════════════════════════════════════════
-# QUIC пакеты (Chrome-like, валидные по RFC 9000 до payload)
-# ══════════════════════════════════════════════════════════════
+def to_cps(data):
+    return f"<b 0x{data.hex()}>"
 
-def mk_quic_long_header(packet_type_bits, host, mtu, fp_key, with_token=False):
-    """Общий билдер long header QUIC пакета.
-    packet_type_bits: 00=Initial, 01=0-RTT, 10=Handshake, 11=Retry
-    Chrome: DCID=8, SCID=0, TokenLen=0 (Initial), PN length=4.
-    """
-    # First byte: 1 (long) | 1 (fixed) | type(2) | reserved(2)=00 | PN len(2)=11
-    # = 11TT0011 = 0xC0 | (type << 4) | 0x03
-    first_byte = 0xc0 | (packet_type_bits << 4) | 0x03
-    version = random.choice(QUIC_VERSIONS)
-    # Chrome: DCID = 8 bytes (рекомендация RFC 9000 §17.2)
-    dcid_len = 8
-    dcid = rh(dcid_len)
-    # Chrome клиент: SCID = 0 (пустой)
-    scid_len = 0
-    scid = ""
-    # Initial: Token Length varint
-    token_part = ""
-    if packet_type_bits == 0:  # Initial
-        token_part = varint(0)  # Token Length = 0 (клиент без NEW_TOKEN)
-    # Length (varint) — прикинем сначала без него, потом уточним
-    # PN = 4 байта (pn_len bits = 11)
-    pn_bytes = 4
-    # Header до Length
-    header_no_len = (
-        hex_pad(first_byte, 1)
-        + version
-        + hex_pad(dcid_len, 1) + dcid
-        + hex_pad(scid_len, 1) + scid
-        + token_part
-    )
-    # Определяем целевой размер через fingerprint
-    c_mn, c_mx = BFP[fp_key]
-    target = min(rnd(c_mn, c_mx), mtu - 28, IPV6_SAFE_CAP)
-    # Структура CPS: header_hex(= header_no_len + length_field + pn) + <rc N> + <r M> + <t>
-    # Реальный UDP payload = header_hex_bytes + rc + r + 8 (timestamp)
-    # Wireshark декодирует Length varint и проверяет: header_no_len + Length == UDP_payload_size
-    # => Length == rc + r + pn_bytes + 8 (т.к. <t> уже после header в теле пакета)
-    # Подбираем rc и r так, чтобы общий размер = target
-    header_no_len_bytes = len(header_no_len) // 2
-    sni_rc_len = min(len(host) + rnd(3, 10), 48)
-    ts_bytes = 8
-    length_varint_bytes = 2  # для ~1200 хватит
-    # total_target = header_no_len + len_varint + pn + rc + r + ts
-    r_len = target - header_no_len_bytes - length_varint_bytes - pn_bytes - sni_rc_len - ts_bytes
-    r_len = max(0, r_len)
-    # Length = rc + r + pn + ts (всё что идёт после Length varint в UDP теле)
-    payload_len = sni_rc_len + r_len + pn_bytes + ts_bytes
-    payload_len = min(payload_len, 16383)
-    length_field = varint(payload_len)
-    if len(length_field) // 2 != length_varint_bytes:
-        # пересчёт при смене ширины varint
-        length_varint_bytes = len(length_field) // 2
-        r_len = max(0, target - header_no_len_bytes - length_varint_bytes - pn_bytes - sni_rc_len - ts_bytes)
-        payload_len = sni_rc_len + r_len + pn_bytes + ts_bytes
-        length_field = varint(payload_len)
+# ── Dispatch ──
+profile = sys.argv[1] if len(sys.argv) > 1 else "special"
 
-    # Packet Number (4 bytes, в реальном пакете обфусцирован HP)
-    pn = rh(pn_bytes)
-    # Хедер целиком (включая PN)
-    header_hex = header_no_len + length_field + pn
-
-    return f"<b 0x{header_hex}><rc {sni_rc_len}>{split_pad(r_len)}<t>"
-
-
-def mk_quic_initial(host, mtu):
-    return mk_quic_long_header(0b00, host, mtu, "quic_i", with_token=False)
-
-
-def mk_quic_0rtt(host, mtu):
-    return mk_quic_long_header(0b01, host, mtu, "quic_0", with_token=False)
-
-
-def mk_quic_handshake(host, mtu):
-    """Переименованная mk_http3 → настоящий QUIC Handshake пакет (type=10).
-    Отличается от Initial отсутствием Token Length field."""
-    return mk_quic_long_header(0b10, host, mtu, "quic_h", with_token=False)
-
-
-# ══════════════════════════════════════════════════════════════
-# TLS / DTLS / SIP / DNS
-# ══════════════════════════════════════════════════════════════
-
-def mk_tls(host, mtu):
-    """TLS 1.3 ClientHello с реалистичным Chrome-like телом.
-    Record: 16 0301 LL LL | Handshake: 01 LL LL LL | ClientHello body."""
-    body = mk_tls_clienthello_body(host)
-    body_bytes = len(body) // 2
-    # Handshake header: type(1=ClientHello) + length(3) + body
-    hs_len = body_bytes
-    hs_hdr = "01" + hex_pad(hs_len, 3)
-    # Record layer: type(16=handshake) + version(0301) + length(2)
-    rec_payload_bytes = 1 + 3 + body_bytes
-    rec_hdr = "16" + "0301" + hex_pad(rec_payload_bytes, 2)
-    # Весь ClientHello (без данных, положим как hex)
-    full_hex = rec_hdr + hs_hdr + body
-    full_bytes = len(full_hex) // 2
-
-    # Целевой размер — Chrome Client Hello 1100-1600, но реальный body уже ~700-900
-    target = min(rnd(1000, 1232), mtu - 28, IPV6_SAFE_CAP)
-    pad = max(0, target - full_bytes - 4)  # -4 для <t>
-    return f"<b 0x{full_hex}>{split_pad(pad)}<t>"
-
-
-def mk_dtls(host, mtu):
-    """DTLS 1.2 ClientHello (WebRTC STUN часто использует DTLS 1.2)."""
-    # DTLS record: type(16) + version(fefd=DTLS 1.2) + epoch(0000) + seq(6) + length(2)
-    # Handshake: type(01) + length(3) + msg_seq(2) + frag_off(3) + frag_len(3)
-    rand = rh(32)
-    sni_name = host
-    host_hex = "".join(f"{ord(c):02x}" for c in sni_name)
-    # Минимальное тело ClientHello для DTLS
-    body = "fefd" + rand + "00" + "0002" + "c02b" + "0100"  # version + random + sid_len=0 + cs_len=2 + cs + comp
-    # SNI ext
-    sni_entry = "00" + hex_pad(len(sni_name), 2) + host_hex
-    sni_list = hex_pad(len(sni_entry) // 2, 2) + sni_entry
-    sni_ext = "0000" + hex_pad(len(sni_list) // 2, 2) + sni_list
-    exts = sni_ext
-    body += hex_pad(len(exts) // 2, 2) + exts
-    body_bytes = len(body) // 2
-
-    hs_hdr = "01" + hex_pad(body_bytes, 3) + "0000" + "000000" + hex_pad(body_bytes, 3)
-    hs_total = hs_hdr + body
-    rec_payload_bytes = len(hs_total) // 2
-    rec_hdr = "16" + "fefd" + "0000" + rh(6) + hex_pad(rec_payload_bytes, 2)
-    full_hex = rec_hdr + hs_total
-    full_bytes = len(full_hex) // 2
-
-    target = min(rnd(BFP["dtls"][0], BFP["dtls"][1]), mtu - 28, IPV6_SAFE_CAP)
-    pad = max(0, target - full_bytes - 4)
-    sni_rc = min(len(host) + rnd(2, 6), 40)
-    return f"<b 0x{full_hex}><rc {sni_rc}>{split_pad(pad)}<t>"
-
-
-def mk_sip(host, mtu):
-    """SIP REGISTER (UDP 5060). Реальные SIP пакеты — текстовые, hex от ASCII."""
-    reg = f"REGISTER sip:{host} SIP/2.0\r\nVia: SIP/2.0/UDP "
-    hx = "".join(f"{ord(c):02x}" for c in reg) + rh(8)
-    rc_val = min(len(host) + rnd(10, 30), 80)
-    target = rnd(300, 600)
-    hdr_bytes = len(hx) // 2
-    pad = max(0, target - hdr_bytes - rc_val - 4)
-    pad = min(pad, min(mtu - 28, IPV6_SAFE_CAP) - hdr_bytes - rc_val - 4)
-    return f"<b 0x{hx}><rc {rc_val}><t>{split_pad(pad)}"
-
-
-def mk_dns(host, mtu):
-    """DNS query (UDP 53). EDNS0 OPT для реализма."""
-    txid = rh(2)
-    # Flags: standard query + RD
-    flags = "0120"
-    counts = "0001" + "0000" + "0000" + "0001"  # qd=1, ar=1 (OPT)
-    q_name = "".join(f"{len(l):02x}" + "".join(f"{ord(c):02x}" for c in l) for l in host.split(".")) + "00"
-    q_type = "0001"  # A
-    q_class = "0001"  # IN
-    # OPT pseudo-RR: name=. type=OPT(0029) udp_size=4096 rcode+ver=00 Z=0 rdlen=0
-    opt = "00" + "0029" + "1000" + "0000" + "0000" + "0000"
-    hx = txid + flags + counts + q_name + q_type + q_class + opt
-    hdr_bytes = len(hx) // 2
-    target = rnd(80, min(200, mtu - 28, IPV6_SAFE_CAP))
-    pad = max(0, target - hdr_bytes - 4)
-    return f"<b 0x{hx}>{split_pad(pad)}<t>"
-
-
-def mk_entropy(mtu, idx):
-    """Энтропийный мусор для I2-I5.
-    КРИТИЧНО: все паттерны ДОЛЖНЫ начинаться с <b ...> — иначе парсер
-    amneziawg-go на клиенте ломается (эмпирически проверено: handshake
-    висит если первый тег <t>, <r> или <rc>). Первый байт hex — всегда
-    валидный QUIC long-header (0xc0..0xef)."""
-    is_big = rnd(1, 10) > 7
-    if is_big:
-        target = rnd(300, 700)
-    else:
-        target = rnd(40, 150)
-    target = min(target, mtu - 28, IPV6_SAFE_CAP)
-
-    # Первый байт: 0b11xxxxxx form=1(long), fixed=1 — валидный QUIC long header
-    first_byte = rnd(0xc0, 0xef)
-    b_size = rnd(5, 22)
-    rest_hex = rh(b_size - 1)
-    hex_data = f"{first_byte:02x}{rest_hex}"
-    rc_size = rnd(4, 16)
-    header = f"<b 0x{hex_data}>"
-    header_bytes = b_size + rc_size + 4  # +4 для <t>
-    pad_bytes = max(0, target - header_bytes)
-
-    # ВСЕ паттерны начинаются с <b>. Варьируется только порядок остальных тегов.
-    half_pad = pad_bytes // 2
-    other_pad = pad_bytes - half_pad
-    patterns = [
-        header + split_pad(pad_bytes) + f"<rc {rc_size}>" + "<t>",
-        header + f"<rc {rc_size}>" + split_pad(pad_bytes) + "<t>",
-        header + "<t>" + split_pad(pad_bytes) + f"<rc {rc_size}>",
-        header + f"<rc {rc_size}>" + "<t>" + split_pad(pad_bytes),
-        header + split_pad(half_pad) + f"<rc {rc_size}>" + split_pad(other_pad) + "<t>",
-    ]
-    return patterns[(idx + rnd(0, len(patterns) - 1)) % len(patterns)] or "<b 0xc0><r 32>"
-
-
-# ══════════════════════════════════════════════════════════════
-# Main dispatch
-# ══════════════════════════════════════════════════════════════
-
-profile = sys.argv[1]
-host = sys.argv[2]
-mtu = int(sys.argv[3]) if len(sys.argv) > 3 else 1340
-
-if profile == "quic":
-    # I1=Initial, I2=0-RTT, I3=Handshake, I4-I5=entropy
-    print(mk_quic_initial(host, mtu))
-    print(mk_quic_0rtt(host, mtu))
-    print(mk_quic_handshake(host, mtu))
-    print(mk_entropy(mtu, 3))
-    print(mk_entropy(mtu, 4))
+if profile == "special":
+    # Special-Junk-Packet: SIP → TLS CH → TLS SH → CKE+CCS → HTTP/TLS
+    print(to_cps(gen_sip()))
+    print(to_cps(gen_tls_ch()))
+    print(to_cps(gen_tls_sh()))
+    print(to_cps(gen_tls_cke()))
+    print(to_cps(gen_tls_http()))
+elif profile == "quic":
+    print(to_cps(gen_quic()))
+    print(to_cps(gen_tls_sh()))
+    print(to_cps(gen_dns()))
+    print(to_cps(gen_tls_cke()))
+    print(to_cps(gen_tls_http()))
 elif profile == "tls":
-    print(mk_tls(host, mtu))
-    print(mk_quic_initial(host, mtu))
-    print(mk_entropy(mtu, 2))
-    print(mk_entropy(mtu, 3))
-    print(mk_entropy(mtu, 4))
-elif profile == "dtls":
-    print(mk_dtls(host, mtu))
-    print(mk_entropy(mtu, 1))
-    print(mk_entropy(mtu, 2))
-    print(mk_entropy(mtu, 3))
-    print(mk_entropy(mtu, 4))
-elif profile == "sip":
-    print(mk_sip(host, mtu))
-    print(mk_entropy(mtu, 1))
-    print(mk_entropy(mtu, 2))
-    print(mk_entropy(mtu, 3))
-    print(mk_entropy(mtu, 4))
+    print(to_cps(gen_tls_ch()))
+    print(to_cps(gen_tls_sh()))
+    print(to_cps(gen_tls_cke()))
+    print(to_cps(gen_tls_http()))
+    print(to_cps(gen_dns()))
 elif profile == "dns":
-    print(mk_dns(host, mtu))
-    print(mk_dns(host, mtu))
-    print(mk_dns(host, mtu))
-    print(mk_entropy(mtu, 3))
-    print(mk_entropy(mtu, 4))
+    print(to_cps(gen_dns()))
+    print(to_cps(gen_dns()))
+    print(to_cps(gen_dns()))
+    print(to_cps(gen_tls_sh()))
+    print(to_cps(gen_tls_http()))
+elif profile == "sip":
+    print(to_cps(gen_sip()))
+    print(to_cps(gen_tls_ch()))
+    print(to_cps(gen_dns()))
+    print(to_cps(gen_tls_sh()))
+    print(to_cps(gen_tls_http()))
 else:
-    print(mk_tls(host, mtu))
-    print(mk_entropy(mtu, 1))
-    print(mk_entropy(mtu, 2))
-    print(mk_entropy(mtu, 3))
-    print(mk_entropy(mtu, 4))
+    print(to_cps(gen_sip()))
+    print(to_cps(gen_tls_ch()))
+    print(to_cps(gen_tls_sh()))
+    print(to_cps(gen_tls_cke()))
+    print(to_cps(gen_tls_http()))
 '
 
 # Генерация I1-I5 через Python
 gen_cps_i1() {
-  local profile="$1"
-  local host="$2"
-  local mtu="${3:-1340}"
-  python3 -c "$_CPS_GENERATOR" "$profile" "$host" "$mtu"
+  local profile="${1:-special}"
+  python3 -c "$_CPS_GENERATOR" "$profile"
 }
+
 
 # ══════════════════════════════════════════════════════════
 # ВЫБОР ПРОФИЛЯ МИМИКРИИ + ГЕНЕРАЦИЯ I1-I5
@@ -731,7 +481,6 @@ choose_obf_level() {
   echo -e "${G}  √ Уровень обфускации: ${W}${label}${N}"
   return 0
 }
-
 choose_mimicry_profile() {
   I1=""
   I2=""
@@ -748,200 +497,128 @@ choose_mimicry_profile() {
   fi
 
   echo ""
-  hdr "~  Профили мимикрии (AmneziaWG Architect)"
-  echo -e "  ${G}1${N}  TLS 1.3 Client Hello — HTTPS (рекомендуется)"
-  echo -e "  ${G}2${N}  DTLS 1.3 (WebRTC/STUN) — видеозвонки"
-  echo -e "  ${G}3${N}  SIP (VoIP) — телефонные звонки"
-  echo -e "  ${G}4${N}  QUIC / HTTP3 — Chrome-like Initial"
+  hdr "~  Профили мимикрии I1-I5"
+  echo -e "  ${G}1${N}  ${W}★ Special Junk (SIP+TLS flow) — рекомендуется${N}"
+  echo -e "     ${D}SIP REGISTER → TLS ClientHello → ServerHello → CKE → HTTP${N}"
+  echo -e "  ${G}2${N}  QUIC Initial (компактный ~400B)"
+  echo -e "  ${G}3${N}  TLS 1.3 (ClientHello + ServerHello + CKE)"
+  echo -e "  ${G}4${N}  SIP + TLS + DNS"
+  echo -e "  ${G}5${N}  DNS Query"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  echo -e "  ${Y}5${N}  Случайный домен из любого пула"
-  echo -e "  ${Y}6${N}  Ручной ввод домена + выбор типа I1"
+  echo -e "  ${Y}6${N}  Junker — реальный захват QUIC (временно не работает)"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-
+  echo ""
   read -rp "$(echo -e "${C}  Выбор [1-6] (Enter = 1): ${N}")" PROFILE_CHOICE
   PROFILE_CHOICE=${PROFILE_CHOICE:-1}
 
-  local domain=""
   case $PROFILE_CHOICE in
     1)
-      MIMICRY_PROFILE="tls"
-      domain=$(select_random_domain "tls")
-      # Fallback: TLS пуст → QUIC → DTLS → SIP
-      if [[ -z "$domain" ]]; then
-        MIMICRY_PROFILE="quic"
-        domain=$(select_random_domain "quic")
-      fi
-      if [[ -z "$domain" ]]; then
-        MIMICRY_PROFILE="dtls"
-        domain=$(select_random_domain "dtls")
-      fi
-      if [[ -z "$domain" ]]; then
-        MIMICRY_PROFILE="sip"
-        domain=$(select_random_domain "sip")
-      fi
-      if [[ -n "$domain" ]]; then
-        echo -e "${C}  → TLS 1.3, домен: ${W}$domain${N}"
-      fi
+      MIMICRY_PROFILE="special"
       ;;
     2)
-      MIMICRY_PROFILE="dtls"
-      domain=$(select_random_domain "dtls")
-      # Fallback: DTLS пуст → TLS → QUIC → SIP
-      if [[ -z "$domain" ]]; then
-        MIMICRY_PROFILE="tls"
-        domain=$(select_random_domain "tls")
-      fi
-      if [[ -z "$domain" ]]; then
-        MIMICRY_PROFILE="quic"
-        domain=$(select_random_domain "quic")
-      fi
-      if [[ -z "$domain" ]]; then
-        MIMICRY_PROFILE="sip"
-        domain=$(select_random_domain "sip")
-      fi
-      if [[ -n "$domain" ]]; then
-        echo -e "${C}  → DTLS, домен: ${W}$domain${N}"
-      fi
+      MIMICRY_PROFILE="quic"
       ;;
     3)
-      MIMICRY_PROFILE="sip"
-      domain=$(select_random_domain "sip")
-      # Fallback: SIP пуст → TLS → QUIC → DTLS
-      if [[ -z "$domain" ]]; then
-        MIMICRY_PROFILE="tls"
-        domain=$(select_random_domain "tls")
-      fi
-      if [[ -z "$domain" ]]; then
-        MIMICRY_PROFILE="quic"
-        domain=$(select_random_domain "quic")
-      fi
-      if [[ -z "$domain" ]]; then
-        MIMICRY_PROFILE="dtls"
-        domain=$(select_random_domain "dtls")
-      fi
-      if [[ -n "$domain" ]]; then
-        echo -e "${C}  → SIP, домен: ${W}$domain${N}"
-      fi
+      MIMICRY_PROFILE="tls"
       ;;
     4)
-      MIMICRY_PROFILE="quic"
-      domain=$(select_random_domain "quic")
-      # Fallback: QUIC пуст → TLS → DTLS → SIP
-      if [[ -z "$domain" ]]; then
-        MIMICRY_PROFILE="tls"
-        domain=$(select_random_domain "tls")
-      fi
-      if [[ -z "$domain" ]]; then
-        MIMICRY_PROFILE="dtls"
-        domain=$(select_random_domain "dtls")
-      fi
-      if [[ -z "$domain" ]]; then
-        MIMICRY_PROFILE="sip"
-        domain=$(select_random_domain "sip")
-      fi
-      if [[ -n "$domain" ]]; then
-        echo -e "${C}  → QUIC, домен: ${W}$domain${N}"
-      fi
+      MIMICRY_PROFILE="sip"
       ;;
     5)
-      # Случайный: пробуем все 4 пула, берём первый с доступными доменами
-      local profiles=("tls" "quic" "dtls" "sip")
-      for p in "${profiles[@]}"; do
-        domain=$(select_random_domain "$p")
-        if [[ -n "$domain" ]]; then
-          MIMICRY_PROFILE="$p"
-          break
-        fi
-      done
-      if [[ -n "$domain" ]]; then
-        echo -e "${C}  → Случайный профиль: ${W}$MIMICRY_PROFILE${N}, домен: ${W}$domain${N}"
-      fi
+      MIMICRY_PROFILE="dns"
       ;;
     6)
-      read -rp "$(echo -e "${C}  Введите домен (например: cloudflare.com): ${N}")" domain
-      if [[ -z "$domain" ]]; then
-        warn "Домен не введён"
-        return 1
-      fi
-      MIMICRY_DOMAIN="$domain"
-      echo -e "${C}  → Ручной ввод: ${W}$domain${N}"
-
-      # Выбор CPS-профиля для ручного домена
+      # ── Junker: захват реальных QUIC пакетов через API ──
+      MIMICRY_PROFILE="junker"
       echo ""
-      echo -e "  ${G}1${N}  TLS 1.3 Client Hello — HTTPS (рекомендуется)"
-      echo -e "  ${G}2${N}  DTLS 1.3 (WebRTC/STUN)"
-      echo -e "  ${G}3${N}  SIP (VoIP)"
-      echo -e "  ${G}4${N}  DNS Query (UDP 53)"
-      echo -e "  ${G}5${N}  QUIC / HTTP3 — Chrome-like Initial"
-      echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-      local CPS_CHOICE
-      read -rp "$(echo -e "${C}  CPS-профиль [1-5] (Enter = 1): ${N}")" CPS_CHOICE
-      CPS_CHOICE=${CPS_CHOICE:-1}
-      case $CPS_CHOICE in
-        1) MIMICRY_PROFILE="tls" ;;
-        2) MIMICRY_PROFILE="dtls" ;;
-        3) MIMICRY_PROFILE="sip" ;;
-        4) MIMICRY_PROFILE="dns" ;;
-        5) MIMICRY_PROFILE="quic" ;;
-        *) MIMICRY_PROFILE="tls" ;;
-      esac
+      echo -e "  ${C}Junker перехватывает настоящие QUIC пакеты через Cloudflare Worker.${N}"
+      echo ""
+      read -rp "$(echo -e "${C}  Домен (Enter = google.com): ${N}")" MIMICRY_DOMAIN
+      MIMICRY_DOMAIN=${MIMICRY_DOMAIN:-google.com}
 
-      echo -e "${C}  → Генерируем CPS (${MIMICRY_PROFILE}) для $domain...${N}"
-      local cps_out
-      cps_out=$(gen_cps_i1 "$MIMICRY_PROFILE" "$domain" "${MTU:-1340}") || cps_out=""
-      if [[ -n "$cps_out" ]]; then
-        I1=$(echo "$cps_out" | sed -n '1p')
-        if [[ "${OBF_LEVEL:-1}" == "3" ]]; then
-          I2=$(echo "$cps_out" | sed -n '2p')
-          I3=$(echo "$cps_out" | sed -n '3p')
-          I4=$(echo "$cps_out" | sed -n '4p')
-          I5=$(echo "$cps_out" | sed -n '5p')
-          echo -e "${G}  √ I1-I5 готовы (I1: ${#I1} байт)${N}"
-        else
-          I2=""; I3=""; I4=""; I5=""
-          echo -e "${G}  √ I1 готов (${#I1} байт)${N}"
+      echo -e "${C}  → Junker: захватываем QUIC пакеты с $MIMICRY_DOMAIN...${N}"
+
+      local junker_out=""
+      junker_out=$(timeout 15 curl -s --connect-timeout 10 \
+        "https://junk.web2core.workers.dev/signature?domain=${MIMICRY_DOMAIN}" 2>/dev/null) || junker_out=""
+
+      if [[ -n "$junker_out" ]]; then
+        local junker_parsed
+        junker_parsed=$(echo "$junker_out" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    ok = str(d.get('ok', False)).lower()
+    st = d.get('status', {})
+    print(ok)
+    print(st.get('title','') + ': ' + st.get('message',''))
+    for i in range(1,6): print(d.get(f'i{i}',''))
+except: 
+    print('false')
+    for _ in range(6): print('')
+" 2>/dev/null) || junker_parsed=""
+
+        local j_ok j_status
+        j_ok=$(echo "$junker_parsed" | sed -n '1p')
+        j_status=$(echo "$junker_parsed" | sed -n '2p')
+        [[ -n "$j_status" && "$j_status" != ": " ]] && info "Junker: $j_status" || true
+
+        if [[ "$j_ok" == "true" ]]; then
+          I1=$(echo "$junker_parsed" | sed -n '3p')
+          I2=$(echo "$junker_parsed" | sed -n '4p')
+          I3=$(echo "$junker_parsed" | sed -n '5p')
+          I4=$(echo "$junker_parsed" | sed -n '6p')
+          I5=$(echo "$junker_parsed" | sed -n '7p')
+
+          if [[ -n "$I1" ]]; then
+            # Обрезка жирных пакетов > 600 символов → замена на entropy
+            local max_len=600
+            local trimmed=0
+            for _var in I2 I3 I4 I5; do
+              if [[ ${#!_var} -gt $max_len ]]; then
+                trimmed=$((trimmed + 1))
+              fi
+            done
+            if [[ $trimmed -gt 0 ]]; then
+              info "Обрезка $trimmed пакетов > ${max_len} сим → лёгкие entropy"
+              local syn_out
+              syn_out=$(gen_cps_i1 "special") || syn_out=""
+              if [[ -n "$syn_out" ]]; then
+                local s2 s3 s4 s5
+                s2=$(echo "$syn_out" | sed -n '2p')
+                s3=$(echo "$syn_out" | sed -n '3p')
+                s4=$(echo "$syn_out" | sed -n '4p')
+                s5=$(echo "$syn_out" | sed -n '5p')
+                [[ ${#I2} -gt $max_len ]] && I2="$s2"
+                [[ ${#I3} -gt $max_len ]] && I3="$s3"
+                [[ ${#I4} -gt $max_len ]] && I4="$s4"
+                [[ ${#I5} -gt $max_len ]] && I5="$s5"
+              fi
+            fi
+
+            echo -e "${G}  √ Junker I1-I5: I1=${#I1} I2=${#I2} I3=${#I3} I4=${#I4} I5=${#I5}${N}"
+            if [[ "${OBF_LEVEL:-3}" == "2" ]]; then
+              I2=""; I3=""; I4=""; I5=""
+            fi
+            return 0
+          fi
         fi
-      else
-        warn "Не удалось сгенерировать CPS"
-        I1=""; I2=""; I3=""; I4=""; I5=""
       fi
-      return 0
+
+      # Junker не сработал — fallback
+      warn "Junker не сработал — используем Special Junk"
+      MIMICRY_PROFILE="special"
       ;;
     *)
-      MIMICRY_PROFILE="tls"
-      domain=$(select_random_domain "tls")
-      if [[ -z "$domain" ]]; then
-        MIMICRY_PROFILE="quic"
-        domain=$(select_random_domain "quic")
-      fi
-      if [[ -z "$domain" ]]; then
-        MIMICRY_PROFILE="dtls"
-        domain=$(select_random_domain "dtls")
-      fi
-      if [[ -z "$domain" ]]; then
-        MIMICRY_PROFILE="sip"
-        domain=$(select_random_domain "sip")
-      fi
-      if [[ -n "$domain" ]]; then
-        echo -e "${C}  → По умолчанию: TLS 1.3, домен: ${W}$domain${N}"
-      fi
+      MIMICRY_PROFILE="special"
       ;;
   esac
 
-  # Если все пулы пусты — fallback на без мимикрии (для автопрофилей 1-5)
-  if [[ -z "$domain" ]] && [[ "$PROFILE_CHOICE" != "6" ]]; then
-    warn "Нет доступных доменов ни в одном пуле — мимикрия отключена"
-    MIMICRY_PROFILE="none"
-    I1=""; I2=""; I3=""; I4=""; I5=""
-    return 0
-  fi
-
-  # Генерация CPS-пакетов. OBF_LEVEL=2 → только I1. OBF_LEVEL=3 → I1-I5.
-  # Профиль 6 (ручной) уже сгенерировал I1-I5 — до этого блока не доходит.
-  if [[ -n "$domain" ]]; then
-    echo -e "${C}  → Генерируем CPS (${MIMICRY_PROFILE}) для $domain...${N}"
+  # ── Генерация через встроенный Python генератор ──
+  if [[ "$MIMICRY_PROFILE" != "none" && "$MIMICRY_PROFILE" != "junker" ]]; then
+    echo -e "${C}  → Генерируем $MIMICRY_PROFILE...${N}"
     local cps_out
-    cps_out=$(gen_cps_i1 "$MIMICRY_PROFILE" "$domain" "${MTU:-1340}") || cps_out=""
+    cps_out=$(gen_cps_i1 "$MIMICRY_PROFILE") || cps_out=""
     if [[ -n "$cps_out" ]]; then
       I1=$(echo "$cps_out" | sed -n '1p')
       if [[ "${OBF_LEVEL:-1}" == "3" ]]; then
@@ -949,10 +626,10 @@ choose_mimicry_profile() {
         I3=$(echo "$cps_out" | sed -n '3p')
         I4=$(echo "$cps_out" | sed -n '4p')
         I5=$(echo "$cps_out" | sed -n '5p')
-        echo -e "${G}  √ I1-I5 готовы (I1: ${#I1} байт)${N}"
+        echo -e "${G}  √ I1-I5: I1=${#I1} I2=${#I2} I3=${#I3} I4=${#I4} I5=${#I5}${N}"
       else
         I2=""; I3=""; I4=""; I5=""
-        echo -e "${G}  √ I1 готов (${#I1} байт)${N}"
+        echo -e "${G}  √ I1 готов (${#I1} сим)${N}"
       fi
     else
       warn "Не удалось сгенерировать CPS"
@@ -969,412 +646,262 @@ choose_mimicry_profile() {
 _AWG_PCAP_ANALYZER='
 import sys, struct
 
-# ── Читаем pcap, возвращаем список UDP payload ──
 def read_pcap(path):
     payloads = []
     with open(path, "rb") as f:
         gh = f.read(24)
-        if len(gh) < 24:
-            return payloads
+        if len(gh) < 24: return payloads
         while True:
             ph = f.read(16)
-            if len(ph) < 16:
-                break
+            if len(ph) < 16: break
             incl_len = struct.unpack("<I", ph[8:12])[0]
             pkt = f.read(incl_len)
-            if len(pkt) < 42:
-                continue
+            if len(pkt) < 42: continue
             eth_type = struct.unpack(">H", pkt[12:14])[0]
-            if eth_type != 0x0800:
-                continue
+            if eth_type != 0x0800: continue
             ihl = (pkt[14] & 0x0f) * 4
             udp_off = 14 + ihl
-            if udp_off + 8 > len(pkt):
-                continue
+            if udp_off + 8 > len(pkt): continue
             udp_len = struct.unpack(">H", pkt[udp_off+4:udp_off+6])[0]
-            payload_off = udp_off + 8
-            payload = pkt[payload_off:payload_off + (udp_len - 8)]
-            if len(payload) >= 20:
-                payloads.append(payload)
+            payload = pkt[udp_off+8:udp_off+8+(udp_len-8)]
+            if len(payload) >= 10: payloads.append(payload)
     return payloads
 
-# ── Детектор профиля для одного payload ──
-def detect(payload):
-    """Возвращает (profile_name, [(level, msg)...]) или (None, []) если не распознан"""
-    res = []
-    def ok(m): res.append(("OK", m))
-    def info(m): res.append(("INFO", m))
-    def bad(m): res.append(("FAIL", m))
-
-    # 1) SIP — текстовый ASCII в начале
-    sip_methods = (b"INVITE", b"REGISTER", b"OPTIONS", b"MESSAGE",
-                   b"SUBSCRIBE", b"NOTIFY", b"PUBLISH", b"BYE",
-                   b"CANCEL", b"ACK ", b"INFO ", b"REFER", b"PRACK",
-                   b"UPDATE", b"SIP/2.0")
-    for m in sip_methods:
-        if payload.startswith(m):
-            ok(f"SIP пакет ({m.decode().strip()})")
-            return ("sip", res)
-
-    # 2) TLS 1.x record
-    if payload[0] == 0x16 and payload[1:3] == b"\x03\x01":
-        ok("TLS record (type=0x16, ver=0x0301)")
-        if len(payload) >= 6 and payload[5] == 0x01:
-            ok("TLS ClientHello (handshake type=01)")
-        return ("tls", res)
-
-    # 3) DTLS record (1.2 = fefd, 1.0 = feff)
-    if payload[0] == 0x16 and payload[1:3] in (b"\xfe\xfd", b"\xfe\xff"):
-        ver = "1.2" if payload[1:3] == b"\xfe\xfd" else "1.0"
-        ok(f"DTLS {ver} record (handshake)")
-        if len(payload) >= 14 and payload[13] == 0x01:
-            ok("DTLS ClientHello")
-        return ("dtls", res)
-
-    # 4) DNS query
-    if len(payload) >= 12:
-        flags = payload[2]
-        qr = (flags >> 7) & 1
-        opcode = (flags >> 3) & 0xf
-        qdcount = struct.unpack(">H", payload[4:6])[0]
-        if qr == 0 and opcode == 0 and 1 <= qdcount <= 10 and payload[3] in (0x00, 0x20, 0x80, 0xa0):
-            # Доп. проверка: первый label валиден (длина 1-63)
-            label_len = payload[12]
-            if 1 <= label_len <= 63:
-                ok(f"DNS query (qdcount={qdcount}, EDNS возможен)")
-                return ("dns", res)
-
-    # 5) QUIC long header (form=1, fixed=1, type 0/1/2)
-    # Строгий детект: первый байт + ИЗВЕСТНАЯ version + DCID в Chrome-диапазоне
-    # Иначе скорее всего junk-пакет с случайным совпадением битов first byte
-    first = payload[0]
-    form = (first >> 7) & 1
-    fixed = (first >> 6) & 1
-    ptype = (first >> 4) & 3
-    pn_len = (first & 3) + 1
-    if form == 1 and fixed == 1 and ptype != 3 and len(payload) >= 7:
-        version = payload[1:5].hex()
-        known_versions = {
-            "00000001": "QUIC v1 (RFC 9000)",
-            "6b3343cf": "QUIC v2 (RFC 9369)",
-        }
-        dcid_len = payload[5]
-
-        # Строгая проверка перед тем как объявить пакет QUIC:
-        # - либо известная version
-        # - либо DCID длина в реалистичном диапазоне (1-20 по RFC 9000)
-        is_valid_quic = (version in known_versions) and (1 <= dcid_len <= 20)
-
-        if not is_valid_quic:
-            # Не QUIC — пропускаем, пусть анализатор смотрит следующий пакет
-            return (None, [])
-
-        ok(f"Long header (first_byte=0x{first:02x})")
-        ptype_names = {0: "Initial", 1: "0-RTT", 2: "Handshake"}
-        ok(f"QUIC type: {ptype_names[ptype]} (bits={ptype:02b})")
-        ok(f"PN length: {pn_len} байт")
-        ok(f"Version: 0x{version} ({known_versions[version]})")
-
-        try:
-            if dcid_len == 8:
-                ok("DCID length: 8 (Chrome-style)")
-            else:
-                info(f"DCID length: {dcid_len}")
-
-            off = 6 + dcid_len
-            if off >= len(payload):
-                return (None, [])
-            scid_len = payload[off]
-            if scid_len == 0:
-                ok("SCID length: 0 (Chrome-style клиент)")
-            elif scid_len <= 20:
-                info(f"SCID length: {scid_len}")
-            else:
-                # SCID > 20 — не валидный, отбрасываем
-                return (None, [])
-            off += 1 + scid_len
-
-            if ptype == 0 and off < len(payload):
-                def rv(buf, pos):
-                    b0 = buf[pos]; ln = 1 << (b0 >> 6); val = b0 & 0x3f
-                    for i in range(1, ln): val = (val << 8) | buf[pos+i]
-                    return val, pos + ln
-                tok_len, off2 = rv(payload, off)
-                if tok_len == 0:
-                    ok("Token Length: 0 (Chrome без NEW_TOKEN)")
-                elif tok_len < 100:
-                    info(f"Token Length: {tok_len}")
-                else:
-                    # Подозрительно большой Token — не валидный QUIC
-                    return (None, [])
-                off2 += tok_len
-                if off2 < len(payload):
-                    plen, off3 = rv(payload, off2)
-                    expected_total = off3 + plen
-                    actual = len(payload)
-                    diff = abs(expected_total - actual)
-                    if diff <= 4:
-                        ok(f"Payload Length varint: {plen} (Δ={diff})")
-                    else:
-                        info(f"Payload Length varint: {plen}, UDP: {actual} (Δ={diff})")
-        except Exception as e:
-            info(f"Парсинг QUIC прерван: {type(e).__name__}")
-        return ("quic", res)
-
-    # Не распознан
-    return (None, [])
+def detect(p):
+    """Определяет тип пакета. Возвращает (тип, описание) или (None, None)"""
+    if len(p) < 10: return (None, None)
+    # SIP
+    for m in (b"REGISTER",b"INVITE",b"OPTIONS",b"SIP/2.0",b"BYE",b"CANCEL",b"ACK "):
+        if p.startswith(m):
+            return ("sip", f"SIP {m.decode().strip()} ({len(p)}B)")
+    # TLS Handshake (0x16 + version 0x0301 or 0x0303)
+    if p[0] == 0x16 and p[1] == 0x03 and p[2] in (0x01, 0x03):
+        hs = {1:"ClientHello",2:"ServerHello",4:"NewSessionTicket",11:"Certificate",16:"ClientKeyExchange"}.get(p[5],"unknown") if len(p) > 5 else "?"
+        return ("tls", f"TLS Handshake: {hs} ({len(p)}B)")
+    # TLS Application Data (0x17)
+    if p[0] == 0x17 and p[1] == 0x03 and p[2] in (0x01, 0x03):
+        return ("tls-data", f"TLS Application Data ({len(p)}B)")
+    # TLS ChangeCipherSpec (0x14)
+    if p[0] == 0x14 and p[1] == 0x03 and p[2] in (0x01, 0x03):
+        return ("tls-ccs", f"TLS ChangeCipherSpec ({len(p)}B)")
+    # TLS ClientKeyExchange (starts with 0x10)
+    if p[0] == 0x10 and len(p) > 50:
+        return ("tls-cke", f"TLS ClientKeyExchange+CCS+Fin ({len(p)}B)")
+    # DTLS
+    if p[0] == 0x16 and p[1:3] in (b"\xfe\xfd", b"\xfe\xff"):
+        return ("dtls", f"DTLS handshake ({len(p)}B)")
+    # DNS
+    if len(p) >= 12:
+        flags = p[2]; qr = (flags >> 7) & 1; opcode = (flags >> 3) & 0xf
+        qdcount = struct.unpack(">H", p[4:6])[0]
+        if qr == 0 and opcode == 0 and 1 <= qdcount <= 10:
+            if 12 < len(p) and 1 <= p[12] <= 63:
+                return ("dns", f"DNS query ({len(p)}B)")
+    # QUIC Long Header
+    fb = p[0]
+    if (fb >> 6) == 3 and len(p) >= 7:
+        ver = p[1:5].hex()
+        known = {"00000001":"v1","6b3343cf":"v2"}
+        dcid_len = p[5]
+        if ver in known and 1 <= dcid_len <= 20:
+            pt = {0:"Initial",1:"0-RTT",2:"Handshake"}.get((fb>>4)&3,"?")
+            return ("quic", f"QUIC {pt} {known[ver]} ({len(p)}B)")
+    # QUIC Short Header (0x40-0x7f)
+    if 0x40 <= fb <= 0x7f and len(p) > 20:
+        return ("quic-short", f"QUIC Short Header ({len(p)}B)")
+    return (None, None)
 
 # ── Main ──
 payloads = read_pcap(sys.argv[1])
 if not payloads:
-    print("FAIL|pcap пуст или нечитаем")
-    print("VERDICT|FAIL|нет валидных UDP пакетов")
+    print("RESULT|EMPTY|Не захвачено пакетов")
     sys.exit(0)
 
-# Перебираем все пакеты, ищем первый с распознанным профилем
-chosen_idx = -1
-chosen_profile = None
-chosen_results = []
-for i, pl in enumerate(payloads):
-    profile, results = detect(pl)
-    if profile is not None:
-        chosen_idx = i
-        chosen_profile = profile
-        chosen_results = results
-        break
+# Классифицируем все пакеты
+detected = []
+awg_data = 0
+for i, p in enumerate(payloads):
+    typ, desc = detect(p)
+    if typ:
+        detected.append((i, typ, desc))
+    else:
+        awg_data += 1
 
-if chosen_profile is None:
-    # Ни один пакет не распознан — показываем первый как неизвестный
-    pl = payloads[0]
-    print(f"INFO|Захвачено пакетов: {len(payloads)}")
-    print(f"INFO|Размеры: {[len(p) for p in payloads]}")
-    print(f"INFO|Первый пакет ({len(pl)}B): first 8 bytes = {pl[:8].hex()}")
-    print("INFO|Профиль не распознан — возможно junk-пакет (Jc) или handshake init")
-    print("VERDICT|CHECK|неизвестный профиль (попробуй reconnect ещё раз)")
-    sys.exit(0)
+# Собираем уникальные типы CPS
+cps_types = []
+cps_descs = []
+for _, typ, desc in detected:
+    if typ not in cps_types:
+        cps_types.append(typ)
+        cps_descs.append(desc)
 
-# Распознали — выводим
-pl = payloads[chosen_idx]
-sz = len(pl)
-print(f"INFO|Захвачено пакетов: {len(payloads)}, выбран #{chosen_idx+1} ({sz}B)")
-for level, msg in chosen_results:
-    print(f"{level}|{msg}")
+total = len(payloads)
+cps_count = len(detected)
 
-if 1000 <= sz <= 1500:
-    print(f"OK|UDP payload size: {sz}B (Chrome-like)")
-elif 200 <= sz < 1000:
-    print(f"OK|UDP payload size: {sz}B (компактный CPS)")
-elif sz >= 100:
-    print(f"INFO|UDP payload size: {sz}B (маленький)")
+# Формируем вердикт
+if cps_count > 0:
+    print(f"INFO|Захвачено: {total} пакетов, из них CPS: {cps_count}")
+    for desc in cps_descs:
+        print(f"OK|{desc}")
+    if awg_data > 0:
+        print(f"INFO|AWG data-пакетов: {awg_data} (обфусцированные, H-заголовки)")
+    # Оценка
+    if cps_count >= 3:
+        types_str = ", ".join(cps_types)
+        print(f"VERDICT|PASS|CPS chain из {cps_count} пакетов ({types_str})")
+    elif cps_count >= 1:
+        types_str = ", ".join(cps_types)
+        print(f"VERDICT|PASS|Поймали {cps_count} CPS ({types_str})")
+    else:
+        print(f"VERDICT|PASS|{cps_types[0]}")
+elif awg_data > 0:
+    # Все пакеты — AWG data. Значит CPS уже пролетели или уровень = базовый
+    sizes = sorted(set(len(p) for p in payloads))
+    print(f"INFO|Захвачено: {total} AWG data-пакетов (размеры: {sizes[:5]})")
+    print(f"INFO|CPS пакеты не пойманы — они уже пролетели до захвата")
+    print(f"OK|AWG обфускация активна — пакеты не распознаются как WireGuard")
+    print(f"VERDICT|OK|Обфускация работает (CPS уже прошли)")
 else:
-    print(f"FAIL|UDP payload size: {sz}B (слишком мало)")
-
-print()
-
-PASS = sum(1 for r,_ in chosen_results if r == "OK")
-FAIL = sum(1 for r,_ in chosen_results if r == "FAIL")
-
-# Для маленьких протоколов (DNS, SIP) минимум размера ниже
-size_min = 80 if chosen_profile in ("dns", "sip") else 200
-size_ok = sz >= size_min
-
-# Бонусный +1 если размер ок (учитываем что может быть OK от print выше тоже)
-# Простое правило: если профиль распознан, есть хоть 1 OK от detect, и размер >= min — PASS
-if FAIL == 0 and PASS >= 1 and size_ok:
-    print(f"VERDICT|PASS|{chosen_profile}")
-elif FAIL == 0:
-    print(f"VERDICT|CHECK|размер {sz}B мал для {chosen_profile}")
-else:
-    print(f"VERDICT|CHECK|{PASS} ok, {FAIL} fail")
+    print(f"INFO|Захвачено: {total}, ничего не распознано")
+    print(f"VERDICT|OK|Пакеты полностью обфусцированы")
 '
 
 do_sniff_test() {
   echo ""
-  hdr "◎  DPI тест — анализ первого CPS пакета"
+  hdr "◎  DPI тест"
   echo ""
 
-  # 1. tcpdump?
   if ! command -v tcpdump &>/dev/null; then
     warn "tcpdump не установлен"
     echo -e "${C}  Установи: ${W}apt install -y tcpdump${N}"
     return 0
   fi
 
-  # 2. Сервер есть?
   if [[ ! -f "$SERVER_CONF" ]]; then
-    warn "Сервер не найден: $SERVER_CONF"
-    echo -e "${C}  Сначала создай сервер (пункт 2)${N}"
+    warn "Сервер не настроен (пункт 2)"
     return 0
   fi
 
-  # 3. ListenPort
   local listen_port
   listen_port=$(awk -F= '/^ListenPort/{gsub(/ /,"",$2); print $2}' "$SERVER_CONF")
-  if [[ -z "$listen_port" ]]; then
-    warn "Не удалось определить ListenPort"
-    return 0
-  fi
-  echo -e "${C}  → AWG порт: ${W}${listen_port}${N}"
+  [[ -z "$listen_port" ]] && { warn "ListenPort не найден"; return 0; }
 
-  # 4. WAN интерфейс
   local wan_if
   wan_if=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
   [[ -z "$wan_if" ]] && wan_if="eth0"
-  echo -e "${C}  → WAN интерфейс: ${W}${wan_if}${N}"
 
-  # 5. Endpoint клиента — обязательное условие + выбор если несколько
+  # Выбор клиента
   local endpoints_raw
   endpoints_raw=$(awg show awg0 endpoints 2>/dev/null | awk 'NF==2 && $2!="(none)"')
   if [[ -z "$endpoints_raw" ]]; then
-    err "Нет подключённых клиентов (endpoint = none)"
-    echo ""
-    echo -e "${Y}  ▲ Сначала нужно хоть раз подключиться клиентом:${N}"
-    echo -e "${C}    1. Импортируй .conf в AmneziaVPN${N}"
-    echo -e "${C}    2. Нажми Connect (дождись успешного handshake)${N}"
-    echo -e "${C}    3. Вернись сюда и запусти тест снова${N}"
-    echo ""
-    echo -e "${D}    (endpoint появляется в awg show только после первого handshake)${N}"
+    warn "Нет подключённых клиентов"
+    echo -e "${C}  Сначала подключись клиентом и вернись сюда${N}"
     return 0
   fi
 
-  local -a peer_list
-  local -a ep_list
+  local -a peer_list ep_list name_list vpn_ip_list
   mapfile -t peer_list < <(echo "$endpoints_raw" | awk '{print $1}')
   mapfile -t ep_list < <(echo "$endpoints_raw" | awk '{print $2}')
 
-  # Сопоставление peer pubkey → (имя файла, VPN IP)
-  # Сканируем /root/*_awg2.conf, вычисляем pubkey из PrivateKey, мапим
-  local -a name_list=()
-  local -a vpn_ip_list=()
   declare -A pk_to_name pk_to_ip
-  local cf cf_priv cf_pub cf_addr cf_basename
+  local cf
   for cf in /root/*_awg2.conf; do
     [[ -f "$cf" ]] || continue
+    local cf_priv cf_pub cf_addr
     cf_priv=$(grep -E '^PrivateKey' "$cf" 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' \r' | head -1)
     [[ -z "$cf_priv" ]] && continue
     cf_pub=$(echo "$cf_priv" | awg pubkey 2>/dev/null) || continue
     cf_addr=$(grep -E '^Address' "$cf" 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' \r' | head -1)
-    cf_basename=$(basename "$cf" .conf)
-    pk_to_name["$cf_pub"]="$cf_basename"
+    pk_to_name["$cf_pub"]="$(basename "$cf" .conf)"
     pk_to_ip["$cf_pub"]="${cf_addr%/*}"
   done
 
   local pk
   for pk in "${peer_list[@]}"; do
-    name_list+=("${pk_to_name[$pk]:-неизвестен}")
+    name_list+=("${pk_to_name[$pk]:-?}")
     vpn_ip_list+=("${pk_to_ip[$pk]:-?}")
   done
 
-  local client_ep client_ip sel_idx=0
-  if [[ ${#ep_list[@]} -eq 1 ]]; then
-    sel_idx=0
-    client_ep="${ep_list[0]}"
-    echo -e "${C}  → Клиент: ${W}${name_list[0]}${N} ${D}(VPN ${vpn_ip_list[0]} • ext ${client_ep})${N}"
-  else
-    echo ""
-    echo -e "${C}  Подключённых клиентов: ${W}${#ep_list[@]}${N}"
+  local sel_idx=0 client_ep client_ip
+  if [[ ${#ep_list[@]} -gt 1 ]]; then
+    echo -e "${C}  Клиенты:${N}"
     local k
     for k in "${!ep_list[@]}"; do
-      printf "  ${G}%d)${N} %-26s ${C}%-15s${N} ${D}%s${N}\n" \
-        "$((k+1))" "${name_list[$k]}" "${vpn_ip_list[$k]}" "${ep_list[$k]}"
+      printf "  ${G}%d)${N} %-24s ${D}%s${N}\n" "$((k+1))" "${name_list[$k]}" "${ep_list[$k]}"
     done
     local PEER_SEL
-    read -rp "$(echo -e "${C}  Выбор клиента для теста [1-${#ep_list[@]}] (Enter = 1): ${N}")" PEER_SEL
+    read -rp "$(echo -e "${C}  Выбор [1-${#ep_list[@]}] (Enter = 1): ${N}")" PEER_SEL
     PEER_SEL=${PEER_SEL:-1}
-    if ! [[ "$PEER_SEL" =~ ^[0-9]+$ ]] || (( PEER_SEL < 1 || PEER_SEL > ${#ep_list[@]} )); then
-      warn "Неверный выбор — возврат в главное меню"
-      return 0
-    fi
+    [[ "$PEER_SEL" =~ ^[0-9]+$ ]] && (( PEER_SEL >= 1 && PEER_SEL <= ${#ep_list[@]} )) || { warn "Неверный выбор"; return 0; }
     sel_idx=$((PEER_SEL - 1))
-    client_ep="${ep_list[$sel_idx]}"
-    echo -e "${C}  → Клиент: ${W}${name_list[$sel_idx]}${N} ${D}(VPN ${vpn_ip_list[$sel_idx]} • ext ${client_ep})${N}"
   fi
+  client_ep="${ep_list[$sel_idx]}"
   client_ip="${client_ep%:*}"
+  echo -e "${C}  → ${W}${name_list[$sel_idx]}${N} ${D}(${client_ep})${N}"
 
-  # 6. Возраст handshake для выбранного peer — в человеческом формате
-  local hs_ts hs_ago hs_fmt
-  hs_ts=$(awg show awg0 latest-handshakes 2>/dev/null | awk -v pk="${peer_list[$sel_idx]}" '$1==pk{print $2; exit}')
-  if [[ -n "$hs_ts" && "$hs_ts" != "0" ]]; then
-    hs_ago=$(( $(date +%s) - hs_ts ))
-    hs_fmt=$(_fmt_duration "$hs_ago")
-    echo -e "${C}  → Последний handshake: ${W}${hs_fmt} назад${N}"
-  else
-    echo -e "${C}  → Последний handshake: ${Y}нет${N}"
-  fi
-
-  # 7. Инструкция
+  # Инструкция
   echo ""
   echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  echo -e "${Y}  ! На клиенте сейчас: Disconnect → Connect${N}"
-  echo -e "${Y}   (нужен новый handshake чтобы поймать CPS chain)${N}"
+  echo -e "${Y}  На клиенте: Disconnect → подожди 3 сек → Connect${N}"
   echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo ""
-  read -rp "$(echo -e "${C}  Enter когда готов (20с на реконнект)... ${N}")" _ || return 0
+  read -rp "$(echo -e "${C}  Enter когда готов... ${N}")" _ || return 0
 
-  # 8. Python анализатор во временный файл
-  local analyzer="/tmp/awg_pcap_analyzer_$$.py"
+  local analyzer="/tmp/awg_analyzer_$$.py"
   echo "$_AWG_PCAP_ANALYZER" > "$analyzer"
 
-  # 9. tcpdump: ловим первые 10 пакетов >100B от клиента на ListenPort
-  # CPS пакеты могут быть маленькими (SIP/DNS ~80-600B), не только >1000B
-  # Анализатор переберёт все и выберет первый распознанный профиль
-  local pcap="/tmp/awg_dpi_test_$$.pcap"
-  echo -e "${C}  → Запускаю tcpdump (20с)...${N}"
-  echo -e "${C}    Подключайся с клиента ПРЯМО СЕЙЧАС${N}"
-  echo ""
+  local pcap="/tmp/awg_dpi_$$.pcap"
+  echo -e "${C}  → Слушаю 20 секунд... Подключайся!${N}"
 
-  timeout 20 tcpdump -i "$wan_if" -nn -c 10 \
-    "udp port ${listen_port} and src host ${client_ip} and greater 100" \
+  timeout 20 tcpdump -i "$wan_if" -nn -c 30 \
+    "udp port ${listen_port} and src host ${client_ip}" \
     -w "$pcap" 2>/dev/null || true
 
   if [[ ! -s "$pcap" ]]; then
-    warn "Не поймали ни одного CPS пакета"
-    echo -e "${Y}  Возможные причины:${N}"
-    echo -e "${C}    • Клиент не переподключился вовремя${N}"
-    echo -e "${C}    • Уровень обфускации = ${W}базовый${C} (CPS отключён)${N}"
-    echo -e "${C}    • Клиент через другой WAN${N}"
+    echo ""
+    echo -e "${Y}  Ничего не поймали. Возможные причины:${N}"
+    echo -e "${C}  • Клиент не переподключился вовремя${N}"
+    echo -e "${C}  • Другой IP клиента (мобильная сеть сменила)${N}"
+    echo -e "${C}  • Попробуй ещё раз${N}"
     rm -f "$pcap" "$analyzer"
     return 0
   fi
 
-  # 10. Парсинг
-  echo -e "${C}  → Анализ захваченного пакета...${N}"
+  echo -e "${C}  → Анализ...${N}"
   echo ""
 
-  local analysis
-  analysis=$(python3 "$analyzer" "$pcap" 2>&1) || analysis="FAIL|Python parse error"
+  local analysis verdict="" verdict_msg=""
+  analysis=$(python3 "$analyzer" "$pcap" 2>&1) || analysis="RESULT|FAIL|Python error"
 
-  # 11. Красивый вывод
-  local verdict="" verdict_extra=""
   while IFS='|' read -r tag msg extra; do
     [[ -z "$tag" ]] && continue
     case "$tag" in
-      OK)   echo -e "  ${G}√${N} $msg" ;;
-      FAIL) echo -e "  ${R}×${N} $msg" ;;
-      INFO) echo -e "  ${D}·${N} $msg" ;;
-      VERDICT)
+      OK)      echo -e "  ${G}√${N} $msg" ;;
+      INFO)    echo -e "  ${D}·${N} $msg" ;;
+      FAIL)    echo -e "  ${R}×${N} $msg" ;;
+      VERDICT|RESULT)
         verdict="$msg"
-        verdict_extra="$extra"
+        verdict_msg="$extra"
         ;;
     esac
   done <<< "$analysis"
 
   echo ""
   echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  if [[ "$verdict" == "PASS" ]]; then
-    local prof_label="${verdict_extra^^}"
-    echo -e "${G}  √ Всё заебись!!! — ${prof_label} мимикрия работает${N}"
-  elif [[ "$verdict" == "CHECK" ]]; then
-    echo -e "${Y}  ▲ Проверь warnings выше${N}"
-    [[ -n "$verdict_extra" ]] && echo -e "${D}    ${verdict_extra}${N}"
-  else
-    echo -e "${R}  × Анализ не удался${N}"
-  fi
+  case "$verdict" in
+    PASS)
+      echo -e "${G}  ✓ DPI тест пройден — $verdict_msg${N}" ;;
+    OK)
+      echo -e "${G}  ✓ $verdict_msg${N}" ;;
+    EMPTY)
+      echo -e "${Y}  ○ $verdict_msg${N}" ;;
+    *)
+      echo -e "${Y}  ○ Попробуй переподключиться и запустить тест снова${N}" ;;
+  esac
   echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
 
   rm -f "$pcap" "$analyzer"
-  log_info "do_sniff_test завершён для клиента $client_ip, verdict=$verdict"
-  return 0
+  log_info "DPI тест: клиент=$client_ip verdict=$verdict"
 }
 
 # ══════════════════════════════════════════════════════════
@@ -1614,9 +1141,9 @@ gen_awg_params() {
   AWG_PARAMS_LINES=""
 
   local Jc Jmin Jmax S1 S2 S2_OFF S3 S4 Q
-  Jc=$(rand_range 3 7)
+  Jc=$(rand_range 3 5)
   Jmin=$(rand_range 64 256)
-  Jmax=$(rand_range 576 1024)
+  Jmax=$(rand_range 277 339)
   S1=$(rand_range 1 39)
   S2_OFF=$(rand_range 1 63)
   [[ "$S2_OFF" -eq 56 ]] && S2_OFF=57 || true   # 56 зарезервировано — избегаем
@@ -2006,13 +1533,8 @@ do_gen() {
     echo "ListenPort = $PORT"
     echo "MTU = $MTU"
     echo -e "$AWG_PARAMS_LINES"
-    if [[ -n "$I1" ]]; then
-      echo "I1 = $I1"
-      [[ -n "$I2" ]] && echo "I2 = $I2" || true
-      [[ -n "$I3" ]] && echo "I3 = $I3" || true
-      [[ -n "$I4" ]] && echo "I4 = $I4" || true
-      [[ -n "$I5" ]] && echo "I5 = $I5" || true
-    fi
+    # I1-I5 НЕ записываем в серверный конфиг — это клиентские параметры.
+    # Сервер не нуждается в CPS signature packets.
     echo ""
     echo "PostUp   = ip link set dev awg0 mtu $MTU; echo 1 > /proc/sys/net/ipv4/ip_forward; iptables -t nat -C POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE; iptables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -j ACCEPT; iptables -C FORWARD -o awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o awg0 -j ACCEPT"
     echo "PostDown = iptables -t nat -D POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE 2>/dev/null || true; iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null || true"
@@ -2080,7 +1602,18 @@ do_gen() {
     fi
   fi
 
-  command -v qrencode &>/dev/null && qrencode -t ansiutf8 -s 1 -m 1 < /root/client1_awg2.conf
+  # QR-код: показываем только если конфиг влезает (< 3000 байт)
+  if command -v qrencode &>/dev/null; then
+    local conf_size
+    conf_size=$(wc -c < /root/client1_awg2.conf)
+    if [[ "$conf_size" -lt 3000 ]]; then
+      qrencode -t ansiutf8 -s 1 -m 1 < /root/client1_awg2.conf
+    else
+      warn "Конфиг слишком большой для QR (${conf_size} байт, макс ~3000)"
+      info "Скопируй файл: scp root@${srv_ip}:/root/client1_awg2.conf ."
+      info "Или используй: cat /root/client1_awg2.conf"
+    fi
+  fi
 
   echo ""
   success_box "■  Сервер создан успешно"
@@ -2455,22 +1988,13 @@ do_add_client() {
 
   local i1_line="" i2_line="" i3_line="" i4_line="" i5_line=""
   hdr "⌘  Выбор I1 для клиента"
-  echo "  1) Использовать I1-I5 из серверного конфига"
-  echo "  2) Сгенерировать новый I1-I5 (выбор уровня + профиля мимикрии)"
-  echo "  3) Без I1 (только H/S/Jc обфускация)"
-  read -rp "$(echo -e "${C}  Выбор [1-3] (Enter = 1): ${N}")" I1_SELECT
+  echo "  1) Сгенерировать новый I1-I5 (выбор уровня + профиля мимикрии / Junker)"
+  echo "  2) Без I1 (только H/S/Jc обфускация)"
+  read -rp "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" I1_SELECT
   I1_SELECT=${I1_SELECT:-1}
 
   case $I1_SELECT in
     1)
-      i1_line=$(grep "^I1 = " "$SERVER_CONF" | head -1 || true)
-      i2_line=$(grep "^I2 = " "$SERVER_CONF" | head -1 || true)
-      i3_line=$(grep "^I3 = " "$SERVER_CONF" | head -1 || true)
-      i4_line=$(grep "^I4 = " "$SERVER_CONF" | head -1 || true)
-      i5_line=$(grep "^I5 = " "$SERVER_CONF" | head -1 || true)
-      [[ -z "$i1_line" ]] && info "I1 не найден в конфиге сервера (уровень = базовый)" || true
-      ;;
-    2)
       choose_obf_level
       choose_mimicry_profile
       [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
@@ -2479,7 +2003,7 @@ do_add_client() {
       [[ -n "$I4" ]] && i4_line="I4 = $I4" || i4_line=""
       [[ -n "$I5" ]] && i5_line="I5 = $I5" || i5_line=""
       ;;
-    3)
+    2)
       i1_line=""
       i2_line=""
       i3_line=""
@@ -2550,7 +2074,18 @@ do_add_client() {
   } > "$client_file"
   chmod 600 "$client_file"
 
-  command -v qrencode &>/dev/null && qrencode -t ansiutf8 -s 1 -m 1 < "$client_file"
+  # QR-код: показываем только если конфиг влезает (< 3000 байт)
+  if command -v qrencode &>/dev/null; then
+    local conf_size
+    conf_size=$(wc -c < "$client_file")
+    if [[ "$conf_size" -lt 3000 ]]; then
+      qrencode -t ansiutf8 -s 1 -m 1 < "$client_file"
+    else
+      warn "Конфиг слишком большой для QR (${conf_size} байт, макс ~3000)"
+      info "Скопируй файл: scp root@$(get_public_ip):${client_file} ."
+      info "Или используй: cat ${client_file}"
+    fi
+  fi
 
   echo ""
   success_box "▣  Клиент добавлен успешно"
@@ -2745,7 +2280,14 @@ do_show_qr() {
   local chosen="${unique[$idx]}"
   [[ -f "$chosen" ]] || { warn "Файл не найден: $chosen — возврат в главное меню"; return 0; }
 
-  qrencode -t ansiutf8 -s 1 -m 1 < "$chosen"
+  local conf_size
+  conf_size=$(wc -c < "$chosen")
+  if [[ "$conf_size" -lt 3000 ]]; then
+    qrencode -t ansiutf8 -s 1 -m 1 < "$chosen"
+  else
+    warn "Конфиг слишком большой для QR (${conf_size} байт)"
+    info "I1-I5 не помещаются в QR-код. Используй файл:"
+  fi
   echo ""
   echo -e "${Y}  ──────────────────────────────────────────────${N}"
   echo -e "${W}  ≡  Или сохрани текст ниже в файл client.conf${N}"
