@@ -87,8 +87,8 @@ sudo awg2
 
 ```
 ╔══════════════════════════════════════════════╗
-║    AWG Toolza v5.5-fix                                                                                          ║
-║   AWG 2.0 only — Special Junk / QUIC / TLS / SIP                                           ║
+║    AWG Toolza v5.5-fix                       ║
+║   AWG 2.0 only — Special Junk / QUIC / TLS.. ║                    
 ╚══════════════════════════════════════════════╝
   IP сервера : 1.2.3.4
   Порт       : 47300
