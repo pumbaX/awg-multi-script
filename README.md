@@ -1,6 +1,6 @@
 <div align="center">
 
-# **AmneziaWG Toolza**
+# **AWG Toolza**
 
 **Менеджер AmneziaWG 2.0** — VPN с DPI-обходом одной командой.<br>
 3 уровня обфускации, 5 профилей мимикрии, локальный CPS-генератор, DPI-тест.
@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20only-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-5.4-00ff88?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-5.5--fix-00ff88?style=flat-square)](#)
 
 </div>
 
@@ -29,7 +29,18 @@ sudo awg2
 
 ---
 
-## Что нового в 5.4
+## Что нового в 5.5-fix
+
+- 🔥 **I1-I5 убраны из серверного конфига** — CPS пакеты теперь только у клиента (как по спецификации AWG 2.0)
+- 🔥 **Полностью переписан CPS-генератор** — порт [Special-Junk-Packet](https://github.com/Jeean1/Special-Junk-Packet-List): компактные реалистичные пакеты, все профили влезают в QR
+- ✅ **Новый профиль Special Junk (по умолчанию)** — SIP REGISTER → TLS ClientHello → TLS ServerHello → CKE+CCS+Finished → HTTP/TLS. Проверен на ТСПУ РФ (домашний провайдер + мобильный инет)
+- ✅ **Junker API интеграция** — опция для захвата реальных QUIC пакетов через [spatiumstas/junker](https://github.com/spatiumstas/junker), с автообрезкой жирных пакетов > 600 сим и fallback на синтетику
+- ✅ **Убраны заблокированные домены** из пулов (cloudflare.com, youtube.com, facebook.com, discord.com, instagram.com, netflix.com) — заменены на реально доступные CDN
+- ✅ **DPI тест переписан** — теперь понимает все типы пакетов (SIP/TLS/DTLS/DNS/QUIC/AWG data), не пугает ложными warnings, корректно показывает статус обфускации
+- ✅ **QR-код** — проверка размера конфига перед генерацией (> 3000 байт → scp/cat вместо ошибки)
+- ✅ **Компактные размеры I1-I5** — special ~2000 сим, quic ~1700, tls ~1300, sip ~1600, dns ~900. Все влезают в QR
+
+### Из 5.4
 
 - ✅ **Переработано главное меню** — логическая группировка: Основные / Утилиты / Бекапы / Опасная зона
 - ✅ **Новый пункт 11** — «Сбросить сервер» — чистая переустановка без удаления пакетов
@@ -76,8 +87,8 @@ sudo awg2
 
 ```
 ╔══════════════════════════════════════════════╗
-║        AmneziaWG Toolza v5.4                         ║
-║   AWG 2.0 only — TLS/DTLS/SIP/DNS/QUIC               ║
+║    AWG Toolza v5.5-fix                                                                                          ║
+║   AWG 2.0 only — Special Junk / QUIC / TLS / SIP                                           ║
 ╚══════════════════════════════════════════════╝
   IP сервера : 1.2.3.4
   Порт       : 47300
@@ -125,20 +136,22 @@ sudo awg2
 ## Профили мимикрии (для уровней 2 и 3)
 
 ```
-1) TLS 1.3 Client Hello   — HTTPS (рекомендуется)
-2) DTLS 1.3 (WebRTC)      — видеозвонки
-3) SIP (VoIP)             — телефония
-4) QUIC / HTTP/3          — Chrome-like Initial
-5) Случайный профиль      — из любого пула с доменами
-6) Ручной ввод домена     — свой домен + выбор типа CPS
+1) ★ Special Junk (SIP+TLS flow) — рекомендуется
+   SIP REGISTER → TLS ClientHello → ServerHello → CKE → HTTP
+2) QUIC Initial (компактный ~400B)
+3) TLS 1.3 (ClientHello + ServerHello + CKE)
+4) SIP + TLS + DNS
+5) DNS Query
+6) Junker — реальный захват QUIC (нужен интернет)
 ```
 
-CPS-генератор собирает байт-валидные пакеты на Python:
-- **TLS 1.3** — Record → Handshake → ClientHello → SNI → ALPN → GREASE → X25519MLKEM768
-- **QUIC v1/v2** — Long Header RFC 9000/9369 с реальным DCID/SCID/Token
-- **DTLS** — record + ClientHello fragment
-- **SIP** — REGISTER с branch / Call-ID / Via
-- **DNS** — wire-format query
+CPS-генератор (порт Special-Junk-Packet) собирает байт-валидные пакеты на Python:
+- **Special Junk** — полный TLS handshake flow: SIP REGISTER + ClientHello + ServerHello + ClientKeyExchange + ChangeCipherSpec + HTTP request. ~2000 символов, влезает в QR
+- **QUIC** — компактный QUIC Initial 300-400B с точным Payload Length varint (Δ=0)
+- **TLS** — ClientHello + ServerHello + CKE + HTTP/TLS Application Data
+- **SIP** — REGISTER с branch / Call-ID / Via + TLS + DNS
+- **DNS** — wire-format query с EDNS0 OPT
+- **Junker** — реальные QUIC пакеты через [spatiumstas/junker](https://github.com/spatiumstas/junker) Cloudflare Worker API
 
 > Все I-пакеты начинаются с тега `<b 0x...>` — критическое требование парсера amneziawg-go.
 > `<r>` режется на куски ≤999 байт для совместимости со старыми клиентами.
@@ -264,24 +277,26 @@ H4 ∈ Q3 [3221225470 .. 4294967292]
 
 ## DPI тест (пункт 7)
 
-Захватывает первые 10 пакетов от выбранного клиента через tcpdump, анализатор перебирает их и находит первый распознанный CPS. Распознаёт:
+Захватывает пакеты от выбранного клиента через tcpdump и анализирует. Распознаёт все типы:
 
-| Профиль | Маркеры | Verdict |
-|---|---|---|
-| **TLS** | Record `0x16 0301`, Handshake type `01` | √ TLS мимикрия работает |
-| **QUIC v1/v2** | Long header + known version + DCID 1-20 | √ QUIC мимикрия работает |
-| **DTLS** | Record `0x16 fefd/feff`, ClientHello | √ DTLS мимикрия работает |
-| **SIP** | 14 методов: INVITE, REGISTER, OPTIONS, MESSAGE, NOTIFY... | √ SIP мимикрия работает |
-| **DNS** | QR=0, qdcount, label encoding | √ DNS мимикрия работает |
+| Тип | Что детектит |
+|---|---|
+| **SIP** | REGISTER, INVITE, OPTIONS, BYE, CANCEL, ACK |
+| **TLS** | ClientHello, ServerHello, CKE, ChangeCipherSpec, Application Data (0x0301 и 0x0303) |
+| **QUIC** | Long Header (Initial/0-RTT/Handshake) + Short Header (1-RTT) |
+| **DTLS** | record + ClientHello |
+| **DNS** | wire-format query |
+| **AWG data** | обфусцированные пакеты с кастомными H-заголовками |
 
-Пропускает junk-пакеты (Jc) и handshake init — смотрит следующий, пока не найдёт валидный CPS. Показывает клиента по имени файла + VPN IP:
+Три возможных результата:
 
 ```
-Подключённых клиентов: 3
-1) phone_yoshi_awg2     10.45.12.2     21.22.75.61:2329
-2) laptop_awg2          10.45.12.3     88.44.75.33:22702
-3) tablet_awg2          10.45.12.4     11.2.55.31:58415
+✓ DPI тест пройден — CPS chain из 3 пакетов (sip, tls, tls-data)
+✓ Обфускация работает (CPS уже прошли)
+○ Ничего не поймали — попробуй переподключиться
 ```
+
+Если CPS-пакеты уже пролетели до начала захвата — тест покажет «обфускация работает», а не ошибку.
 
 ---
 
@@ -396,7 +411,9 @@ H4 ∈ Q3 [3221225470 .. 4294967292]
 <div align="center">
 
 Вдохновлено **[AmneziaWG Architect](https://architect.vai-rice.space/)** — веб-генератором обфускации.<br>
-Спасибо **Vadim-Khristenko** за оригинальную идею.
+Спасибо **Vadim-Khristenko** за оригинальную идею.<br>
+CPS-генератор основан на **[Special-Junk-Packet](https://github.com/Jeean1/Special-Junk-Packet-List)** — проверенные пакеты для обхода DPI.<br>
+Junker API — **[spatiumstas/junker](https://github.com/spatiumstas/junker)** — захват реальных QUIC пакетов.
 
 *Отдельная благодарность [AWG-Manager](https://t.me/awgmanager)*
 
@@ -404,6 +421,6 @@ H4 ∈ Q3 [3221225470 .. 4294967292]
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AmneziaWG Toolza v5.4** · MIT License
+**AWGToolza v5.5-fix** · MIT License
 
 </div>
