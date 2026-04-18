@@ -410,11 +410,6 @@ H4 ∈ Q3 [3221225470 .. 4294967292]
 
 <div align="center">
 
-Вдохновлено **[AmneziaWG Architect](https://architect.vai-rice.space/)** — веб-генератором обфускации.<br>
-Спасибо **Vadim-Khristenko** за оригинальную идею.<br>
-CPS-генератор основан на **[Special-Junk-Packet](https://github.com/Jeean1/Special-Junk-Packet-List)** — проверенные пакеты для обхода DPI.<br>
-Junker API — **[spatiumstas/junker](https://github.com/spatiumstas/junker)** — захват реальных QUIC пакетов.
-
 *Отдельная благодарность [AWG-Manager](https://t.me/awgmanager)*
 
 <br>
