@@ -1,10 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v5.5-fix"
+VERSION="v6.2"
 
 # ─────────────────────────────────────────────────────────────
-# - AmneziaWG Toolza — только AWG 2.0
+# - AWG Toolza — только AWG 2.0
 # - Выбор типа I1 при ручном вводе домена (7 протоколов)
 # - Бекап и восстановление конфигов AWG 2.0 (~/awg_backup/)
 # ─────────────────────────────────────────────────────────────
@@ -162,7 +162,7 @@ choose_region() {
   echo -e "${W}                  Регион сервера${N}"
   echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo -e "  ${G}1${N}  Европа / Мир "
-  echo -e "  ${G}2${N}  Россия — RU домены"
+  echo -e "  ${G}2${N}  Россия — RU "
   echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   local REGION_CHOICE
   read -rp "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" REGION_CHOICE
@@ -261,172 +261,405 @@ select_random_domain() {
 
 # Единый Python генератор для всех профилей мимикрии
 _CPS_GENERATOR='
-import sys, random, secrets, struct
+import sys, os, random, secrets, struct, time, binascii
 
 def rh(n): return secrets.token_bytes(n)
 def rhex(n): return secrets.token_hex(n)
+def ri(a, b): return random.randint(a, b)
+def rc(lst): return random.choice(lst)
+def u16(v): return struct.pack(">H", v & 0xFFFF)
+def u32(v): return struct.pack(">I", v & 0xFFFFFFFF)
+def u24(v): return struct.pack(">I", v)[1:]
 
-# ── SIP REGISTER (~350-380 байт, ~740 сим CPS) ──
-def gen_sip():
-    domains = ["google.com","gmail.com","youtube.com","drive.google.com",
-               "accounts.google.com","photos.google.com","docs.google.com"]
-    agents = ["Linphone/5.0.0","Zoiper/5.0.0","MicroSIP/3.0.0","Bria/5.0.0"]
-    call_id = secrets.token_hex(16)
-    branch = f"z9hG4bK{secrets.token_hex(12)}"
-    tag = secrets.token_hex(8)
-    ip1 = f"192.168.{random.randint(1,255)}.{random.randint(1,255)}"
-    ip2 = f"192.168.{random.randint(1,255)}.{random.randint(1,255)}"
-    domain = random.choice(domains)
-    pkt = (f"REGISTER sip:{domain} SIP/2.0\r\n"
-           f"Via: SIP/2.0/UDP {ip1}:5060;branch={branch}\r\n"
-           f"Max-Forwards: 70\r\n"
-           f"To: <sip:user@{domain}>\r\n"
-           f"From: <sip:user@{domain}>;tag={tag}\r\n"
-           f"Call-ID: {call_id}\r\n"
-           f"CSeq: 1 REGISTER\r\n"
-           f"Contact: <sip:user@{ip2}:5060>\r\n"
-           f"User-Agent: {random.choice(agents)}\r\n"
-           f"Expires: {random.randint(1800,7200)}\r\n"
-           f"Content-Length: 0\r\n\r\n").encode()
-    return pkt
+# ──────────────────────────────────────────────────────
+# DOMAIN POOL из payloadGen (Sketchystan1)
+# Микс популярных мировых + российских доменов
+# ──────────────────────────────────────────────────────
+DOMAIN_POOL = [
+    "google.com","amazon.com","reddit.com","github.com","mozilla.org",
+    "microsoft.com","apple.com","cloudflare.com","bing.com","adobe.com",
+    "stackoverflow.com","office.com","dropbox.com","zoom.us","spotify.com",
+    "imdb.com","wikipedia.org","yandex.ru","ozon.ru","vk.com",
+    "gismeteo.ru","mail.ru","kinopoisk.ru","pinterest.com","dzen.ru",
+    "rutube.ru","gdz.ru","rbc.ru","wildberries.ru","ya.ru",
+    "sberbank.ru","ria.ru","tbank.ru","championat.com","fandom.com",
+    "rambler.ru","kp.ru","dns-shop.ru","chatgpt.com","avito.ru",
+    "2gis.ru","cbr.ru","ivi.ru","gosuslugi.ru","lenta.ru",
+    "auto.ru","steampowered.com","rustore.ru","okko.tv","domclick.ru",
+    "sports.ru","cian.ru","drom.ru","aviasales.ru","sovcombank.ru",
+    "sportbox.ru","invitro.ru","tutu.ru","vtb.ru","goldapple.ru",
+    "ok.ru","pikabu.ru","iz.ru","apteka.ru","hh.ru",
+    "habr.com","uchi.ru","lamoda.ru"
+]
 
-# ── TLS ClientHello (~90-130 байт, ~200-260 сим CPS) ──
-def gen_tls_ch():
-    domains = ["google.com","www.google.com","mail.google.com",
-               "youtube.com","accounts.google.com","gmail.com"]
-    hostname = random.choice(domains).encode()
-    client_random = rh(32)
-    sid_len = random.randint(0, 32)
-    sid = rh(sid_len)
-    ciphers = [b"\x13\x02",b"\x13\x03",b"\xc0\x2c",b"\xc0\x30",
-               b"\xcc\xa9",b"\xcc\xa8",b"\xc0\x2b",b"\xc0\x2f"]
-    cs = b"\x00\x02" + random.choice(ciphers)
-    comp = b"\x01\x00"
-    sni = (b"\x00\x00" + struct.pack(">H", len(hostname)+5)
-           + b"\x00" + struct.pack(">H", len(hostname)+3)
-           + b"\x00" + struct.pack(">H", len(hostname)) + hostname)
-    exts = sni + b"\x00\x0b\x00\x04\x03\x00\x01\x02\x00\x0a\x00\x0a\x00\x08" + rh(8)
-    body = b"\x03\x03" + client_random + bytes([sid_len]) + sid + cs + comp + struct.pack(">H", len(exts)) + exts
-    hs = b"\x01" + struct.pack(">I", len(body))[1:] + body
-    return b"\x16\x03\x03" + struct.pack(">H", len(hs)) + hs
+# ──────────────────────────────────────────────────────
+# QUIC MINI — ультракомпактный (~38 байт, I1 ~88 сим)
+# Формат: <b 0xc1...><r 16>
+# Проверено работает на ТСПУ РФ
+# ──────────────────────────────────────────────────────
+def gen_quic_mini():
+    # First byte 0xC0-0xCF (long header + Initial)
+    pnl = ri(0, 1)
+    fb = 0xC0 | pnl
+    pn_bytes = pnl + 1
+    ver = b"\x00\x00\x00\x01"  # QUIC v1
+    # DCID 1 байт (как в рабочем примере)
+    dcid = rh(1)
+    # SCID = 0, Token = 0
+    # Payload length varint (1 byte, value < 64)
+    plen = ri(30, 60)
+    pl_varint = bytes([plen & 0x3F])
+    # PN + random encrypted payload
+    pn = rh(pn_bytes)
+    payload = rh(ri(20, 35))
+    return bytes([fb]) + ver + bytes([1]) + dcid + b"\x00\x00" + pl_varint + pn + payload
 
-# ── TLS ServerHello (~50-70 байт, ~110-140 сим CPS) ──
-def gen_tls_sh():
-    server_random = rh(32)
-    sid_len = random.randint(0, 16)
-    sid = bytes([sid_len]) + rh(sid_len) if sid_len > 0 else b"\x00"
-    cs = random.choice([b"\x13\x01",b"\x13\x02",b"\x13\x03",b"\xc0\x2c"])
-    body = b"\x03\x03" + server_random + sid + cs + b"\x00\x00\x00"
-    hs = b"\x02" + struct.pack(">I", len(body))[1:] + body
-    return b"\x16\x03\x03" + struct.pack(">H", len(hs)) + hs
+# ──────────────────────────────────────────────────────
+# QUIC FULL — полноразмерный Chrome-like (~1200 байт)
+# Структура настоящего QUIC Initial с правильной длиной varint
+# Проверено: I1 вида 0xc5000000010808...
+# ──────────────────────────────────────────────────────
+def _quic_varint_encode(value):
+    """QUIC varint encoder."""
+    if value < 64:
+        return bytes([value])
+    elif value < 16384:
+        return bytes([0x40 | (value >> 8) & 0x3F, value & 0xFF])
+    elif value < 1073741824:
+        return bytes([
+            0x80 | (value >> 24) & 0x3F,
+            (value >> 16) & 0xFF,
+            (value >> 8) & 0xFF,
+            value & 0xFF
+        ])
+    else:
+        # 8-byte varint
+        return struct.pack(">Q", 0xC000000000000000 | value)
 
-# ── TLS CKE + ChangeCipherSpec + Finished (~195 байт, ~396 сим) ──
-def gen_tls_cke():
-    key_data = rh(128)
-    cke = b"\x10" + struct.pack(">I", len(key_data))[1:] + key_data
-    ccs = b"\x14\x03\x03\x00\x01\x01"
-    fin_data = rh(52)
-    fin = b"\x16\x03\x03" + struct.pack(">H", len(fin_data)) + fin_data
-    return cke + ccs + fin
+def gen_quic_full(pad_to_1200=False):
+    """Полноразмерный QUIC Initial как Chrome."""
+    # First byte: 0xC0-0xCF
+    pn_len = 2  # Chrome всегда 2 байта PN для Initial
+    reserved = ri(0, 1)  # 0 или 1 (у payloadGen 1), было 0
+    fb = 0xC0 | (reserved << 2) | (pn_len - 1)
 
-# ── TLS Application Data — HTTP request (~300-380 байт, ~710 сим) ──
-def gen_tls_http():
-    domains = ["google.com","www.google.com","docs.google.com",
-               "mail.google.com","drive.google.com","youtube.com"]
-    methods = ["GET","POST","HEAD"]
-    paths = ["/","/search","/mail","/drive","/photos","/favicon.ico"]
-    method = random.choice(methods)
-    path = random.choice(paths)
-    host = random.choice(domains)
-    req = (f"{method} {path} HTTP/1.1\r\n"
-           f"Host: {host}\r\n"
-           "User-Agent: Mozilla/5.0\r\n"
-           "Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8\r\n"
-           "Accept-Encoding: gzip, deflate, br\r\n"
-           "Connection: keep-alive\r\n")
-    if method == "POST":
-        req += "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 0\r\n"
-    req += "\r\n"
-    payload = req.encode()
-    return b"\x17\x03\x03" + struct.pack(">H", len(payload)) + payload
+    ver = b"\x00\x00\x00\x01"  # QUIC v1
+    # DCID — 8 байт (стандарт Chrome)
+    dcid = rh(8)
+    # SCID — 8 байт (тоже как Chrome, не 0!)
+    scid = rh(8)
+    # Token length = 0 (varint 1 byte)
+    token_len = bytes([0])
 
-# ── Компактный QUIC Initial (~400-500 байт, ~900 сим) ──
-def gen_quic():
-    versions = ["00000001","6b3343cf"]
-    low = random.randint(0, 15)
-    fb = 0xc0 | low
-    pn_bytes = (low & 3) + 1
-    ver = random.choice(versions)
-    dcid = rhex(8)
-    scid_len = random.choice([0, 8])
-    scid = rhex(scid_len) if scid_len else ""
-    hdr = f"{fb:02x}" + ver + f"{8:02x}" + dcid + f"{scid_len:02x}" + scid + "00"
-    hdr_b = len(hdr) // 2
-    target = random.randint(300, 400)
-    enc_len = max(16, target - hdr_b - 2 - pn_bytes)
-    pl = pn_bytes + enc_len
-    lf = f"{0x4000 | pl:04x}"
-    full = hdr + lf + rhex(pn_bytes) + rhex(enc_len)
-    return bytes.fromhex(full)
+    # Payload = PN + encrypted ClientHello (~1150 байт)
+    # Target: весь пакет ~1200 байт
+    # Header: 1 (fb) + 4 (ver) + 1 (dcid_len) + 8 (dcid) + 1 (scid_len) + 8 (scid) + 1 (token_len) = 24 байта
+    # + payload length varint (2 байта) + PN + encrypted payload
+    if pad_to_1200:
+        target_total = 1200
+    else:
+        target_total = ri(800, 1250)  # реалистичный размер
 
-# ── DNS Query (~50-80 байт) ──
+    # Считаем с учётом varint payload length
+    header_fixed = 1 + 4 + 1 + 8 + 1 + 8 + 1  # = 24
+    # Payload length varint = 2 байта когда value 64-16383
+    # PN + encrypted = target - header - varint(2)
+    enc_size = target_total - header_fixed - 2 - pn_len
+    if enc_size < 16:
+        enc_size = 100  # минимум для auth tag
+
+    payload_len_value = pn_len + enc_size  # правильная длина!
+    # Выбираем varint 2-байтовый (value 64-16383)
+    if payload_len_value >= 64 and payload_len_value < 16384:
+        pl_varint = u16(0x4000 | payload_len_value)
+    else:
+        pl_varint = _quic_varint_encode(payload_len_value)
+
+    # PN bytes
+    pn = rh(pn_len)
+    # Encrypted payload (выглядит как шифротекст)
+    encrypted = rh(enc_size)
+
+    return (bytes([fb]) + ver + bytes([8]) + dcid + bytes([8]) + scid +
+            token_len + pl_varint + pn + encrypted)
+
+# ──────────────────────────────────────────────────────
+# WebRTC Combined — STUN + DTLS + RTCP (~500 байт)
+# Из haha.conf — проверено работает
+# ──────────────────────────────────────────────────────
+def _crc32(data):
+    return binascii.crc32(data) & 0xFFFFFFFF
+
+def gen_webrtc_combined(pad=False):
+    sni = rc(DOMAIN_POOL)
+    provider_soft = rc([
+        b"Cloudflare WebRTC client",
+        b"Chrome WebRTC ICE agent",
+        b"Firefox ICE stack",
+        b"Safari WebRTC networking",
+        b"WhatsApp/2"
+    ])
+
+    # ── STUN Binding Request ──
+    txn = rh(12)
+    # SOFTWARE (0x8022)
+    soft_pad = (4 - len(provider_soft) % 4) % 4
+    soft_attr = u16(0x8022) + u16(len(provider_soft)) + provider_soft + b"\x00" * soft_pad
+    # PRIORITY (0x0024)
+    prio_attr = u16(0x0024) + u16(4) + u32(ri(0x40000000, 0x7FFFFFFF))
+    # ICE-CONTROLLED (0x8029)
+    ice_attr = u16(0x8029) + u16(8) + rh(8)
+    # USERNAME (0x0006)
+    uname_str = ("%s:%s" % (rhex(4), sni)).encode()
+    uname_pad = (4 - len(uname_str) % 4) % 4
+    uname_attr = u16(0x0006) + u16(len(uname_str)) + uname_str + b"\x00" * uname_pad
+
+    attrs_body = soft_attr + prio_attr + ice_attr + uname_attr
+    msg_len = len(attrs_body) + 8  # + FINGERPRINT
+    stun_hdr = u16(0x0001) + u16(msg_len) + u32(0x2112A442) + txn
+    crc_input = stun_hdr + attrs_body
+    fp_val = (_crc32(crc_input) ^ 0x5354554E) & 0xFFFFFFFF
+    fp_attr = u16(0x8028) + u16(4) + u32(fp_val)
+    stun_packet = stun_hdr + attrs_body + fp_attr
+
+    # ── DTLS 1.2 ClientHello с SNI ──
+    dtls_random = rh(32)
+    sess_id = b"\x00"
+    cookie = b"\x00"
+    ciphers = bytes.fromhex("000cc02bc02fcca9c02c009c009d")
+    compression = b"\x01\x00"
+
+    sni_bytes = sni.encode()
+    sni_entry = b"\x00" + u16(len(sni_bytes)) + sni_bytes
+    sni_list = u16(len(sni_entry)) + sni_entry
+    sni_ext = u16(0x0000) + u16(len(sni_list)) + sni_list
+    sg_ext = bytes.fromhex("000a00080006001d00170018")
+    ecp_ext = bytes.fromhex("000b00020100")
+    sa_ext = bytes.fromhex("000d00140012040308040401050308050501080606010807")
+    srtp_ext = bytes.fromhex("000e00050002000100")
+    ems_ext = bytes.fromhex("00170000")
+
+    extensions = sni_ext + sg_ext + ecp_ext + sa_ext + srtp_ext + ems_ext
+    ext_block = u16(len(extensions)) + extensions
+
+    ch_body = b"\xfe\xfd" + dtls_random + sess_id + cookie + ciphers + compression + ext_block
+    hs_header = b"\x01" + u24(len(ch_body)) + u16(0) + u24(0) + u24(len(ch_body))
+    handshake = hs_header + ch_body
+    dtls_record = b"\x16\xfe\xfd\x00\x00" + rh(6) + u16(len(handshake)) + handshake
+
+    # ── RTCP-tail ──
+    tail_ssrc = rh(4)
+    rtcp_sr = bytes([0x80, 0x00, 0x00]) + bytes([ri(0, 255)]) + tail_ssrc
+    extra = rh(ri(20, 40))
+    tail = rtcp_sr + extra
+
+    packet = stun_packet + dtls_record + tail
+
+    if pad and len(packet) < 1200:
+        packet += b"\x00" * (1200 - len(packet))
+
+    return packet
+
+# ──────────────────────────────────────────────────────
+# SIP — OPTIONS / REGISTER / TRYING (случайно)
+# Реалистичный формат из payloadGen
+# ──────────────────────────────────────────────────────
+_SIP_UAS = [
+    "Linphone/5.2.5 (belle-sip/5.3.90)", "Zoiper rv2.10.15-mod",
+    "MicroSIP/3.21.6", "baresip 3.8.0", "Blink 6.0.4 (Windows)",
+    "Asterisk PBX 20.7.0"
+]
+_SIP_SERVERS = [
+    "Kamailio (5.8.1)", "OpenSIPS (3.5.1)", "Asterisk PBX (20.7.0)",
+    "FreeSWITCH (1.10.12)"
+]
+_SIP_ALLOWS = [
+    "INVITE, ACK, CANCEL, OPTIONS, BYE, REFER, NOTIFY, INFO, MESSAGE, SUBSCRIBE",
+    "INVITE, ACK, CANCEL, OPTIONS, BYE, UPDATE, MESSAGE",
+    "INVITE, ACK, CANCEL, OPTIONS, BYE, PRACK, UPDATE"
+]
+_SIP_SUPPORTED = [
+    "replaces, outbound, path, timer",
+    "outbound, path, gruu, 100rel",
+    "timer, replaces, resource-priority"
+]
+_SIP_DISPLAY_NAMES = [
+    "Alice Carter", "Bob Smith", "Support Desk", "Sales Queue",
+    "NOC Bridge", "Reception", "Operator", "Dispatch"
+]
+_SIP_USERS = ["100","101","200","300","400","500","alice","bob","support","sales","noc","ops"]
+
+def _sip_domain():
+    # генерируем реалистичный SIP домен на базе DOMAIN_POOL
+    base = rc(DOMAIN_POOL)
+    prefixes = ["sip","voip","pbx","edge","gw","proxy","media","trunk"]
+    if ri(0, 2) == 0:
+        return base
+    return "%s-%d.%s" % (rc(prefixes), ri(10, 99), base)
+
+def _sip_priv_ip():
+    pools = [
+        (10, ri(0,255), ri(0,255), ri(10,210)),
+        (172, 16+ri(0,15), ri(0,255), ri(10,210)),
+        (192, 168, ri(0,255), ri(10,210))
+    ]
+    o = rc(pools)
+    return "%d.%d.%d.%d" % o
+
+def _build_sip_options(host, fuser, tuser, lip, lport, branch, tag, callid, cseq, ua, fn, tn):
+    lines = [
+        "OPTIONS sip:%s@%s SIP/2.0" % (tuser, host),
+        "Via: SIP/2.0/UDP %s:%d;branch=%s;rport" % (lip, lport, branch),
+        "Max-Forwards: 70",
+        "From: \"%s\" <sip:%s@%s>;tag=%s" % (fn, fuser, host, tag),
+        "To: \"%s\" <sip:%s@%s>" % (tn, tuser, host),
+        "Call-ID: %s" % callid,
+        "CSeq: %d OPTIONS" % cseq,
+        "Contact: <sip:%s@%s:%d;transport=udp>" % (fuser, lip, lport),
+        "User-Agent: %s" % ua,
+        "Allow: %s" % rc(_SIP_ALLOWS),
+        "Supported: %s" % rc(_SIP_SUPPORTED),
+        "Accept: application/sdp",
+        "Accept-Language: en-US",
+        "Content-Length: 0",
+        "", ""
+    ]
+    return "\r\n".join(lines).encode()
+
+def _build_sip_register(host, fuser, lip, lport, branch, tag, callid, cseq, ua, fn):
+    lines = [
+        "REGISTER sip:%s SIP/2.0" % host,
+        "Via: SIP/2.0/UDP %s:%d;branch=%s;rport" % (lip, lport, branch),
+        "Max-Forwards: 70",
+        "From: \"%s\" <sip:%s@%s>;tag=%s" % (fn, fuser, host, tag),
+        "To: \"%s\" <sip:%s@%s>" % (fn, fuser, host),
+        "Call-ID: %s" % callid,
+        "CSeq: %d REGISTER" % cseq,
+        "Contact: <sip:%s@%s:%d;transport=udp>" % (fuser, lip, lport),
+        "User-Agent: %s" % ua,
+        "Allow: %s" % rc(_SIP_ALLOWS),
+        "Supported: %s" % rc(_SIP_SUPPORTED),
+        "Expires: %d" % rc([300,600,900,1200,1800,3600]),
+        "Content-Length: 0",
+        "", ""
+    ]
+    return "\r\n".join(lines).encode()
+
+def _build_sip_trying(host, fuser, tuser, lip, lport, branch, tag, callid, cseq, fn, tn):
+    lines = [
+        "SIP/2.0 100 CONNECTING",
+        "Via: SIP/2.0/UDP %s:%d;branch=%s;rport" % (lip, lport, branch),
+        "To: \"%s\" <sip:%s@%s>" % (tn, tuser, host),
+        "From: \"%s\" <sip:%s@%s>;tag=%s" % (fn, fuser, host, tag),
+        "Call-ID: %s" % callid,
+        "CSeq: %d INVITE" % cseq,
+        "Server: %s" % rc(_SIP_SERVERS),
+        "Content-Length: 0",
+        "", ""
+    ]
+    return "\r\n".join(lines).encode()
+
+def gen_sip(action=None):
+    if action is None:
+        action = rc(["OPTIONS", "REGISTER", "TRYING"])
+    host = _sip_domain()
+    lip = _sip_priv_ip()
+    lport = rc([5060, 5062, 5070, 5080, 5160])
+    fuser = rc(_SIP_USERS) + str(ri(100, 999))
+    tuser = rc(_SIP_USERS) + str(ri(100, 999)) if action != "REGISTER" else fuser
+    branch = "z9hG4bK" + rhex(9)
+    tag = rhex(6)
+    callid = "%s@%s" % (rhex(12), host)
+    cseq = ri(1, 80)
+    ua = rc(_SIP_UAS)
+    fn = rc(_SIP_DISPLAY_NAMES)
+    tn = rc(_SIP_DISPLAY_NAMES) if action != "REGISTER" else fn
+
+    if action == "REGISTER":
+        return _build_sip_register(host, fuser, lip, lport, branch, tag, callid, cseq, ua, fn)
+    elif action == "TRYING":
+        return _build_sip_trying(host, fuser, tuser, lip, lport, branch, tag, callid, cseq, fn, tn)
+    else:
+        return _build_sip_options(host, fuser, tuser, lip, lport, branch, tag, callid, cseq, ua, fn, tn)
+
+# ──────────────────────────────────────────────────────
+# DNS — DNS Response (как у оригинальной Amnezia)
+# ──────────────────────────────────────────────────────
 def gen_dns():
-    domains = ["google.com","youtube.com","gmail.com","drive.google.com"]
-    host = random.choice(domains)
-    txid = rhex(2)
-    counts = "01000001000000000001"
-    labels = host.split(".")
-    qn = ""
-    for l in labels:
-        qn += f"{len(l):02x}" + l.encode().hex()
-    qn += "00"
-    qtype = random.choice(["0001","001c"])
-    opt = "00002910000000000000"
-    return bytes.fromhex(txid + counts + qn + qtype + "0001" + opt)
+    host = rc(DOMAIN_POOL)
+    # Flags: QR=1 (response), RD=1, RA=1, RCODE=0 → 0x8580
+    flags = b"\x85\x80"
+    counts = b"\x00\x01\x00\x01\x00\x00\x00\x00"
+    qn = b""
+    for l in host.split("."):
+        qn += bytes([len(l)]) + l.encode()
+    qn += b"\x00"
+    qtype = b"\x00\x01"  # A
+    qclass = b"\x00\x01"  # IN
+    # Answer: pointer to domain, A record
+    ans_name = b"\xc0\x0c"
+    ans_type = b"\x00\x01"
+    ans_class = b"\x00\x01"
+    ttl = u32(ri(60, 86400))
+    rdlen = b"\x00\x04"
+    rdata = bytes([ri(1,255), ri(0,255), ri(0,255), ri(1,254)])
+    # TXID не включаем — он идёт через <r 2>
+    return flags + counts + qn + qtype + qclass + ans_name + ans_type + ans_class + ttl + rdlen + rdata
 
-def to_cps(data):
-    return f"<b 0x{data.hex()}>"
+# ──────────────────────────────────────────────────────
+# Output wrapper
+# ──────────────────────────────────────────────────────
+def to_cps(data, suffix=""):
+    return "<b 0x%s>%s" % (data.hex(), suffix)
 
-# ── Dispatch ──
-profile = sys.argv[1] if len(sys.argv) > 1 else "special"
+# ──────────────────────────────────────────────────────
+# Dispatch
+# ──────────────────────────────────────────────────────
+profile = sys.argv[1] if len(sys.argv) > 1 else "quic_full"
+pad_flag = os.environ.get("CPS_PAD", "0") == "1"
 
-if profile == "special":
-    # Special-Junk-Packet: SIP → TLS CH → TLS SH → CKE+CCS → HTTP/TLS
-    print(to_cps(gen_sip()))
-    print(to_cps(gen_tls_ch()))
-    print(to_cps(gen_tls_sh()))
-    print(to_cps(gen_tls_cke()))
-    print(to_cps(gen_tls_http()))
-elif profile == "quic":
-    print(to_cps(gen_quic()))
-    print(to_cps(gen_tls_sh()))
-    print(to_cps(gen_dns()))
-    print(to_cps(gen_tls_cke()))
-    print(to_cps(gen_tls_http()))
-elif profile == "tls":
-    print(to_cps(gen_tls_ch()))
-    print(to_cps(gen_tls_sh()))
-    print(to_cps(gen_tls_cke()))
-    print(to_cps(gen_tls_http()))
-    print(to_cps(gen_dns()))
-elif profile == "dns":
-    print(to_cps(gen_dns()))
-    print(to_cps(gen_dns()))
-    print(to_cps(gen_dns()))
-    print(to_cps(gen_tls_sh()))
-    print(to_cps(gen_tls_http()))
+if profile == "quic_full":
+    # ★ Полноразмерный Chrome-like QUIC — ТОЛЬКО I1 (один большой пакет ~1200B)
+    print(to_cps(gen_quic_full(pad_to_1200=pad_flag)))
+    print("")
+    print("")
+    print("")
+    print("")
+elif profile == "quic_mini":
+    # Ультракомпактный QUIC ~40B — заполняем все I1-I5
+    print(to_cps(gen_quic_mini(), "<r 16>"))
+    print(to_cps(gen_quic_mini()))
+    print(to_cps(gen_quic_mini()))
+    print(to_cps(gen_quic_mini()))
+    print(to_cps(gen_quic_mini()))
+elif profile == "webrtc":
+    # WebRTC Combined ~500B — I1 + 4 mini QUIC
+    print(to_cps(gen_webrtc_combined(pad=pad_flag)))
+    print(to_cps(gen_quic_mini()))
+    print(to_cps(gen_quic_mini()))
+    print(to_cps(gen_quic_mini()))
+    print(to_cps(gen_quic_mini()))
 elif profile == "sip":
+    # SIP ~500B — только I1 (один SIP пакет, как реальный вызов)
     print(to_cps(gen_sip()))
-    print(to_cps(gen_tls_ch()))
+    print("")
+    print("")
+    print("")
+    print("")
+elif profile == "dns":
+    # DNS Response как у Amnezia — все I1-I5
+    print(to_cps(gen_dns(), "<r 2>"))
     print(to_cps(gen_dns()))
-    print(to_cps(gen_tls_sh()))
-    print(to_cps(gen_tls_http()))
+    print(to_cps(gen_dns()))
+    print(to_cps(gen_dns()))
+    print(to_cps(gen_dns()))
 else:
-    print(to_cps(gen_sip()))
-    print(to_cps(gen_tls_ch()))
-    print(to_cps(gen_tls_sh()))
-    print(to_cps(gen_tls_cke()))
-    print(to_cps(gen_tls_http()))
+    # default = quic_full (рекомендуется)
+    print(to_cps(gen_quic_full()))
+    print("")
+    print("")
+    print("")
+    print("")
 '
 
 # Генерация I1-I5 через Python
@@ -449,7 +682,7 @@ gen_cps_i1() {
 # 3. OBF_LEVEL=1 отключает мимикрию (I1="", MIMICRY_PROFILE="none")
 #
 # Все профили генерируют I1-I5 через CPS-генератор (_CPS_GENERATOR).
-# Глобальные переменные на выходе: I1, I2, I3, I4, I5, MIMICRY_PROFILE, MIMICRY_DOMAIN
+# Глобальные переменные на выходе: I1, I2, I3, I4, I5, MIMICRY_PROFILE
 # ══════════════════════════════════════════════════════════
 choose_obf_level() {
   # Глобальная переменная OBF_LEVEL:
@@ -488,7 +721,6 @@ choose_mimicry_profile() {
   I4=""
   I5=""
   MIMICRY_PROFILE=""
-  MIMICRY_DOMAIN=""
 
   # OBF_LEVEL=1 (базовый) — пропускаем мимикрию полностью
   if [[ "${OBF_LEVEL:-1}" == "1" ]]; then
@@ -498,143 +730,65 @@ choose_mimicry_profile() {
 
   echo ""
   hdr "~  Профили мимикрии I1-I5"
-  echo -e "  ${G}1${N}  ${W}★ Special Junk (SIP+TLS flow) — рекомендуется${N}"
-  echo -e "     ${D}SIP REGISTER → TLS ClientHello → ServerHello → CKE → HTTP${N}"
-  echo -e "  ${G}2${N}  QUIC Initial (компактный ~400B)"
-  echo -e "  ${G}3${N}  TLS 1.3 (ClientHello + ServerHello + CKE)"
-  echo -e "  ${G}4${N}  SIP + TLS + DNS"
-  echo -e "  ${G}5${N}  DNS Query"
-  echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  echo -e "  ${Y}6${N}  Junker — реальный захват QUIC (временно не работает)"
-  echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo -e "  ${D}Works (проверено на ТСПУ РФ):${N}"
+  echo -e "  ${G}1${N}  ${W}★ QUIC Full${N}     — полноразмерный Chrome-like (~1200B, только I1)"
+  echo -e "  ${G}2${N}  QUIC Mini       — ультракомпактный (~40B, I1-I5 с <r 16>)"
   echo ""
-  read -rp "$(echo -e "${C}  Выбор [1-6] (Enter = 1): ${N}")" PROFILE_CHOICE
+  echo -e "  ${D}Kinda (может работать):${N}"
+  echo -e "  ${G}3${N}  WebRTC Combined — STUN + DTLS 1.2 + RTCP"
+  echo -e "  ${G}4${N}  SIP             — OPTIONS/REGISTER/TRYING (случайно)"
+  echo -e "  ${G}5${N}  DNS Response    — как у оригинальной Amnezia"
+  echo ""
+  read -rp "$(echo -e "${C}  Выбор [1-5] (Enter = 1): ${N}")" PROFILE_CHOICE
   PROFILE_CHOICE=${PROFILE_CHOICE:-1}
 
   case $PROFILE_CHOICE in
-    1)
-      MIMICRY_PROFILE="special"
-      ;;
-    2)
-      MIMICRY_PROFILE="quic"
-      ;;
-    3)
-      MIMICRY_PROFILE="tls"
-      ;;
-    4)
-      MIMICRY_PROFILE="sip"
-      ;;
-    5)
-      MIMICRY_PROFILE="dns"
-      ;;
-    6)
-      # ── Junker: захват реальных QUIC пакетов через API ──
-      MIMICRY_PROFILE="junker"
-      echo ""
-      echo -e "  ${C}Junker перехватывает настоящие QUIC пакеты через Cloudflare Worker.${N}"
-      echo ""
-      read -rp "$(echo -e "${C}  Домен (Enter = google.com): ${N}")" MIMICRY_DOMAIN
-      MIMICRY_DOMAIN=${MIMICRY_DOMAIN:-google.com}
-
-      echo -e "${C}  → Junker: захватываем QUIC пакеты с $MIMICRY_DOMAIN...${N}"
-
-      local junker_out=""
-      junker_out=$(timeout 15 curl -s --connect-timeout 10 \
-        "https://junk.web2core.workers.dev/signature?domain=${MIMICRY_DOMAIN}" 2>/dev/null) || junker_out=""
-
-      if [[ -n "$junker_out" ]]; then
-        local junker_parsed
-        junker_parsed=$(echo "$junker_out" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    ok = str(d.get('ok', False)).lower()
-    st = d.get('status', {})
-    print(ok)
-    print(st.get('title','') + ': ' + st.get('message',''))
-    for i in range(1,6): print(d.get(f'i{i}',''))
-except: 
-    print('false')
-    for _ in range(6): print('')
-" 2>/dev/null) || junker_parsed=""
-
-        local j_ok j_status
-        j_ok=$(echo "$junker_parsed" | sed -n '1p')
-        j_status=$(echo "$junker_parsed" | sed -n '2p')
-        [[ -n "$j_status" && "$j_status" != ": " ]] && info "Junker: $j_status" || true
-
-        if [[ "$j_ok" == "true" ]]; then
-          I1=$(echo "$junker_parsed" | sed -n '3p')
-          I2=$(echo "$junker_parsed" | sed -n '4p')
-          I3=$(echo "$junker_parsed" | sed -n '5p')
-          I4=$(echo "$junker_parsed" | sed -n '6p')
-          I5=$(echo "$junker_parsed" | sed -n '7p')
-
-          if [[ -n "$I1" ]]; then
-            # Обрезка жирных пакетов > 600 символов → замена на entropy
-            local max_len=600
-            local trimmed=0
-            for _var in I2 I3 I4 I5; do
-              if [[ ${#!_var} -gt $max_len ]]; then
-                trimmed=$((trimmed + 1))
-              fi
-            done
-            if [[ $trimmed -gt 0 ]]; then
-              info "Обрезка $trimmed пакетов > ${max_len} сим → лёгкие entropy"
-              local syn_out
-              syn_out=$(gen_cps_i1 "special") || syn_out=""
-              if [[ -n "$syn_out" ]]; then
-                local s2 s3 s4 s5
-                s2=$(echo "$syn_out" | sed -n '2p')
-                s3=$(echo "$syn_out" | sed -n '3p')
-                s4=$(echo "$syn_out" | sed -n '4p')
-                s5=$(echo "$syn_out" | sed -n '5p')
-                [[ ${#I2} -gt $max_len ]] && I2="$s2"
-                [[ ${#I3} -gt $max_len ]] && I3="$s3"
-                [[ ${#I4} -gt $max_len ]] && I4="$s4"
-                [[ ${#I5} -gt $max_len ]] && I5="$s5"
-              fi
-            fi
-
-            echo -e "${G}  √ Junker I1-I5: I1=${#I1} I2=${#I2} I3=${#I3} I4=${#I4} I5=${#I5}${N}"
-            if [[ "${OBF_LEVEL:-3}" == "2" ]]; then
-              I2=""; I3=""; I4=""; I5=""
-            fi
-            return 0
-          fi
-        fi
-      fi
-
-      # Junker не сработал — fallback
-      warn "Junker не сработал — используем Special Junk"
-      MIMICRY_PROFILE="special"
-      ;;
-    *)
-      MIMICRY_PROFILE="special"
-      ;;
+    1) MIMICRY_PROFILE="quic_full" ;;
+    2) MIMICRY_PROFILE="quic_mini" ;;
+    3) MIMICRY_PROFILE="webrtc" ;;
+    4) MIMICRY_PROFILE="sip" ;;
+    5) MIMICRY_PROFILE="dns" ;;
+    *) MIMICRY_PROFILE="quic_full" ;;
   esac
 
-  # ── Генерация через встроенный Python генератор ──
-  if [[ "$MIMICRY_PROFILE" != "none" && "$MIMICRY_PROFILE" != "junker" ]]; then
-    echo -e "${C}  → Генерируем $MIMICRY_PROFILE...${N}"
-    local cps_out
+  # Padding опция (для quic_full и webrtc)
+  local use_pad=0
+  if [[ "$MIMICRY_PROFILE" == "quic_full" || "$MIMICRY_PROFILE" == "webrtc" ]]; then
+    echo ""
+    read -rp "$(echo -e "${C}  Padding до 1200B (реалистичнее)? [y/N]: ${N}")" PAD_CHOICE
+    [[ "$PAD_CHOICE" =~ ^[Yy]$ ]] && use_pad=1
+  fi
+
+  # ── Генерация через Python ──
+  echo -e "${C}  → Генерируем $MIMICRY_PROFILE...${N}"
+  local cps_out
+  if [[ $use_pad -eq 1 ]]; then
+    cps_out=$(CPS_PAD=1 gen_cps_i1 "$MIMICRY_PROFILE") || cps_out=""
+  else
     cps_out=$(gen_cps_i1 "$MIMICRY_PROFILE") || cps_out=""
-    if [[ -n "$cps_out" ]]; then
-      I1=$(echo "$cps_out" | sed -n '1p')
-      if [[ "${OBF_LEVEL:-1}" == "3" ]]; then
-        I2=$(echo "$cps_out" | sed -n '2p')
-        I3=$(echo "$cps_out" | sed -n '3p')
-        I4=$(echo "$cps_out" | sed -n '4p')
-        I5=$(echo "$cps_out" | sed -n '5p')
-        echo -e "${G}  √ I1-I5: I1=${#I1} I2=${#I2} I3=${#I3} I4=${#I4} I5=${#I5}${N}"
-      else
-        I2=""; I3=""; I4=""; I5=""
-        echo -e "${G}  √ I1 готов (${#I1} сим)${N}"
-      fi
+  fi
+
+  if [[ -n "$cps_out" ]]; then
+    I1=$(echo "$cps_out" | sed -n '1p')
+    if [[ "${OBF_LEVEL:-1}" == "3" ]]; then
+      I2=$(echo "$cps_out" | sed -n '2p')
+      I3=$(echo "$cps_out" | sed -n '3p')
+      I4=$(echo "$cps_out" | sed -n '4p')
+      I5=$(echo "$cps_out" | sed -n '5p')
+      # Считаем непустые
+      local nonempty=1
+      [[ -n "$I2" ]] && nonempty=$((nonempty+1))
+      [[ -n "$I3" ]] && nonempty=$((nonempty+1))
+      [[ -n "$I4" ]] && nonempty=$((nonempty+1))
+      [[ -n "$I5" ]] && nonempty=$((nonempty+1))
+      echo -e "${G}  √ ${nonempty}/5 пакетов: I1=${#I1} I2=${#I2} I3=${#I3} I4=${#I4} I5=${#I5}${N}"
     else
-      warn "Не удалось сгенерировать CPS"
-      I1=""; I2=""; I3=""; I4=""; I5=""
+      I2=""; I3=""; I4=""; I5=""
+      echo -e "${G}  √ I1 готов (${#I1} сим)${N}"
     fi
+  else
+    warn "Не удалось сгенерировать CPS"
+    I1=""; I2=""; I3=""; I4=""; I5=""
   fi
 }
 
@@ -959,10 +1113,30 @@ check_deps() {
 
 get_public_ip() {
   local ip=""
-  ip=$(timeout 5 curl -s --connect-timeout 3 -4 ifconfig.me 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-  ip=$(timeout 5 curl -s --connect-timeout 3 -4 api.ipify.org 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
-  ip=$(timeout 5 curl -s --connect-timeout 3 -4 ipinfo.io/ip 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return 0
+  # Использую explicit check вместо chain с set -e
+  ip=$(timeout 5 curl -s --connect-timeout 3 -4 ifconfig.me 2>/dev/null || true)
+  if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "$ip"; return 0
+  fi
+
+  ip=$(timeout 5 curl -s --connect-timeout 3 -4 api.ipify.org 2>/dev/null || true)
+  if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "$ip"; return 0
+  fi
+
+  ip=$(timeout 5 curl -s --connect-timeout 3 -4 ipinfo.io/ip 2>/dev/null || true)
+  if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "$ip"; return 0
+  fi
+
+  # Fallback — локальный IP через ip route
+  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
+  if [[ -n "$ip" ]]; then
+    echo "$ip"; return 0
+  fi
+
   echo ""
+  return 0
 }
 
 rand_range() {
@@ -1027,7 +1201,7 @@ show_header() {
   s=$(get_status)
   IFS='|' read -r ip port st clients <<< "$s"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  echo -e "  ${W}AmneziaWG Toolza $VERSION${N}"
+  echo -e "  ${W}AwgToolza $VERSION${N}"
   echo -e "  ${C}AWG 2.0 only — TLS/DTLS/SIP/DNS/QUIC${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo -e "  IP сервера : ${W}$ip${N}"
@@ -1054,7 +1228,7 @@ show_menu() {
     echo -e "  ${D}3) Управление клиентами (нужен пункт 2)${N}"
   fi
   if $HAS_AWG && $HAS_SERVER_CONF; then
-    echo -e "  ${C}4)${N} Показать клиентов"
+    echo -e "  ${C}4)${N} Активность клиентов"
   else
     echo -e "  ${D}4) Показать клиентов (нужен пункт 2)${N}"
   fi
@@ -1126,68 +1300,144 @@ choose_dns() {
 }
 
 # ══════════════════════════════════════════════════════════
-# ГЕНЕРАЦИЯ AWG ПАРАМЕТРОВ (AWG 2.0 only: S3/S4 + H1-H4 диапазоны)
+# ГЕНЕРАЦИЯ AWG ПАРАМЕТРОВ (AWG 2.0)
 # ══════════════════════════════════════════════════════════
-# Параметры обфускации AmneziaWG:
-#   Jc/Jmin/Jmax — дробление пакетов (junk packets)
-#   S1/S2        — размер специальных пакетов
-#   S3/S4        — частота специальных пакетов (S3 из каждых S4)
-#   H1-H4        — непересекающиеся диапазоны последовательностей по 4 квадрантам
-#                  Q = 2^30 = 1073741823, квадранты: [0..Q], [Q..2Q], [2Q..3Q], [3Q..4Q]
-#                  Каждый диапазон: ширина 30K-130K, начинается после предыдущего
-#                  Непересечение критично — иначе сервер и клиент рассинхронизируются
-# Результат: глобальная AWG_PARAMS_LINES (строки для конфига, \n-разделённые)
+# H1-H4: 8 random + sort алгоритм (из amneziawg-installer)
+#   Гарантирует непересечение без квадрантов.
+#   Ограничение 2^31-1 для совместимости с Windows клиентом.
+# Jc/Jmax: снижены для мобильных сетей (Yota/Tele2/МТС).
+# Результат: глобальная AWG_PARAMS_LINES
 gen_awg_params() {
   AWG_PARAMS_LINES=""
 
-  local Jc Jmin Jmax S1 S2 S2_OFF S3 S4 Q
-  Jc=$(rand_range 4 12)
-  Jmin=$(rand_range 64 256)
-  Jmax=$(rand_range 277 339)
-  S1=$(rand_range 15 139)
-  S2_OFF=$(rand_range 15 149)
-  [[ "$S2_OFF" -eq 56 ]] && S2_OFF=57 || true   # 56 зарезервировано — избегаем
-  S2=$(( S1 + S2_OFF ))
-  [[ $S2 -gt 1188 ]] && S2=1188 || true
-  S3=$(rand_range 5 64)
-  S4=$(rand_range 3 29)
-  Q=1073741823  # 2^30 - 1, базовый квадрант uint32
+  # ══════════════════════════════════════════════════════════
+  # Параметры AmneziaWG по ОФИЦИАЛЬНОМУ МАНУАЛУ
+  # https://docs.amnezia.org/documentation/amnezia-wg/
+  # ══════════════════════════════════════════════════════════
 
-  # Строгое разбиение по квадрантам:
-  #   H1 ∈ Q0 [5 .. Q]
-  #   H2 ∈ Q1 [Q+1 .. 2Q]
-  #   H3 ∈ Q2 [2Q+1 .. 3Q]
-  #   H4 ∈ Q3 [3Q+1 .. 4Q]
-  # Ширина каждого диапазона: 30000-130000 (рекомендация AWG 2.0)
-  # Маржа 130000 на каждом конце чтобы диапазон гарантированно влез в квадрант
-  local H1_START H1_END H1 H2_START H2_END H2 H3_START H3_END H3 H4_START H4_END H4
-  local MARGIN=130000
+  # ── Junk train ──
+  local Jc Jmin Jmax
+  Jc=$(rand_range 4 16)
+  Jmin=$(rand_range 8 64)
+  Jmax=$(rand_range 80 200)
+  # Обеспечиваем Jmin < Jmax
+  if [[ $Jmin -ge $Jmax ]]; then
+    Jmax=$((Jmin + $(rand_range 10 60)))
+  fi
 
-  # H1 в Q0
-  H1_START=$(rand_range 5 $((Q - MARGIN)))
-  H1_END=$(rand_range $((H1_START + 30000)) $((H1_START + MARGIN)))
-  [[ $H1_END -gt $Q ]] && H1_END=$Q || true
-  H1="${H1_START}-${H1_END}"
+  # ── Padding S1/S2 ──
+  # Мануал: S1 ≤ 1132, S2 ≤ 1188, recommended 15-150
+  #         Обязательно: S1 + 56 ≠ S2
+  local S1 S2
+  S1=$(rand_range 15 150)
+  S2=$(rand_range 15 150)
+  # Проверяем S1+56 != S2 (требование мануала)
+  local tries=0
+  while [[ $((S1 + 56)) -eq $S2 ]] && [[ $tries -lt 10 ]]; do
+    S2=$(rand_range 15 150)
+    tries=$((tries + 1))
+  done
 
-  # H2 в Q1 — стартует от Q+1, НЕ от H1_END
-  H2_START=$(rand_range $((Q + 1)) $((2 * Q - MARGIN)))
-  H2_END=$(rand_range $((H2_START + 30000)) $((H2_START + MARGIN)))
-  [[ $H2_END -gt $((2 * Q)) ]] && H2_END=$((2 * Q)) || true
-  H2="${H2_START}-${H2_END}"
+  # ── Padding S3/S4 (AWG 2.0 extension) ──
+  # Не в мануале, но используется в AWG 2.0. Держим осмысленно малые
+  local S3 S4
+  S3=$(rand_range 8 64)
+  S4=$(rand_range 6 31)
 
-  # H3 в Q2 — стартует от 2Q+1
-  H3_START=$(rand_range $((2 * Q + 1)) $((3 * Q - MARGIN)))
-  H3_END=$(rand_range $((H3_START + 30000)) $((H3_START + MARGIN)))
-  [[ $H3_END -gt $((3 * Q)) ]] && H3_END=$((3 * Q)) || true
-  H3="${H3_START}-${H3_END}"
+  # ── H1-H4: уникальные диапазоны в рамках recommended [5 .. 2^31-1] ──
+  # Мануал: H1/H2/H3/H4 must be unique, recommended range 5 ≤ H ≤ 2147483647
+  # Разделяем весь recommended диапазон на 4 подсегмента (~2^29 каждый)
+  # Sub-Q1: [5 .. 2^29-1]            (5 .. 536,870,911)
+  # Sub-Q2: [2^29 .. 2^30-1]         (536,870,912 .. 1,073,741,823)
+  # Sub-Q3: [2^30 .. 3*2^29-1]       (1,073,741,824 .. 1,610,612,735)
+  # Sub-Q4: [3*2^29 .. 2^31-1]       (1,610,612,736 .. 2,147,483,647)
+  local SQ1_MAX=536870911       # 2^29 - 1
+  local SQ2_MIN=536870912       # 2^29
+  local SQ2_MAX=1073741823      # 2^30 - 1
+  local SQ3_MIN=1073741824      # 2^30
+  local SQ3_MAX=1610612735      # 3*2^29 - 1
+  local SQ4_MIN=1610612736      # 3*2^29
+  local SQ4_MAX=2147483647      # 2^31 - 1 (мануальный лимит)
 
-  # H4 в Q3 — стартует от 3Q+1
-  H4_START=$(rand_range $((3 * Q + 1)) $((4 * Q - MARGIN)))
-  H4_END=$(rand_range $((H4_START + 30000)) $((H4_START + MARGIN)))
-  [[ $H4_END -gt $((4 * Q)) ]] && H4_END=$((4 * Q)) || true
-  H4="${H4_START}-${H4_END}"
+  # Генерация пары [lo, hi] в подсегменте, шириной >= 1000
+  _gen_quadrant_pair() {
+    local qmin="$1" qmax="$2"
+    local span=$((qmax - qmin))
+    local lo hi
+    lo=$(rand_range "$qmin" $((qmin + span / 3)))
+    hi=$(rand_range $((qmin + 2 * span / 3)) "$qmax")
+    if (( hi - lo < 1000 )); then
+      hi=$((lo + 1000 + RANDOM % 10000))
+      (( hi > qmax )) && hi=$qmax
+    fi
+    echo "${lo}-${hi}"
+  }
+
+  local H1 H2 H3 H4
+  H1=$(_gen_quadrant_pair 5 "$SQ1_MAX")
+  H2=$(_gen_quadrant_pair "$SQ2_MIN" "$SQ2_MAX")
+  H3=$(_gen_quadrant_pair "$SQ3_MIN" "$SQ3_MAX")
+  H4=$(_gen_quadrant_pair "$SQ4_MIN" "$SQ4_MAX")
 
   AWG_PARAMS_LINES="Jc = $Jc\nJmin = $Jmin\nJmax = $Jmax\nS1 = $S1\nS2 = $S2\nS3 = $S3\nS4 = $S4\nH1 = $H1\nH2 = $H2\nH3 = $H3\nH4 = $H4"
+}
+
+# ══════════════════════════════════════════════════════════
+# SYNCCONF — горячая перезагрузка без разрыва соединений
+# ══════════════════════════════════════════════════════════
+_apply_config() {
+  # Попытка syncconf (без разрыва соединений)
+  local strip_out
+  strip_out=$(timeout 10 awg-quick strip awg0 2>/dev/null) || strip_out=""
+  if [[ -n "$strip_out" ]]; then
+    if echo "$strip_out" | timeout 10 awg syncconf awg0 /dev/stdin 2>/dev/null; then
+      return 0
+    fi
+  fi
+  # Fallback: полный restart
+  awg-quick down "$SERVER_CONF" 2>/dev/null || true
+  awg-quick up "$SERVER_CONF" 2>/dev/null
+}
+
+# ══════════════════════════════════════════════════════════
+# РАЗДАЧА КОНФИГА — QR (только без I1-I5) + текст
+# ══════════════════════════════════════════════════════════
+# Стратегия:
+#   - Конфиг БЕЗ I1-I5 → QR код (компактный, влезает)
+#   - Конфиг С I1-I5 → только текст конфига (QR не делаем — слишком большой)
+_share_config() {
+  local conf_file="$1"
+  [[ -f "$conf_file" ]] || return 1
+
+  # Проверяем наличие I1-I5 в конфиге и общий размер
+  local has_i1 conf_size
+  has_i1=$(grep -cE "^I[1-5] = " "$conf_file" 2>/dev/null || echo 0)
+  conf_size=$(wc -c < "$conf_file")
+
+  # QR лимит (с запасом) ~2800 байт
+  local qr_fits=1
+  [[ "$conf_size" -gt 2800 ]] && qr_fits=0
+
+  if [[ "$qr_fits" -eq 1 ]] && command -v qrencode &>/dev/null; then
+    # Влезает в QR
+    echo ""
+    qrencode -t ansiutf8 -s 1 -m 1 < "$conf_file"
+    echo -e "${D}  ↑ QR-код конфига (${conf_size} байт) — сканируй в AmneziaVPN${N}"
+  else
+    # Большой конфиг → только текст
+    echo ""
+    echo -e "${Y}  ──────────────────────────────────────────────${N}"
+    echo -e "${W}  ≡ Текст конфига (сохрани как client.conf):${N}"
+    echo -e "${Y}  ──────────────────────────────────────────────${N}"
+    echo ""
+    cat "$conf_file"
+    echo ""
+    echo -e "${Y}  ──────────────────────────────────────────────${N}"
+    echo -e "${D}  (QR не показан: конфиг ${conf_size} байт > 2800 лимит)${N}"
+    if [[ "$has_i1" -gt 0 ]]; then
+      echo -e "${D}  Попробуй профиль QUIC Mini или DNS — они меньше${N}"
+    fi
+  fi
 }
 
 # ══════════════════════════════════════════════════════════
@@ -1466,12 +1716,10 @@ do_gen() {
   esac
 
   hdr "»  Порт сервера"
-  read -rp "$(echo -e "${C}  Порт [51820 / r = случайный]: ${N}")" PORT
-  if [[ "${PORT:-}" == "r" || "${PORT:-}" == "R" ]]; then
+  read -rp "$(echo -e "${C}  Порт [Enter = случайный / 51820 = стандартный / свой]: ${N}")" PORT
+  if [[ -z "${PORT:-}" || "${PORT:-}" == "r" || "${PORT:-}" == "R" ]]; then
     PORT=$(rand_range 30001 65535)
     ok "случайный порт: $PORT"
-  else
-    PORT=${PORT:-51820}
   fi
   [[ "$PORT" =~ ^[0-9]+$ ]] && [[ "$PORT" -ge 1024 && "$PORT" -le 65535 ]] || {
     err "Порт должен быть 1024-65535"; return 1
@@ -1501,23 +1749,44 @@ do_gen() {
   [[ $CONFIRM =~ ^[Yy]$ ]] || { warn "Отменено."; return 0; }
 
   local srv_priv srv_pub cli_priv cli_pub psk srv_ip iface
-  srv_priv=$(awg genkey)
-  srv_pub=$(echo "$srv_priv" | awg pubkey)
-  cli_priv=$(awg genkey)
-  cli_pub=$(echo "$cli_priv" | awg pubkey)
-  psk=$(awg genpsk)
 
-  srv_ip=$(get_public_ip)
-  [[ -z "$srv_ip" ]] && { err "не удалось получить внешний IP"; return 1; }
+  # Генерация ключей с диагностикой
+  info "Генерация ключей..."
+  srv_priv=$(awg genkey 2>/dev/null) || { err "awg genkey failed — awg не работает?"; return 1; }
+  srv_pub=$(echo "$srv_priv" | awg pubkey 2>/dev/null) || { err "awg pubkey failed"; return 1; }
+  cli_priv=$(awg genkey 2>/dev/null) || { err "awg genkey failed (client)"; return 1; }
+  cli_pub=$(echo "$cli_priv" | awg pubkey 2>/dev/null) || { err "awg pubkey failed (client)"; return 1; }
+  psk=$(awg genpsk 2>/dev/null) || { err "awg genpsk failed"; return 1; }
 
-  iface=$(ip route | awk '/default/{print $5; exit}')
-  [[ -z "$iface" ]] && { err "не удалось определить интерфейс"; return 1; }
+  info "Определение внешнего IP..."
+  srv_ip=$(get_public_ip 2>/dev/null || echo "")
+  if [[ -z "$srv_ip" ]]; then
+    err "Не удалось получить внешний IP (нет интернета?)"
+    read -rp "$(echo -e "${C}  Введи IP сервера вручную: ${N}")" srv_ip
+    [[ -z "$srv_ip" ]] && { err "IP обязателен"; return 1; }
+  fi
+  ok "IP сервера: $srv_ip"
 
+  info "Определение сетевого интерфейса..."
+  iface=$(ip route 2>/dev/null | awk '/default/{print $5; exit}' || echo "")
+  if [[ -z "$iface" ]]; then
+    err "Не удалось определить default интерфейс"
+    iface=$(ip link 2>/dev/null | awk -F: '/^[0-9]+: e/{print $2; exit}' | tr -d ' ' || echo "eth0")
+    warn "Использую интерфейс по умолчанию: $iface"
+  fi
+  ok "Интерфейс: $iface"
+
+  info "Генерация параметров AWG..."
   AWG_PARAMS_LINES=""
-  gen_awg_params
+  gen_awg_params || { err "gen_awg_params failed"; return 1; }
+  [[ -z "$AWG_PARAMS_LINES" ]] && { err "AWG_PARAMS_LINES пустой"; return 1; }
 
-  # Исправлено: sysctl -w вместо sysctl -p
-  sysctl -w net.ipv4.ip_forward=1 -q
+  # sysctl может падать в LXC/OpenVZ — не критично, но предупреждаем
+  if ! sysctl -w net.ipv4.ip_forward=1 -q 2>/dev/null; then
+    warn "sysctl -w не сработал (LXC/OpenVZ?) — пробуем /proc"
+    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || \
+      warn "IP forwarding не включился — возможно, нужны права хоста"
+  fi
 
   mkdir -p /etc/amnezia/amneziawg
 
@@ -1602,18 +1871,8 @@ do_gen() {
     fi
   fi
 
-  # QR-код: показываем только если конфиг влезает (< 3000 байт)
-  if command -v qrencode &>/dev/null; then
-    local conf_size
-    conf_size=$(wc -c < /root/client1_awg2.conf)
-    if [[ "$conf_size" -lt 3000 ]]; then
-      qrencode -t ansiutf8 -s 1 -m 1 < /root/client1_awg2.conf
-    else
-      warn "Конфиг слишком большой для QR (${conf_size} байт, макс ~3000)"
-      info "Скопируй файл: scp root@${srv_ip}:/root/client1_awg2.conf ."
-      info "Или используй: cat /root/client1_awg2.conf"
-    fi
-  fi
+  # Раздача конфига
+  _share_config "/root/client1_awg2.conf"
 
   echo ""
   success_box "■  Сервер создан успешно"
@@ -1705,21 +1964,63 @@ do_manage_clients() {
     echo -e "  ${G}2)${N} Переименовать клиента"
     echo -e "  ${R}3)${N} Удалить клиента"
     echo -e "  ${C}4)${N} Показать QR клиента"
+    echo -e "  ${C}5)${N} Показать конфиг клиента (текст)"
     echo -e "  ${W}0)${N} Назад в главное меню"
     echo ""
     local MGMT_CHOICE
-    read -rp "$(echo -e "${C}  Выбор [0-4]: ${N}")" MGMT_CHOICE
+    read -rp "$(echo -e "${C}  Выбор [0-5]: ${N}")" MGMT_CHOICE
     case "${MGMT_CHOICE:-}" in
       1) do_add_client ;;
       2) do_rename_client ;;
       3) do_delete_client ;;
       4) do_show_qr ;;
+      5) do_show_config ;;
       0) return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
     echo ""
     read -rp "$(echo -e "${C}  Enter для продолжения...${N}")" _ || return 0
   done
+}
+
+# ── Показать конфиг клиента (текст) ──
+do_show_config() {
+  local found=()
+  while IFS= read -r -d '' f; do
+    found+=("$f")
+  done < <(find /root -maxdepth 1 -name "*_awg2.conf" -print0 2>/dev/null)
+
+  [[ ${#found[@]} -eq 0 ]] && { err "Конфиги не найдены в /root/"; return 1; }
+
+  local unique
+  mapfile -t unique < <(printf "%s\n" "${found[@]}" | sort -u)
+
+  hdr "≡  Выбери конфиг"
+  local i=0
+  for f in "${unique[@]}"; do
+    i=$((i+1))
+    echo "  $i) $(basename "$f")"
+  done
+
+  local SEL
+  local prompt="  Выбор [1-$i] (Enter = 1): "
+  [[ $i -eq 1 ]] && prompt="  Выбор [1] (Enter = 1): "
+  read -rp "$(echo -e "${C}${prompt}${N}")" SEL
+  SEL=${SEL:-1}
+  [[ "$SEL" =~ ^[0-9]+$ ]] && (( SEL >= 1 && SEL <= i )) || { warn "Неверный выбор"; return 0; }
+
+  local chosen="${unique[$((SEL - 1))]}"
+  [[ -f "$chosen" ]] || { warn "Файл не найден"; return 0; }
+
+  echo ""
+  echo -e "${Y}  ──────────────────────────────────────────────${N}"
+  echo -e "${W}  ≡ Конфиг: $(basename "$chosen")${N}"
+  echo -e "${Y}  ──────────────────────────────────────────────${N}"
+  echo ""
+  cat "$chosen"
+  echo ""
+  echo -e "${Y}  ──────────────────────────────────────────────${N}"
+  echo -e "${D}  Скопируй текст выше или: scp root@$(get_public_ip 2>/dev/null):$chosen .${N}"
 }
 
 # ── Переименование клиента ──
@@ -1954,7 +2255,7 @@ do_add_client() {
   # MTU: по умолчанию из конфига сервера, но даём возможность override
   local srv_mtu
   srv_mtu=$(grep "^MTU = " "$SERVER_CONF" | awk -F'= ' '{print $2}' | head -1 || true)
-  srv_mtu=${srv_mtu:-1380}
+  srv_mtu=${srv_mtu:-1320}
   echo ""
   hdr "▬  MTU для клиента"
   echo "  1) $srv_mtu — как у сервера (рекомендуется)"
@@ -1988,7 +2289,7 @@ do_add_client() {
 
   local i1_line="" i2_line="" i3_line="" i4_line="" i5_line=""
   hdr "⌘  Выбор I1 для клиента"
-  echo "  1) Сгенерировать новый I1-I5 (выбор уровня + профиля мимикрии / Junker)"
+  echo "  1) Сгенерировать новый I1-I5 (выбор уровня + профиля мимикрии)"
   echo "  2) Без I1 (только H/S/Jc обфускация)"
   read -rp "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" I1_SELECT
   I1_SELECT=${I1_SELECT:-1}
@@ -2074,18 +2375,12 @@ do_add_client() {
   } > "$client_file"
   chmod 600 "$client_file"
 
-  # QR-код: показываем только если конфиг влезает (< 3000 байт)
-  if command -v qrencode &>/dev/null; then
-    local conf_size
-    conf_size=$(wc -c < "$client_file")
-    if [[ "$conf_size" -lt 3000 ]]; then
-      qrencode -t ansiutf8 -s 1 -m 1 < "$client_file"
-    else
-      warn "Конфиг слишком большой для QR (${conf_size} байт, макс ~3000)"
-      info "Скопируй файл: scp root@$(get_public_ip):${client_file} ."
-      info "Или используй: cat ${client_file}"
-    fi
-  fi
+  # Применяем через syncconf (без разрыва других клиентов)
+  info "Применяем конфиг..."
+  _apply_config 2>/dev/null || warn "syncconf не удался, может потребоваться перезапуск (пункт 5)"
+
+  # Раздача конфига (QR без I1-I5 или текст)
+  _share_config "$client_file"
 
   echo ""
   success_box "▣  Клиент добавлен успешно"
@@ -2207,15 +2502,17 @@ _print_client_info() {
     local current_time diff
     current_time=$(date +%s)
     diff=$((current_time - handshake_time))
+    local time_str
+    time_str=$(_fmt_duration "$diff")
     if [[ $diff -lt 120 ]]; then
       status_icon="${G}●${N}"
-      status_text="активен"
+      status_text="активен (${time_str} назад)"
     elif [[ $diff -lt 300 ]]; then
       status_icon="${Y}◐${N}"
-      status_text="неактивен ($((diff/60)) мин)"
+      status_text="неактивен (${time_str})"
     else
       status_icon="${R}○${N}"
-      status_text="офлайн ($((diff/60)) мин)"
+      status_text="офлайн (${time_str})"
     fi
   else
     status_icon="${R}○${N}"
@@ -2241,8 +2538,6 @@ _print_client_info() {
 # 5. QR КЛИЕНТА
 # ══════════════════════════════════════════════════════════
 do_show_qr() {
-  command -v qrencode &>/dev/null || { err "qrencode не установлен"; return 1; }
-
   local found=()
   while IFS= read -r -d '' f; do
     found+=("$f")
@@ -2260,8 +2555,7 @@ do_show_qr() {
     echo "  $i) $(basename "$f")"
   done
 
-  local QR_CHOICE
-  local prompt_txt
+  local QR_CHOICE prompt_txt
   if [[ $i -eq 1 ]]; then
     prompt_txt="  Выбор [1] (Enter = 1): "
   else
@@ -2269,34 +2563,16 @@ do_show_qr() {
   fi
   read -rp "$(echo -e "${C}${prompt_txt}${N}")" QR_CHOICE
   QR_CHOICE=${QR_CHOICE:-1}
-  if ! [[ "$QR_CHOICE" =~ ^[0-9]+$ ]] || \
-     ! [[ "$QR_CHOICE" -ge 1 ]] || \
-     ! [[ "$QR_CHOICE" -le $i ]]; then
-    warn "Неверный выбор (1-$i) — возврат в главное меню"
-    return 0
+  if ! [[ "$QR_CHOICE" =~ ^[0-9]+$ ]] || (( QR_CHOICE < 1 || QR_CHOICE > i )); then
+    warn "Неверный выбор"; return 0
   fi
 
-  local idx=$((QR_CHOICE - 1))
-  local chosen="${unique[$idx]}"
-  [[ -f "$chosen" ]] || { warn "Файл не найден: $chosen — возврат в главное меню"; return 0; }
+  local chosen="${unique[$((QR_CHOICE - 1))]}"
+  [[ -f "$chosen" ]] || { warn "Файл не найден"; return 0; }
 
-  local conf_size
-  conf_size=$(wc -c < "$chosen")
-  if [[ "$conf_size" -lt 3000 ]]; then
-    qrencode -t ansiutf8 -s 1 -m 1 < "$chosen"
-  else
-    warn "Конфиг слишком большой для QR (${conf_size} байт)"
-    info "I1-I5 не помещаются в QR-код. Используй файл:"
-  fi
+  _share_config "$chosen"
   echo ""
-  echo -e "${Y}  ──────────────────────────────────────────────${N}"
-  echo -e "${W}  ≡  Или сохрани текст ниже в файл client.conf${N}"
-  echo -e "${W}     Импортируй в AmneziaVPN: Добавить туннель → Из файла${N}"
-  echo -e "${Y}  ──────────────────────────────────────────────${N}"
-  echo ""
-  cat "$chosen"
-  echo ""
-  ok "$chosen"
+  echo -e "${D}  Конфиг: $chosen${N}"
 }
 
 # ══════════════════════════════════════════════════════════
@@ -2503,25 +2779,23 @@ do_uninstall() {
 # Результаты сохраняются в кэш /tmp/awg_domain_cache.txt.
 do_check_domains() {
   echo ""
-  hdr "◎  Проверка доступности доменов для мимикрии"
+  hdr "◎  Проверка доменов для мимикрии"
 
   # Показываем текущий регион и какие пулы будут проверены
   local region_label
   case "${SERVER_REGION:-world}" in
-    ru)    region_label="🇷🇺 РФ (российский сегмент)" ;;
+    ru)    region_label="🇷🇺 РФ" ;;
     world) region_label="🌍 Мир/Европа" ;;
-    *)     region_label="🌍 Мир (по умолчанию)" ;;
+    *)     region_label="🌍 Мир" ;;
   esac
-  echo -e "  ${C}Регион :${N} ${W}${region_label}${N}"
-  echo -e "  ${C}Пулы   :${N} ${W}TLS · DTLS · SIP · QUIC${N}"
-  echo -e "  ${D}(выбирается при создании сервера, пункт 2)${N}"
+  echo -e "  ${C}Регион:${N} ${W}${region_label}${N}"
   echo ""
 
   local cache_file="/tmp/awg_domain_cache.txt"
   local ts
   ts=$(date '+%Y-%m-%d %H:%M:%S')
 
-  # ── Выбираем пулы в зависимости от региона ──
+  # ── Выбираем пулы ──
   local -a tls_pool dtls_pool sip_pool quic_pool
   if [[ "${SERVER_REGION:-world}" == "ru" ]]; then
     tls_pool=("${TLS_DOMAINS_RU[@]}")
@@ -2535,81 +2809,120 @@ do_check_domains() {
     quic_pool=("${QUIC_DOMAINS_WORLD[@]}")
   fi
 
-  # Объединяем для одного параллельного пинга
   local all_domains=("${tls_pool[@]}" "${dtls_pool[@]}" "${sip_pool[@]}" "${quic_pool[@]}")
   local total=${#all_domains[@]}
   local avail_count=0
   local tmpdir="/tmp/awg_ping_$$"
   mkdir -p "$tmpdir"
 
-  # Ловушка на прерывание — cleanup + выход
   trap 'rm -rf "$tmpdir"; exit 1' INT TERM
 
-  # Параллельный пинг всех доменов
+  # Параллельный пинг с замером ms
   local domain
   for domain in "${all_domains[@]}"; do
-    (timeout 2 ping -c 1 -W 1 "$domain" &>/dev/null 2>&1 && echo "ok" || echo "fail") > "$tmpdir/${domain//./_}" &
+    (
+      local result
+      # ping -c 1 -W 1 возвращает "time=XX.X ms" при успехе
+      result=$(timeout 2 ping -c 1 -W 1 "$domain" 2>/dev/null | grep -oE 'time=[0-9.]+' | head -1 | cut -d= -f2)
+      if [[ -n "$result" ]]; then
+        # Округляем до целого
+        printf "%.0f" "$result" > "$tmpdir/${domain//./_}"
+      else
+        echo "fail" > "$tmpdir/${domain//./_}"
+      fi
+    ) &
   done
-  wait
 
-  # Хелпер: прочитать результат пинга одного домена
+  # Защита от пустых пулов
+  if [[ $total -eq 0 ]]; then
+    warn "Нет доменов в пулах (регион: ${SERVER_REGION:-world})"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  # Прогресс-бар пока пинги выполняются
+  local bar_width=40
+  local last_done=-1
+  while true; do
+    local running
+    running=$(jobs -r 2>/dev/null | wc -l)
+    local done_count=$((total - running))
+    [[ $done_count -lt 0 ]] && done_count=0
+
+    if [[ $done_count -ne $last_done ]]; then
+      local pct=$((done_count * 100 / total))
+      local filled=$((done_count * bar_width / total))
+      [[ $filled -gt $bar_width ]] && filled=$bar_width
+      local bar=""
+      local i
+      for ((i=0; i<filled; i++)); do bar+="█"; done
+      for ((i=filled; i<bar_width; i++)); do bar+="░"; done
+      printf "\r  ${C}Пинг: ${G}%s${N} ${W}%3d%%${N} (${done_count}/${total})" "$bar" "$pct"
+      last_done=$done_count
+    fi
+
+    [[ $running -eq 0 ]] && break
+    sleep 0.1
+  done
+  wait 2>/dev/null || true
+  printf "\r                                                                                   \r"
+
+  # Хелпер получить результат
   _ping_result() {
-    local domain="$1"
-    local key="${domain//./_}"
-    cat "$tmpdir/$key" 2>/dev/null || echo "fail"
+    cat "$tmpdir/${1//./_}" 2>/dev/null || echo "fail"
   }
 
-  # Хелпер: обработать пул — вывести на экран и записать в кэш
-  _check_pool() {
-    local pool_label="$2"
-    shift 2
+  # Хелпер обработать пул — показать с ms
+  _show_pool() {
+    local label="$1" icon="$2" cache_label="$3"
+    shift 3
     local domains=("$@")
-    local d
+    local pool_ok=0
+    local d ms
+
+    echo -e "${C}  $icon $label${N} ${D}(${#domains[@]})${N}"
     for d in "${domains[@]}"; do
-      if [[ "$(_ping_result "$d")" == "ok" ]]; then
-        echo -e "    ${G}√${N} $d"
-        echo "${pool_label}|$d|ok|$ts" >> "$cache_file"
-        avail_count=$((avail_count + 1))
+      ms=$(_ping_result "$d")
+      if [[ "$ms" == "fail" ]]; then
+        printf "    ${R}×${N}  %-32s  ${R}offline${N}\n" "$d"
+        echo "${cache_label}|$d|fail|$ts" >> "$cache_file"
       else
-        echo -e "    ${R}×${N} $d"
-        echo "${pool_label}|$d|fail|$ts" >> "$cache_file"
+        local color="${G}"
+        [[ $ms -gt 100 ]] && color="${Y}"
+        [[ $ms -gt 300 ]] && color="${R}"
+        printf "    ${G}√${N}  %-32s  ${color}%4d мс${N}\n" "$d" "$ms"
+        echo "${cache_label}|$d|ok|$ts|$ms" >> "$cache_file"
+        pool_ok=$((pool_ok + 1))
+        avail_count=$((avail_count + 1))
       fi
     done
+    echo -e "    ${D}───────────────────────────────────${N}"
+    echo -e "    ${D}${pool_ok}/${#domains[@]} доступно${N}"
+    echo ""
   }
 
   : > "$cache_file"
 
-  # --- TLS ---
-  echo -e "${C}  ◎ TLS 1.3 (${#tls_pool[@]} доменов):${N}"
-  _check_pool "TLS" "tls" "${tls_pool[@]}"
+  _show_pool "TLS 1.3 / HTTPS"     "◎" "TLS"  "${tls_pool[@]}"
+  _show_pool "DTLS / STUN / WebRTC" "◇" "DTLS" "${dtls_pool[@]}"
+  _show_pool "SIP / VoIP"           "◈" "SIP"  "${sip_pool[@]}"
+  _show_pool "QUIC / HTTP/3"        "◆" "QUIC" "${quic_pool[@]}"
 
-  # --- DTLS ---
-  echo ""
-  echo -e "${C}  ◎ DTLS / STUN (${#dtls_pool[@]} доменов):${N}"
-  _check_pool "DTLS" "dtls" "${dtls_pool[@]}"
-
-  # --- SIP ---
-  echo ""
-  echo -e "${C}  ◎ SIP (${#sip_pool[@]} доменов):${N}"
-  _check_pool "SIP" "sip" "${sip_pool[@]}"
-
-  # --- QUIC / HTTP3 ---
-  echo ""
-  echo -e "${C}  ◎ QUIC / HTTP3 (${#quic_pool[@]} доменов):${N}"
-  _check_pool "QUIC" "quic" "${quic_pool[@]}"
-
-  # Cleanup
   rm -rf "$tmpdir"
   trap - INT TERM
 
-  echo ""
-  hdr "∑  Результат проверки"
-  echo -e "${C}  Регион   : ${W}${region_label}${N}"
-  echo -e "${G}  √ Доступно: $avail_count из $total доменов${N}"
-  echo -e "${C}  → Кэш сохранён: $cache_file${N}"
+  hdr "∑  Итог"
+  local pct=$((avail_count * 100 / total))
+  local status_color="${G}"
+  [[ $pct -lt 70 ]] && status_color="${Y}"
+  [[ $pct -lt 40 ]] && status_color="${R}"
+  echo -e "  ${C}Регион    :${N} ${W}${region_label}${N}"
+  echo -e "  ${C}Доступно  :${N} ${status_color}${avail_count}/${total} (${pct}%)${N}"
+  echo -e "  ${C}Кэш       :${N} ${D}${cache_file}${N}"
 
   if [[ $avail_count -lt $total ]]; then
-    echo -e "${Y}  ! Часть доменов недоступна — при выборе мимикрии используются только доступные${N}"
+    echo ""
+    echo -e "${Y}  ! Недоступные домены не будут использоваться при выборе мимикрии${N}"
   fi
 
   return 0
@@ -2850,13 +3163,12 @@ I3=""
 I4=""
 I5=""
 MIMICRY_PROFILE=""
-MIMICRY_DOMAIN=""
 MTU=""
 AWG_PARAMS_LINES=""
 ERROR_COUNT=0
 
 touch "$LOG_FILE" 2>/dev/null && chmod 600 "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/awg-manager.log"
-log_info "=== AWG Toolza v5.4 запущен ==="
+log_info "=== AWG Toolza v6.2 запущен ==="
 
 # Trap EXIT — cleanup временных файлов
 trap 'rm -rf /tmp/awg_tmp_* /tmp/awg_ping_* 2>/dev/null || true' EXIT
