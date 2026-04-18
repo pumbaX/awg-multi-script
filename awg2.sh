@@ -1141,11 +1141,11 @@ gen_awg_params() {
   AWG_PARAMS_LINES=""
 
   local Jc Jmin Jmax S1 S2 S2_OFF S3 S4 Q
-  Jc=$(rand_range 3 5)
+  Jc=$(rand_range 4 12)
   Jmin=$(rand_range 64 256)
   Jmax=$(rand_range 277 339)
-  S1=$(rand_range 1 39)
-  S2_OFF=$(rand_range 1 63)
+  S1=$(rand_range 15 139)
+  S2_OFF=$(rand_range 15 149)
   [[ "$S2_OFF" -eq 56 ]] && S2_OFF=57 || true   # 56 зарезервировано — избегаем
   S2=$(( S1 + S2_OFF ))
   [[ $S2 -gt 1188 ]] && S2=1188 || true
