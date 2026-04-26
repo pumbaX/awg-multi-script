@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.2"
+VERSION="v6.3"
 
 # ─────────────────────────────────────────────────────────────
 # - AWG Toolza — только AWG 2.0
@@ -260,412 +260,142 @@ select_random_domain() {
 # ══════════════════════════════════════════════════════════
 
 # Единый Python генератор для всех профилей мимикрии
+# Единый Python генератор для всех профилей мимикрии
 _CPS_GENERATOR='
-import sys, os, random, secrets, struct, time, binascii
+import sys, secrets, struct, random
 
-def rh(n): return secrets.token_bytes(n)
-def rhex(n): return secrets.token_hex(n)
-def ri(a, b): return random.randint(a, b)
+def rh(n):  return secrets.token_bytes(n)
+def ri(a,b): return random.randint(a,b)
 def rc(lst): return random.choice(lst)
 def u16(v): return struct.pack(">H", v & 0xFFFF)
 def u32(v): return struct.pack(">I", v & 0xFFFFFFFF)
 def u24(v): return struct.pack(">I", v)[1:]
+def qv(v):
+    if v < 64:    return bytes([v])
+    elif v < 16384: return bytes([0x40|(v>>8)&0x3f, v&0xff])
+    else:         return bytes([0x80|(v>>24)&0x3f,(v>>16)&0xff,(v>>8)&0xff,v&0xff])
+def to_cps(raw): return "<b 0x%s>" % raw.hex()
 
-# ──────────────────────────────────────────────────────
-# DOMAIN POOL из payloadGen (Sketchystan1)
-# Микс популярных мировых + российских доменов
-# ──────────────────────────────────────────────────────
+# ── Аргументы ──────────────────────────────────────────
+# argv[1] = profile: quic|sip|dns
+# argv[2] = domain (опционально, иначе из пула)
+PROFILE = sys.argv[1] if len(sys.argv) > 1 else "quic"
+DOMAIN  = sys.argv[2] if len(sys.argv) > 2 else ""
+
 DOMAIN_POOL = [
-    "google.com","amazon.com","reddit.com","github.com","mozilla.org",
-    "microsoft.com","apple.com","cloudflare.com","bing.com","adobe.com",
-    "stackoverflow.com","office.com","dropbox.com","zoom.us","spotify.com",
-    "imdb.com","wikipedia.org","yandex.ru","ozon.ru","vk.com",
-    "gismeteo.ru","mail.ru","kinopoisk.ru","pinterest.com","dzen.ru",
-    "rutube.ru","gdz.ru","rbc.ru","wildberries.ru","ya.ru",
-    "sberbank.ru","ria.ru","tbank.ru","championat.com","fandom.com",
-    "rambler.ru","kp.ru","dns-shop.ru","chatgpt.com","avito.ru",
-    "2gis.ru","cbr.ru","ivi.ru","gosuslugi.ru","lenta.ru",
-    "auto.ru","steampowered.com","rustore.ru","okko.tv","domclick.ru",
-    "sports.ru","cian.ru","drom.ru","aviasales.ru","sovcombank.ru",
-    "sportbox.ru","invitro.ru","tutu.ru","vtb.ru","goldapple.ru",
-    "ok.ru","pikabu.ru","iz.ru","apteka.ru","hh.ru",
-    "habr.com","uchi.ru","lamoda.ru"
+    "google.com","github.com","microsoft.com","cloudflare.com","apple.com",
+    "amazon.com","mozilla.org","zoom.us","dropbox.com","spotify.com",
+    "yandex.ru","vk.com","mail.ru","ozon.ru","ya.ru",
+    "sberbank.ru","gosuslugi.ru","wildberries.ru","avito.ru","hh.ru",
+]
+if not DOMAIN:
+    DOMAIN = rc(DOMAIN_POOL)
+
+SIP_POOL = [
+    "sipgate.de","sip.ovh.net","sip.voipfone.co.uk","sip.linphone.org",
+    "sip.beeline.ru","sip.mts.ru","sip.megafon.ru","sip.tele2.ru",
+    "sip.dus.net","sip.easybell.de","sip.1und1.de","sip.voys.nl",
 ]
 
-# ──────────────────────────────────────────────────────
-# QUIC MINI — ультракомпактный (~38 байт, I1 ~88 сим)
-# Формат: <b 0xc1...><r 16>
-# Проверено работает на ТСПУ РФ
-# ──────────────────────────────────────────────────────
-def gen_quic_mini():
-    # First byte 0xC0-0xCF (long header + Initial)
-    pnl = ri(0, 1)
-    fb = 0xC0 | pnl
-    pn_bytes = pnl + 1
-    ver = b"\x00\x00\x00\x01"  # QUIC v1
-    # DCID 1 байт (как в рабочем примере)
-    dcid = rh(1)
-    # SCID = 0, Token = 0
-    # Payload length varint (1 byte, value < 64)
-    plen = ri(30, 60)
-    pl_varint = bytes([plen & 0x3F])
-    # PN + random encrypted payload
-    pn = rh(pn_bytes)
-    payload = rh(ri(20, 35))
-    return bytes([fb]) + ver + bytes([1]) + dcid + b"\x00\x00" + pl_varint + pn + payload
+# ── I1: QUIC Long Header Initial, строго 1200 байт ─────
+# Chrome fingerprint: fb=0xC0/0xC3, DCID=8B, SCID=8B, token=0, pad до 1200
+def gen_quic_initial(domain=None):
+    TARGET = 1200
+    fb     = rc([0xC0, 0xC0, 0xC0, 0xC3])   # Chrome чаще шлёт 0xC0
+    pn_len = (fb & 0x03) + 1
+    dcid   = rh(8)
+    scid   = rh(8)
+    # header = 1+4+1+8+1+8+1(tok)+2(varint plen) = 26
+    enc_size  = TARGET - 26 - pn_len
+    plen_val  = pn_len + enc_size
+    pl_varint = u16(0x4000 | plen_val)
+    pn      = rh(pn_len)
+    # Payload: полностью случайный (имитация зашифрованного ClientHello)
+    # Chrome Initial не содержит блоков нулей — всё выглядит как шифротекст
+    payload = rh(enc_size)
+    pkt = (bytes([fb]) + b"\x00\x00\x00\x01" +
+           bytes([8]) + dcid + bytes([8]) + scid +
+           b"\x00" + pl_varint + pn + payload)
+    assert len(pkt) == TARGET, "I1 size=%d" % len(pkt)
+    return pkt
 
-# ──────────────────────────────────────────────────────
-# QUIC FULL — полноразмерный Chrome-like (~1200 байт)
-# Структура настоящего QUIC Initial с правильной длиной varint
-# Проверено: I1 вида 0xc5000000010808...
-# ──────────────────────────────────────────────────────
-def _quic_varint_encode(value):
-    """QUIC varint encoder."""
-    if value < 64:
-        return bytes([value])
-    elif value < 16384:
-        return bytes([0x40 | (value >> 8) & 0x3F, value & 0xFF])
-    elif value < 1073741824:
-        return bytes([
-            0x80 | (value >> 24) & 0x3F,
-            (value >> 16) & 0xFF,
-            (value >> 8) & 0xFF,
-            value & 0xFF
-        ])
-    else:
-        # 8-byte varint
-        return struct.pack(">Q", 0xC000000000000000 | value)
+# ── I2-I5: QUIC Short Header (1-RTT) ───────────────────
+# Chrome после Initial шлёт 1-RTT пакеты: Short Header 0x40-0x7F
+def gen_quic_short():
+    pn_len = ri(1, 2)
+    spin   = ri(0, 1) << 5
+    key    = ri(0, 1) << 2
+    fb     = 0x40 | spin | key | (pn_len - 1)
+    dcid   = rh(8)
+    pn     = rh(pn_len)
+    data   = rh(ri(40, 90))
+    return bytes([fb]) + dcid + pn + data
 
-def gen_quic_full(pad_to_1200=False):
-    """Полноразмерный QUIC Initial как Chrome."""
-    # First byte: 0xC0-0xCF
-    pn_len = 2  # Chrome всегда 2 байта PN для Initial
-    reserved = ri(0, 1)  # 0 или 1 (у payloadGen 1), было 0
-    fb = 0xC0 | (reserved << 2) | (pn_len - 1)
-
-    ver = b"\x00\x00\x00\x01"  # QUIC v1
-    # DCID — 8 байт (стандарт Chrome)
-    dcid = rh(8)
-    # SCID — 8 байт (тоже как Chrome, не 0!)
-    scid = rh(8)
-    # Token length = 0 (varint 1 byte)
-    token_len = bytes([0])
-
-    # Payload = PN + encrypted ClientHello (~1150 байт)
-    # Target: весь пакет ~1200 байт
-    # Header: 1 (fb) + 4 (ver) + 1 (dcid_len) + 8 (dcid) + 1 (scid_len) + 8 (scid) + 1 (token_len) = 24 байта
-    # + payload length varint (2 байта) + PN + encrypted payload
-    if pad_to_1200:
-        target_total = 1200
-    else:
-        target_total = ri(800, 1250)  # реалистичный размер
-
-    # Считаем с учётом varint payload length
-    header_fixed = 1 + 4 + 1 + 8 + 1 + 8 + 1  # = 24
-    # Payload length varint = 2 байта когда value 64-16383
-    # PN + encrypted = target - header - varint(2)
-    enc_size = target_total - header_fixed - 2 - pn_len
-    if enc_size < 16:
-        enc_size = 100  # минимум для auth tag
-
-    payload_len_value = pn_len + enc_size  # правильная длина!
-    # Выбираем varint 2-байтовый (value 64-16383)
-    if payload_len_value >= 64 and payload_len_value < 16384:
-        pl_varint = u16(0x4000 | payload_len_value)
-    else:
-        pl_varint = _quic_varint_encode(payload_len_value)
-
-    # PN bytes
-    pn = rh(pn_len)
-    # Encrypted payload (выглядит как шифротекст)
-    encrypted = rh(enc_size)
-
-    return (bytes([fb]) + ver + bytes([8]) + dcid + bytes([8]) + scid +
-            token_len + pl_varint + pn + encrypted)
-
-# ──────────────────────────────────────────────────────
-# WebRTC Combined — STUN + DTLS + RTCP (~500 байт)
-# Из haha.conf — проверено работает
-# ──────────────────────────────────────────────────────
-def _crc32(data):
-    return binascii.crc32(data) & 0xFFFFFFFF
-
-def gen_webrtc_combined(pad=False):
-    sni = rc(DOMAIN_POOL)
-    provider_soft = rc([
-        b"Cloudflare WebRTC client",
-        b"Chrome WebRTC ICE agent",
-        b"Firefox ICE stack",
-        b"Safari WebRTC networking",
-        b"WhatsApp/2"
-    ])
-
-    # ── STUN Binding Request ──
-    txn = rh(12)
-    # SOFTWARE (0x8022)
-    soft_pad = (4 - len(provider_soft) % 4) % 4
-    soft_attr = u16(0x8022) + u16(len(provider_soft)) + provider_soft + b"\x00" * soft_pad
-    # PRIORITY (0x0024)
-    prio_attr = u16(0x0024) + u16(4) + u32(ri(0x40000000, 0x7FFFFFFF))
-    # ICE-CONTROLLED (0x8029)
-    ice_attr = u16(0x8029) + u16(8) + rh(8)
-    # USERNAME (0x0006)
-    uname_str = ("%s:%s" % (rhex(4), sni)).encode()
-    uname_pad = (4 - len(uname_str) % 4) % 4
-    uname_attr = u16(0x0006) + u16(len(uname_str)) + uname_str + b"\x00" * uname_pad
-
-    attrs_body = soft_attr + prio_attr + ice_attr + uname_attr
-    msg_len = len(attrs_body) + 8  # + FINGERPRINT
-    stun_hdr = u16(0x0001) + u16(msg_len) + u32(0x2112A442) + txn
-    crc_input = stun_hdr + attrs_body
-    fp_val = (_crc32(crc_input) ^ 0x5354554E) & 0xFFFFFFFF
-    fp_attr = u16(0x8028) + u16(4) + u32(fp_val)
-    stun_packet = stun_hdr + attrs_body + fp_attr
-
-    # ── DTLS 1.2 ClientHello с SNI ──
-    dtls_random = rh(32)
-    sess_id = b"\x00"
-    cookie = b"\x00"
-    ciphers = bytes.fromhex("000cc02bc02fcca9c02c009c009d")
-    compression = b"\x01\x00"
-
-    sni_bytes = sni.encode()
-    sni_entry = b"\x00" + u16(len(sni_bytes)) + sni_bytes
-    sni_list = u16(len(sni_entry)) + sni_entry
-    sni_ext = u16(0x0000) + u16(len(sni_list)) + sni_list
-    sg_ext = bytes.fromhex("000a00080006001d00170018")
-    ecp_ext = bytes.fromhex("000b00020100")
-    sa_ext = bytes.fromhex("000d00140012040308040401050308050501080606010807")
-    srtp_ext = bytes.fromhex("000e00050002000100")
-    ems_ext = bytes.fromhex("00170000")
-
-    extensions = sni_ext + sg_ext + ecp_ext + sa_ext + srtp_ext + ems_ext
-    ext_block = u16(len(extensions)) + extensions
-
-    ch_body = b"\xfe\xfd" + dtls_random + sess_id + cookie + ciphers + compression + ext_block
-    hs_header = b"\x01" + u24(len(ch_body)) + u16(0) + u24(0) + u24(len(ch_body))
-    handshake = hs_header + ch_body
-    dtls_record = b"\x16\xfe\xfd\x00\x00" + rh(6) + u16(len(handshake)) + handshake
-
-    # ── RTCP-tail ──
-    tail_ssrc = rh(4)
-    rtcp_sr = bytes([0x80, 0x00, 0x00]) + bytes([ri(0, 255)]) + tail_ssrc
-    extra = rh(ri(20, 40))
-    tail = rtcp_sr + extra
-
-    packet = stun_packet + dtls_record + tail
-
-    if pad and len(packet) < 1200:
-        packet += b"\x00" * (1200 - len(packet))
-
-    return packet
-
-# ──────────────────────────────────────────────────────
-# SIP — OPTIONS / REGISTER / TRYING (случайно)
-# Реалистичный формат из payloadGen
-# ──────────────────────────────────────────────────────
-_SIP_UAS = [
-    "Linphone/5.2.5 (belle-sip/5.3.90)", "Zoiper rv2.10.15-mod",
-    "MicroSIP/3.21.6", "baresip 3.8.0", "Blink 6.0.4 (Windows)",
-    "Asterisk PBX 20.7.0"
-]
-_SIP_SERVERS = [
-    "Kamailio (5.8.1)", "OpenSIPS (3.5.1)", "Asterisk PBX (20.7.0)",
-    "FreeSWITCH (1.10.12)"
-]
-_SIP_ALLOWS = [
-    "INVITE, ACK, CANCEL, OPTIONS, BYE, REFER, NOTIFY, INFO, MESSAGE, SUBSCRIBE",
-    "INVITE, ACK, CANCEL, OPTIONS, BYE, UPDATE, MESSAGE",
-    "INVITE, ACK, CANCEL, OPTIONS, BYE, PRACK, UPDATE"
-]
-_SIP_SUPPORTED = [
-    "replaces, outbound, path, timer",
-    "outbound, path, gruu, 100rel",
-    "timer, replaces, resource-priority"
-]
-_SIP_DISPLAY_NAMES = [
-    "Alice Carter", "Bob Smith", "Support Desk", "Sales Queue",
-    "NOC Bridge", "Reception", "Operator", "Dispatch"
-]
-_SIP_USERS = ["100","101","200","300","400","500","alice","bob","support","sales","noc","ops"]
-
-def _sip_domain():
-    # генерируем реалистичный SIP домен на базе DOMAIN_POOL
-    base = rc(DOMAIN_POOL)
-    prefixes = ["sip","voip","pbx","edge","gw","proxy","media","trunk"]
-    if ri(0, 2) == 0:
-        return base
-    return "%s-%d.%s" % (rc(prefixes), ri(10, 99), base)
-
-def _sip_priv_ip():
-    pools = [
-        (10, ri(0,255), ri(0,255), ri(10,210)),
-        (172, 16+ri(0,15), ri(0,255), ri(10,210)),
-        (192, 168, ri(0,255), ri(10,210))
-    ]
-    o = rc(pools)
-    return "%d.%d.%d.%d" % o
-
-def _build_sip_options(host, fuser, tuser, lip, lport, branch, tag, callid, cseq, ua, fn, tn):
-    lines = [
-        "OPTIONS sip:%s@%s SIP/2.0" % (tuser, host),
-        "Via: SIP/2.0/UDP %s:%d;branch=%s;rport" % (lip, lport, branch),
-        "Max-Forwards: 70",
-        "From: \"%s\" <sip:%s@%s>;tag=%s" % (fn, fuser, host, tag),
-        "To: \"%s\" <sip:%s@%s>" % (tn, tuser, host),
-        "Call-ID: %s" % callid,
-        "CSeq: %d OPTIONS" % cseq,
-        "Contact: <sip:%s@%s:%d;transport=udp>" % (fuser, lip, lport),
-        "User-Agent: %s" % ua,
-        "Allow: %s" % rc(_SIP_ALLOWS),
-        "Supported: %s" % rc(_SIP_SUPPORTED),
-        "Accept: application/sdp",
-        "Accept-Language: en-US",
-        "Content-Length: 0",
-        "", ""
-    ]
-    return "\r\n".join(lines).encode()
-
-def _build_sip_register(host, fuser, lip, lport, branch, tag, callid, cseq, ua, fn):
-    lines = [
+# ── SIP REGISTER ────────────────────────────────────────
+def gen_sip():
+    host   = rc(SIP_POOL)
+    user   = rc(["alice","bob","100","200","sip"]) + str(ri(10,99))
+    lip    = "10.%d.%d.%d" % (ri(0,255), ri(0,255), ri(10,200))
+    lport  = rc([5060,5062,5080])
+    branch = "z9hG4bK" + secrets.token_hex(7)
+    tag    = secrets.token_hex(4)
+    callid = "%s@%s" % (secrets.token_hex(8), host)
+    cseq   = ri(1, 50)
+    lines  = [
         "REGISTER sip:%s SIP/2.0" % host,
         "Via: SIP/2.0/UDP %s:%d;branch=%s;rport" % (lip, lport, branch),
         "Max-Forwards: 70",
-        "From: \"%s\" <sip:%s@%s>;tag=%s" % (fn, fuser, host, tag),
-        "To: \"%s\" <sip:%s@%s>" % (fn, fuser, host),
+        "From: <sip:%s@%s>;tag=%s" % (user, host, tag),
+        "To: <sip:%s@%s>" % (user, host),
         "Call-ID: %s" % callid,
         "CSeq: %d REGISTER" % cseq,
-        "Contact: <sip:%s@%s:%d;transport=udp>" % (fuser, lip, lport),
-        "User-Agent: %s" % ua,
-        "Allow: %s" % rc(_SIP_ALLOWS),
-        "Supported: %s" % rc(_SIP_SUPPORTED),
-        "Expires: %d" % rc([300,600,900,1200,1800,3600]),
+        "Contact: <sip:%s@%s:%d;transport=udp>" % (user, lip, lport),
+        "Expires: %d" % rc([300,600,1800,3600]),
         "Content-Length: 0",
         "", ""
     ]
     return "\r\n".join(lines).encode()
 
-def _build_sip_trying(host, fuser, tuser, lip, lport, branch, tag, callid, cseq, fn, tn):
-    lines = [
-        "SIP/2.0 100 CONNECTING",
-        "Via: SIP/2.0/UDP %s:%d;branch=%s;rport" % (lip, lport, branch),
-        "To: \"%s\" <sip:%s@%s>" % (tn, tuser, host),
-        "From: \"%s\" <sip:%s@%s>;tag=%s" % (fn, fuser, host, tag),
-        "Call-ID: %s" % callid,
-        "CSeq: %d INVITE" % cseq,
-        "Server: %s" % rc(_SIP_SERVERS),
-        "Content-Length: 0",
-        "", ""
-    ]
-    return "\r\n".join(lines).encode()
-
-def gen_sip(action=None):
-    if action is None:
-        action = rc(["OPTIONS", "REGISTER", "TRYING"])
-    host = _sip_domain()
-    lip = _sip_priv_ip()
-    lport = rc([5060, 5062, 5070, 5080, 5160])
-    fuser = rc(_SIP_USERS) + str(ri(100, 999))
-    tuser = rc(_SIP_USERS) + str(ri(100, 999)) if action != "REGISTER" else fuser
-    branch = "z9hG4bK" + rhex(9)
-    tag = rhex(6)
-    callid = "%s@%s" % (rhex(12), host)
-    cseq = ri(1, 80)
-    ua = rc(_SIP_UAS)
-    fn = rc(_SIP_DISPLAY_NAMES)
-    tn = rc(_SIP_DISPLAY_NAMES) if action != "REGISTER" else fn
-
-    if action == "REGISTER":
-        return _build_sip_register(host, fuser, lip, lport, branch, tag, callid, cseq, ua, fn)
-    elif action == "TRYING":
-        return _build_sip_trying(host, fuser, tuser, lip, lport, branch, tag, callid, cseq, fn, tn)
-    else:
-        return _build_sip_options(host, fuser, tuser, lip, lport, branch, tag, callid, cseq, ua, fn, tn)
-
-# ──────────────────────────────────────────────────────
-# DNS — DNS Response (как у оригинальной Amnezia)
-# ──────────────────────────────────────────────────────
-def gen_dns():
-    host = rc(DOMAIN_POOL)
-    # Flags: QR=1 (response), RD=1, RA=1, RCODE=0 → 0x8580
-    flags = b"\x85\x80"
-    counts = b"\x00\x01\x00\x01\x00\x00\x00\x00"
-    qn = b""
-    for l in host.split("."):
-        qn += bytes([len(l)]) + l.encode()
+# ── DNS Query ────────────────────────────────────────────
+# I1 начинается с <r 2> (TXID), остальные — тоже с TXID
+def gen_dns(domain=None):
+    host  = domain or DOMAIN
+    flags = b"\x01\x00"   # QR=0 Query, RD=1
+    qn    = b""
+    for lbl in host.split("."):
+        qn += bytes([len(lbl)]) + lbl.encode()
     qn += b"\x00"
-    qtype = b"\x00\x01"  # A
-    qclass = b"\x00\x01"  # IN
-    # Answer: pointer to domain, A record
-    ans_name = b"\xc0\x0c"
-    ans_type = b"\x00\x01"
-    ans_class = b"\x00\x01"
-    ttl = u32(ri(60, 86400))
-    rdlen = b"\x00\x04"
-    rdata = bytes([ri(1,255), ri(0,255), ri(0,255), ri(1,254)])
-    # TXID не включаем — он идёт через <r 2>
-    return flags + counts + qn + qtype + qclass + ans_name + ans_type + ans_class + ttl + rdlen + rdata
+    return flags + b"\x00\x01\x00\x00\x00\x00\x00\x00" + qn + b"\x00\x01\x00\x01"
 
-# ──────────────────────────────────────────────────────
-# Output wrapper
-# ──────────────────────────────────────────────────────
-def to_cps(data, suffix=""):
-    return "<b 0x%s>%s" % (data.hex(), suffix)
-
-# ──────────────────────────────────────────────────────
-# Dispatch
-# ──────────────────────────────────────────────────────
-profile = sys.argv[1] if len(sys.argv) > 1 else "quic_full"
-pad_flag = os.environ.get("CPS_PAD", "0") == "1"
-
-if profile == "quic_full":
-    # ★ Полноразмерный Chrome-like QUIC — ТОЛЬКО I1 (один большой пакет ~1200B)
-    print(to_cps(gen_quic_full(pad_to_1200=pad_flag)))
-    print("")
-    print("")
-    print("")
-    print("")
-elif profile == "quic_mini":
-    # Ультракомпактный QUIC ~40B — заполняем все I1-I5
-    print(to_cps(gen_quic_mini(), "<r 16>"))
-    print(to_cps(gen_quic_mini()))
-    print(to_cps(gen_quic_mini()))
-    print(to_cps(gen_quic_mini()))
-    print(to_cps(gen_quic_mini()))
-elif profile == "webrtc":
-    # WebRTC Combined ~500B — I1 + 4 mini QUIC
-    print(to_cps(gen_webrtc_combined(pad=pad_flag)))
-    print(to_cps(gen_quic_mini()))
-    print(to_cps(gen_quic_mini()))
-    print(to_cps(gen_quic_mini()))
-    print(to_cps(gen_quic_mini()))
-elif profile == "sip":
-    # SIP ~500B — только I1 (один SIP пакет, как реальный вызов)
+# ── Dispatch ─────────────────────────────────────────────
+if PROFILE == "sip":
     print(to_cps(gen_sip()))
-    print("")
-    print("")
-    print("")
-    print("")
-elif profile == "dns":
-    # DNS Response как у Amnezia — все I1-I5
-    print(to_cps(gen_dns(), "<r 2>"))
-    print(to_cps(gen_dns()))
-    print(to_cps(gen_dns()))
-    print(to_cps(gen_dns()))
-    print(to_cps(gen_dns()))
-else:
-    # default = quic_full (рекомендуется)
-    print(to_cps(gen_quic_full()))
-    print("")
-    print("")
-    print("")
-    print("")
+    print(""); print(""); print(""); print("")
+
+elif PROFILE == "dns":
+    # DNS wire format: TXID(2b) + flags(2b) + counts(8b) + QNAME + QTYPE + QCLASS
+    # TXID рандомный через <r 2> — в начале каждого пакета
+    # Разные домены для I1-I5 чтобы не было паттерна
+    import random as _r
+    pool = DOMAIN_POOL.copy()
+    _r.shuffle(pool)
+    for i in range(5):
+        dom = pool[i % len(pool)]
+        print("<r 2><b 0x%s>" % gen_dns(dom).hex())
+
+else:  # quic (default)
+    print(to_cps(gen_quic_initial(DOMAIN)))
+    for _ in range(4):
+        print(to_cps(gen_quic_short()))
 '
 
+
 # Генерация I1-I5 через Python
+# $1 = profile (quic|sip|dns), $2 = domain (опционально)
 gen_cps_i1() {
-  local profile="${1:-special}"
-  python3 -c "$_CPS_GENERATOR" "$profile"
+  local profile="${1:-quic}"
+  local domain="${2:-}"
+  python3 -c "$_CPS_GENERATOR" "$profile" "$domain"
 }
 
 
@@ -730,43 +460,36 @@ choose_mimicry_profile() {
 
   echo ""
   hdr "~  Профили мимикрии I1-I5"
-  echo -e "  ${D}Works (проверено на ТСПУ РФ):${N}"
-  echo -e "  ${G}1${N}  ${W}★ QUIC Full${N}     — полноразмерный Chrome-like (~1200B, только I1)"
-  echo -e "  ${G}2${N}  QUIC Mini       — ультракомпактный (~40B, I1-I5 с <r 16>)"
+  echo -e "  ${G}1${N}  ${W}★ QUIC${N}  — Chrome-like Initial 1200B + Short Header I2-I5"
+  echo -e "     ${D}Лучший выбор для РФ. I1=1200B, I2-I5=50-90B.${N}"
+  echo -e "  ${G}2${N}  SIP   — REGISTER запрос (VoIP мимикрия)"
+  echo -e "     ${D}Только I1. Хорошо работает с SIP провайдерами.${N}"
+  echo -e "  ${G}3${N}  DNS   — DNS Query с рандомным TXID (<r 2>)"
+  echo -e "     ${D}Компактный, I1-I5 с TXID prefix.${N}"
   echo ""
-  echo -e "  ${D}Kinda (может работать):${N}"
-  echo -e "  ${G}3${N}  WebRTC Combined — STUN + DTLS 1.2 + RTCP"
-  echo -e "  ${G}4${N}  SIP             — OPTIONS/REGISTER/TRYING (случайно)"
-  echo -e "  ${G}5${N}  DNS Response    — как у оригинальной Amnezia"
-  echo ""
-  read -rp "$(echo -e "${C}  Выбор [1-5] (Enter = 1): ${N}")" PROFILE_CHOICE
+  read -rp "$(echo -e "${C}  Выбор [1-3] (Enter = 1): ${N}")" PROFILE_CHOICE
   PROFILE_CHOICE=${PROFILE_CHOICE:-1}
 
   case $PROFILE_CHOICE in
-    1) MIMICRY_PROFILE="quic_full" ;;
-    2) MIMICRY_PROFILE="quic_mini" ;;
-    3) MIMICRY_PROFILE="webrtc" ;;
-    4) MIMICRY_PROFILE="sip" ;;
-    5) MIMICRY_PROFILE="dns" ;;
-    *) MIMICRY_PROFILE="quic_full" ;;
+    1) MIMICRY_PROFILE="quic" ;;
+    2) MIMICRY_PROFILE="sip"  ;;
+    3) MIMICRY_PROFILE="dns"  ;;
+    *) MIMICRY_PROFILE="quic" ;;
   esac
 
-  # Padding опция (для quic_full и webrtc)
-  local use_pad=0
-  if [[ "$MIMICRY_PROFILE" == "quic_full" || "$MIMICRY_PROFILE" == "webrtc" ]]; then
-    echo ""
-    read -rp "$(echo -e "${C}  Padding до 1200B (реалистичнее)? [y/N]: ${N}")" PAD_CHOICE
-    [[ "$PAD_CHOICE" =~ ^[Yy]$ ]] && use_pad=1
-  fi
+  # Выбираем домен из пула под профиль
+  local sel_domain=""
+  case "$MIMICRY_PROFILE" in
+    quic) sel_domain=$(select_random_domain "quic") ;;
+    sip)  sel_domain=$(select_random_domain "sip")  ;;
+    dns)  sel_domain=$(select_random_domain "tls")  ;;
+  esac
+  [[ -z "$sel_domain" ]] && sel_domain=""
 
   # ── Генерация через Python ──
-  echo -e "${C}  → Генерируем $MIMICRY_PROFILE...${N}"
+  echo -e "${C}  → Генерируем $MIMICRY_PROFILE${sel_domain:+ ($sel_domain)}...${N}"
   local cps_out
-  if [[ $use_pad -eq 1 ]]; then
-    cps_out=$(CPS_PAD=1 gen_cps_i1 "$MIMICRY_PROFILE") || cps_out=""
-  else
-    cps_out=$(gen_cps_i1 "$MIMICRY_PROFILE") || cps_out=""
-  fi
+  cps_out=$(gen_cps_i1 "$MIMICRY_PROFILE" "$sel_domain") || cps_out=""
 
   if [[ -n "$cps_out" ]]; then
     I1=$(echo "$cps_out" | sed -n '1p')
@@ -2728,6 +2451,122 @@ do_reset_server() {
 # ══════════════════════════════════════════════════════════
 # 11. УДАЛИТЬ ВСЁ
 # ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# 999. DEBUG — генерация всех вариантов CPS в /tmp/awg_debug/
+# ══════════════════════════════════════════════════════════
+do_debug_cps() {
+  local DEBUG_DIR="/tmp/awg_debug"
+  rm -rf "$DEBUG_DIR"
+  mkdir -p "$DEBUG_DIR"
+
+  echo ""
+  hdr "🔧 DEBUG: генерация всех вариантов CPS"
+  echo -e "  ${C}Папка: ${W}$DEBUG_DIR${N}"
+  echo ""
+
+  local DOMAINS_QUIC=("google.com" "ya.ru" "cloudflare.com")
+  local DOMAINS_SIP=("sipgate.de" "sip.beeline.ru" "sip.ovh.net")
+  local DOMAINS_DNS=("github.com" "yandex.ru" "microsoft.com")
+
+  local total=0 failed=0
+  local domain safe_domain fname out i1 i2 i3 i4 i5 i1_sz i1_preview
+
+  # ── QUIC ──────────────────────────────────────────────
+  info "Генерируем QUIC варианты..."
+  for domain in "${DOMAINS_QUIC[@]}"; do
+    safe_domain="${domain//./_}"
+    fname="${DEBUG_DIR}/quic__${safe_domain}.conf"
+    out=$(gen_cps_i1 "quic" "$domain" 2>/dev/null) || { warn "QUIC $domain — FAIL"; failed=$((failed+1)); continue; }
+    i1=$(echo "$out" | sed -n '1p')
+    i2=$(echo "$out" | sed -n '2p')
+    i3=$(echo "$out" | sed -n '3p')
+    i4=$(echo "$out" | sed -n '4p')
+    i5=$(echo "$out" | sed -n '5p')
+    i1_sz=$(echo "$i1" | grep -oP '(?<=<b 0x)[0-9a-f]+' | awk '{print length/2}')
+    {
+      echo "# AWG Debug — профиль: QUIC  домен: $domain"
+      echo "# I1: Long Header Initial ${i1_sz}B | I2-I5: Short Header 1-RTT"
+      echo "# Сгенерировано: $(date '+%Y-%m-%d %H:%M:%S')"
+      echo ""
+      echo "I1 = $i1"
+      [[ -n "$i2" ]] && echo "I2 = $i2"
+      [[ -n "$i3" ]] && echo "I3 = $i3"
+      [[ -n "$i4" ]] && echo "I4 = $i4"
+      [[ -n "$i5" ]] && echo "I5 = $i5"
+    } > "$fname"
+    echo -e "  ${G}✓${N} quic__${safe_domain}.conf  I1=${i1_sz}B"
+    total=$((total+1))
+  done
+
+  echo ""
+
+  # ── SIP ───────────────────────────────────────────────
+  info "Генерируем SIP варианты..."
+  for domain in "${DOMAINS_SIP[@]}"; do
+    safe_domain="${domain//./_}"
+    fname="${DEBUG_DIR}/sip__${safe_domain}.conf"
+    out=$(gen_cps_i1 "sip" "$domain" 2>/dev/null) || { warn "SIP $domain — FAIL"; failed=$((failed+1)); continue; }
+    i1=$(echo "$out" | sed -n '1p')
+    i1_sz=$(echo "$i1" | grep -oP '(?<=<b 0x)[0-9a-f]+' | awk '{print length/2}')
+    {
+      echo "# AWG Debug — профиль: SIP  домен/сервер: $domain"
+      echo "# I1: REGISTER запрос ${i1_sz}B | I2-I5: пусто (SIP не повторяется)"
+      echo "# Сгенерировано: $(date '+%Y-%m-%d %H:%M:%S')"
+      echo ""
+      echo "I1 = $i1"
+    } > "$fname"
+    echo -e "  ${G}✓${N} sip__${safe_domain}.conf  I1=${i1_sz}B"
+    total=$((total+1))
+  done
+
+  echo ""
+
+  # ── DNS ───────────────────────────────────────────────
+  info "Генерируем DNS варианты..."
+  for domain in "${DOMAINS_DNS[@]}"; do
+    safe_domain="${domain//./_}"
+    fname="${DEBUG_DIR}/dns__${safe_domain}.conf"
+    out=$(gen_cps_i1 "dns" "$domain" 2>/dev/null) || { warn "DNS $domain — FAIL"; failed=$((failed+1)); continue; }
+    i1=$(echo "$out" | sed -n '1p')
+    i2=$(echo "$out" | sed -n '2p')
+    i3=$(echo "$out" | sed -n '3p')
+    i4=$(echo "$out" | sed -n '4p')
+    i5=$(echo "$out" | sed -n '5p')
+    {
+      echo "# AWG Debug — профиль: DNS  домен: $domain"
+      echo "# I1-I5: DNS Query с <r 2> TXID prefix, разные домены из пула"
+      echo "# Сгенерировано: $(date '+%Y-%m-%d %H:%M:%S')"
+      echo ""
+      echo "I1 = $i1"
+      [[ -n "$i2" ]] && echo "I2 = $i2"
+      [[ -n "$i3" ]] && echo "I3 = $i3"
+      [[ -n "$i4" ]] && echo "I4 = $i4"
+      [[ -n "$i5" ]] && echo "I5 = $i5"
+    } > "$fname"
+    i1_preview=$(echo "$i1" | cut -c1-50)
+    echo -e "  ${G}✓${N} dns__${safe_domain}.conf  ${i1_preview}..."
+    total=$((total+1))
+  done
+
+  echo ""
+
+  # ── Итог ──────────────────────────────────────────────
+  hdr "√ DEBUG завершён"
+  echo -e "  Создано файлов : ${G}${total}${N}"
+  [[ $failed -gt 0 ]] && echo -e "  Ошибок         : ${R}${failed}${N}"
+  echo ""
+  echo -e "  ${W}Файлы:${N}"
+  ls -1 "$DEBUG_DIR/"*.conf 2>/dev/null | while read -r f; do
+    echo -e "    ${C}$(basename "$f")${N}"
+  done
+  echo ""
+  echo -e "  ${D}cat $DEBUG_DIR/quic__google_com.conf${N}"
+  log_info "do_debug_cps: создано ${total} файлов в $DEBUG_DIR"
+}
+
+# ══════════════════════════════════════════════════════════
+# 12. УДАЛИТЬ ВСЁ
+# ══════════════════════════════════════════════════════════
 do_uninstall() {
   echo ""
   hdr "⌧  Удаление AmneziaWG"
@@ -3180,18 +3019,19 @@ while true; do
   # show_menu уже читает CHOICE, дополнительный read не нужен
 
   case "${CHOICE:-}" in
-    1)  do_install ;;
-    2)  do_gen ;;
-    3)  do_manage_clients ;;
-    4)  do_list_clients ;;
-    5)  do_restart ;;
-    6)  do_check_domains ;;
-    7)  do_sniff_test ;;
-    8)  do_backup ;;
-    9)  do_restore ;;
-    10) do_clean_clients ;;
-    11) do_reset_server ;;
-    12) do_uninstall ;;
+    1)   do_install ;;
+    2)   do_gen ;;
+    3)   do_manage_clients ;;
+    4)   do_list_clients ;;
+    5)   do_restart ;;
+    6)   do_check_domains ;;
+    7)   do_sniff_test ;;
+    8)   do_backup ;;
+    9)   do_restore ;;
+    10)  do_clean_clients ;;
+    11)  do_reset_server ;;
+    12)  do_uninstall ;;
+    999) do_debug_cps ;;
     0)  log_info "Выход"
         echo -e "\n${G}  В путь! ${N}"
         echo -e "\n▓▒░ DPI ОТСТОЙ! ░▒▓"
@@ -3209,7 +3049,7 @@ while true; do
       ;;
   esac
 
-  if [[ "${CHOICE:-}" =~ ^[0-9]+$ ]] && [[ "${CHOICE:-}" -le 12 ]]; then
+  if [[ "${CHOICE:-}" =~ ^[0-9]+$ ]] && { [[ "${CHOICE:-}" -le 12 ]] || [[ "${CHOICE:-}" == "999" ]]; }; then
     ERROR_COUNT=0
   fi
 
