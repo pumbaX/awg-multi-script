@@ -188,9 +188,11 @@ import time
 from pathlib import Path
 
 from telegram import (
-    InlineKeyboardButton, InlineKeyboardMarkup,
-    InputFile, Update,
+    BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
+    InputFile, KeyboardButton, ReplyKeyboardMarkup,
+    ReplyKeyboardRemove, Update,
 )
+from telegram.constants import ChatAction
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CallbackQueryHandler, ContextTypes,
@@ -336,16 +338,19 @@ def get_server_info() -> dict:
 # Клавиатуры
 # ══════════════════════════════════════════════════════════════════════════════
 
-def kb_main() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 Клиенты", callback_data="clients"),
-         InlineKeyboardButton("📊 Статус",  callback_data="status")],
-        [InlineKeyboardButton("➕ Добавить клиента", callback_data="add_start")],
-        [InlineKeyboardButton("🔄 Перезапустить awg0", callback_data="restart")],
-    ])
+def kb_main() -> ReplyKeyboardMarkup:
+    """Постоянная клавиатура снизу — главное меню."""
+    return ReplyKeyboardMarkup([
+        ["👥 Клиенты",        "📊 Статус"],
+        ["➕ Добавить клиента"],
+        ["🔄 Перезапустить awg0"],
+    ], resize_keyboard=True)
 
 def kb_back() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Главное меню", callback_data="main")]])
+    """Inline кнопка назад — для использования в edit_message_text."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("◀️ Главное меню", callback_data="main")
+    ]])
 
 def kb_clients(clients: list) -> InlineKeyboardMarkup:
     rows = []
@@ -423,7 +428,8 @@ def main_text() -> str:
 @auth
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        main_text(), parse_mode=ParseMode.HTML, reply_markup=kb_main()
+        main_text(), parse_mode=ParseMode.HTML,
+        reply_markup=kb_main()
     )
 
 
@@ -434,8 +440,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d = q.data
 
     # Главное меню
+    if d == "cancel_add":
+        ctx.user_data.clear()
+        await q.message.reply_text(main_text(), parse_mode=ParseMode.HTML, reply_markup=kb_main())
+        await q.message.delete()
+        return ConversationHandler.END
+
     if d == "main":
-        await q.edit_message_text(main_text(), parse_mode=ParseMode.HTML, reply_markup=kb_main())
+        await q.message.reply_text(main_text(), parse_mode=ParseMode.HTML, reply_markup=kb_main())
+        await q.message.delete()
         return
 
     # Список клиентов
@@ -612,7 +625,44 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"✅ <b>{name}</b> удалён", parse_mode=ParseMode.HTML, reply_markup=kb_back())
         return
 
-    # Статус
+    # Статус из inline кнопки "Обновить"
+    if d == "status_msg":
+        info = get_server_info()
+        clients = get_clients()
+        stats = get_live_stats()
+        online = sum(
+            1 for c in clients
+            if stats.get(c["pubkey"], {}).get("last_hs", 0)
+            and (time.time() - stats[c["pubkey"]]["last_hs"]) < 300
+        )
+        rc, out, _ = await asyncio.to_thread(run, ["awg", "show", AWG_IFACE, "transfer"])
+        rx = tx = 0
+        for line in out.splitlines():
+            p = line.split()
+            if len(p) >= 3:
+                try: rx += int(p[1]); tx += int(p[2])
+                except: pass
+        def hb2(b):
+            if b < 1024: return f"{b}B"
+            if b < 1024**2: return f"{b/1024:.1f}KB"
+            if b < 1024**3: return f"{b/1024**2:.1f}MB"
+            return f"{b/1024**3:.1f}GB"
+        text_s = (
+            f"📊 <b>Статус</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"🖥 <code>{info['ip']}:{info['port']}</code>\n"
+            f"📡 {'🟢 активен' if info['iface_up'] else '🔴 остановлен'}\n"
+            f"👥 {len(clients)} клиентов  🟢 {online} онлайн\n"
+            f"↓ {hb2(rx)}  ↑ {hb2(tx)}"
+        )
+        await q.edit_message_text(
+            text_s, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Обновить", callback_data="status_msg")]
+            ])
+        )
+        return
+
+    # Статус из on_callback (legacy)
     if d == "status":
         info = get_server_info()
         clients = get_clients()
@@ -846,17 +896,17 @@ def add_client(name: str, profile: str) -> tuple:
 
 @auth
 async def on_add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Entry point — нажатие кнопки Добавить клиента."""
-    q = update.callback_query
-    await q.answer()
+    """Entry point — нажатие кнопки Добавить клиента (Inline или Reply KB)."""
     ctx.user_data.clear()
-    await q.edit_message_text(
-        "➕ *Новый клиент*\n\nВведи имя (латиница, цифры, _):",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Отмена", callback_data="main")]
-        ])
-    )
+    text_msg = "➕ <b>Новый клиент</b>\n\nВведи имя (латиница, цифры, _):"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_add")]])
+
+    if update.callback_query:
+        q = update.callback_query
+        await q.answer()
+        await q.edit_message_text(text_msg, parse_mode=ParseMode.HTML, reply_markup=kb)
+    else:
+        await update.message.reply_text(text_msg, parse_mode=ParseMode.HTML, reply_markup=kb)
     return ADD_NAME
 
 
@@ -898,16 +948,85 @@ async def on_conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     ctx.user_data.clear()
-    await q.edit_message_text(main_text(), parse_mode=ParseMode.HTML, reply_markup=kb_main())
+    await q.message.reply_text(main_text(), parse_mode=ParseMode.HTML, reply_markup=kb_main())
+    await q.message.delete()
     return ConversationHandler.END
 
 
 @auth
 async def handle_any_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Любое текстовое сообщение вне ConversationHandler → главное меню."""
-    await update.message.reply_text(
-        main_text(), parse_mode=ParseMode.HTML, reply_markup=kb_main()
-    )
+    """Обработка кнопок Reply Keyboard и любых других сообщений."""
+    text = (update.message.text or "").strip()
+
+    if text == "👥 Клиенты":
+        clients = get_clients()
+        if not clients:
+            await update.message.reply_text(
+                "👥 Клиентов нет\n\nДобавь через ➕ Добавить клиента",
+                reply_markup=kb_main()
+            )
+            return
+        stats = get_live_stats()
+        lines = ["👥 <b>Клиенты:</b>\n"]
+        for c in clients:
+            s = stats.get(c["pubkey"], {})
+            hs = s.get("last_hs", 0)
+            icon = online_icon(hs)
+            lines.append(f"{icon} <b>{c['name']}</b>  <code>{c['ip'].split('/')[0]}</code>  ↓{s.get('rx','—')} ↑{s.get('tx','—')}")
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_clients(clients)
+        )
+
+    elif text == "📊 Статус":
+        info = get_server_info()
+        clients = get_clients()
+        stats = get_live_stats()
+        online = sum(
+            1 for c in clients
+            if stats.get(c["pubkey"], {}).get("last_hs", 0)
+            and (time.time() - stats[c["pubkey"]]["last_hs"]) < 300
+        )
+        rc, out, _ = await asyncio.to_thread(run, ["awg", "show", AWG_IFACE, "transfer"])
+        rx = tx = 0
+        for line in out.splitlines():
+            p = line.split()
+            if len(p) >= 3:
+                try: rx += int(p[1]); tx += int(p[2])
+                except: pass
+        def hb(b):
+            if b < 1024: return f"{b}B"
+            if b < 1024**2: return f"{b/1024:.1f}KB"
+            if b < 1024**3: return f"{b/1024**2:.1f}MB"
+            return f"{b/1024**3:.1f}GB"
+        text_out = (
+            f"📊 <b>Статус</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"🖥 <code>{info['ip']}:{info['port']}</code>\n"
+            f"📡 {'🟢 активен' if info['iface_up'] else '🔴 остановлен'}\n"
+            f"👥 {len(clients)} клиентов  🟢 {online} онлайн\n"
+            f"↓ {hb(rx)}  ↑ {hb(tx)}"
+        )
+        await update.message.reply_text(
+            text_out, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Обновить", callback_data="status_msg")]
+            ])
+        )
+
+    elif text == "🔄 Перезапустить awg0":
+        msg = await update.message.reply_text("⏳ Перезапускаю awg0...")
+        await asyncio.to_thread(run, ["awg-quick", "down", SERVER_CONF])
+        await asyncio.sleep(1)
+        rc, _, err = await asyncio.to_thread(run, ["awg-quick", "up", SERVER_CONF])
+        result = "✅ awg0 перезапущен" if rc == 0 else f"❌ Ошибка:\n<code>{_html.escape(err[:200])}</code>"
+        await msg.edit_text(result, parse_mode=ParseMode.HTML)
+
+    else:
+        # Любой другой текст → показываем главное меню
+        await update.message.reply_text(
+            main_text(), parse_mode=ParseMode.HTML, reply_markup=kb_main()
+        )
 
 
 def main():
@@ -923,7 +1042,10 @@ def main():
     # ConversationHandler — строго для добавления клиента
     # Важно: group=-1 чтобы обрабатывался РАНЬШЕ основного on_callback
     conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(on_add_start, pattern="^add_start$")],
+        entry_points=[
+            CallbackQueryHandler(on_add_start, pattern="^add_start$"),
+            MessageHandler(filters.Regex("^➕ Добавить клиента$"), on_add_start),
+        ],
         states={
             ADD_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, on_add_name)],
             ADD_PROFILE: [CallbackQueryHandler(on_add_profile, pattern="^prof:")],
@@ -938,17 +1060,28 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(conv, group=-1)
     app.add_handler(CallbackQueryHandler(on_callback), group=0)
-    # Любое сообщение вне диалога → главное меню
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, handle_any_message
     ), group=1)
+
+    async def post_init(application):
+        # Устанавливаем кнопку Menu и команды
+        await application.bot.set_my_commands([
+            BotCommand("start", "Главное меню"),
+        ])
+        from telegram import MenuButtonCommands
+        await application.bot.set_chat_menu_button(
+            menu_button=MenuButtonCommands()
+        )
+        log.info("MenuButton и команды установлены")
+
+    app.post_init = post_init
     log.info("Polling...")
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
-
 PYEOF
 
 chmod +x "$BOT_PY"
