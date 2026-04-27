@@ -428,7 +428,8 @@ def main_text() -> str:
 @auth
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        main_text(), parse_mode=ParseMode.HTML,
+        "🛡 <b>AWG Toolza Bot</b>\nГлавное меню:",
+        parse_mode=ParseMode.HTML,
         reply_markup=kb_main()
     )
 
@@ -447,7 +448,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if d == "main":
-        await q.message.reply_text(main_text(), parse_mode=ParseMode.HTML, reply_markup=kb_main())
+        await q.message.reply_text("🛡 <b>AWG Toolza Bot</b>\nГлавное меню:", parse_mode=ParseMode.HTML, reply_markup=kb_main())
         await q.message.delete()
         return
 
@@ -787,6 +788,7 @@ def add_client(name: str, profile: str) -> tuple:
 
     content = Path(SERVER_CONF).read_text()
     sp = {}
+    listen_port = ""
     for line in content.splitlines():
         if "=" in line and not line.startswith("[") and not line.startswith("#"):
             k, v = line.split("=", 1)
@@ -813,23 +815,34 @@ def add_client(name: str, profile: str) -> tuple:
     octet = next(i for i in range(2, 255) if i not in used)
     client_ip = f"{base}{octet}/32"
 
-    # Endpoint
-    endpoint = ""
-    for fpath in _glob.glob(CLIENTS_GLOB):
-        for line in Path(fpath).read_text().splitlines():
-            if line.startswith("Endpoint"):
-                endpoint = line.split("=", 1)[1].strip()
-                break
-        if endpoint: break
+    # Endpoint определён выше вместе с server_pubkey
 
-    # Публичный ключ сервера — из первого клиентского конфига
+    # Публичный ключ сервера — генерируем из серверного PrivateKey
     server_pubkey = ""
-    for fpath in _glob.glob(CLIENTS_GLOB):
-        for line in Path(fpath).read_text().splitlines():
-            if line.startswith("PublicKey"):
-                server_pubkey = line.split("=", 1)[1].strip()
-                break
-        if server_pubkey: break
+    endpoint = ""
+    for line in content.splitlines():
+        if line.startswith("PrivateKey"):
+            priv_srv = line.split("=", 1)[1].strip()
+            rc_pk, pub_srv, _ = run(["awg", "pubkey"], input_str=priv_srv)
+            if rc_pk == 0:
+                server_pubkey = pub_srv.strip()
+        if line.startswith("ListenPort"):
+            listen_port = line.split("=", 1)[1].strip()
+
+    # Endpoint — из IP сервера + ListenPort
+    rc_ip, srv_ip, _ = run(["bash", "-c", "ip route get 1 2>/dev/null | awk '{print $7; exit}'"])
+    if rc_ip == 0 and srv_ip.strip():
+        endpoint = f"{srv_ip.strip()}:{listen_port}" if listen_port else ""
+    
+    # Fallback — из существующих клиентских конфигов
+    if not server_pubkey or not endpoint:
+        for fpath in _glob.glob(CLIENTS_GLOB):
+            for line in Path(fpath).read_text().splitlines():
+                if line.startswith("PublicKey") and not server_pubkey:
+                    server_pubkey = line.split("=", 1)[1].strip()
+                if line.startswith("Endpoint") and not endpoint:
+                    endpoint = line.split("=", 1)[1].strip()
+            if server_pubkey and endpoint: break
 
     # CPS
     i_params = ""
@@ -1022,11 +1035,7 @@ async def handle_any_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         result = "✅ awg0 перезапущен" if rc == 0 else f"❌ Ошибка:\n<code>{_html.escape(err[:200])}</code>"
         await msg.edit_text(result, parse_mode=ParseMode.HTML)
 
-    else:
-        # Любой другой текст → показываем главное меню
-        await update.message.reply_text(
-            main_text(), parse_mode=ParseMode.HTML, reply_markup=kb_main()
-        )
+    # else: игнорируем неизвестные сообщения — не спамим меню
 
 
 def main():
