@@ -1353,11 +1353,11 @@ gen_awg_params() {
   # ── Junk train ──
   local Jc Jmin Jmax
   Jc=$(rand_range 4 16)
-  Jmin=$(rand_range 8 64)
-  Jmax=$(rand_range 80 200)
-  # Обеспечиваем Jmin < Jmax
+  Jmin=$(rand_range 50 256)
+  Jmax=$(rand_range 300 1000)
+  # Обеспечиваем Jmin < Jmax!
   if [[ $Jmin -ge $Jmax ]]; then
-    Jmax=$((Jmin + $(rand_range 10 60)))
+    Jmax=$((Jmin + $(rand_range 100 500)))
   fi
 
   # ── Padding S1/S2 ──
