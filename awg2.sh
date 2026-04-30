@@ -1,9 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.3"
+VERSION="v6.4"
+UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
+SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ─────────────────────────────────────────────────────────────
+# v6.4:
+#   • Сохранение клиентов при «Сбросить сервер» (переподпись)
+#   • Авто-бэкап перед опасными операциями
+#   • Авторемонт awg0 (проверка состояния и восстановление)
+#   • Обновление скрипта с GitHub
+# v6.3:
 # - AWG Toolza — только AWG 2.0
 # - Выбор типа I1 при ручном вводе домена (7 протоколов)
 # - Бекап и восстановление конфигов AWG 2.0 (~/awg_backup/)
@@ -918,6 +926,300 @@ get_status() {
   echo -e "$ip|$port|$status|$clients"
 }
 
+# ══════════════════════════════════════════════════════════
+# v6.4: Авто-бэкап перед опасными операциями
+# ══════════════════════════════════════════════════════════
+# Создаёт быстрый автоматический бэкап с префиксом "auto_<reason>_"
+# в ~/awg_backup/. Не задаёт вопросов. Используется do_reset_server,
+# do_clean_clients, do_uninstall.
+auto_backup() {
+  local reason="${1:-operation}"
+  [[ ! -f "$SERVER_CONF" ]] && return 0  # нечего бэкапить
+
+  mkdir -p "$BACKUP_DIR" 2>/dev/null || return 1
+  local stamp
+  stamp=$(date +%Y%m%d_%H%M%S)
+  local archive="${BACKUP_DIR}/auto_${reason}_${stamp}.tar.gz"
+
+  # Архивируем серверный конфиг + все клиентские
+  local files=("$SERVER_CONF")
+  shopt -s nullglob
+  local clients=( /root/*_awg2.conf )
+  shopt -u nullglob
+  [[ ${#clients[@]} -gt 0 ]] && files+=("${clients[@]}")
+
+  if tar -czf "$archive" "${files[@]}" 2>/dev/null; then
+    chmod 600 "$archive"
+    bkup "Авто-бэкап: $(basename "$archive")"
+    return 0
+  fi
+  return 1
+}
+
+# ══════════════════════════════════════════════════════════
+# v6.4: Авторемонт awg0
+# ══════════════════════════════════════════════════════════
+# Проверяет состояние awg0 и пытается починить:
+#   - конфиг есть, но интерфейс не запущен → awg-quick up
+#   - конфиг есть и интерфейс запущен, но peer'ов нет → reload
+#   - модуль не загружен → modprobe
+do_repair() {
+  echo ""
+  hdr "🔧 Проверка и авторемонт awg0"
+
+  local issues=0 fixed=0
+
+  # 1. Модуль ядра
+  if lsmod | grep -q '^amneziawg'; then
+    ok "Модуль amneziawg загружен"
+  else
+    warn "Модуль amneziawg НЕ загружен"
+    issues=$((issues+1))
+    info "Пробую: modprobe amneziawg"
+    if modprobe amneziawg 2>/dev/null; then
+      ok "Модуль загружен"
+      fixed=$((fixed+1))
+    else
+      err "modprobe amneziawg провалился"
+      info "Возможно нужен reboot или переустановка модуля"
+    fi
+  fi
+
+  # 1.5. Автозагрузка модуля при старте системы
+  if [[ -f /etc/modules-load.d/amneziawg.conf ]] && \
+     grep -q "^amneziawg" /etc/modules-load.d/amneziawg.conf; then
+    ok "Автозагрузка модуля настроена"
+  else
+    warn "Автозагрузка модуля НЕ настроена (после reboot модуль не поднимется сам)"
+    issues=$((issues+1))
+    if echo "amneziawg" > /etc/modules-load.d/amneziawg.conf 2>/dev/null; then
+      ok "Автозагрузка настроена: /etc/modules-load.d/amneziawg.conf"
+      fixed=$((fixed+1))
+    else
+      err "Не удалось записать /etc/modules-load.d/amneziawg.conf"
+    fi
+  fi
+
+  # 2. Конфиг
+  if [[ ! -f "$SERVER_CONF" ]]; then
+    err "Серверный конфиг не найден: $SERVER_CONF"
+    info "Сначала пункт 2 — создать сервер"
+    return 1
+  fi
+  ok "Серверный конфиг на месте"
+
+  # 3. IP forwarding
+  local ipfwd
+  ipfwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "0")
+  if [[ "$ipfwd" == "1" ]]; then
+    ok "IP forwarding включён"
+  else
+    warn "IP forwarding выключён"
+    issues=$((issues+1))
+    sysctl -w net.ipv4.ip_forward=1 -q
+    grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf || \
+      echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+    ok "IP forwarding включён"
+    fixed=$((fixed+1))
+  fi
+
+  # 4. Интерфейс
+  if ip link show awg0 &>/dev/null; then
+    ok "Интерфейс awg0 присутствует"
+
+    # Проверка состояния (UP/DOWN)
+    if ip link show awg0 | grep -q "state UP\|UP,"; then
+      ok "awg0 в состоянии UP"
+    else
+      warn "awg0 существует, но не UP"
+      issues=$((issues+1))
+      ip link set awg0 up 2>/dev/null && ok "awg0 поднят" && fixed=$((fixed+1)) || \
+        warn "Не удалось поднять, попробуем перезапуск"
+    fi
+
+    # Сверяем количество peer'ов в конфиге и в ядре
+    local conf_peers live_peers
+    conf_peers=$(grep -c "^\[Peer\]" "$SERVER_CONF" 2>/dev/null || echo "0")
+    live_peers=$(awg show awg0 peers 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$conf_peers" != "$live_peers" ]]; then
+      warn "Расхождение: в конфиге $conf_peers пиров, в ядре $live_peers"
+      issues=$((issues+1))
+      info "Перезапуск awg0 для синхронизации..."
+      awg-quick down "$SERVER_CONF" 2>/dev/null || true
+      sleep 1
+      if awg-quick up "$SERVER_CONF" 2>/dev/null; then
+        ok "awg0 перезапущен — пиры синхронизированы"
+        fixed=$((fixed+1))
+      else
+        err "Не удалось перезапустить awg0"
+      fi
+    else
+      ok "Пиры синхронизированы ($conf_peers)"
+    fi
+  else
+    warn "Интерфейс awg0 НЕ существует"
+    issues=$((issues+1))
+    info "Запускаю: awg-quick up $SERVER_CONF"
+    if awg-quick up "$SERVER_CONF" 2>/dev/null; then
+      ok "awg0 запущен"
+      fixed=$((fixed+1))
+    else
+      err "awg-quick up провалился"
+      info "Подробности: awg-quick up $SERVER_CONF"
+    fi
+  fi
+
+  # 5. iptables NAT
+  local ext_if
+  ext_if=$(ip route | awk '/default/ {print $5; exit}')
+  if [[ -n "$ext_if" ]]; then
+    if iptables -t nat -C POSTROUTING -o "$ext_if" -j MASQUERADE 2>/dev/null; then
+      ok "iptables NAT MASQUERADE на $ext_if"
+    else
+      warn "iptables NAT MASQUERADE отсутствует"
+      issues=$((issues+1))
+      iptables -t nat -A POSTROUTING -o "$ext_if" -j MASQUERADE && \
+        ok "MASQUERADE добавлен" && fixed=$((fixed+1))
+    fi
+
+    if iptables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null; then
+      ok "iptables FORWARD -i awg0 ACCEPT"
+    else
+      warn "iptables FORWARD -i awg0 отсутствует"
+      issues=$((issues+1))
+      iptables -A FORWARD -i awg0 -j ACCEPT && \
+        ok "FORWARD -i awg0 добавлен" && fixed=$((fixed+1))
+    fi
+  fi
+
+  # Итог
+  echo ""
+  if [[ $issues -eq 0 ]]; then
+    success_box "✓ Всё в порядке — ремонт не требуется"
+  elif [[ $fixed -eq $issues ]]; then
+    success_box "✓ Найдено $issues проблем(ы), все исправлены"
+  else
+    hdr "⚠ Найдено $issues проблем(ы), исправлено $fixed"
+    info "Часть проблем требует ручного вмешательства"
+  fi
+}
+
+# ══════════════════════════════════════════════════════════
+# v6.4: Обновление скрипта с GitHub
+# ══════════════════════════════════════════════════════════
+do_self_update() {
+  echo ""
+  hdr "⬇  Обновление скрипта"
+
+  # Куда установлен awg2 — ищем динамически
+  local target="$SCRIPT_PATH"
+  if [[ ! -f "$target" ]]; then
+    # Резервный путь — текущий запущенный скрипт
+    target=$(readlink -f "$0" 2>/dev/null || echo "$0")
+  fi
+
+  info "URL: $UPDATE_URL"
+  info "Файл: $target"
+  echo ""
+
+  # Качаем во временный файл
+  local tmp_file
+  tmp_file=$(mktemp /tmp/awg2.new.XXXXXX) || { err "mktemp провалился"; return 1; }
+
+  if ! curl -fsSL --connect-timeout 10 --max-time 60 "$UPDATE_URL" -o "$tmp_file"; then
+    err "Не удалось скачать обновление"
+    info "Проверь соединение или URL"
+    rm -f "$tmp_file"
+    return 1
+  fi
+
+  # Базовая валидация скачанного: должен быть bash-скрипт
+  if ! head -1 "$tmp_file" | grep -q '^#!.*bash'; then
+    err "Скачанный файл не похож на bash-скрипт"
+    rm -f "$tmp_file"
+    return 1
+  fi
+
+  # Проверка синтаксиса
+  if ! bash -n "$tmp_file" 2>/dev/null; then
+    err "Скачанный скрипт содержит синтаксические ошибки"
+    info "Возможно сетевой сбой при скачивании, попробуй ещё раз"
+    rm -f "$tmp_file"
+    return 1
+  fi
+
+  # Извлекаем версию из скачанного
+  local new_ver
+  new_ver=$(grep -m1 '^VERSION=' "$tmp_file" | cut -d'"' -f2)
+  if [[ -z "$new_ver" ]]; then
+    warn "Не удалось определить версию в скачанном файле"
+    new_ver="?"
+  fi
+
+  echo -e "  ${W}Текущая  : ${N}$VERSION"
+  echo -e "  ${W}Новая    : ${N}$new_ver"
+  echo ""
+
+  # Сравниваем версии (vX.Y → числа). Если на GitHub старше или такая же — спрашиваем.
+  local cur_num new_num
+  cur_num=$(echo "$VERSION" | sed 's/^v//' | awk -F. '{ printf "%d%03d\n", $1, $2 }')
+  new_num=$(echo "$new_ver" | sed 's/^v//' | awk -F. '{ printf "%d%03d\n", $1, $2 }')
+
+  if [[ "$new_ver" == "?" ]]; then
+    warn "Не удалось определить версию"
+    local CONFIRM_FORCE
+    read -rp "$(echo -e "${C}  Установить всё равно? [y/N]: ${N}")" CONFIRM_FORCE
+    if [[ ! "$CONFIRM_FORCE" =~ ^[Yy]$ ]]; then
+      rm -f "$tmp_file"
+      return 0
+    fi
+  elif [[ "$new_num" -lt "$cur_num" ]]; then
+    warn "На GitHub версия СТАРШЕ текущей — это даунгрейд!"
+    echo -e "${Y}  Текущая ($VERSION) > GitHub ($new_ver)${N}"
+    echo -e "${Y}  Возможно ты обновлял скрипт вручную, а в репо ещё старая версия.${N}"
+    echo ""
+    local CONFIRM_DOWNGRADE
+    read -rp "$(echo -e "${R}  Откатить до $new_ver? [y/N]: ${N}")" CONFIRM_DOWNGRADE
+    if [[ ! "$CONFIRM_DOWNGRADE" =~ ^[Yy]$ ]]; then
+      info "Отменено — текущая версия сохранена"
+      rm -f "$tmp_file"
+      return 0
+    fi
+  elif [[ "$new_num" -eq "$cur_num" ]]; then
+    info "Версия совпадает, обновление не нужно"
+    local CONFIRM_FORCE
+    read -rp "$(echo -e "${C}  Всё равно перезаписать? [y/N]: ${N}")" CONFIRM_FORCE
+    if [[ ! "$CONFIRM_FORCE" =~ ^[Yy]$ ]]; then
+      rm -f "$tmp_file"
+      return 0
+    fi
+  else
+    ok "Доступно обновление: $VERSION → $new_ver"
+  fi
+
+  # Бэкап текущего скрипта
+  local backup="${target}.bak.$(date +%s)"
+  if cp "$target" "$backup" 2>/dev/null; then
+    info "Резервная копия: $backup"
+  else
+    warn "Не удалось создать резервную копию (продолжаем)"
+  fi
+
+  # Atomic replace
+  chmod +x "$tmp_file"
+  if mv "$tmp_file" "$target"; then
+    ok "Скрипт обновлён до $new_ver"
+    echo ""
+    info "Перезапусти: ${W}sudo awg2${N}"
+    echo ""
+    exit 0
+  else
+    err "Не удалось заменить файл (нет прав?)"
+    info "Скачанная версия: $tmp_file"
+    return 1
+  fi
+}
+
 show_header() {
   clear
   local s ip port st clients
@@ -995,6 +1297,16 @@ show_menu() {
     echo -e "  ${D}11) Сбросить сервер (нет сервера)${N}"
   fi
   echo -e "  ${R}12)${N} Удалить всё (пакеты + конфиги)"
+  echo ""
+
+  # === СЕРВИС ===
+  echo -e "  ${M}▸ Сервис:${N}"
+  if $HAS_SERVER_CONF; then
+    echo -e "  ${M}13)${N} Проверить и починить awg0 (авторемонт)"
+  else
+    echo -e "  ${D}13) Авторемонт (нужен пункт 2)${N}"
+  fi
+  echo -e "  ${M}14)${N} Обновить скрипт с GitHub"
 
   echo ""
   echo -e "  ${W}0)${N} Выход"
@@ -1364,17 +1676,17 @@ do_gen() {
   # MTU выбираем ДО мимикрии — CPS-генератору нужен актуальный MTU
   hdr "▬  MTU"
   echo "  1) 1420 — стандартный WireGuard"
-  echo "  2) 1380 — баланс, рекомендуется"
+  echo "  2) 1380 — баланс"
   echo "  3) 1360 — провайдеры с PPPoE overhead"
   echo "  4) 1340 — мобильный 4G/LTE"
-  echo "  5) 1320 — безопасно для AWG 2.0 + CPS"
+  echo "  5) 1320 — безопасно для AWG 2.0 + CPS, рекомендуется"
   echo "  6) 1280 — максимальная совместимость"
   echo "  7) 1500 — Ethernet без tunnel overhead"
   echo "  8) Вручную"
   MTU=""
   local MTU_CHOICE
-  read -rp "$(echo -e "${C}  Выбор [1-8] (Enter = 1380): ${N}")" MTU_CHOICE
-  MTU_CHOICE=${MTU_CHOICE:-2}
+  read -rp "$(echo -e "${C}  Выбор [1-8] (Enter = 1320): ${N}")" MTU_CHOICE
+  MTU_CHOICE=${MTU_CHOICE:-5}
   case $MTU_CHOICE in
     1) MTU=1420 ;;
     2) MTU=1380 ;;
@@ -1392,7 +1704,7 @@ do_gen() {
         warn "Некорректный MTU. Должно быть число 1280-1500"
       done
       ;;
-    *) MTU=1380 ;;
+    *) MTU=1320 ;;
   esac
 
   choose_obf_level
@@ -1439,14 +1751,18 @@ do_gen() {
   esac
 
   hdr "»  Порт сервера"
-  read -rp "$(echo -e "${C}  Порт [Enter = случайный / 51820 = стандартный / свой]: ${N}")" PORT
-  if [[ -z "${PORT:-}" || "${PORT:-}" == "r" || "${PORT:-}" == "R" ]]; then
-    PORT=$(rand_range 30001 65535)
-    ok "случайный порт: $PORT"
-  fi
-  [[ "$PORT" =~ ^[0-9]+$ ]] && [[ "$PORT" -ge 1024 && "$PORT" -le 65535 ]] || {
-    err "Порт должен быть 1024-65535"; return 1
-  }
+  while true; do
+    read -rp "$(echo -e "${C}  Порт [Enter = случайный / 51820 = стандартный / свой]: ${N}")" PORT
+    if [[ -z "${PORT:-}" || "${PORT:-}" == "r" || "${PORT:-}" == "R" ]]; then
+      PORT=$(rand_range 30001 65535)
+      ok "случайный порт: $PORT"
+      break
+    fi
+    if [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1024 && PORT <= 65535 )); then
+      break
+    fi
+    warn "Порт должен быть числом 1024-65535. Попробуй ещё раз."
+  done
 
   local obf_label
   case ${OBF_LEVEL:-1} in
@@ -1485,8 +1801,18 @@ do_gen() {
   srv_ip=$(get_public_ip 2>/dev/null || echo "")
   if [[ -z "$srv_ip" ]]; then
     err "Не удалось получить внешний IP (нет интернета?)"
-    read -rp "$(echo -e "${C}  Введи IP сервера вручную: ${N}")" srv_ip
-    [[ -z "$srv_ip" ]] && { err "IP обязателен"; return 1; }
+    while true; do
+      read -rp "$(echo -e "${C}  Введи IP сервера вручную: ${N}")" srv_ip
+      if [[ -n "$srv_ip" ]]; then
+        # Базовая валидация — IPv4 или домен
+        if [[ "$srv_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$srv_ip" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+          break
+        fi
+        warn "Некорректный IP/домен. Пример: 1.2.3.4 или example.com"
+      else
+        warn "IP обязателен. Введи или нажми Ctrl+C для отмены."
+      fi
+    done
   fi
   ok "IP сервера: $srv_ip"
 
@@ -1609,6 +1935,7 @@ do_gen() {
   _setup_autostart
 }
 
+
 _setup_autostart() {
   local unit_dir="/etc/systemd/system/awg-quick@awg0.service.d"
   mkdir -p "$unit_dir"
@@ -1618,8 +1945,15 @@ ExecStart=
 ExecStart=/usr/bin/awg-quick up awg0
 EOF
   systemctl daemon-reload
-  systemctl enable awg-quick@awg0 2>/dev/null && ok "Автозапуск включён" || \
-    warn "Не удалось включить автозапуск"
+  systemctl enable awg-quick@awg0 2>/dev/null && ok "Автозапуск awg0 включён" || \
+    warn "Не удалось включить автозапуск awg0"
+
+  # Автозагрузка модуля ядра при старте системы
+  if echo "amneziawg" > /etc/modules-load.d/amneziawg.conf 2>/dev/null; then
+    ok "Автозагрузка модуля amneziawg настроена"
+  else
+    warn "Не удалось настроить автозагрузку модуля"
+  fi
 }
 
 # ══════════════════════════════════════════════════════════
@@ -2371,21 +2705,9 @@ do_reset_server() {
     return 0
   fi
 
-  # Предложение бекапа
+  # Авто-бэкап (всегда создаём перед сбросом)
   if [[ -f "$SERVER_CONF" ]]; then
-    echo ""
-    local CONFIRM_BAK
-    read -rp "$(echo -e "${C}  Создать бекап перед сбросом? [Y/n]: ${N}")" CONFIRM_BAK
-    CONFIRM_BAK=${CONFIRM_BAK:-y}
-    if [[ "$CONFIRM_BAK" =~ ^[Yy]$ ]]; then
-      info "Создаём бекап..."
-      if do_backup; then
-        ok "Бекап создан — можно восстановить через пункт 8"
-      else
-        warn "Бекап не удался — продолжаем сброс"
-      fi
-      echo ""
-    fi
+    auto_backup "reset" || warn "Авто-бэкап не удался"
   fi
 
   # === Сброс ===
@@ -2581,6 +2903,11 @@ do_uninstall() {
   read -rp "$(echo -e "${R}  Подтверди удаление [yes/N]: ${N}")" CONFIRM_DEL
   [[ "$CONFIRM_DEL" != "yes" ]] && { warn "Отменено."; return 0; }
 
+  # v6.4: авто-бэкап перед удалением (последний шанс восстановиться)
+  if [[ -f "$SERVER_CONF" ]]; then
+    auto_backup "uninstall" || warn "Авто-бэкап не удался"
+  fi
+
   trash "Останавливаем awg0..."
   awg-quick down "$SERVER_CONF" 2>/dev/null || \
     ip link delete dev awg0 2>/dev/null || true
@@ -2597,6 +2924,7 @@ do_uninstall() {
   trash "Удаляем конфиги..."
   rm -rf /etc/amnezia 2>/dev/null || true
   rm -f /root/*_awg2.conf 2>/dev/null || true
+  rm -f /etc/modules-load.d/amneziawg.conf 2>/dev/null || true
 
   trash "Удаляем UFW правила..."
   if command -v ufw &>/dev/null; then
@@ -2788,6 +3116,9 @@ do_clean_clients() {
   echo ""
   read -rp "$(echo -e "${R}  Подтвердить удаление клиентов? [yes/N]: ${N}")" CONFIRM
   [[ "$CONFIRM" != "yes" ]] && { warn "Отменено."; return 0; }
+
+  # v6.4: авто-бэкап перед опасной операцией
+  auto_backup "clean" || warn "Авто-бэкап не удался"
 
   trash "Останавливаем awg0..."
   awg-quick down "$SERVER_CONF" 2>/dev/null || true
@@ -3031,6 +3362,8 @@ while true; do
     10)  do_clean_clients ;;
     11)  do_reset_server ;;
     12)  do_uninstall ;;
+    13)  do_repair ;;
+    14)  do_self_update ;;
     999) do_debug_cps ;;
     0)  log_info "Выход"
         echo -e "\n${G}  В путь! ${N}"
