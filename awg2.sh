@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.4"
+VERSION="v6.7"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -73,6 +73,18 @@ prompt_retry() {
 
 SERVER_CONF="/etc/amnezia/amneziawg/awg0.conf"
 LOG_FILE="/var/log/awg-manager.log"
+
+# Warp туннель (Cloudflare wgcf) — пункт меню 15
+WARP_DIR="/etc/wgcf"
+WARP_CONF="/etc/wireguard/warp0.conf"
+WARP_ACCOUNT="$WARP_DIR/wgcf-account.toml"
+WARP_PROFILE="$WARP_DIR/wgcf-profile.conf"
+WARP_STATE="$WARP_DIR/state"
+WARP_PEERS="$WARP_DIR/peers.list"
+WARP_HEALTH_LOG="/var/log/awg-warp-health.log"
+WARP_HEALTH_SCRIPT="/usr/local/bin/awg-warp-healthcheck.sh"
+WARP_HEALTH_TIMER="/etc/systemd/system/awg-warp-healthcheck.timer"
+WARP_HEALTH_SERVICE="/etc/systemd/system/awg-warp-healthcheck.service"
 
 # ── Логирование ────────────────────────────────────────────
 _log() {
@@ -1209,6 +1221,29 @@ do_self_update() {
   chmod +x "$tmp_file"
   if mv "$tmp_file" "$target"; then
     ok "Скрипт обновлён до $new_ver"
+
+    # Авто-очистка PPA остатков при апгрейде с версий до v6.7 (когда был PPA)
+    # Сравним мажорные/минорные числа: если новая >= 6.7, чистим
+    local new_major_minor
+    new_major_minor=$(echo "$new_ver" | sed 's/^v//' | awk -F. '{ printf "%d%03d\n", $1, $2 }')
+    if [[ "${new_major_minor:-0}" -ge "6007" ]]; then
+      local cleaned=0
+      for f in /etc/apt/sources.list.d/amnezia*.list \
+               /etc/apt/sources.list.d/amnezia*.sources \
+               /etc/apt/sources.list.d/canonical-kernel-team*.list \
+               /etc/apt/sources.list.d/canonical-kernel-team*.sources; do
+        if [[ -f "$f" ]]; then
+          rm -f "$f"
+          cleaned=1
+        fi
+      done
+      rm -f /etc/apt/trusted.gpg.d/amnezia*.gpg 2>/dev/null
+      rm -f /etc/apt/keyrings/amnezia*.gpg 2>/dev/null
+      if [[ $cleaned -eq 1 ]]; then
+        info "Удалены остатки PPA от прошлых версий (теперь установка через git)"
+      fi
+    fi
+
     echo ""
     info "Перезапусти: ${W}sudo awg2${N}"
     echo ""
@@ -1307,6 +1342,17 @@ show_menu() {
     echo -e "  ${D}13) Авторемонт (нужен пункт 2)${N}"
   fi
   echo -e "  ${M}14)${N} Обновить скрипт с GitHub"
+  echo ""
+
+  # === WARP ТУННЕЛЬ ===
+  echo -e "  ${C}▸ Warp туннель:${N}"
+  if ip link show warp0 &>/dev/null; then
+    echo -e "  ${C}15)${N} Warp туннель  ${G}● включен${N}"
+  elif [[ -f "$WARP_CONF" ]]; then
+    echo -e "  ${C}15)${N} Warp туннель  ${D}○ настроен, выключен${N}"
+  else
+    echo -e "  ${C}15)${N} Warp туннель  ${D}○ не настроен${N}"
+  fi
 
   echo ""
   echo -e "  ${W}0)${N} Выход"
@@ -1498,26 +1544,21 @@ do_install() {
   echo -e "  ${W}Codename${N} : ${OS_CODENAME:-n/a}"
   echo ""
 
-  local USE_PPA=0 USE_GIT_TOOLS=0
   case "$OS_ID" in
     ubuntu)
       case "$OS_VER" in
         24.04|24.10|25.04|25.10)
-          USE_PPA=1
-          ok "Ubuntu $OS_VER — PPA amnezia/ppa поддерживается"
+          ok "Ubuntu $OS_VER — будем собирать amneziawg через git+DKMS"
           ;;
         *)
-          warn "Ubuntu $OS_VER не в списке проверенных, но пробуем PPA"
-          USE_PPA=1
+          warn "Ubuntu $OS_VER не в списке проверенных, но пробуем git+DKMS"
           ;;
       esac
       ;;
     debian)
       case "$OS_VER" in
         12|13)
-          USE_GIT_TOOLS=1
-          ok "Debian $OS_VER — будем собирать amneziawg-tools из исходников"
-          info "PPA amnezia/ppa для Debian не собирается, используем git + make"
+          ok "Debian $OS_VER — будем собирать amneziawg через git+DKMS"
           ;;
         *)
           err "Debian $OS_VER не поддерживается. Нужен 12 или 13"
@@ -1531,6 +1572,66 @@ do_install() {
       ;;
   esac
 
+  # ───────────── Очистка остатков PPA от прошлых попыток установки
+  # Чтобы apt-get update не плевался ошибками типа "Temporary failure resolving"
+  # при наличии висящих PPA от прошлой версии скрипта
+  hdr "✂  Очистка старых PPA"
+  local cleaned=0
+  for f in /etc/apt/sources.list.d/amnezia*.list \
+           /etc/apt/sources.list.d/amnezia*.sources \
+           /etc/apt/sources.list.d/canonical-kernel-team*.list \
+           /etc/apt/sources.list.d/canonical-kernel-team*.sources; do
+    if [[ -f "$f" ]]; then
+      info "Удаляю $f"
+      rm -f "$f"
+      cleaned=1
+    fi
+  done
+  # GPG ключи от старых PPA
+  rm -f /etc/apt/trusted.gpg.d/amnezia*.gpg 2>/dev/null
+  rm -f /etc/apt/keyrings/amnezia*.gpg 2>/dev/null
+  if [[ $cleaned -eq 1 ]]; then
+    ok "Старые PPA удалены"
+  else
+    ok "Чисто — PPA остатков нет"
+  fi
+
+  # ───────────── Проверка DNS
+  hdr "⌘  Проверка DNS"
+  if ! getent hosts github.com &>/dev/null; then
+    warn "DNS не работает — github.com не резолвится"
+    info "Применяю Cloudflare + Google DNS как fallback..."
+    if [[ -L /etc/resolv.conf ]]; then
+      # systemd-resolved — добавляем DNS через resolvectl
+      resolvectl dns 2>/dev/null | head -5 || true
+      info "Если есть systemd-resolved, проверь: resolvectl status"
+    fi
+    cat > /tmp/resolv.conf.fix << EOF
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 9.9.9.9
+EOF
+    # Бекапим существующий resolv.conf
+    [[ -f /etc/resolv.conf && ! -f /etc/resolv.conf.awg-backup ]] && \
+      cp /etc/resolv.conf /etc/resolv.conf.awg-backup 2>/dev/null
+    cp /tmp/resolv.conf.fix /etc/resolv.conf
+    rm -f /tmp/resolv.conf.fix
+
+    if getent hosts github.com &>/dev/null; then
+      ok "DNS работает (Cloudflare + Google)"
+    else
+      err "DNS всё ещё не работает. Проверь сетевую настройку сервера"
+      info "Команды для диагностики:"
+      info "  ping 1.1.1.1            (проверка интернета)"
+      info "  cat /etc/resolv.conf    (текущие DNS)"
+      info "  resolvectl status       (если systemd-resolved)"
+      prompt_retry || return 1
+      continue
+    fi
+  else
+    ok "DNS работает"
+  fi
+
   hdr "+  Обновление системы"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -q || { err "Не удалось обновить репозитории"; prompt_retry || return 1; continue; }
@@ -1540,12 +1641,8 @@ do_install() {
 
   hdr "+  Установка зависимостей"
   local base_deps=(python3 net-tools curl ufw iptables qrencode bc ca-certificates gnupg)
-  if [[ $USE_PPA -eq 1 ]]; then
-    base_deps+=(software-properties-common python3-launchpadlib)
-  fi
-  if [[ $USE_GIT_TOOLS -eq 1 ]]; then
-    base_deps+=(build-essential git libmnl-dev pkg-config dkms)
-  fi
+  # Всегда добавляем deps для git+DKMS сборки
+  base_deps+=(build-essential git libmnl-dev pkg-config dkms)
   apt-get install -y -q "${base_deps[@]}"
 
   hdr "+  Kernel headers"
@@ -1554,42 +1651,37 @@ do_install() {
   apt-get install -y -q linux-headers-amd64 || \
   { err "Не удалось установить linux-headers"; info "Попробуй: apt-get install linux-headers-generic"; prompt_retry || return 1; continue; }
 
-  if [[ $USE_PPA -eq 1 ]]; then
-    hdr "+  AmneziaWG (PPA)"
-    add-apt-repository -y ppa:amnezia/ppa || { err "Не удалось добавить PPA"; prompt_retry || return 1; continue; }
-    apt-get update -q
-    apt-get install -y -q amneziawg amneziawg-tools
-  else
-    # Debian: kernel module + tools из git
-    hdr "+  AmneziaWG kernel module (git + DKMS)"
-    local tmp_mod=/tmp/amneziawg-linux-kernel-module
-    rm -rf "$tmp_mod"
-    git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git "$tmp_mod" || {
-      err "Не удалось клонировать kernel module"; prompt_retry || return 1; continue
-    }
-    (
-      cd "$tmp_mod/src" || exit 1
-      make dkms-install || exit 1
-      local mod_ver
-      mod_ver=$(grep -oP 'version\s*"\K[^"]+' dkms.conf 2>/dev/null || echo "1.0.0")
-      dkms add -m amneziawg -v "$mod_ver" 2>/dev/null || true
-      dkms build -m amneziawg -v "$mod_ver" || exit 1
-      dkms install -m amneziawg -v "$mod_ver" || exit 1
-    ) || { err "Сборка kernel module провалилась"; prompt_retry || return 1; continue; }
-    rm -rf "$tmp_mod"
+  # AmneziaWG kernel module + tools через git+DKMS (стабильнее PPA)
+  hdr "+  AmneziaWG kernel module (git + DKMS)"
+  local tmp_mod=/tmp/amneziawg-linux-kernel-module
+  rm -rf "$tmp_mod"
+  git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git "$tmp_mod" || {
+    err "Не удалось клонировать kernel module"
+    info "Проверь интернет: ping github.com"
+    prompt_retry || return 1; continue
+  }
+  (
+    cd "$tmp_mod/src" || exit 1
+    make dkms-install || exit 1
+    local mod_ver
+    mod_ver=$(grep -oP 'version\s*"\K[^"]+' dkms.conf 2>/dev/null || echo "1.0.0")
+    dkms add -m amneziawg -v "$mod_ver" 2>/dev/null || true
+    dkms build -m amneziawg -v "$mod_ver" || exit 1
+    dkms install -m amneziawg -v "$mod_ver" || exit 1
+  ) || { err "Сборка kernel module провалилась"; prompt_retry || return 1; continue; }
+  rm -rf "$tmp_mod"
 
-    hdr "+  amneziawg-tools (git + make)"
-    local tmp_tools=/tmp/amneziawg-tools
-    rm -rf "$tmp_tools"
-    git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-tools.git "$tmp_tools" || {
-      err "Не удалось клонировать tools"; prompt_retry || return 1; continue
-    }
-    (
-      cd "$tmp_tools/src" || exit 1
-      make && make install
-    ) || { err "Сборка tools провалилась"; prompt_retry || return 1; continue; }
-    rm -rf "$tmp_tools"
-  fi
+  hdr "+  amneziawg-tools (git + make)"
+  local tmp_tools=/tmp/amneziawg-tools
+  rm -rf "$tmp_tools"
+  git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-tools.git "$tmp_tools" || {
+    err "Не удалось клонировать tools"; prompt_retry || return 1; continue
+  }
+  (
+    cd "$tmp_tools/src" || exit 1
+    make && make install
+  ) || { err "Сборка tools провалилась"; prompt_retry || return 1; continue; }
+  rm -rf "$tmp_tools"
 
   if command -v awg &>/dev/null; then
     ok "amneziawg-tools: $(awg --version 2>/dev/null || echo 'установлен')"
@@ -2886,6 +2978,859 @@ do_debug_cps() {
   log_info "do_debug_cps: создано ${total} файлов в $DEBUG_DIR"
 }
 
+
+# ══════════════════════════════════════════════════════════
+# 15. WARP ТУННЕЛЬ (Cloudflare wgcf)
+# ══════════════════════════════════════════════════════════
+# Перенаправляет трафик AWG туннеля через Cloudflare Warp.
+# Поддерживает бесплатный Warp и Warp+ с лицензионным ключом.
+# Полезно когда IP сервера в блок-листах РКН — выходной IP меняется на Cloudflare.
+
+_warp_install_wgcf() {
+  if command -v wgcf &>/dev/null && wgcf --help &>/dev/null; then
+    info "wgcf уже установлен"
+    return 0
+  fi
+
+  info "Устанавливаем wgcf..."
+
+  local arch
+  case "$(uname -m)" in
+    x86_64)  arch="amd64" ;;
+    aarch64) arch="arm64" ;;
+    armv7l)  arch="armv7" ;;
+    *) err "Неподдерживаемая архитектура: $(uname -m)"; return 1 ;;
+  esac
+
+  # Получаем актуальную версию через GitHub API
+  local latest_tag=""
+  info "Узнаём последнюю версию wgcf..."
+  latest_tag=$(curl -fsSL --connect-timeout 10 --max-time 15 \
+    "https://api.github.com/repos/ViRb3/wgcf/releases/latest" 2>/dev/null \
+    | grep -oP '"tag_name"\s*:\s*"\K[^"]+' | head -1 || echo "")
+
+  # Список версий для перебора (latest_tag первый, потом fallback)
+  local versions=()
+  [[ -n "$latest_tag" ]] && versions+=("${latest_tag#v}")
+  versions+=("2.2.30" "2.2.29" "2.2.28" "2.2.27" "2.2.26" "2.2.25" "2.2.22")
+
+  # Зеркала
+  local mirrors=(
+    ""
+    "https://gh-proxy.com/"
+    "https://ghproxy.net/"
+    "https://mirror.ghproxy.com/"
+  )
+
+  local downloaded=0
+  for ver in "${versions[@]}"; do
+    info "Пробуем версию v${ver}..."
+    for mp in "${mirrors[@]}"; do
+      local url="${mp}https://github.com/ViRb3/wgcf/releases/download/v${ver}/wgcf_${ver}_linux_${arch}"
+      [[ -z "$mp" ]] && info "  curl ${url:0:80}..." || info "  via mirror: ${mp:0:35}..."
+
+      # Используем те же флаги что у пользователя в ручном тесте: -L для редиректов
+      # 2>&1 | tail -1 — показываем последнюю строку ошибки если что
+      local curl_err
+      curl_err=$(curl -L --fail --silent --show-error --connect-timeout 10 --max-time 180 \
+        --retry 2 --retry-delay 2 \
+        "$url" -o /tmp/wgcf_dl 2>&1)
+      local curl_rc=$?
+
+      if [[ $curl_rc -eq 0 ]]; then
+        local sz
+        sz=$(stat -c%s /tmp/wgcf_dl 2>/dev/null || echo 0)
+        # Минимальный размер 1MB
+        if [[ $sz -lt 1000000 ]]; then
+          warn "  Файл слишком маленький ($sz байт) — наверное HTML-заглушка"
+          rm -f /tmp/wgcf_dl
+          continue
+        fi
+        # Проверка что это ELF бинарник а не HTML/redirect-страница
+        local ftype
+        ftype=$(file -b /tmp/wgcf_dl 2>/dev/null || echo "")
+        if [[ ! "$ftype" =~ ELF ]]; then
+          warn "  Не ELF бинарник: ${ftype:0:60}"
+          rm -f /tmp/wgcf_dl
+          continue
+        fi
+        # Проверка архитектуры — должна быть наша
+        local expected_arch=""
+        case "$arch" in
+          amd64) expected_arch="x86-64" ;;
+          arm64) expected_arch="aarch64" ;;
+          armv7) expected_arch="ARM" ;;
+        esac
+        if [[ -n "$expected_arch" ]] && [[ ! "$ftype" =~ $expected_arch ]]; then
+          warn "  Неверная архитектура: ${ftype:0:80}"
+          rm -f /tmp/wgcf_dl
+          continue
+        fi
+        # Перемещаем и проверяем запуск
+        mv -f /tmp/wgcf_dl /usr/local/bin/wgcf
+        chmod +x /usr/local/bin/wgcf
+        if /usr/local/bin/wgcf --help &>/dev/null; then
+          ok "wgcf установлен (v${ver})"
+          downloaded=1
+          break
+        else
+          local why
+          why=$(/usr/local/bin/wgcf --help 2>&1 | head -1)
+          warn "  Не запускается: ${why:0:80}"
+          rm -f /usr/local/bin/wgcf
+        fi
+      else
+        local err_short
+        err_short=$(echo "$curl_err" | tail -1 | head -c 100)
+        warn "  curl rc=$curl_rc: ${err_short}"
+        rm -f /tmp/wgcf_dl 2>/dev/null
+      fi
+    done
+    [[ $downloaded -eq 1 ]] && break
+  done
+
+  if [[ $downloaded -eq 0 ]]; then
+    err "Не удалось скачать wgcf"
+    echo ""
+    info "Установка вручную:"
+    info "  curl -L -o /usr/local/bin/wgcf \\"
+    info "    https://github.com/ViRb3/wgcf/releases/download/v2.2.30/wgcf_2.2.30_linux_${arch}"
+    info "  chmod +x /usr/local/bin/wgcf"
+    return 1
+  fi
+
+  # WireGuard tools
+  if ! command -v wg-quick &>/dev/null; then
+    info "Устанавливаем wireguard-tools..."
+    apt-get install -y -q wireguard-tools 2>/dev/null || warn "wireguard-tools не установился"
+  fi
+  return 0
+}
+
+_warp_register() {
+  mkdir -p "$WARP_DIR"
+  cd "$WARP_DIR" || return 1
+
+  if [[ -f "$WARP_ACCOUNT" ]]; then
+    info "Аккаунт Warp уже зарегистрирован: $WARP_ACCOUNT"
+    return 0
+  fi
+
+  info "Регистрируем новый Warp аккаунт..."
+
+  if ! wgcf register --accept-tos; then
+    err "Регистрация не удалась"
+    return 1
+  fi
+
+  if [[ ! -f "wgcf-account.toml" ]]; then
+    err "wgcf-account.toml не создан после регистрации"
+    return 1
+  fi
+
+  chmod 600 wgcf-account.toml
+  ok "Warp аккаунт зарегистрирован (бесплатный)"
+  return 0
+}
+
+_warp_apply_license() {
+  if [[ ! -f "$WARP_ACCOUNT" ]]; then
+    err "Сначала зарегистрируй аккаунт Warp (пункт 1)"
+    return 1
+  fi
+
+  echo ""
+  hdr "★  Активация Warp+"
+  echo ""
+  echo -e "  ${D}Лицензионный ключ — из приложения 1.1.1.1 (Cloudflare WARP):${N}"
+  echo -e "  ${D}Шестерёнка → Аккаунт → Ключ${N}"
+  echo -e "  ${D}Формат: xxxxxxxx-xxxxxxxx-xxxxxxxx${N}"
+  echo ""
+  read -rp "$(echo -e "${C}  Лицензионный ключ (Enter = отмена): ${N}")" LICENSE_KEY
+
+  if [[ -z "$LICENSE_KEY" ]]; then
+    warn "Отменено — Warp+ не активирован"
+    return 0
+  fi
+
+  if [[ ! "$LICENSE_KEY" =~ ^[a-zA-Z0-9]+-[a-zA-Z0-9]+-[a-zA-Z0-9]+$ ]]; then
+    err "Некорректный формат ключа (должен быть xxxx-xxxx-xxxx)"
+    return 1
+  fi
+
+  cd "$WARP_DIR" || return 1
+
+  if grep -q "^license_key" wgcf-account.toml; then
+    sed -i "s|^license_key = .*|license_key = \"$LICENSE_KEY\"|" wgcf-account.toml
+  else
+    echo "license_key = \"$LICENSE_KEY\"" >> wgcf-account.toml
+  fi
+  chmod 600 wgcf-account.toml
+
+  info "Применяем лицензию..."
+  if ! wgcf update; then
+    err "Не удалось применить лицензию"
+    warn "Возможно ключ невалиден или Warp+ уже на другом устройстве"
+    return 1
+  fi
+
+  ok "Warp+ активирован"
+  info "Перегенерируем профиль..."
+  wgcf generate 2>/dev/null && cp "$WARP_DIR/wgcf-profile.conf" "$WARP_CONF" 2>/dev/null
+  return 0
+}
+
+_warp_generate_profile() {
+  cd "$WARP_DIR" || return 1
+
+  if [[ ! -f "$WARP_ACCOUNT" ]]; then
+    err "Нет wgcf-account.toml — сначала зарегистрируйся (пункт 1)"
+    return 1
+  fi
+
+  info "Генерируем wgcf-profile.conf..."
+  if ! wgcf generate; then
+    err "wgcf generate провалился"
+    return 1
+  fi
+
+  if [[ ! -f "wgcf-profile.conf" ]]; then
+    err "wgcf-profile.conf не создан"
+    return 1
+  fi
+
+  cp "wgcf-profile.conf" "$WARP_CONF"
+  chmod 600 "$WARP_CONF"
+
+  ok "Профиль создан: $WARP_CONF"
+  return 0
+}
+
+_warp_get_client_net() {
+  if [[ ! -f "$SERVER_CONF" ]]; then
+    echo ""
+    return 1
+  fi
+  local addr
+  addr=$(awk '/^Address/{print $3; exit}' "$SERVER_CONF")
+  if [[ "$addr" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+/([0-9]+)$ ]]; then
+    echo "${BASH_REMATCH[1]}.0/${BASH_REMATCH[2]}"
+    return 0
+  fi
+  echo ""
+  return 1
+}
+
+# ── Helpers для выборочного Warp по клиентам ────────────────────
+
+# Возвращает список всех клиентов AWG в формате "name|ip"
+_warp_list_awg_clients() {
+  [[ ! -f "$SERVER_CONF" ]] && return 0
+  awk '
+    /^# /{ name=$2 }
+    /^AllowedIPs/{
+      if (name) {
+        gsub(/\/32.*/, "", $3)
+        print name "|" $3
+        name=""
+      }
+    }
+  ' "$SERVER_CONF"
+}
+
+# Проверяет включён ли клиент в Warp (по IP)
+_warp_peer_enabled() {
+  local ip="$1"
+  [[ ! -f "$WARP_PEERS" ]] && return 1
+  grep -qxF "$ip" "$WARP_PEERS"
+}
+
+# Добавляет клиента в Warp
+_warp_peer_add() {
+  local ip="$1"
+  mkdir -p "$WARP_DIR"
+  touch "$WARP_PEERS"
+  if ! _warp_peer_enabled "$ip"; then
+    echo "$ip" >> "$WARP_PEERS"
+  fi
+}
+
+# Удаляет клиента из Warp
+_warp_peer_remove() {
+  local ip="$1"
+  [[ ! -f "$WARP_PEERS" ]] && return 0
+  grep -vxF "$ip" "$WARP_PEERS" > "$WARP_PEERS.tmp" 2>/dev/null || true
+  mv "$WARP_PEERS.tmp" "$WARP_PEERS" 2>/dev/null || true
+}
+
+# Применить ip rules для всех включённых клиентов
+_warp_apply_peer_rules() {
+  [[ ! -f "$WARP_PEERS" ]] && return 0
+  local ip
+  while IFS= read -r ip; do
+    [[ -z "$ip" ]] && continue
+    # Удаляем старое правило (если есть) и добавляем заново
+    ip rule del from "$ip" lookup 200 2>/dev/null || true
+    ip rule add from "$ip" lookup 200
+  done < "$WARP_PEERS"
+}
+
+# Удалить все ip rules клиентов
+_warp_remove_peer_rules() {
+  [[ ! -f "$WARP_PEERS" ]] && return 0
+  local ip
+  while IFS= read -r ip; do
+    [[ -z "$ip" ]] && continue
+    ip rule del from "$ip" lookup 200 2>/dev/null || true
+  done < "$WARP_PEERS"
+}
+
+# ── Health-check Warp ────────────────────────────────────────────
+
+_warp_health_status() {
+  if systemctl is-active --quiet awg-warp-healthcheck.timer 2>/dev/null; then
+    echo -e "  Health-check: ${G}● включен${N}"
+    if [[ -f "$WARP_HEALTH_LOG" ]]; then
+      local last_5
+      last_5=$(tail -5 "$WARP_HEALTH_LOG" 2>/dev/null | awk '{print $NF}' | tr '\n' ' ')
+      [[ -n "$last_5" ]] && echo -e "  Последние 5: ${C}$last_5${N}"
+    fi
+  else
+    echo -e "  Health-check: ${D}○ выключен${N}"
+  fi
+}
+
+_warp_health_install() {
+  info "Создаём health-check скрипт..."
+
+  cat > "$WARP_HEALTH_SCRIPT" << 'EOSCRIPT'
+#!/bin/bash
+# AWG Toolza Warp health-check
+# Проверяет что warp0 жив, при 3 фейлах подряд — опускает Warp
+
+LOG="/var/log/awg-warp-health.log"
+STATE="/etc/wgcf/state"
+FAIL_COUNTER="/tmp/awg-warp-fails"
+MAX_FAILS=3
+
+log() { echo "$(date +'%F %T') $*" >> "$LOG"; }
+
+# Если warp0 не существует — health-check бессмысленен
+if ! ip link show warp0 &>/dev/null; then
+  log "warp0 не существует - skip"
+  exit 0
+fi
+
+# Ping через warp0
+if ping -c1 -W2 -I warp0 1.1.1.1 &>/dev/null; then
+  log "OK"
+  echo "0" > "$FAIL_COUNTER"
+  exit 0
+fi
+
+# Fail
+fails=$(cat "$FAIL_COUNTER" 2>/dev/null || echo "0")
+fails=$((fails + 1))
+echo "$fails" > "$FAIL_COUNTER"
+log "FAIL ($fails/$MAX_FAILS)"
+
+if [[ $fails -ge $MAX_FAILS ]]; then
+  log "ALERT: Warp недоступен $MAX_FAILS раз подряд — failover"
+
+  # Читаем state для отката
+  client_net=$(grep "^client_net=" "$STATE" 2>/dev/null | cut -d= -f2)
+  iface=$(grep "^iface=" "$STATE" 2>/dev/null | cut -d= -f2)
+
+  # Удаляем правила для всех включённых клиентов
+  if [[ -f /etc/wgcf/peers.list ]]; then
+    while IFS= read -r ip; do
+      [[ -z "$ip" ]] && continue
+      ip rule del from "$ip" lookup 200 2>/dev/null
+    done < /etc/wgcf/peers.list
+  fi
+  # На случай если есть правило для всей подсети
+  [[ -n "$client_net" ]] && ip rule del from "$client_net" lookup 200 2>/dev/null
+
+  ip route flush table 200 2>/dev/null
+
+  # Убираем iptables правила warp0
+  if [[ -n "$client_net" ]]; then
+    iptables -t nat -D POSTROUTING -s "$client_net" -o warp0 -j MASQUERADE 2>/dev/null
+    iptables -D FORWARD -i awg0 -o warp0 -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -i warp0 -o awg0 -j ACCEPT 2>/dev/null
+
+    # Восстанавливаем MASQUERADE через основной интерфейс
+    if [[ -n "$iface" ]]; then
+      iptables -t nat -C POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE
+    fi
+  fi
+
+  # Опускаем warp0
+  ip link delete warp0 2>/dev/null
+
+  log "FAILOVER завершён — трафик AWG идёт напрямую"
+  echo "failed" > "$STATE.failed"
+fi
+
+exit 0
+EOSCRIPT
+  chmod +x "$WARP_HEALTH_SCRIPT"
+
+  cat > "$WARP_HEALTH_SERVICE" << EOF
+[Unit]
+Description=AWG Toolza Warp health-check
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$WARP_HEALTH_SCRIPT
+EOF
+
+  cat > "$WARP_HEALTH_TIMER" << EOF
+[Unit]
+Description=AWG Toolza Warp health-check timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+Unit=awg-warp-healthcheck.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now awg-warp-healthcheck.timer 2>/dev/null
+  ok "Health-check установлен (проверка каждые 60 сек)"
+  return 0
+}
+
+_warp_health_remove() {
+  systemctl disable --now awg-warp-healthcheck.timer 2>/dev/null || true
+  rm -f "$WARP_HEALTH_SCRIPT" "$WARP_HEALTH_TIMER" "$WARP_HEALTH_SERVICE"
+  systemctl daemon-reload 2>/dev/null
+  ok "Health-check удалён"
+  return 0
+}
+
+_warp_health_toggle() {
+  if systemctl is-active --quiet awg-warp-healthcheck.timer 2>/dev/null; then
+    info "Выключаем health-check..."
+    _warp_health_remove
+  else
+    info "Включаем health-check..."
+    _warp_health_install
+  fi
+}
+
+# ── Меню управления клиентами в Warp ────────────────────────────
+
+do_warp_peers_menu() {
+  set +e
+  while true; do
+    clear
+    echo ""
+    hdr "⚙ Клиенты в Warp туннеле"
+    echo ""
+
+    local clients=()
+    while IFS='|' read -r name ip; do
+      [[ -z "$name" || -z "$ip" ]] && continue
+      clients+=("$name|$ip")
+    done < <(_warp_list_awg_clients)
+
+    if [[ ${#clients[@]} -eq 0 ]]; then
+      warn "AWG клиентов нет — добавь через пункт 3"
+      read -rp "Enter..."
+      set -e
+      return 0
+    fi
+
+    local i=1
+    for entry in "${clients[@]}"; do
+      local name="${entry%|*}"
+      local ip="${entry##*|}"
+      if _warp_peer_enabled "$ip"; then
+        echo -e "  ${G}[$i]${N} $name  ${D}$ip${N}  ${C}☁ через Warp${N}"
+      else
+        echo -e "  ${G}[$i]${N} $name  ${D}$ip${N}  → напрямую"
+      fi
+      i=$((i + 1))
+    done
+
+    echo ""
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "  Введи номер клиента для переключения"
+    echo -e "  a — все через Warp, n — все напрямую"
+    echo -e "  0 — назад"
+    echo ""
+    read -rp "$(echo -e "${C}  Выбор: ${N}")" PEER_CHOICE
+
+    case "${PEER_CHOICE:-}" in
+      0|"") set -e; return 0 ;;
+      a|A)
+        for entry in "${clients[@]}"; do
+          local ip="${entry##*|}"
+          _warp_peer_add "$ip"
+        done
+        # Если warp0 активен — применить правила сейчас
+        if ip link show warp0 &>/dev/null; then
+          _warp_apply_peer_rules
+        fi
+        ok "Все клиенты включены в Warp"
+        sleep 1
+        ;;
+      n|N)
+        for entry in "${clients[@]}"; do
+          local ip="${entry##*|}"
+          _warp_peer_remove "$ip"
+        done
+        if ip link show warp0 &>/dev/null; then
+          _warp_remove_peer_rules
+        fi
+        ok "Все клиенты идут напрямую"
+        sleep 1
+        ;;
+      *)
+        if [[ "$PEER_CHOICE" =~ ^[0-9]+$ ]] && [[ $PEER_CHOICE -ge 1 && $PEER_CHOICE -le ${#clients[@]} ]]; then
+          local idx=$((PEER_CHOICE - 1))
+          local entry="${clients[$idx]}"
+          local name="${entry%|*}"
+          local ip="${entry##*|}"
+          if _warp_peer_enabled "$ip"; then
+            _warp_peer_remove "$ip"
+            if ip link show warp0 &>/dev/null; then
+              ip rule del from "$ip" lookup 200 2>/dev/null || true
+            fi
+            ok "$name → напрямую"
+          else
+            _warp_peer_add "$ip"
+            if ip link show warp0 &>/dev/null; then
+              ip rule del from "$ip" lookup 200 2>/dev/null || true
+              ip rule add from "$ip" lookup 200
+            fi
+            ok "$name → через Warp"
+          fi
+          sleep 1
+        else
+          warn "Неверный выбор"
+          sleep 1
+        fi
+        ;;
+    esac
+  done
+  set -e
+}
+
+_warp_up() {
+  if [[ ! -f "$WARP_CONF" ]]; then
+    err "Конфиг Warp не найден. Сначала выполни пункт 1"
+    return 1
+  fi
+
+  if ip link show warp0 &>/dev/null; then
+    info "warp0 уже активен"
+    return 0
+  fi
+
+  # Получаем CLIENT_NET ДО поднятия интерфейса — без AWG нет смысла делать split-tunnel
+  local client_net iface
+  client_net=$(_warp_get_client_net 2>/dev/null || echo "")
+  iface=$(ip route 2>/dev/null | awk '/default/{print $5; exit}' || echo "eth0")
+
+  if [[ -z "$client_net" ]]; then
+    err "AWG сервер не настроен"
+    info "Сначала создай AWG сервер (пункт 2), потом включай Warp"
+    return 1
+  fi
+
+  info "Парсим конфиг Warp..."
+  # Извлекаем поля из wgcf-profile.conf для ручной настройки
+  local warp_priv warp_pub warp_endpoint warp_addr4 warp_mtu addr_line
+  warp_priv=$(awk -F' = ' '/^PrivateKey/{print $2; exit}' "$WARP_CONF")
+  warp_pub=$(awk -F' = ' '/^PublicKey/{print $2; exit}' "$WARP_CONF")
+  warp_endpoint=$(awk -F' = ' '/^Endpoint/{print $2; exit}' "$WARP_CONF")
+  warp_mtu=$(awk -F' = ' '/^MTU/{print $2; exit}' "$WARP_CONF")
+  [[ -z "$warp_mtu" ]] && warp_mtu=1280
+
+  # Address строка типа: "172.16.0.2/32, 2606:4700:110:8419::/128"
+  # Берём ТОЛЬКО IPv4 — IPv6 от Cloudflare нам не нужен (избегаем утечек)
+  addr_line=$(awk -F' = ' '/^Address/{print $2; exit}' "$WARP_CONF")
+  warp_addr4=""
+  local IFS=','
+  for a in $addr_line; do
+    a="${a#"${a%%[![:space:]]*}"}"
+    a="${a%"${a##*[![:space:]]}"}"
+    if [[ "$a" =~ \. ]] && [[ ! "$a" =~ : ]]; then
+      warp_addr4="$a"
+    fi
+  done
+  unset IFS
+
+  if [[ -z "$warp_priv" || -z "$warp_pub" || -z "$warp_endpoint" || -z "$warp_addr4" ]]; then
+    err "Не удалось распарсить конфиг Warp"
+    info "PrivateKey: ${warp_priv:+есть} ${warp_priv:-нет}"
+    info "PublicKey: ${warp_pub:+есть} ${warp_pub:-нет}"
+    info "Endpoint: ${warp_endpoint:-нет}"
+    info "Address4: ${warp_addr4:-нет}"
+    return 1
+  fi
+
+  info "Поднимаем warp0 (split-tunnel: только $client_net)..."
+  info "  IP4: $warp_addr4"
+  info "  Endpoint: $warp_endpoint"
+  info "  MTU: $warp_mtu"
+
+  # Создаём интерфейс
+  ip link add dev warp0 type wireguard 2>&1 || { err "Не удалось создать warp0"; return 1; }
+
+  # Конфигурируем приватный ключ + peer
+  # ВАЖНО: AllowedIPs = 0.0.0.0/0 нужен только на стороне peer config wireguard
+  # это значит "куда МЫ шлём трафик через peer", НЕ маршрутизация ОС
+  local tmp_wg_conf
+  tmp_wg_conf=$(mktemp)
+  cat > "$tmp_wg_conf" << EOF
+[Interface]
+PrivateKey = $warp_priv
+
+[Peer]
+PublicKey = $warp_pub
+AllowedIPs = 0.0.0.0/0
+Endpoint = $warp_endpoint
+EOF
+  if ! wg setconf warp0 "$tmp_wg_conf"; then
+    err "wg setconf warp0 failed"
+    rm -f "$tmp_wg_conf"
+    ip link delete warp0 2>/dev/null
+    return 1
+  fi
+  rm -f "$tmp_wg_conf"
+
+  # Только IPv4 — IPv6 от Warp нам не нужен (избегаем утечек)
+  ip -4 address add "$warp_addr4" dev warp0 2>&1
+
+  # MTU и UP
+  ip link set mtu "$warp_mtu" up dev warp0 || { err "ip link set up warp0 failed"; ip link delete warp0; return 1; }
+
+  ok "warp0 активен"
+
+  # ── SPLIT-TUNNEL: маршруты только для AWG подсети ──
+  # БЕЗ policy routing (fwmark) — тогда SSH не сломается
+  # MASQUERADE на warp0 для трафика из AWG подсети
+
+  info "Настраиваем split-tunnel для $client_net..."
+
+  # Удаляем старый MASQUERADE через основной интерфейс
+  iptables -t nat -D POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE 2>/dev/null || true
+
+  # Добавляем MASQUERADE через warp0
+  iptables -t nat -C POSTROUTING -s "$client_net" -o warp0 -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -s "$client_net" -o warp0 -j MASQUERADE
+
+  # FORWARD правила
+  iptables -C FORWARD -i awg0 -o warp0 -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i awg0 -o warp0 -j ACCEPT
+  iptables -C FORWARD -i warp0 -o awg0 -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i warp0 -o awg0 -j ACCEPT
+
+  # rp_filter loose mode только для VPN интерфейсов
+  # ВАЖНО: НЕ трогаем .all.rp_filter — иначе eth0 тоже станет loose, ослабнет защита от spoofing
+  # Linux применяет max(all.rp_filter, iface.rp_filter), значит для warp0/awg0 будет loose, для eth0 — strict
+  sysctl -w net.ipv4.conf.warp0.rp_filter=2 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.awg0.rp_filter=2 >/dev/null 2>&1 || true
+
+  # Policy routing: создаём отдельную таблицу 200 для трафика выбранных клиентов
+  # ВАЖНО: src обязательно указать иначе kernel не сможет маршрутизировать (warp0 имеет /32)
+  ip route flush table 200 2>/dev/null || true
+  ip route add default dev warp0 src "${warp_addr4%/*}" table 200
+
+  # Если peers list пуст или не существует — заполняем всеми клиентами по умолчанию
+  if [[ ! -s "$WARP_PEERS" ]]; then
+    info "Список клиентов в Warp пуст — добавляем всех по умолчанию"
+    mkdir -p "$WARP_DIR"
+    while IFS='|' read -r name ip; do
+      [[ -z "$ip" ]] && continue
+      echo "$ip" >> "$WARP_PEERS"
+    done < <(_warp_list_awg_clients)
+  fi
+
+  # Убираем старое правило для всей подсети (если осталось от прошлых версий)
+  ip rule del from "$client_net" lookup 200 2>/dev/null || true
+
+  # Применяем правила для каждого включённого клиента
+  _warp_apply_peer_rules
+
+  local peer_count
+  peer_count=$(wc -l < "$WARP_PEERS" 2>/dev/null || echo 0)
+
+  # Сохраняем состояние
+  echo "active" > "$WARP_STATE"
+  echo "client_net=$client_net" >> "$WARP_STATE"
+  echo "iface=$iface" >> "$WARP_STATE"
+
+  ok "Split-tunnel активен: $peer_count клиент(ов) через Warp"
+  info "SSH и серверный трафик идут напрямую"
+  info "Управление клиентами в Warp: пункт 7 в меню"
+  return 0
+}
+
+_warp_down() {
+  if [[ -f "$WARP_STATE" ]]; then
+    local client_net iface
+    client_net=$(grep "^client_net=" "$WARP_STATE" 2>/dev/null | cut -d= -f2)
+    iface=$(grep "^iface=" "$WARP_STATE" 2>/dev/null | cut -d= -f2)
+
+    # Убираем правила для всех включённых клиентов
+    _warp_remove_peer_rules
+
+    if [[ -n "$client_net" ]]; then
+      # Убираем legacy правила (если остались)
+      ip rule del from "$client_net" lookup 200 2>/dev/null || true
+      ip rule del from "$client_net" table 200 2>/dev/null || true
+      ip route flush table 200 2>/dev/null || true
+
+      # Убираем iptables правила warp0
+      iptables -t nat -D POSTROUTING -s "$client_net" -o warp0 -j MASQUERADE 2>/dev/null || true
+      iptables -D FORWARD -i awg0 -o warp0 -j ACCEPT 2>/dev/null || true
+      iptables -D FORWARD -i warp0 -o awg0 -j ACCEPT 2>/dev/null || true
+
+      # Восстанавливаем MASQUERADE через основной интерфейс
+      if [[ -n "$iface" ]]; then
+        iptables -t nat -C POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE 2>/dev/null || \
+          iptables -t nat -A POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE
+      fi
+    fi
+  fi
+
+  # Опускаем интерфейс
+  if ip link show warp0 &>/dev/null; then
+    info "Удаляем warp0..."
+    ip link delete warp0 2>/dev/null || true
+  fi
+
+  rm -f "$WARP_STATE" 2>/dev/null
+  ok "Warp выключен — трафик AWG идёт напрямую"
+  return 0
+}
+
+_warp_remove() {
+  echo ""
+  warn "Удалить Warp полностью? Будет удалено:"
+  warn "  • $WARP_CONF"
+  warn "  • $WARP_DIR (аккаунт + список клиентов)"
+  warn "  • /usr/local/bin/wgcf"
+  warn "  • Health-check service/timer"
+  echo ""
+  read -rp "$(echo -e "${R}  Подтверди [yes/N]: ${N}")" CONFIRM
+  [[ "$CONFIRM" != "yes" ]] && { warn "Отменено"; return 0; }
+
+  _warp_down
+  _warp_health_remove 2>/dev/null || true
+  rm -rf "$WARP_DIR" "$WARP_CONF" 2>/dev/null
+  rm -f /usr/local/bin/wgcf 2>/dev/null
+  rm -f "$WARP_HEALTH_LOG" /tmp/awg-warp-fails 2>/dev/null
+  ok "Warp удалён полностью"
+  return 0
+}
+
+_warp_status() {
+  if command -v wgcf &>/dev/null && wgcf --help &>/dev/null; then
+    echo -e "  wgcf       : ${G}установлен${N}"
+  else
+    echo -e "  wgcf       : ${D}не установлен${N}"
+    return 0
+  fi
+
+  if [[ -f "$WARP_ACCOUNT" ]]; then
+    local lic
+    lic=$(grep "^license_key" "$WARP_ACCOUNT" 2>/dev/null | cut -d'"' -f2)
+    if [[ -n "$lic" && ${#lic} -gt 10 ]]; then
+      echo -e "  Аккаунт    : ${G}зарегистрирован${N} ${C}(Warp+)${N}"
+    else
+      echo -e "  Аккаунт    : ${G}зарегистрирован${N} (бесплатный)"
+    fi
+  else
+    echo -e "  Аккаунт    : ${D}не зарегистрирован${N}"
+  fi
+
+  if [[ -f "$WARP_CONF" ]]; then
+    echo -e "  Профиль    : ${G}$WARP_CONF${N}"
+  else
+    echo -e "  Профиль    : ${D}не создан${N}"
+  fi
+
+  if ip link show warp0 &>/dev/null; then
+    echo -e "  Интерфейс  : ${G}● warp0 активен${N}"
+    # Подсчёт включённых клиентов
+    local peer_count=0
+    [[ -f "$WARP_PEERS" ]] && peer_count=$(grep -c '^[0-9]' "$WARP_PEERS" 2>/dev/null || echo 0)
+    local total_clients=0
+    total_clients=$(_warp_list_awg_clients | grep -c '^' 2>/dev/null || echo 0)
+    echo -e "  Через Warp : ${G}$peer_count${N} из ${C}$total_clients${N} клиент(ов)"
+    local warp_ip
+    warp_ip=$(timeout 3 curl -s --interface warp0 -4 https://1.1.1.1/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/{print $2}' | head -1 || echo "")
+    [[ -n "$warp_ip" ]] && echo -e "  Warp IP    : ${C}$warp_ip${N}"
+  else
+    echo -e "  Интерфейс  : ${D}○ warp0 выключен${N}"
+  fi
+
+  # Health-check статус
+  _warp_health_status
+
+  return 0
+}
+
+do_warp_menu() {
+  # Отключаем set -e внутри меню чтобы один сбой не убивал весь скрипт
+  set +e
+  while true; do
+    clear
+    echo ""
+    hdr "☁  Warp туннель (Cloudflare)"
+    echo ""
+    _warp_status || true
+    echo ""
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "  1) Установить wgcf и зарегистрировать Warp (бесплатный)"
+    echo -e "  2) Активировать Warp+ (ввести лицензионный ключ)"
+    echo -e "  3) Включить туннель"
+    echo -e "  4) Выключить туннель"
+    echo -e "  5) Перегенерировать профиль (после смены лицензии)"
+    echo -e "  ${C}7) Управление клиентами в Warp${N}"
+    echo -e "  ${C}8) Health-check (вкл/выкл авто-failover)${N}"
+    echo -e "  ${R}6) Удалить Warp полностью${N}"
+    echo -e "  0) Назад в главное меню"
+    echo ""
+    read -rp "$(echo -e "${C}  Выбор [0-8]: ${N}")" WARP_CHOICE
+
+    case "${WARP_CHOICE:-}" in
+      1)
+        _warp_install_wgcf || { read -rp "Enter..."; continue; }
+        _warp_register || { read -rp "Enter..."; continue; }
+        _warp_generate_profile || { read -rp "Enter..."; continue; }
+        ok "Готово! Теперь пункт 3 — включить туннель"
+        read -rp "Enter..."
+        ;;
+      2) _warp_apply_license; read -rp "Enter..." ;;
+      3) _warp_up; read -rp "Enter..." ;;
+      4) _warp_down; read -rp "Enter..." ;;
+      5)
+        _warp_generate_profile && info "Профиль обновлён. Если warp0 активен — выключи и включи (4 → 3)"
+        read -rp "Enter..."
+        ;;
+      7) do_warp_peers_menu ;;
+      8) _warp_health_toggle; read -rp "Enter..." ;;
+      6) _warp_remove; read -rp "Enter..." ;;
+      0|"")
+        set -e
+        return 0
+        ;;
+      *) warn "Неверный выбор"; sleep 1 ;;
+    esac
+  done
+  set -e
+}
 # ══════════════════════════════════════════════════════════
 # 12. УДАЛИТЬ ВСЁ
 # ══════════════════════════════════════════════════════════
@@ -3364,6 +4309,7 @@ while true; do
     12)  do_uninstall ;;
     13)  do_repair ;;
     14)  do_self_update ;;
+    15)  do_warp_menu ;;
     999) do_debug_cps ;;
     0)  log_info "Выход"
         echo -e "\n${G}  В путь! ${N}"
@@ -3382,7 +4328,7 @@ while true; do
       ;;
   esac
 
-  if [[ "${CHOICE:-}" =~ ^[0-9]+$ ]] && { [[ "${CHOICE:-}" -le 12 ]] || [[ "${CHOICE:-}" == "999" ]]; }; then
+  if [[ "${CHOICE:-}" =~ ^[0-9]+$ ]] && { [[ "${CHOICE:-}" -le 15 ]] || [[ "${CHOICE:-}" == "999" ]]; }; then
     ERROR_COUNT=0
   fi
 
