@@ -107,9 +107,9 @@ sudo awg2
 
 ```
 ╔══════════════════════════════════════════════╗
-║    AWG Toolza v6.7                           ║
-║   AWG 2.0 — QUIC / WebRTC / SIP / DNS        ║
-║              + Warp туннель Cloudflare       ║
+║    AWG Toolza v6.7                                   ║
+║   AWG 2.0 — QUIC / WebRTC / SIP / DNS                ║
+║              + Warp туннель Cloudflare               ║
 ╚══════════════════════════════════════════════╝
   IP сервера : 1.2.3.4
   Порт       : 47300
