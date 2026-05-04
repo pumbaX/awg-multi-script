@@ -3013,108 +3013,166 @@ _warp_install_wgcf() {
     *) err "Неподдерживаемая архитектура: $(uname -m)"; return 1 ;;
   esac
 
-  # Получаем актуальную версию через GitHub API
+  # Получаем последнюю версию
   local latest_tag=""
   info "Узнаём последнюю версию wgcf..."
-  latest_tag=$(curl -fsSL --connect-timeout 10 --max-time 15 \
+  latest_tag=$(curl -4 -fsSL --connect-timeout 8 --max-time 15 \
     "https://api.github.com/repos/ViRb3/wgcf/releases/latest" 2>/dev/null \
     | grep -oP '"tag_name"\s*:\s*"\K[^"]+' | head -1 || echo "")
 
-  # Список версий для перебора (latest_tag первый, потом fallback)
   local versions=()
   [[ -n "$latest_tag" ]] && versions+=("${latest_tag#v}")
-  versions+=("2.2.30" "2.2.29" "2.2.28" "2.2.27" "2.2.26" "2.2.25" "2.2.22")
+  versions+=("2.2.30" "2.2.29" "2.2.28" "2.2.27" "2.2.26")
 
   # Зеркала
   local mirrors=(
     ""
+    "https://ghfast.top/"
     "https://gh-proxy.com/"
     "https://ghproxy.net/"
     "https://mirror.ghproxy.com/"
+    "https://github.moeyy.xyz/"
+    "https://cors.isomorphic-git.org/"
   )
 
+# ───── fastest mirror ─────
+info "Выбор самого быстрого зеркала..."
+
+declare -A mirror_speed
+local best_mirrors=()
+
+  for mp in "${mirrors[@]}"; do
+  local key="${mp:-direct}"
+
+  # ТЕСТИРУЕМ РЕАЛЬНЫЙ ФАЙЛ (ключевой момент!)
+  local test_url="${mp}https://github.com/ViRb3/wgcf/releases/download/v2.2.30/wgcf_2.2.30_linux_${arch}"
+
+  local t
+  t=$(curl -4 -o /dev/null -s --fail \
+      --connect-timeout 5 \
+      --max-time 8 \
+      --range 0-100 \
+      -w "%{time_total}" \
+      "$test_url" 2>/dev/null)
+
+  # фильтр мусора
+  if [[ -z "$t" || "$t" == "0.000" || "$t" == "0.001" ]]; then
+    t=999
+  fi
+
+  mirror_speed["$key"]=$t
+  info "  ${key} → ${t}s"
+  done
+
+ best_mirrors=($(for k in "${!mirror_speed[@]}"; do
+  echo "${mirror_speed[$k]}|$k"
+ done | sort -n | cut -d'|' -f2))
+
+ info "Порядок зеркал:"
+ for m in "${best_mirrors[@]}"; do
+  info "  → ${m}"
+  done
+
+  # ───── загрузка ─────
   local downloaded=0
+
   for ver in "${versions[@]}"; do
     info "Пробуем версию v${ver}..."
-    for mp in "${mirrors[@]}"; do
-      local url="${mp}https://github.com/ViRb3/wgcf/releases/download/v${ver}/wgcf_${ver}_linux_${arch}"
-      [[ -z "$mp" ]] && info "  curl ${url:0:80}..." || info "  via mirror: ${mp:0:35}..."
 
-      # Используем те же флаги что у пользователя в ручном тесте: -L для редиректов
-      # 2>&1 | tail -1 — показываем последнюю строку ошибки если что
+    for mp in "${best_mirrors[@]}"; do
+      local real_mp="$mp"
+      [[ "$real_mp" == "direct" ]] && real_mp=""
+
+      local url="${real_mp}https://github.com/ViRb3/wgcf/releases/download/v${ver}/wgcf_${ver}_linux_${arch}"
+
+      if [[ -z "$real_mp" ]]; then
+        info "  curl ${url:0:80}..."
+      else
+        info "  via ${real_mp:0:40}..."
+      fi
+
       local curl_err
-      curl_err=$(curl -L --fail --silent --show-error --connect-timeout 10 --max-time 180 \
+      curl_err=$(timeout 25s curl -4 -L --fail --silent --show-error \
+        --connect-timeout 8 \
+        --max-time 20 \
         --retry 2 --retry-delay 2 \
+        --speed-time 10 --speed-limit 1024 \
         "$url" -o /tmp/wgcf_dl 2>&1)
+
       local curl_rc=$?
+
+      # fallback wget
+      if [[ $curl_rc -ne 0 ]]; then
+        warn "  curl не сработал → wget"
+        if timeout 25s wget -4 --tries=2 --timeout=10 \
+          "$url" -O /tmp/wgcf_dl 2>/dev/null; then
+          curl_rc=0
+        fi
+      fi
 
       if [[ $curl_rc -eq 0 ]]; then
         local sz
-        sz=$(stat -c%s /tmp/wgcf_dl 2>/dev/null || echo 0)
-        # Минимальный размер 1MB
+        sz=$(wc -c < /tmp/wgcf_dl 2>/dev/null || echo 0)
+
         if [[ $sz -lt 1000000 ]]; then
-          warn "  Файл слишком маленький ($sz байт) — наверное HTML-заглушка"
+          warn "  маленький файл ($sz)"
           rm -f /tmp/wgcf_dl
           continue
         fi
-        # Проверка что это ELF бинарник а не HTML/redirect-страница
+
         local ftype
         ftype=$(file -b /tmp/wgcf_dl 2>/dev/null || echo "")
+
         if [[ ! "$ftype" =~ ELF ]]; then
-          warn "  Не ELF бинарник: ${ftype:0:60}"
+          warn "  не бинарник: ${ftype:0:60}"
           rm -f /tmp/wgcf_dl
           continue
         fi
-        # Проверка архитектуры — должна быть наша
+
         local expected_arch=""
         case "$arch" in
           amd64) expected_arch="x86-64" ;;
           arm64) expected_arch="aarch64" ;;
           armv7) expected_arch="ARM" ;;
         esac
+
         if [[ -n "$expected_arch" ]] && [[ ! "$ftype" =~ $expected_arch ]]; then
-          warn "  Неверная архитектура: ${ftype:0:80}"
+          warn "  неверная архитектура"
           rm -f /tmp/wgcf_dl
           continue
         fi
-        # Перемещаем и проверяем запуск
+
         mv -f /tmp/wgcf_dl /usr/local/bin/wgcf
         chmod +x /usr/local/bin/wgcf
+
         if /usr/local/bin/wgcf --help &>/dev/null; then
           ok "wgcf установлен (v${ver})"
           downloaded=1
           break
         else
-          local why
-          why=$(/usr/local/bin/wgcf --help 2>&1 | head -1)
-          warn "  Не запускается: ${why:0:80}"
+          warn "  бинарь не запускается"
           rm -f /usr/local/bin/wgcf
         fi
       else
-        local err_short
-        err_short=$(echo "$curl_err" | tail -1 | head -c 100)
-        warn "  curl rc=$curl_rc: ${err_short}"
+        warn "  curl rc=$curl_rc"
         rm -f /tmp/wgcf_dl 2>/dev/null
       fi
     done
+
     [[ $downloaded -eq 1 ]] && break
   done
 
   if [[ $downloaded -eq 0 ]]; then
     err "Не удалось скачать wgcf"
-    echo ""
-    info "Установка вручную:"
-    info "  curl -L -o /usr/local/bin/wgcf \\"
-    info "    https://github.com/ViRb3/wgcf/releases/download/v2.2.30/wgcf_2.2.30_linux_${arch}"
-    info "  chmod +x /usr/local/bin/wgcf"
     return 1
   fi
 
-  # WireGuard tools
+  # WireGuard
   if ! command -v wg-quick &>/dev/null; then
     info "Устанавливаем wireguard-tools..."
     apt-get install -y -q wireguard-tools 2>/dev/null || warn "wireguard-tools не установился"
   fi
+
   return 0
 }
 
