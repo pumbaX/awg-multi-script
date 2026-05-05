@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20only-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-6.7-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-6.7.4-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -33,40 +33,47 @@ sudo awg2
 ```
 
 --- 
-## ☁ Что нового в v6.7 — Warp туннель Cloudflare
+## ☁ Warp туннель Cloudflare
 
-**Главная фича** — Warp туннель Cloudflare для обхода блокировки IP сервера в РФ. Когда ТСПУ блокирует IP Hetzner/OVH — заворачиваем выходной трафик через Cloudflare, и блокировки перестают мешать.
+Обход блокировки IP сервера в РФ. Когда ТСПУ блокирует IP Hetzner/OVH — заворачиваем выходной трафик через Cloudflare.
 
-**Архитектура split-tunnel:**
 ```
 Клиент РФ → AWG → твой сервер → Cloudflare → интернет
 ```
 
-Внешний IP меняется с твоего хостинга на Cloudflare. SSH и серверный трафик идут напрямую — не через Warp.
+SSH и серверный трафик идут напрямую — не через Warp.
 
 **Меню Warp (пункт 15):**
+
 ```
-1) Установить wgcf и зарегистрировать Warp (бесплатный)
-2) Активировать Warp+ (лицензионный ключ из 1.1.1.1)
+1) Установить wgcf и зарегистрировать Warp
+2) Активировать Warp+ (лицензионный ключ)
 3) Включить туннель
 4) Выключить туннель
 5) Перегенерировать профиль
-7) Управление клиентами в Warp        ← кто через Warp, кто напрямую
-8) Health-check (вкл/выкл авто-failover) ← если Warp упал — direct routing
-6) Удалить Warp полностью
+6) Управление клиентами в Warp     ← кто через Warp, кто напрямую
+7) Health-check + auto-failover    ← если упал — direct routing
+8) Импорт wgcf-profile.conf        ← если регистрация блокируется
+9) Поиск рабочего endpoint         ← если 2408 режется DPI
+d) Удалить Warp полностью
 ```
 
-**Где взять Warp+ ключ (бесплатно):**
-- Приложение **1.1.1.1** → Шестерёнка → Аккаунт → Ключ
-- Реферальная программа в приложении (до 25 ГБ)
-- **Cloudflare Zero Trust** на dash.cloudflare.com — безлимит до 50 пользователей
+**Где взять Warp+ ключ:**
+- 🥇 **Cloudflare Zero Trust** на dash.cloudflare.com — безлимит до 50 устройств
+- 🥈 Приложение **1.1.1.1** → Аккаунт → Ключ
+- 🥉 Реферальная программа в 1.1.1.1 (до 25 ГБ, может уже не работать)
+
+**Если Warp не подключается на РФ хостинге:**
+1. `15 → 8` — импорт готового профиля через Google Cloud Shell
+2. `15 → 9` — автоматический поиск рабочего endpoint
+3. Если ничего не помогло — провайдер режет UDP к Cloudflare, нужен другой хостинг
 
 
 ## Меню
 
 ```
 ╔══════════════════════════════════════════════╗
-║    AWG Toolza v6.7                           ║
+║    AWG Toolza v6.7.4                         ║
 ║   AWG 2.0 — QUIC / WebRTC / SIP / DNS        ║
 ║              + Warp туннель Cloudflare       ║
 ╚══════════════════════════════════════════════╝
@@ -208,6 +215,6 @@ sudo journalctl -u awg-bot -f       # живые логи
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v6.7** · MIT License
+**AWG Toolza v6.7.4** · MIT License
 
 </div>
