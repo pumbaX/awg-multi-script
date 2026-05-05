@@ -1,11 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.7.1"
+VERSION="v6.7.4"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
-#────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# v6.4:
+#   • Сохранение клиентов при «Сбросить сервер» (переподпись)
+#   • Авто-бэкап перед опасными операциями
+#   • Авторемонт awg0 (проверка состояния и восстановление)
+#   • Обновление скрипта с GitHub
+# v6.3:
+# - AWG Toolza — только AWG 2.0
+# - Выбор типа I1 при ручном вводе домена (7 протоколов)
+# - Бекап и восстановление конфигов AWG 2.0 (~/awg_backup/)
+# ─────────────────────────────────────────────────────────────
 
 # ── Цвета ──────────────────────────────────────────────────
 # shellcheck disable=SC2034  # цветовая палитра — часть публичного API функций
@@ -84,10 +94,6 @@ _log() {
 log_info()  { _log "INFO"  "$@"; }
 log_warn()  { _log "WARN"  "$@"; }
 log_err()   { _log "ERROR" "$@"; }
-
-# ══════════════════════════════════════════════════════════
-# ДОМЕННЫЕ ПУЛЫ ДЛЯ МИМИКРИИ
-# ══════════════════════════════════════════════════════════
 
 # Россия
 TLS_DOMAINS_RU=(
@@ -262,13 +268,6 @@ select_random_domain() {
   fi
 }
 
-# ══════════════════════════════════════════════════════════
-# CPS ГЕНЕРАТОР I1-I5
-# Порт Special-Junk-Packet (SIP+TLS handshake flow)
-# + компактный QUIC Initial для профиля quic
-# I1-I5 только в клиентском конфиге — сервер не требует
-# ══════════════════════════════════════════════════════════
-
 # Единый Python генератор для всех профилей мимикрии
 # Единый Python генератор для всех профилей мимикрии
 _CPS_GENERATOR='
@@ -409,9 +408,6 @@ gen_cps_i1() {
 }
 
 
-# ══════════════════════════════════════════════════════════
-# ВЫБОР ПРОФИЛЯ МИМИКРИИ + ГЕНЕРАЦИЯ I1-I5
-# ══════════════════════════════════════════════════════════
 # Алгоритм:
 # 1. Профиль 1-4: выбираем домен из пула через scan_pool → select_random_domain
 #    Fallback-каскад: если целевой пул пуст → пробуем следующий → ... → none
@@ -423,7 +419,6 @@ gen_cps_i1() {
 #
 # Все профили генерируют I1-I5 через CPS-генератор (_CPS_GENERATOR).
 # Глобальные переменные на выходе: I1, I2, I3, I4, I5, MIMICRY_PROFILE
-# ══════════════════════════════════════════════════════════
 choose_obf_level() {
   # Глобальная переменная OBF_LEVEL:
   #   1 = basic (без I1-I5) — max совместимость, рекомендуется
@@ -524,10 +519,6 @@ choose_mimicry_profile() {
     I1=""; I2=""; I3=""; I4=""; I5=""
   fi
 }
-
-# ══════════════════════════════════════════════════════════
-# ТЕСТ DPI — захват первого CPS пакета и анализ
-# ══════════════════════════════════════════════════════════
 
 # Python-анализатор pcap (генерируется во временный файл при вызове)
 _AWG_PCAP_ANALYZER='
@@ -791,9 +782,6 @@ do_sniff_test() {
   log_info "DPI тест: клиент=$client_ip verdict=$verdict"
 }
 
-# ══════════════════════════════════════════════════════════
-# ПРОВЕРКА ЗАВИСИМОСТЕЙ ДЛЯ МЕНЮ
-# ══════════════════════════════════════════════════════════
 check_deps() {
   HAS_AWG=false
   HAS_QRENCODE=false
@@ -839,10 +827,6 @@ check_deps() {
     done
   fi
 }
-
-# ══════════════════════════════════════════════════════════
-# ОСТАЛЬНЫЕ ФУНКЦИИ
-# ══════════════════════════════════════════════════════════
 
 get_public_ip() {
   local ip=""
@@ -928,9 +912,6 @@ get_status() {
   echo -e "$ip|$port|$status|$clients"
 }
 
-# ══════════════════════════════════════════════════════════
-# v6.4: Авто-бэкап перед опасными операциями
-# ══════════════════════════════════════════════════════════
 # Создаёт быстрый автоматический бэкап с префиксом "auto_<reason>_"
 # в ~/awg_backup/. Не задаёт вопросов. Используется do_reset_server,
 # do_clean_clients, do_uninstall.
@@ -958,9 +939,6 @@ auto_backup() {
   return 1
 }
 
-# ══════════════════════════════════════════════════════════
-# v6.4: Авторемонт awg0
-# ══════════════════════════════════════════════════════════
 # Проверяет состояние awg0 и пытается починить:
 #   - конфиг есть, но интерфейс не запущен → awg-quick up
 #   - конфиг есть и интерфейс запущен, но peer'ов нет → reload
@@ -1125,9 +1103,6 @@ do_repair() {
   fi
 }
 
-# ══════════════════════════════════════════════════════════
-# v6.4: Обновление скрипта с GitHub
-# ══════════════════════════════════════════════════════════
 do_self_update() {
   echo ""
   hdr "⬇  Обновление скрипта"
@@ -1389,9 +1364,6 @@ choose_dns() {
   esac
 }
 
-# ══════════════════════════════════════════════════════════
-# ГЕНЕРАЦИЯ AWG ПАРАМЕТРОВ (AWG 2.0)
-# ══════════════════════════════════════════════════════════
 # H1-H4: 8 random + sort алгоритм (из amneziawg-installer)
 #   Гарантирует непересечение без квадрантов.
 #   Ограничение 2^31-1 для совместимости с Windows клиентом.
@@ -1472,9 +1444,6 @@ gen_awg_params() {
   AWG_PARAMS_LINES="Jc = $Jc\nJmin = $Jmin\nJmax = $Jmax\nS1 = $S1\nS2 = $S2\nS3 = $S3\nS4 = $S4\nH1 = $H1\nH2 = $H2\nH3 = $H3\nH4 = $H4"
 }
 
-# ══════════════════════════════════════════════════════════
-# SYNCCONF — горячая перезагрузка без разрыва соединений
-# ══════════════════════════════════════════════════════════
 _apply_config() {
   # Попытка syncconf (без разрыва соединений)
   local strip_out
@@ -1489,9 +1458,6 @@ _apply_config() {
   awg-quick up "$SERVER_CONF" 2>/dev/null
 }
 
-# ══════════════════════════════════════════════════════════
-# РАЗДАЧА КОНФИГА — QR (только без I1-I5) + текст
-# ══════════════════════════════════════════════════════════
 # Стратегия:
 #   - Конфиг БЕЗ I1-I5 → QR код (компактный, влезает)
 #   - Конфиг С I1-I5 → только текст конфига (QR не делаем — слишком большой)
@@ -1530,9 +1496,6 @@ _share_config() {
   fi
 }
 
-# ══════════════════════════════════════════════════════════
-# 1. УСТАНОВКА
-# ══════════════════════════════════════════════════════════
 do_install() {
   while true; do
   # Detect OS
@@ -1758,9 +1721,6 @@ EOF
   done
 }
 
-# ══════════════════════════════════════════════════════════
-# 2. СОЗДАТЬ СЕРВЕР
-# ══════════════════════════════════════════════════════════
 do_gen() {
   log_info "do_gen: старт"
   command -v awg &>/dev/null || { err "awg не найден. Сначала пункт 1"; return 1; }
@@ -2059,9 +2019,6 @@ EOF
   fi
 }
 
-# ══════════════════════════════════════════════════════════
-# 3. УПРАВЛЕНИЕ КЛИЕНТАМИ (меню)
-# ══════════════════════════════════════════════════════════
 # Вспомогательная функция: выводит нумерованный список клиентов из SERVER_CONF
 # Заполняет глобальные массивы:
 #   MGMT_NAMES[]   — имена клиентов (из # comment или "безымянный")
@@ -2370,11 +2327,13 @@ do_delete_client() {
 
   ok "Клиент удалён: $del_name ($del_ip)"
   info "Бекап конфига: $bak"
+
+  # Синхронизируем peers.list — убираем удалённого клиента из Warp
+  if declare -f _warp_sync_peers >/dev/null 2>&1; then
+    _warp_sync_peers 2>/dev/null || true
+  fi
 }
 
-# ══════════════════════════════════════════════════════════
-# 3a. ДОБАВИТЬ КЛИЕНТА
-# ══════════════════════════════════════════════════════════
 do_add_client() {
   [[ ! -f "$SERVER_CONF" ]] && { warn "Конфиг сервера не найден. Сначала пункт 2 — возврат в главное меню"; return 0; }
   command -v awg &>/dev/null || { warn "awg не найден — возврат в главное меню"; return 0; }
@@ -2549,9 +2508,6 @@ do_add_client() {
   echo -e "${W}  Конфиг : ${N}$client_file"
 }
 
-# ══════════════════════════════════════════════════════════
-# 4. ПОКАЗАТЬ КЛИЕНТОВ
-# ══════════════════════════════════════════════════════════
 do_list_clients() {
   [[ ! -f "$SERVER_CONF" ]] && { err "Конфиг сервера не найден"; return 1; }
 
@@ -2694,9 +2650,6 @@ _print_client_info() {
   echo -e "  ${W}└─────────────────────────────────────────────────────────────────────────${N}"
 }
 
-# ══════════════════════════════════════════════════════════
-# 5. QR КЛИЕНТА
-# ══════════════════════════════════════════════════════════
 do_show_qr() {
   local found=()
   while IFS= read -r -d '' f; do
@@ -2735,9 +2688,6 @@ do_show_qr() {
   echo -e "${D}  Конфиг: $chosen${N}"
 }
 
-# ══════════════════════════════════════════════════════════
-# 6. ПЕРЕЗАПУСК
-# ══════════════════════════════════════════════════════════
 do_restart() {
   hdr "↻  Перезапуск awg0"
   if [[ ! -f "$SERVER_CONF" ]]; then
@@ -2775,10 +2725,7 @@ do_restart() {
   fi
 }
 
-# ══════════════════════════════════════════════════════════
-# ══════════════════════════════════════════════════════════
 # 10. СБРОС СЕРВЕРА (чистая переустановка)
-# ══════════════════════════════════════════════════════════
 # Удаляет конфиги и правила firewall, но НЕ трогает пакеты/бинарники.
 # После сброса можно сразу пункт 2 — создать новый сервер.
 do_reset_server() {
@@ -2873,12 +2820,6 @@ do_reset_server() {
   log_info "do_reset_server: сброс выполнен"
 }
 
-# ══════════════════════════════════════════════════════════
-# 11. УДАЛИТЬ ВСЁ
-# ══════════════════════════════════════════════════════════
-# ══════════════════════════════════════════════════════════
-# 999. DEBUG — генерация всех вариантов CPS в /tmp/awg_debug/
-# ══════════════════════════════════════════════════════════
 do_debug_cps() {
   local DEBUG_DIR="/tmp/awg_debug"
   rm -rf "$DEBUG_DIR"
@@ -2990,9 +2931,6 @@ do_debug_cps() {
 }
 
 
-# ══════════════════════════════════════════════════════════
-# 15. WARP ТУННЕЛЬ (Cloudflare wgcf)
-# ══════════════════════════════════════════════════════════
 # Перенаправляет трафик AWG туннеля через Cloudflare Warp.
 # Поддерживает бесплатный Warp и Warp+ с лицензионным ключом.
 # Полезно когда IP сервера в блок-листах РКН — выходной IP меняется на Cloudflare.
@@ -3130,20 +3068,74 @@ _warp_register() {
   fi
 
   info "Регистрируем новый Warp аккаунт..."
+  info "Сервер: api.cloudflareclient.com"
 
-  if ! wgcf register --accept-tos; then
-    err "Регистрация не удалась"
-    return 1
+  # Pre-check: доступен ли API Cloudflare с этого сервера?
+  # Российские VPS часто блокируют api.cloudflareclient.com
+  local api_check
+  api_check=$(curl -4 -s -o /dev/null -w "%{http_code}" \
+    --connect-timeout 5 --max-time 8 \
+    "https://api.cloudflareclient.com/v0a1922/" 2>/dev/null || echo "000")
+
+  if [[ "$api_check" == "000" ]]; then
+    warn "API Cloudflare недоступен с этого сервера"
+    info "Это типично для российских VPS — Cloudflare API часто блокируется"
+    echo ""
+    info "Возможные решения:"
+    info "  1. Использовать VPS вне РФ (Hetzner, OVH, DigitalOcean)"
+    info "  2. Прописать proxy для wgcf через переменные окружения:"
+    info "     export HTTPS_PROXY=http://proxy.example.com:8080"
+    info "  3. Использовать готовый wgcf-account.toml с другого сервера"
+    echo ""
+    read -rp "$(echo -e "${C}  Продолжить попытку регистрации? [y/N]: ${N}")" CONT
+    [[ ! "$CONT" =~ ^[Yy]$ ]] && { warn "Отменено"; return 1; }
   fi
 
-  if [[ ! -f "wgcf-account.toml" ]]; then
-    err "wgcf-account.toml не создан после регистрации"
-    return 1
-  fi
+  # Retry с экспоненциальной задержкой — TLS handshake timeout часто решается повтором
+  local attempt=0
+  local max_attempts=3
+  local delay=3
 
-  chmod 600 wgcf-account.toml
-  ok "Warp аккаунт зарегистрирован (бесплатный)"
-  return 0
+  while [[ $attempt -lt $max_attempts ]]; do
+    attempt=$((attempt + 1))
+    info "Попытка $attempt/$max_attempts..."
+
+    if wgcf register --accept-tos 2>/tmp/wgcf_reg_err; then
+      if [[ -f "wgcf-account.toml" ]]; then
+        chmod 600 wgcf-account.toml
+        ok "Warp аккаунт зарегистрирован (бесплатный)"
+        rm -f /tmp/wgcf_reg_err
+        return 0
+      fi
+    fi
+
+    # Анализируем ошибку
+    local err_msg
+    err_msg=$(grep -E "TLS handshake timeout|connection refused|i/o timeout|no such host" /tmp/wgcf_reg_err 2>/dev/null | head -1)
+
+    if [[ -n "$err_msg" ]] && [[ $attempt -lt $max_attempts ]]; then
+      warn "  $err_msg"
+      info "  Жду ${delay}с перед повтором..."
+      sleep "$delay"
+      delay=$((delay * 2))
+    elif [[ $attempt -lt $max_attempts ]]; then
+      warn "  Регистрация не удалась, повторяю через ${delay}с..."
+      sleep "$delay"
+      delay=$((delay * 2))
+    fi
+  done
+
+  err "Регистрация не удалась после $max_attempts попыток"
+  echo ""
+  if grep -qE "TLS handshake timeout|connection refused|i/o timeout" /tmp/wgcf_reg_err 2>/dev/null; then
+    warn "Cloudflare API недоступен — скорее всего блокировка на уровне ВПС"
+    info "Решение: использовать VPS вне РФ или wgcf-account.toml с другого сервера"
+  else
+    info "Лог ошибки:"
+    cat /tmp/wgcf_reg_err 2>/dev/null | head -20
+  fi
+  rm -f /tmp/wgcf_reg_err
+  return 1
 }
 
 _warp_apply_license() {
@@ -3335,6 +3327,49 @@ _warp_remove_peer_rules() {
   done < "$WARP_PEERS"
 }
 
+# Синхронизирует peers.list с реальным server.conf
+# Убирает из peers.list те IP'ы, которые уже не существуют в AWG
+# (когда клиент был удалён через пункт 3)
+# Возвращает количество удалённых "мёртвых" IP'шников
+_warp_sync_peers() {
+  [[ ! -f "$WARP_PEERS" ]] && return 0
+  [[ ! -f "$SERVER_CONF" ]] && {
+    # Сервер удалён — чистим всё
+    > "$WARP_PEERS"
+    return 0
+  }
+
+  # Собираем все живые IP клиентов (без CIDR)
+  local live_ips
+  live_ips=$(_warp_list_awg_clients | awk -F'|' '{print $2}' | sort -u)
+
+  if [[ -z "$live_ips" ]]; then
+    > "$WARP_PEERS"
+    return 0
+  fi
+
+  # Перезаписываем peers.list только теми IP, что есть в live_ips
+  local tmp="${WARP_PEERS}.tmp"
+  > "$tmp"
+  local removed=0
+  local ip
+  while IFS= read -r ip; do
+    [[ -z "$ip" ]] && continue
+    if echo "$live_ips" | grep -qxF "$ip"; then
+      echo "$ip" >> "$tmp"
+    else
+      # Этого IP больше нет в server.conf — убираем правило если warp активен
+      if ip link show warp0 &>/dev/null; then
+        ip rule del from "$ip" lookup 200 2>/dev/null || true
+      fi
+      removed=$((removed + 1))
+    fi
+  done < "$WARP_PEERS"
+  mv "$tmp" "$WARP_PEERS"
+
+  return 0
+}
+
 # ── Health-check Warp ────────────────────────────────────────────
 
 _warp_health_status() {
@@ -3479,6 +3514,9 @@ _warp_health_toggle() {
 do_warp_peers_menu() {
   set +e
   while true; do
+    # Синхронизируем при каждом входе — на случай если клиенты были удалены
+    _warp_sync_peers 2>/dev/null || true
+
     clear
     echo ""
     hdr "⚙ Клиенты в Warp туннеле"
@@ -3695,6 +3733,9 @@ EOF
   ip route flush table 200 2>/dev/null || true
   ip route add default dev warp0 src "${warp_addr4%/*}" table 200
 
+  # Сначала синхронизируем — убираем мёртвые IP (удалённых клиентов)
+  _warp_sync_peers 2>/dev/null || true
+
   # Если peers list пуст или не существует — заполняем всеми клиентами по умолчанию
   if [[ ! -s "$WARP_PEERS" ]]; then
     info "Список клиентов в Warp пуст — добавляем всех по умолчанию"
@@ -3764,46 +3805,139 @@ _warp_down() {
   return 0
 }
 
+# Перебор Cloudflare endpoint'ов — для случаев когда стандартный 2408 блокируется DPI
+# (типично на РФ хостингах). Пробует разные порты на разных IP пока не найдёт рабочий.
+_warp_endpoint_finder() {
+  if ! ip link show warp0 &>/dev/null; then
+    err "warp0 не активен — сначала включи туннель (пункт 3)"
+    return 1
+  fi
+
+  # Pubkey peer'а для wg set
+  local peer_pub
+  peer_pub=$(wg show warp0 peers 2>/dev/null | head -1)
+  if [[ -z "$peer_pub" ]]; then
+    err "Не могу получить pubkey peer'а из warp0"
+    return 1
+  fi
+
+  echo ""
+  hdr "🔍  Поиск рабочего Cloudflare endpoint"
+  echo ""
+  echo -e "  Если стандартный 2408 не работает — пробуем альтернативы."
+  echo -e "  ${D}Список из NTC.party — портов которые иногда проходят через DPI${N}"
+  echo ""
+
+  # Топ-портов которые часто работают (взято из NTC.party и обсуждений)
+  local TOP_PORTS=(2408 1701 4500 500 1002 854 859 894 955 7156 7281 891 943 4198 8854)
+  # IP блоки Cloudflare Warp (только начало диапазонов 162.159.192.x и 195.x)
+  local TOP_IPS=(162.159.192.1 162.159.193.10 162.159.195.1 162.159.192.10 162.159.192.5 162.159.195.5)
+
+  local found_endpoint=""
+  local attempts=0
+  local max_attempts=30
+
+  echo -e "  Начинаю перебор (макс $max_attempts попыток)..."
+  echo ""
+
+  for ip in "${TOP_IPS[@]}"; do
+    for port in "${TOP_PORTS[@]}"; do
+      attempts=$((attempts+1))
+      [[ $attempts -gt $max_attempts ]] && break 2
+
+      local endpoint="${ip}:${port}"
+      printf "  [%2d/%d] %-26s ... " "$attempts" "$max_attempts" "$endpoint"
+
+      # Меняем endpoint
+      wg set warp0 peer "$peer_pub" endpoint "$endpoint" 2>/dev/null || {
+        echo -e "${R}set fail${N}"
+        continue
+      }
+
+      # Сбрасываем счётчик received (узнаем стартовое значение)
+      local rx_before
+      rx_before=$(wg show warp0 transfer 2>/dev/null | awk '{print $2}' | head -1 || echo "0")
+
+      # Триггерим handshake — отправляем 1 ping чтобы wireguard попытался connect
+      timeout 1 ping -c 1 -W 1 -I warp0 1.1.1.1 &>/dev/null || true
+
+      # Ждём 4 секунды для handshake
+      sleep 4
+
+      # Проверяем — есть ли новые байты в received
+      local rx_after
+      rx_after=$(wg show warp0 transfer 2>/dev/null | awk '{print $2}' | head -1 || echo "0")
+
+      if [[ "$rx_after" -gt "$rx_before" ]]; then
+        echo -e "${G}✓ работает!${N} (received: $rx_after)"
+        found_endpoint="$endpoint"
+        break 2
+      else
+        echo -e "${D}нет ответа${N}"
+      fi
+    done
+  done
+
+  echo ""
+  if [[ -n "$found_endpoint" ]]; then
+    ok "Найден рабочий endpoint: $found_endpoint"
+    echo ""
+    info "Сохраняю в state и в профиль..."
+
+    # Обновляем wgcf-profile.conf чтобы при следующем рестарте использовался этот endpoint
+    if [[ -f "$WARP_PROFILE" ]]; then
+      sed -i "s|^Endpoint = .*|Endpoint = $found_endpoint|" "$WARP_PROFILE"
+    fi
+    if [[ -f "$WARP_CONF" ]]; then
+      sed -i "s|^Endpoint = .*|Endpoint = $found_endpoint|" "$WARP_CONF"
+    fi
+
+    # Делаем ping для проверки реальной связности
+    info "Проверяем туннель..."
+    if timeout 5 ping -c 2 -W 2 -I warp0 1.1.1.1 &>/dev/null; then
+      ok "Туннель работает! Через Warp проходит трафик"
+    else
+      warn "Handshake есть, но ping ещё не идёт. Подожди 10-30 секунд"
+    fi
+  else
+    err "Ни один endpoint не ответил за $attempts попыток"
+    echo ""
+    warn "Скорее всего твой провайдер ($(curl -s ipinfo.io/org 2>/dev/null || echo 'хостер')) блокирует UDP-трафик к Cloudflare"
+    echo ""
+    info "Рекомендации:"
+    info "  • Сменить хостинг (российские VPS часто блокируют Cloudflare)"
+    info "  • Использовать AWG без Warp (пункт 4 — выключить Warp)"
+    info "  • Попробовать MASQUE-клиент (usque) — он ходит через 443/HTTPS"
+  fi
+
+  return 0
+}
+
+
 _warp_remove() {
   echo ""
   warn "Удалить Warp полностью? Будет удалено:"
   warn "  • $WARP_CONF"
   warn "  • $WARP_DIR (аккаунт + список клиентов)"
   warn "  • /usr/local/bin/wgcf"
-  warn "  • systemd wg-quick@warp0"
   warn "  • Health-check service/timer"
   echo ""
-
   read -rp "$(echo -e "${R}  Подтверди [yes/N]: ${N}")" CONFIRM
   [[ "$CONFIRM" != "yes" ]] && { warn "Отменено"; return 0; }
 
-  # остановка туннеля
-  if command -v wg-quick >/dev/null 2>&1; then
-    wg-quick down warp0 2>/dev/null || true
-  fi
-
-  # systemd cleanup
-  systemctl disable wg-quick@warp0 2>/dev/null || true
-  systemctl stop wg-quick@warp0 2>/dev/null || true
-
-  # health check
+  _warp_down
   _warp_health_remove 2>/dev/null || true
-
-  # файлы
   rm -rf "$WARP_DIR" "$WARP_CONF" 2>/dev/null
-
-  # бинарь
   rm -f /usr/local/bin/wgcf 2>/dev/null
-  hash -r
-
-  # мусор
   rm -f "$WARP_HEALTH_LOG" /tmp/awg-warp-fails 2>/dev/null
-
   ok "Warp удалён полностью"
   return 0
 }
 
 _warp_status() {
+  # Сначала синхронизируем — убираем мёртвые IP из peers.list
+  _warp_sync_peers 2>/dev/null || true
+
   if command -v wgcf &>/dev/null && wgcf --help &>/dev/null; then
     echo -e "  wgcf       : ${G}установлен${N}"
   else
@@ -3833,10 +3967,21 @@ _warp_status() {
     echo -e "  Интерфейс  : ${G}● warp0 активен${N}"
     # Подсчёт включённых клиентов
     local peer_count=0
-    [[ -f "$WARP_PEERS" ]] && peer_count=$(grep -c '^[0-9]' "$WARP_PEERS" 2>/dev/null || echo 0)
-    local total_clients=0
-    total_clients=$(_warp_list_awg_clients | grep -c '^' 2>/dev/null || echo 0)
-    echo -e "  Через Warp : ${G}$peer_count${N} из ${C}$total_clients${N} клиент(ов)"
+    if [[ -f "$WARP_PEERS" ]]; then
+      peer_count=$(grep -c '^[0-9]' "$WARP_PEERS" 2>/dev/null)
+      peer_count="${peer_count:-0}"
+      # Убираем возможные переводы строки и пробелы
+      peer_count=$(echo "$peer_count" | tr -d '\n\r ')
+      [[ -z "$peer_count" ]] && peer_count=0
+    fi
+    local total_clients
+    total_clients=$(_warp_list_awg_clients 2>/dev/null | grep -c '^' || echo "0")
+    total_clients=$(echo "$total_clients" | tr -d '\n\r ')
+    [[ -z "$total_clients" ]] && total_clients=0
+    # Цвет числа: зелёный если есть, серый если 0
+    local pc_color="$G"
+    [[ "$peer_count" == "0" ]] && pc_color="$D"
+    echo -e "  Через Warp : ${pc_color}${peer_count}${N} из ${C}${total_clients}${N} клиент(ов)"
     local warp_ip
     warp_ip=$(timeout 3 curl -s --interface warp0 -4 https://1.1.1.1/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/{print $2}' | head -1 || echo "")
     [[ -n "$warp_ip" ]] && echo -e "  Warp IP    : ${C}$warp_ip${N}"
@@ -3849,6 +3994,120 @@ _warp_status() {
 
   return 0
 }
+
+# ── Импорт готового wgcf-account.toml с другого VPS ─────────────
+
+_warp_import_account() {
+  echo ""
+  hdr "★  Импорт готового профиля Warp"
+  echo ""
+  echo -e "  ${W}Когда нужен импорт:${N}"
+  echo -e "  Когда твой VPS не может подключиться к Cloudflare API"
+  echo -e "  (TLS handshake timeout — типично для российских VPS)"
+  echo ""
+  echo -e "  ${Y}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo -e "  ${W}⚡ ИНСТРУКЦИЯ: Google Cloud Shell${N} ${G}(бесплатно, 1 минута)${N}"
+  echo -e "  ${Y}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo ""
+  echo -e "  ${Y}⚠ Из РФ — открывать через VPN${N} ${D}(Cloud Shell заблокирован)${N}"
+  echo ""
+  echo -e "  ${W}1.${N} Открой ${C}https://shell.cloud.google.com${N} (нужен Google аккаунт)"
+  echo -e "  ${W}2.${N} Выполни команду (одну):"
+  echo ""
+  echo -e "${G}  rm -f wgcf-account.toml wgcf-profile.conf && curl -fsSL -o wgcf https://github.com/ViRb3/wgcf/releases/download/v2.2.30/wgcf_2.2.30_linux_amd64 && chmod +x wgcf && ./wgcf register --accept-tos && ./wgcf generate && cat wgcf-profile.conf${N}"
+  echo ""
+  echo -e "  ${W}3.${N} Скопируй ${C}весь вывод${N} от ${D}[Interface]${N} до конца"
+  echo -e "     ${D}(должно быть содержимое wgcf-profile.conf — Address, PrivateKey, Endpoint и т.д.)${N}"
+  echo ""
+  echo -e "  ${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo -e "  ${W}Альтернативы:${N} GitHub Codespaces, Replit, любой VPS не из РФ"
+  echo -e "  ${R}✗ НЕ работают:${N} aeza, timeweb, beget — Cloudflare блокирует РФ"
+  echo ""
+  echo -e "  ${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo -e "  ${W}Вставь сюда содержимое wgcf-profile.conf:${N}"
+  echo ""
+  echo -e "  ${D}Когда закончишь — нажми Enter, затем Ctrl+D${N}"
+  echo -e "  ${D}Для отмены — Ctrl+C${N}"
+  echo ""
+  echo -e "${C}━━━━━━ начало вставки ━━━━━━${N}"
+
+  # Читаем multiline ввод до EOF (Ctrl+D)
+  local content
+  content=$(cat)
+
+  echo -e "${C}━━━━━━ конец вставки ━━━━━━${N}"
+  echo ""
+
+  if [[ -z "$content" ]]; then
+    err "Пусто — отменено"
+    return 1
+  fi
+
+  # Валидация — это должен быть wgcf-profile.conf (формат WireGuard)
+  # Обязательные поля: [Interface], PrivateKey, Address, [Peer], PublicKey, Endpoint
+  if ! echo "$content" | grep -q '^\[Interface\]'; then
+    err "Не похоже на wgcf-profile.conf — нет секции [Interface]"
+    info ""
+    info "Ожидался формат WireGuard конфига:"
+    info "  [Interface]"
+    info "  PrivateKey = ..."
+    info "  Address = 172.16.0.2/32"
+    info "  [Peer]"
+    info "  PublicKey = ..."
+    info "  Endpoint = engage.cloudflareclient.com:2408"
+    return 1
+  fi
+  if ! echo "$content" | grep -q '^PrivateKey'; then
+    err "Нет поля PrivateKey — некорректный файл"
+    return 1
+  fi
+  if ! echo "$content" | grep -q '^\[Peer\]'; then
+    err "Нет секции [Peer] — некорректный файл"
+    return 1
+  fi
+  if ! echo "$content" | grep -q '^PublicKey'; then
+    err "Нет поля PublicKey — некорректный файл"
+    return 1
+  fi
+  if ! echo "$content" | grep -q '^Endpoint'; then
+    err "Нет поля Endpoint — некорректный файл"
+    return 1
+  fi
+
+  # Бекапим существующий профиль если есть
+  mkdir -p "$WARP_DIR"
+  if [[ -f "$WARP_PROFILE" ]]; then
+    local bak="${WARP_PROFILE}.bak.$(date +%s)"
+    cp "$WARP_PROFILE" "$bak"
+    info "Старый профиль сохранён: $bak"
+  fi
+
+  # Записываем профиль
+  echo "$content" > "$WARP_PROFILE"
+  chmod 600 "$WARP_PROFILE"
+
+  # Также копируем в /etc/wireguard/warp0.conf для использования скриптом
+  cp "$WARP_PROFILE" "$WARP_CONF"
+  chmod 600 "$WARP_CONF"
+
+  ok "wgcf-profile.conf импортирован"
+
+  # Если есть wgcf — устанавливаем фейковый account.toml для совместимости со статусом
+  # (чтобы в _warp_status показывалось "Аккаунт: импортирован")
+  if [[ ! -f "$WARP_ACCOUNT" ]]; then
+    cat > "$WARP_ACCOUNT" << 'EOF'
+# Account info imported via wgcf-profile.conf
+# Original account.toml not available (network blocked from this server)
+imported = true
+EOF
+    chmod 600 "$WARP_ACCOUNT"
+  fi
+
+  echo ""
+  ok "Готово! Теперь пункт 3 — включить туннель"
+  return 0
+}
+
 
 do_warp_menu() {
   # Отключаем set -e внутри меню чтобы один сбой не убивал весь скрипт
@@ -3866,17 +4125,35 @@ do_warp_menu() {
     echo -e "  3) Включить туннель"
     echo -e "  4) Выключить туннель"
     echo -e "  5) Перегенерировать профиль (после смены лицензии)"
-    echo -e "  ${C}7) Управление клиентами в Warp${N}"
-    echo -e "  ${C}8) Health-check (вкл/выкл авто-failover)${N}"
-    echo -e "  ${R}6) Удалить Warp полностью${N}"
+    echo -e "  ${C}6) Управление клиентами в Warp${N}"
+    echo -e "  ${C}7) Health-check (вкл/выкл авто-failover)${N}"
+    echo -e "  ${C}8) Импорт wgcf-profile.conf (если регистрация не работает)${N}"
+    echo -e "  ${C}9) Поиск рабочего endpoint (если 2408 заблокирован DPI)${N}"
+    echo -e "  ${R}d) Удалить Warp полностью${N}"
     echo -e "  0) Назад в главное меню"
     echo ""
-    read -rp "$(echo -e "${C}  Выбор [0-8]: ${N}")" WARP_CHOICE
+    read -rp "$(echo -e "${C}  Выбор [0-9, d]: ${N}")" WARP_CHOICE
 
     case "${WARP_CHOICE:-}" in
       1)
         _warp_install_wgcf || { read -rp "Enter..."; continue; }
-        _warp_register || { read -rp "Enter..."; continue; }
+        if ! _warp_register; then
+          echo ""
+          echo -e "${Y}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+          echo -e "${W}  💡 Регистрация не удалась — что делать дальше:${N}"
+          echo -e "${Y}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+          echo ""
+          echo -e "  Это типичная проблема российских VPS — Cloudflare API"
+          echo -e "  блокирует регистрацию с российских IP-адресов."
+          echo ""
+          echo -e "  ${G}Решение:${N} зарегистрируй аккаунт на другом сервере"
+          echo -e "  и импортируй сюда через ${W}пункт 8${N} в этом меню."
+          echo ""
+          echo -e "  ${C}Подробная инструкция:${N} меню 15 → ${W}8${N}"
+          echo ""
+          read -rp "Enter..."
+          continue
+        fi
         _warp_generate_profile || { read -rp "Enter..."; continue; }
         ok "Готово! Теперь пункт 3 — включить туннель"
         read -rp "Enter..."
@@ -3888,9 +4165,11 @@ do_warp_menu() {
         _warp_generate_profile && info "Профиль обновлён. Если warp0 активен — выключи и включи (4 → 3)"
         read -rp "Enter..."
         ;;
-      7) do_warp_peers_menu ;;
-      8) _warp_health_toggle; read -rp "Enter..." ;;
-      6) _warp_remove; read -rp "Enter..." ;;
+      6) do_warp_peers_menu ;;
+      7) _warp_health_toggle; read -rp "Enter..." ;;
+      8) _warp_import_account; read -rp "Enter..." ;;
+      9) _warp_endpoint_finder; read -rp "Enter..." ;;
+      d|D) _warp_remove; read -rp "Enter..." ;;
       0|"")
         set -e
         return 0
@@ -3900,9 +4179,6 @@ do_warp_menu() {
   done
   set -e
 }
-# ══════════════════════════════════════════════════════════
-# 12. УДАЛИТЬ ВСЁ
-# ══════════════════════════════════════════════════════════
 do_uninstall() {
   echo ""
   hdr "⌧  Удаление AmneziaWG"
@@ -3953,9 +4229,6 @@ do_uninstall() {
   ok "Всё удалено"
 }
 
-# ══════════════════════════════════════════════════════════
-# 8. ПРОВЕРКА ДОМЕНОВ
-# ══════════════════════════════════════════════════════════
 # Параллельный пинг всех доменов из 4 пулов.
 # Результаты сохраняются в кэш /tmp/awg_domain_cache.txt.
 do_check_domains() {
@@ -4109,9 +4382,6 @@ do_check_domains() {
   return 0
 }
 
-# ══════════════════════════════════════════════════════════
-# 9. ОЧИСТИТЬ КЛИЕНТОВ
-# ══════════════════════════════════════════════════════════
 do_clean_clients() {
   hdr "⌧  Очистка всех клиентов"
   [[ ! -f "$SERVER_CONF" ]] && { err "Конфиг сервера не найден"; return 1; }
@@ -4173,11 +4443,13 @@ do_clean_clients() {
   echo ""
   ok "Удалено $client_count клиентов"
   info "Конфиги клиентов из /root удалены"
+
+  # Все клиенты удалены — очищаем Warp peers.list
+  if declare -f _warp_sync_peers >/dev/null 2>&1; then
+    _warp_sync_peers 2>/dev/null || true
+  fi
 }
 
-# ══════════════════════════════════════════════════════════
-# 10. БЕКАП AWG 2.0
-# ══════════════════════════════════════════════════════════
 do_backup() {
   local username timestamp backup_path
 
@@ -4235,9 +4507,6 @@ do_backup() {
   log_info "Бекап создан: $backup_path ($backed_up файлов)"
 }
 
-# ══════════════════════════════════════════════════════════
-# 11. ВОССТАНОВЛЕНИЕ ИЗ БЕКАПА
-# ══════════════════════════════════════════════════════════
 do_restore() {
   echo ""
   hdr "◈  Восстановление AmneziaWG 2.0"
@@ -4335,9 +4604,6 @@ do_restore() {
   log_info "Восстановление из бекапа: $chosen_backup ($restored файлов)"
 }
 
-# ══════════════════════════════════════════════════════════
-# ГЛАВНЫЙ ЦИКЛ
-# ══════════════════════════════════════════════════════════
 CHOICE=""
 CLIENT_DNS="1.1.1.1, 1.0.0.1"
 AWG_VERSION="2.0"   # единственная поддерживаемая версия
