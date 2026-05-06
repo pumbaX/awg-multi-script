@@ -157,6 +157,8 @@ d) Удалить Warp полностью
 ```bash
 sudo curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg-bot-install.sh -o /tmp/awg-bot-install.sh
 ```
+
+**Запуск:**
 ```bash
 sudo bash /tmp/awg-bot-install.sh
 ```
