@@ -5548,9 +5548,8 @@ while true; do
     999) do_debug_cps ;;
     0)  log_info "Выход"
         echo -e "\n${G}  В путь! ${N}"
-        echo -e "\n▓▒░ DPI ОТСТОЙ! ░▒▓"
-        echo -e "<< НЕТ КОНТРОЛЮ! >>"
-        echo -e "<< VIVAT СВОБОДНЫЙ ИНТЕРНЕТ!!! >>\n"
+        echo -e "<< Подпишись на ТГ :) >>"
+        echo -e "<< https://t.me/awgToolza >>\n"
         exit 0 ;;
     *)
       warn "Неверный выбор"
