@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.8.0"
+VERSION="v6.8.2"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -184,14 +184,19 @@ log_err()   { _log "ERROR" "$@"; }
 # RU и WORLD массивы оставлены идентичными — choose_region сохранён для совместимости
 # со старыми конфигами (метка "# Region: ru" в шапке awg0.conf).
 
-# TLS SNI (ClientHello) — крупные мировые сайты, открытые в РФ
+# TLS SNI (ClientHello) — крупные мировые сайты + РФ-сайты для RU-региона
+# RU = WORLD + домены крупных российских сервисов (открытые в РФ, отвечают на ping)
 TLS_DOMAINS_RU=(
+  # WORLD-набор (мировые сайты, открытые в РФ)
   "google.com" "github.com" "gitlab.com" "stackoverflow.com"
-  "microsoft.com" "apple.com" "amazon.com" "wikipedia.org"
+  "microsoft.com" "apple.com" "amazon.com"
   "mozilla.org" "kernel.org" "debian.org" "ubuntu.com"
   "cdn.jsdelivr.net" "unpkg.com" "pypi.org"
   "hetzner.com" "ovhcloud.com" "digitalocean.com"
   "steampowered.com" "spotify.com"
+  # РФ-набор (массовый трафик внутри страны, TCP/443 + ping OK)
+  "ya.ru" "vk.com" "mail.ru" "ozon.ru" "wildberries.ru"
+  "rutube.ru" "gosuslugi.ru"
 )
 DTLS_DOMAINS_RU=(
   # Только домены, реально отвечающие на ICMP ping.
@@ -216,21 +221,37 @@ SIP_DOMAINS_RU=(
 QUIC_DOMAINS_RU=(
   # Удалены ICMP-блокирующие: cdn-apple.com, steamstatic.com, steamcontent.com.
   # (h3 у них работает, но ping-проверка систематически даёт fail.)
+  # Удалены HTTP/3-нерабочие: wikipedia.org, wikimedia.org, bunny.net, cdn77.com,
+  # gcdn.co, g.gcdn.co (TCP/ping OK, но h3 не отвечает или офлайн).
   "google.com" "youtube.com"
   "cdn.jsdelivr.net" "unpkg.com"
   "icloud.com" "mzstatic.com"
   "fastly.net" "a.ssl.fastly.net"
-  "b-cdn.net" "bunny.net" "cdn77.com"
+  "b-cdn.net"
   "github.com" "objects.githubusercontent.com"
-  "wikipedia.org" "wikimedia.org"
-  "gcdn.co" "g.gcdn.co"
+  # РФ-домены с подтверждённой поддержкой HTTP/3
+  "ozon.ru"
 )
 
-# WORLD — синонимы RU (универсальный пул)
-TLS_DOMAINS_WORLD=("${TLS_DOMAINS_RU[@]}")
+# WORLD — универсальный пул (мировые сайты без РФ-специфики)
+TLS_DOMAINS_WORLD=(
+  "google.com" "github.com" "gitlab.com" "stackoverflow.com"
+  "microsoft.com" "apple.com" "amazon.com"
+  "mozilla.org" "kernel.org" "debian.org" "ubuntu.com"
+  "cdn.jsdelivr.net" "unpkg.com" "pypi.org"
+  "hetzner.com" "ovhcloud.com" "digitalocean.com"
+  "steampowered.com" "spotify.com"
+)
 DTLS_DOMAINS_WORLD=("${DTLS_DOMAINS_RU[@]}")
 SIP_DOMAINS_WORLD=("${SIP_DOMAINS_RU[@]}")
-QUIC_DOMAINS_WORLD=("${QUIC_DOMAINS_RU[@]}")
+QUIC_DOMAINS_WORLD=(
+  "google.com" "youtube.com"
+  "cdn.jsdelivr.net" "unpkg.com"
+  "icloud.com" "mzstatic.com"
+  "fastly.net" "a.ssl.fastly.net"
+  "b-cdn.net"
+  "github.com" "objects.githubusercontent.com"
+)
 
 # Активные пулы (устанавливаются при выборе региона)
 TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_WORLD[@]}")
@@ -452,7 +473,7 @@ if PROFILE not in ALLOWED_PROFILES:
 
 DOMAIN_POOL = [
     "google.com","github.com","gitlab.com","stackoverflow.com",
-    "microsoft.com","apple.com","amazon.com","wikipedia.org",
+    "microsoft.com","apple.com","amazon.com",
     "mozilla.org","cdn.jsdelivr.net","unpkg.com","pypi.org",
     "ubuntu.com","debian.org","hetzner.com","ovhcloud.com",
     "digitalocean.com",
@@ -625,6 +646,71 @@ gen_cps_i1() {
 #
 # Все профили генерируют I1-I5 через CPS-генератор (_CPS_GENERATOR).
 # Глобальные переменные на выходе: I1, I2, I3, I4, I5, MIMICRY_PROFILE
+# ── Профили AWG (Lite / Standard / Pro) ──────────────────
+# AWG_PROFILE определяет ВСЁ:
+#   - параметры Jc/Jmin/Jmax/S1-S4/H1-H4 (gen_awg_params)
+#   - уровень обфускации (OBF_LEVEL)
+#   - профиль мимикрии (MIMICRY_PROFILE)
+# Маркер пишется первой строкой awg0.conf: "# AWG_PROFILE=<value>"
+choose_awg_profile() {
+  AWG_PROFILE=""
+  echo ""
+  hdr "⚙  Профиль AmneziaWG"
+  echo -e "  ${G}1${N}  ${W}Lite${N}     — параметры оригинальной Amnezia"
+  echo -e "     ${D}Минимум junk, малые S/J. I1 = DNS (icloud.com). Макс совместимость.${N}"
+  echo -e "  ${G}2${N}  ${W}Standard${N} — сбалансированный набор"
+  echo -e "     ${D}Средние Jc/S. I1 = QUIC. Хороший баланс защита/совместимость.${N}"
+  echo -e "  ${G}3${N}  ${W}Pro${N}      — максимальная защита (текущий набор)"
+  echo -e "     ${D}Полные диапазоны. Опционально I1-I5 (выбор уровня + профиля).${N}"
+  echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  local _choice
+  read_choice _choice "$(echo -e "${C}  Выбор [1-3] (Enter = 2): ${N}")" 1 3 2
+
+  case "$_choice" in
+    1)
+      AWG_PROFILE="lite"
+      OBF_LEVEL=2                # клиентам кладём I1
+      MIMICRY_PROFILE="dns"
+      # Фиксированный домен для Lite — как в оригинале Amnezia
+      info "Профиль: Lite (I1 = DNS / icloud.com)"
+      local cps_out
+      cps_out=$(gen_cps_i1 "dns" "icloud.com") || cps_out=""
+      I1=$(echo "$cps_out" | sed -n '1p')
+      I2=""; I3=""; I4=""; I5=""
+      if [[ -z "$I1" ]]; then
+        warn "Не удалось сгенерировать I1 для Lite — клиенты пойдут без CPS"
+      else
+        ok "I1 готов (${#I1} сим)"
+      fi
+      ;;
+    2)
+      AWG_PROFILE="standard"
+      OBF_LEVEL=2                # клиентам кладём I1
+      MIMICRY_PROFILE="quic"
+      info "Профиль: Standard (I1 = QUIC)"
+      local sel_domain
+      sel_domain=$(select_random_domain "quic")
+      [[ -z "$sel_domain" ]] && sel_domain=""
+      local cps_out
+      cps_out=$(gen_cps_i1 "quic" "$sel_domain") || cps_out=""
+      I1=$(echo "$cps_out" | sed -n '1p')
+      I2=""; I3=""; I4=""; I5=""
+      if [[ -z "$I1" ]]; then
+        warn "Не удалось сгенерировать I1 для Standard — клиенты пойдут без CPS"
+      else
+        ok "I1 готов (${#I1} сим${sel_domain:+, $sel_domain})"
+      fi
+      ;;
+    3)
+      AWG_PROFILE="pro"
+      info "Профиль: Pro — выбор уровня I1-I5 и мимикрии"
+      choose_obf_level
+      choose_mimicry_profile || return 1
+      ;;
+  esac
+  return 0
+}
+
 choose_obf_level() {
   # Глобальная переменная OBF_LEVEL:
   #   1 = basic (без I1-I5) — max совместимость, рекомендуется
@@ -1471,6 +1557,14 @@ do_self_update() {
     fi
   else
     ok "Доступно обновление: $VERSION → $new_ver"
+    echo ""
+    local CONFIRM_UPDATE
+    read_yesno CONFIRM_UPDATE "$(echo -e "${C}  Установить обновление? [Y/n]: ${N}")" "y"
+    if [[ ! "$CONFIRM_UPDATE" =~ ^[Yy]$ ]]; then
+      info "Отменено — текущая версия сохранена"
+      rm -f "$tmp_file"
+      return 0
+    fi
   fi
 
   # ───── 6. Бэкап текущего скрипта ─────
@@ -1533,13 +1627,29 @@ show_header() {
   local s ip port st clients
   s=$(get_status)
   IFS='|' read -r ip port st clients <<< "$s"
+
+  # Читаем профиль из awg0.conf (Lite / Standard / Pro / —)
+  local profile_raw="—"
+  local profile_label="—"
+  if [[ -f "$SERVER_CONF" ]]; then
+    profile_raw=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2)
+    case "$profile_raw" in
+      lite)     profile_label="Lite" ;;
+      standard) profile_label="Standard" ;;
+      pro)      profile_label="Pro" ;;
+      "")       profile_label="—" ;;
+      *)        profile_label="$profile_raw" ;;
+    esac
+  fi
+
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo -e "  ${W}AwgToolza $VERSION${N}"
-  echo -e "  ${C}AWG 2.0 only — TLS/DTLS/SIP/DNS/QUIC${N}"
+  echo -e "  ${C}TG: @awgToolza${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo -e "  IP сервера : ${W}$ip${N}"
   echo -e "  Порт       : ${W}$port${N}"
   echo -e "  Интерфейс  : $st${N}"
+  echo -e "  Профиль    : ${W}$profile_label${N}"
   echo -e "  Клиентов   : ${W}$clients${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
 }
@@ -1687,35 +1797,79 @@ gen_awg_params() {
   # Параметры AmneziaWG по ОФИЦИАЛЬНОМУ МАНУАЛУ
   # https://docs.amnezia.org/documentation/amnezia-wg/
   # ══════════════════════════════════════════════════════════
+  # Ветвление по AWG_PROFILE: lite / standard / pro
+  # Pro = текущая логика без изменений (полные диапазоны).
 
-  # ── Junk train ──
-  local Jc Jmin Jmax
-  Jc=$(rand_range 4 16)
-  Jmin=$(rand_range 50 256)
-  Jmax=$(rand_range 300 1000)
-  # Обеспечиваем Jmin < Jmax!
+  local Jc Jmin Jmax S1 S2 S3 S4
+
+  case "${AWG_PROFILE:-pro}" in
+    lite)
+      # ── Lite: параметры как у оригинальной Amnezia, ±5 рандом ──
+      # Образец оригинала: Jc=4, Jmin=10, Jmax=50, S1=102, S2=22, S3=21, S4=7
+      Jc=$(rand_range 3 5)              # 4 ±1
+      Jmin=$(rand_range 5 15)           # 10 ±5
+      Jmax=$(rand_range 45 55)          # 50 ±5
+      S1=$(rand_range 97 107)           # 102 ±5
+      S2=$(rand_range 17 27)            # 22 ±5
+      S3=$(rand_range 16 26)            # 21 ±5
+      S4=$(rand_range 4 10)             # 7 ±3 (нельзя ±5: ниже 0 уйдём)
+      ;;
+    standard)
+      # ── Standard: промежуточные значения ──
+      Jc=$(rand_range 5 8)
+      Jmin=$(rand_range 30 80)
+      Jmax=$(rand_range 100 250)
+      S1=$(rand_range 30 80)
+      S2=$(rand_range 30 80)
+      S3=$(rand_range 15 32)
+      S4=$(rand_range 10 20)
+      ;;
+    pro|*)
+      # ── Pro: текущие полные диапазоны (без изменений) ──
+      Jc=$(rand_range 4 16)
+      Jmin=$(rand_range 50 256)
+      Jmax=$(rand_range 300 1000)
+      S1=$(rand_range 15 150)
+      S2=$(rand_range 15 150)
+      S3=$(rand_range 8 64)
+      S4=$(rand_range 6 31)
+      ;;
+  esac
+
+  # ── Инварианты мануала (применяются для всех профилей) ──
+
+  # Jmin < Jmax
   if [[ $Jmin -ge $Jmax ]]; then
     Jmax=$((Jmin + $(rand_range 100 500)))
   fi
 
-  # ── Padding S1/S2 ──
-  # Мануал: S1 ≤ 1132, S2 ≤ 1188, recommended 15-150
-  #         Обязательно: S1 + 56 ≠ S2
-  local S1 S2
-  S1=$(rand_range 15 150)
-  S2=$(rand_range 15 150)
-  # Проверяем S1+56 != S2 (требование мануала)
-  local tries=0
-  while [[ $((S1 + 56)) -eq $S2 ]] && [[ $tries -lt 10 ]]; do
-    S2=$(rand_range 15 150)
+  # S1 + 56 ≠ S2 (требование мануала). Усиливаем: gap >= 10
+  # для защиты от off-by-one в реализации awg.
+  # Если за 10 попыток не вышло — оставляем последнее значение
+  # (математически в наших диапазонах такого не должно случиться,
+  # но логируем для отладки).
+  local tries=0 max_tries=10 gap=10
+  local S1_plus_56=$((S1 + 56))
+  while [[ $tries -lt $max_tries ]]; do
+    local diff=$((S1_plus_56 - S2))
+    [[ $diff -lt 0 ]] && diff=$((-diff))
+    [[ $diff -ge $gap ]] && break
+    # Перегенерируем S2 в рамках того же профиля
+    case "${AWG_PROFILE:-pro}" in
+      lite)     S2=$(rand_range 17 27) ;;
+      standard) S2=$(rand_range 30 80) ;;
+      pro|*)    S2=$(rand_range 15 150) ;;
+    esac
     tries=$((tries + 1))
   done
-
-  # ── Padding S3/S4 (AWG 2.0 extension) ──
-  # Не в мануале, но используется в AWG 2.0. Держим осмысленно малые
-  local S3 S4
-  S3=$(rand_range 8 64)
-  S4=$(rand_range 6 31)
+  if [[ $tries -gt 0 ]]; then
+    log_info "gen_awg_params: S1+56=$S1_plus_56 vs S2=$S2 — корректировка за $tries попыток (gap=$gap)"
+  fi
+  # Финальная страховка от прямого равенства S1+56==S2
+  if [[ $S1_plus_56 -eq $S2 ]]; then
+    S2=$((S2 + gap))
+    log_info "gen_awg_params: применён ручной сдвиг S2 → $S2 (страховка от S1+56=S2)"
+  fi
 
   # ── H1-H4: уникальные диапазоны в рамках recommended [5 .. 2^31-1] ──
   # Мануал: H1/H2/H3/H4 must be unique, recommended range 5 ≤ H ≤ 2147483647
@@ -1802,7 +1956,7 @@ _share_config() {
     echo -e "${Y}  ──────────────────────────────────────────────${N}"
     echo -e "${D}  (QR не показан: конфиг ${conf_size} байт > 2800 лимит)${N}"
     if [[ "$has_i1" -gt 0 ]]; then
-      echo -e "${D}  Попробуй профиль QUIC Mini или DNS — они меньше${N}"
+      echo -e "${D}  Используй DNS или SIP профиль — у них I1 значительно меньше${N}"
     fi
   fi
 }
@@ -2129,6 +2283,22 @@ do_gen() {
   command -v awg &>/dev/null || { err "awg не найден. Сначала пункт 1"; return 1; }
   command -v python3 &>/dev/null || { err "python3 не найден — нужен для генерации параметров"; info "Запусти пункт 1 или: apt-get install python3"; return 1; }
 
+  # ── Защита: сервер уже установлен? ──
+  if [[ -f "$SERVER_CONF" ]]; then
+    local _current_profile
+    _current_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2)
+    [[ -z "$_current_profile" ]] && _current_profile="custom (старый сервер без маркера)"
+    echo ""
+    warn "Сервер AmneziaWG уже установлен."
+    warn "Текущий профиль: ${W}${_current_profile}${N}"
+    echo ""
+    info "Для смены профиля сначала удали текущий сервер:"
+    info "  • Пункт 11 — Сбросить настройки сервера (чистая переустановка)"
+    info "  • Пункт 12 — Удалить всё (пакеты + конфиги)"
+    info "После этого выбери пункт 2 заново и укажи нужный профиль."
+    return 0
+  fi
+
   local bak_ts
   bak_ts="${SERVER_CONF}.bak.$(date +%s)"
   if [[ -f "$SERVER_CONF" ]]; then
@@ -2171,8 +2341,7 @@ do_gen() {
       ;;
   esac
 
-  choose_obf_level
-  choose_mimicry_profile || return 1
+  choose_awg_profile || return 1
 
   hdr "»  IP подсеть сервера"
   echo "  1) Случайная подсеть из пула 10.[10-55].[1-254].0/24 (рекомендуется)"
@@ -2310,6 +2479,7 @@ do_gen() {
     ip link delete dev awg0 2>/dev/null || true
 
   {
+    echo "# AWG_PROFILE=${AWG_PROFILE:-pro}"
     echo "# AmneziaWG Toolza — AWG 2.0 server config"
     echo "# Region: ${SERVER_REGION:-world}"
     echo "[Interface]"
@@ -2364,7 +2534,7 @@ do_gen() {
     echo ""
     echo -e "  ${Y}→ Возможные причины:${N}"
     echo -e "  ${Y}  • Модуль amneziawg не загружен → reboot${N}"
-    echo -e "  ${Y}  • Конфликт iptables правил → пункт 7 (удалить) и заново${N}"
+    echo -e "  ${Y}  • Конфликт iptables правил → пункт 11 (сброс сервера) и заново${N}"
     echo -e "  ${Y}  • Порт $PORT заблокирован → ufw allow $PORT/udp${N}"
     if [[ -n "$bak_ts" && -f "$bak_ts" ]]; then
       echo -e "  ${Y}  • Предыдущий конфиг сохранён: $bak_ts${N}"
@@ -2809,27 +2979,59 @@ do_add_client() {
   esac
 
   local i1_line="" i2_line="" i3_line="" i4_line="" i5_line=""
-  hdr "⌘  Выбор I1 для клиента"
-  echo "  1) Сгенерировать новый I1-I5 (выбор уровня + профиля мимикрии)"
-  echo "  2) Без I1 (только H/S/Jc обфускация)"
-  read_choice I1_SELECT "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" 1 2 1
 
-  case $I1_SELECT in
-    1)
-      choose_obf_level
-      choose_mimicry_profile
+  # Читаем профиль сервера — определяет поведение для клиентского I1
+  local _srv_profile
+  _srv_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2)
+  _srv_profile="${_srv_profile:-pro}"
+
+  case "$_srv_profile" in
+    lite)
+      # Lite-сервер: клиенту всегда I1=DNS (icloud.com), без I2-I5
+      info "Профиль сервера: Lite — клиент получит I1=DNS (icloud.com)"
+      local cps_out
+      cps_out=$(gen_cps_i1 "dns" "icloud.com") || cps_out=""
+      I1=$(echo "$cps_out" | sed -n '1p')
+      I2=""; I3=""; I4=""; I5=""
       [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
-      [[ -n "$I2" ]] && i2_line="I2 = $I2" || i2_line=""
-      [[ -n "$I3" ]] && i3_line="I3 = $I3" || i3_line=""
-      [[ -n "$I4" ]] && i4_line="I4 = $I4" || i4_line=""
-      [[ -n "$I5" ]] && i5_line="I5 = $I5" || i5_line=""
       ;;
-    2)
-      i1_line=""
-      i2_line=""
-      i3_line=""
-      i4_line=""
-      i5_line=""
+    standard)
+      # Standard-сервер: клиенту всегда I1=QUIC, без I2-I5
+      info "Профиль сервера: Standard — клиент получит I1=QUIC"
+      local sel_domain
+      sel_domain=$(select_random_domain "quic")
+      [[ -z "$sel_domain" ]] && sel_domain=""
+      local cps_out
+      cps_out=$(gen_cps_i1 "quic" "$sel_domain") || cps_out=""
+      I1=$(echo "$cps_out" | sed -n '1p')
+      I2=""; I3=""; I4=""; I5=""
+      [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+      ;;
+    pro|*)
+      # Pro-сервер: интерактивный выбор уровня + профиля мимикрии
+      hdr "⌘  Выбор I1 для клиента"
+      echo "  1) Сгенерировать новый I1-I5 (выбор уровня + профиля мимикрии)"
+      echo "  2) Без I1 (только H/S/Jc обфускация)"
+      read_choice I1_SELECT "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" 1 2 1
+
+      case $I1_SELECT in
+        1)
+          choose_obf_level
+          choose_mimicry_profile
+          [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+          [[ -n "$I2" ]] && i2_line="I2 = $I2" || i2_line=""
+          [[ -n "$I3" ]] && i3_line="I3 = $I3" || i3_line=""
+          [[ -n "$I4" ]] && i4_line="I4 = $I4" || i4_line=""
+          [[ -n "$I5" ]] && i5_line="I5 = $I5" || i5_line=""
+          ;;
+        2)
+          i1_line=""
+          i2_line=""
+          i3_line=""
+          i4_line=""
+          i5_line=""
+          ;;
+      esac
       ;;
   esac
 
@@ -3999,10 +4201,14 @@ EOF
 
   info "Настраиваем split-tunnel для $client_net..."
 
-  # Удаляем старый MASQUERADE через основной интерфейс
-  iptables -t nat -D POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE 2>/dev/null || true
+  # ВАЖНО: НЕ удаляем eth0-MASQUERADE — оно нужно как fallback
+  # для клиентов которые НЕ в warp_peers (идут через main table → eth0).
+  # Иначе их пакеты уйдут наружу с приватным src (10.x.x.x) → дропнутся провайдером.
+  # Гарантируем что eth0-MASQUERADE существует:
+  iptables -t nat -C POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE
 
-  # Добавляем MASQUERADE через warp0
+  # Добавляем MASQUERADE через warp0 (для клиентов с ip rule lookup 200)
   iptables -t nat -C POSTROUTING -s "$client_net" -o warp0 -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -s "$client_net" -o warp0 -j MASQUERADE
 
@@ -4052,7 +4258,7 @@ EOF
 
   ok "Split-tunnel активен: $peer_count клиент(ов) через Warp"
   info "SSH и серверный трафик идут напрямую"
-  info "Управление клиентами в Warp: пункт 7 в меню"
+  info "Управление клиентами в Warp: пункт 6 в меню"
   return 0
 }
 
@@ -5073,12 +5279,17 @@ _dns_proxy_change_upstream() {
   read -rp "  Выбор: " UPSTREAM_CHOICE
 
   local servers=""
+  # Флаг: нужно ли резолверам быть без фильтрации.
+  # true  = пресет содержит только nofilter-резолверы → require_nofilter=true (защита от случайного фильтра)
+  # false = пресет содержит filter-резолвер (yandex-safe) → require_nofilter=false (иначе сервис не запустится)
+  # ""    = пресет ручной (case 6), там логика своя
+  local need_nofilter=""
   case "${UPSTREAM_CHOICE:-}" in
-    1) servers="['cloudflare', 'google', 'cisco-doh']" ;;
-    2) servers="['cloudflare']" ;;
-    3) servers="['yandex-safe']" ;;
-    4) servers="['cisco-doh']" ;;
-    5) servers="['google']" ;;
+    1) servers="['cloudflare', 'google', 'cisco-doh']"; need_nofilter="true" ;;
+    2) servers="['cloudflare']";                        need_nofilter="true" ;;
+    3) servers="['yandex-safe']";                       need_nofilter="false" ;;
+    4) servers="['cisco-doh']";                         need_nofilter="true" ;;
+    5) servers="['google']";                            need_nofilter="true" ;;
     6)
       echo ""
       echo -e "  ${W}Доступные резолверы:${N} полный список в public-resolvers.md"
@@ -5144,6 +5355,20 @@ _dns_proxy_change_upstream() {
     0|"") return 0 ;;
     *) warn "Неверный выбор"; return 1 ;;
   esac
+
+  # Применяем require_nofilter для пресетов 1-5 (только если он отличается от текущего)
+  if [[ -n "$need_nofilter" ]]; then
+    local current_nofilter
+    current_nofilter=$(grep -E '^require_nofilter\s*=' "$DNS_PROXY_CONF" 2>/dev/null | awk -F'=' '{gsub(/[[:space:]]/,"",$2); print $2}')
+    if [[ "$current_nofilter" != "$need_nofilter" ]]; then
+      sed -i "s|^require_nofilter\s*=.*|require_nofilter = $need_nofilter|" "$DNS_PROXY_CONF"
+      if [[ "$need_nofilter" == "true" ]]; then
+        info "Восстановлено require_nofilter=true (защита от фильтр-резолверов)"
+      else
+        info "Установлено require_nofilter=false (пресет содержит фильтрующий резолвер)"
+      fi
+    fi
+  fi
 
   sed -i "s|^server_names\s*=.*|server_names = $servers|" "$DNS_PROXY_CONF"
   ok "Upstream обновлён: $servers"
@@ -5264,14 +5489,27 @@ do_uninstall() {
 do_check_domains() {
   echo ""
   hdr "◎  Проверка доменов для мимикрии"
+  echo ""
+
+  # Спрашиваем регион (не зависит от установленного сервера)
+  echo -e "  ${G}1${N}  Европа / Мир"
+  echo -e "  ${G}2${N}  Россия — RU"
+  echo ""
+  local CHECK_REGION_CHOICE check_region
+  read_choice CHECK_REGION_CHOICE "$(echo -e "${C}  Выбор региона для проверки [1-2] (Enter = 1): ${N}")" 1 2 1
+  case "$CHECK_REGION_CHOICE" in
+    2) check_region="ru" ;;
+    *) check_region="world" ;;
+  esac
 
   # Показываем текущий регион и какие пулы будут проверены
   local region_label
-  case "${SERVER_REGION:-world}" in
+  case "$check_region" in
     ru)    region_label="🇷🇺 РФ" ;;
     world) region_label="🌍 Мир/Европа" ;;
     *)     region_label="🌍 Мир" ;;
   esac
+  echo ""
   echo -e "  ${C}Регион:${N} ${W}${region_label}${N}"
   echo ""
 
@@ -5279,9 +5517,9 @@ do_check_domains() {
   local ts
   ts=$(date '+%Y-%m-%d %H:%M:%S')
 
-  # ── Выбираем пулы ──
+  # ── Выбираем пулы (по выбору юзера, а не по установленному серверу) ──
   local -a tls_pool dtls_pool sip_pool quic_pool
-  if [[ "${SERVER_REGION:-world}" == "ru" ]]; then
+  if [[ "$check_region" == "ru" ]]; then
     tls_pool=("${TLS_DOMAINS_RU[@]}")
     dtls_pool=("${DTLS_DOMAINS_RU[@]}")
     sip_pool=("${SIP_DOMAINS_RU[@]}")
@@ -5325,7 +5563,7 @@ do_check_domains() {
 
   # Защита от пустых пулов
   if [[ $total -eq 0 ]]; then
-    warn "Нет доменов в пулах (регион: ${SERVER_REGION:-world})"
+    warn "Нет доменов в пулах (регион: $check_region)"
     rm -rf "$tmpdir"
     return 1
   fi

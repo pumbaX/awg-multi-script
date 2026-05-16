@@ -574,7 +574,7 @@ def get_server_info() -> dict:
     if cached is not None:
         return cached
 
-    info = {"ip": "?", "port": "?", "region": "world", "iface_up": False}
+    info = {"ip": "?", "port": "?", "region": "world", "profile": "—", "iface_up": False}
     if not Path(SERVER_CONF).exists():
         return info
 
@@ -583,6 +583,8 @@ def get_server_info() -> dict:
             info["port"] = line.split("=", 1)[1].strip()
         if "Region:" in line:
             info["region"] = line.split(":", 1)[1].strip()
+        if line.startswith("# AWG_PROFILE="):
+            info["profile"] = line.split("=", 1)[1].strip()
 
     rc, out, _ = run(["bash", "-c", "ip route get 1 2>/dev/null | awk '{print $7; exit}'"])
     if rc == 0 and out.strip():
@@ -837,12 +839,26 @@ def text_status() -> str:
                 tx += int(p[2])
             except ValueError:
                 pass
+    # Лейбл профиля (Lite / Standard / Pro / —)
+    prof_raw = info.get("profile", "—")
+    prof_map = {"lite": "Lite", "standard": "Standard", "pro": "Pro"}
+    prof_label = prof_map.get(prof_raw, prof_raw if prof_raw != "—" else "—")
+
+    status_label = "active" if info["iface_up"] else "stopped"
+
     return (
-        f"📊 <b>Статус</b>\n━━━━━━━━━━━━━━━━━━\n"
-        f"🖥 <code>{info['ip']}:{info['port']}</code>\n"
-        f"📡 {'🟢 активен' if info['iface_up'] else '🔴 остановлен'}\n"
-        f"👥 {len(clients)} {plural_ru(len(clients), 'клиент', 'клиента', 'клиентов')}  🟢 {online} онлайн\n"
-        f"↓ {fmt_bytes(rx)}  ↑ {fmt_bytes(tx)}"
+        "<pre>"
+        "AwgToolza\n"
+        "─────────────────────────────\n"
+        f"Profile   :  {prof_label}\n"
+        f"Address   :  {info['ip']}\n"
+        f"Port      :  {info['port']}\n"
+        f"Status    :  {status_label}\n"
+        f"Clients   :  {len(clients)}  ({online} online)\n"
+        f"Download  :  {fmt_bytes(rx)}\n"
+        f"Upload    :  {fmt_bytes(tx)}\n"
+        "─────────────────────────────"
+        "</pre>"
     )
 
 
@@ -1421,6 +1437,64 @@ async def on_add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return ADD_NAME
     ctx.user_data["new_name"] = name
+
+    # Читаем профиль сервера — для Lite/Standard выбор мимикрии фиксирован
+    srv_profile = get_server_info().get("profile", "—")
+    auto_profile = None
+    if srv_profile == "lite":
+        auto_profile = "dns"       # Lite: I1 = DNS (как в скрипте)
+    elif srv_profile == "standard":
+        auto_profile = "quic"      # Standard: I1 = QUIC
+
+    if auto_profile is not None:
+        # Создаём сразу без меню — профиль зашит в серверный пресет
+        msg_obj = await update.message.reply_text(
+            f"👤 Имя: <b>{name}</b>\n"
+            f"⚙ Сервер: <b>{srv_profile.capitalize()}</b> → мимикрия зафиксирована\n"
+            f"⏳ Создаю...",
+            parse_mode=ParseMode.HTML,
+        )
+        admin_id = ctx.bot_data.get("admin_id", "")
+
+        global _add_client_lock
+        if _add_client_lock is None:
+            _add_client_lock = asyncio.Lock()
+
+        async with _add_client_lock:
+            client_path = Path(f"/root/{name}_awg2.conf")
+            if client_path.exists():
+                _clients_cache.invalidate()
+                existing = {c["name"] for c in get_clients()}
+                if name in existing:
+                    await msg_obj.edit_text(
+                        f"❌ <b>{name}</b> уже существует.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return ConversationHandler.END
+                log.warning(f"Удаляю осиротевший файл: {client_path}")
+                client_path.unlink()
+
+            ok_flag, result_msg = await asyncio.to_thread(
+                add_client, name, auto_profile, admin_id
+            )
+            _clients_cache.invalidate()
+
+        if ok_flag:
+            await msg_obj.edit_text(
+                f"✅ <b>{name}</b> создан!\n{result_msg}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("👥 К клиентам", callback_data="clients")
+                ]])
+            )
+        else:
+            await msg_obj.edit_text(
+                f"❌ Ошибка:\n<code>{_html.escape(result_msg)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        return ConversationHandler.END
+
+    # Pro / неизвестный профиль — показываем меню как раньше
     await update.message.reply_text(
         f"👤 Имя: <b>{name}</b>\n\nВыбери профиль мимикрии:",
         parse_mode=ParseMode.HTML, reply_markup=kb.profile()
@@ -1913,8 +1987,20 @@ def add_client(name: str, profile: str, admin_id: str = "") -> tuple:
         if profile != "basic":
             rc2, cps_out, _ = run(["python3", "-c", _CPS_CODE, profile])
             if rc2 == 0 and cps_out.strip():
+                # Читаем профиль сервера: для Lite/Standard нужен только I1
+                # (как делает do_add_client в awg2.sh для этих профилей).
+                # Для Pro и неизвестных профилей — полный I1-I5.
+                srv_profile_marker = ""
+                try:
+                    for ln in Path(SERVER_CONF).read_text().splitlines():
+                        if ln.startswith("# AWG_PROFILE="):
+                            srv_profile_marker = ln.split("=", 1)[1].strip()
+                            break
+                except Exception:
+                    pass
+                max_i_packets = 1 if srv_profile_marker in ("lite", "standard") else 5
                 labels = ["I1", "I2", "I3", "I4", "I5"]
-                for i, line in enumerate(cps_out.strip().splitlines()[:5]):
+                for i, line in enumerate(cps_out.strip().splitlines()[:max_i_packets]):
                     if line.strip():
                         i_params += f"\n{labels[i]} = {line.strip()}"
 
