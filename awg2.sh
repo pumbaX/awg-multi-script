@@ -971,10 +971,10 @@ do_sniff_test() {
   for cf in /root/*_awg2.conf; do
     [[ -f "$cf" ]] || continue
     local cf_priv cf_pub cf_addr
-    cf_priv=$(grep -E '^PrivateKey' "$cf" 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' \r' | head -1)
+    cf_priv=$(grep -E '^PrivateKey' "$cf" 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' \r' | head -1 || true)
     [[ -z "$cf_priv" ]] && continue
     cf_pub=$(echo "$cf_priv" | awg pubkey 2>/dev/null) || continue
-    cf_addr=$(grep -E '^Address' "$cf" 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' \r' | head -1)
+    cf_addr=$(grep -E '^Address' "$cf" 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' \r' | head -1 || true)
     pk_to_name["$cf_pub"]="$(basename "$cf" .conf)"
     pk_to_ip["$cf_pub"]="${cf_addr%/*}"
   done
@@ -1498,7 +1498,7 @@ do_self_update() {
 
   # ───── 4. Извлечение версии ─────
   local new_ver
-  new_ver=$(grep -m1 '^VERSION=' "$tmp_file" | cut -d'"' -f2)
+  new_ver=$(grep -m1 '^VERSION=' "$tmp_file" 2>/dev/null | cut -d'"' -f2 || true)
   if [[ -z "$new_ver" ]]; then
     warn "Не удалось определить версию в скачанном файле"
     new_ver="?"
@@ -1632,7 +1632,7 @@ show_header() {
   local profile_raw="—"
   local profile_label="—"
   if [[ -f "$SERVER_CONF" ]]; then
-    profile_raw=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2)
+    profile_raw=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
     case "$profile_raw" in
       lite)     profile_label="Lite" ;;
       standard) profile_label="Standard" ;;
@@ -2286,7 +2286,7 @@ do_gen() {
   # ── Защита: сервер уже установлен? ──
   if [[ -f "$SERVER_CONF" ]]; then
     local _current_profile
-    _current_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2)
+    _current_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
     [[ -z "$_current_profile" ]] && _current_profile="custom (старый сервер без маркера)"
     echo ""
     warn "Сервер AmneziaWG уже установлен."
@@ -2914,7 +2914,7 @@ do_add_client() {
   command -v awg &>/dev/null || { warn "awg не найден — возврат в главное меню"; return 0; }
 
   local server_net base_ip client_addr
-  server_net=$(grep "^Address" "$SERVER_CONF" | awk -F'=' '{print $2}' | tr -d ' ' | head -1)
+  server_net=$(grep "^Address" "$SERVER_CONF" 2>/dev/null | awk -F'=' '{print $2}' | tr -d ' ' | head -1 || true)
   base_ip=$(echo "$server_net" | cut -d. -f1-3)
   client_addr=$(find_free_ip "$base_ip") || { warn "Подсеть заполнена — возврат в главное меню"; return 0; }
 
@@ -2982,7 +2982,7 @@ do_add_client() {
 
   # Читаем профиль сервера — определяет поведение для клиентского I1
   local _srv_profile
-  _srv_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2)
+  _srv_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
   _srv_profile="${_srv_profile:-pro}"
 
   case "$_srv_profile" in
@@ -3040,7 +3040,7 @@ do_add_client() {
     || { err "awg0 не поднят. Запусти: awg-quick up $SERVER_CONF"; return 1; }
   srv_ip=$(get_public_ip)
   [[ -z "$srv_ip" ]] && { err "не удалось получить внешний IP"; return 1; }
-  port=$(grep "^ListenPort = " "$SERVER_CONF" | awk -F'= ' '{print $2}' | tr -d ' ')
+  port=$(grep "^ListenPort = " "$SERVER_CONF" 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' ' || true)
   [[ -z "$port" ]] && { err "ListenPort не найден в конфиге сервера"; return 1; }
 
   local cli_priv cli_pub psk
@@ -3603,7 +3603,7 @@ _warp_register() {
 
     # Анализируем ошибку
     local err_msg
-    err_msg=$(grep -E "TLS handshake timeout|connection refused|i/o timeout|no such host" /tmp/wgcf_reg_err 2>/dev/null | head -1)
+    err_msg=$(grep -E "TLS handshake timeout|connection refused|i/o timeout|no such host" /tmp/wgcf_reg_err 2>/dev/null | head -1 || true)
 
     if [[ -n "$err_msg" ]] && [[ $attempt -lt $max_attempts ]]; then
       warn "  $err_msg"
@@ -3915,8 +3915,8 @@ if [[ $fails -ge $MAX_FAILS ]]; then
   log "ALERT: Warp недоступен $MAX_FAILS раз подряд — failover"
 
   # Читаем state для отката
-  client_net=$(grep "^client_net=" "$STATE" 2>/dev/null | cut -d= -f2)
-  iface=$(grep "^iface=" "$STATE" 2>/dev/null | cut -d= -f2)
+  client_net=$(grep "^client_net=" "$STATE" 2>/dev/null | cut -d= -f2 || true)
+  iface=$(grep "^iface=" "$STATE" 2>/dev/null | cut -d= -f2 || true)
 
   # Удаляем правила для всех включённых клиентов
   if [[ -f /etc/wgcf/peers.list ]]; then
@@ -4265,8 +4265,8 @@ EOF
 _warp_down() {
   if [[ -f "$WARP_STATE" ]]; then
     local client_net iface
-    client_net=$(grep "^client_net=" "$WARP_STATE" 2>/dev/null | cut -d= -f2)
-    iface=$(grep "^iface=" "$WARP_STATE" 2>/dev/null | cut -d= -f2)
+    client_net=$(grep "^client_net=" "$WARP_STATE" 2>/dev/null | cut -d= -f2 || true)
+    iface=$(grep "^iface=" "$WARP_STATE" 2>/dev/null | cut -d= -f2 || true)
 
     # Убираем правила для всех включённых клиентов
     _warp_remove_peer_rules
@@ -4443,7 +4443,7 @@ _warp_status() {
 
   if [[ -f "$WARP_ACCOUNT" ]]; then
     local lic
-    lic=$(grep "^license_key" "$WARP_ACCOUNT" 2>/dev/null | cut -d'"' -f2)
+    lic=$(grep "^license_key" "$WARP_ACCOUNT" 2>/dev/null | cut -d'"' -f2 || true)
     if [[ -n "$lic" && ${#lic} -gt 10 ]]; then
       echo -e "  Аккаунт    : ${G}зарегистрирован${N} ${C}(Warp+)${N}"
     else
@@ -4723,7 +4723,7 @@ _dns_proxy_status() {
     # Резолвер
     if [[ -f "$DNS_PROXY_CONF" ]]; then
       local servers
-      servers=$(grep -E "^server_names" "$DNS_PROXY_CONF" 2>/dev/null | head -1 | sed "s/server_names\s*=\s*//; s/\[//; s/\]//" | tr -d "'\"")
+      servers=$(grep -E "^server_names" "$DNS_PROXY_CONF" 2>/dev/null | head -1 | sed "s/server_names\s*=\s*//; s/\[//; s/\]//" | tr -d "'\"" || true)
       [[ -n "$servers" ]] && echo -e "  Резолверы  : ${C}${servers}${N}"
     fi
   else
@@ -5359,7 +5359,7 @@ _dns_proxy_change_upstream() {
   # Применяем require_nofilter для пресетов 1-5 (только если он отличается от текущего)
   if [[ -n "$need_nofilter" ]]; then
     local current_nofilter
-    current_nofilter=$(grep -E '^require_nofilter\s*=' "$DNS_PROXY_CONF" 2>/dev/null | awk -F'=' '{gsub(/[[:space:]]/,"",$2); print $2}')
+    current_nofilter=$(grep -E '^require_nofilter\s*=' "$DNS_PROXY_CONF" 2>/dev/null | awk -F'=' '{gsub(/[[:space:]]/,"",$2); print $2}' || true)
     if [[ "$current_nofilter" != "$need_nofilter" ]]; then
       sed -i "s|^require_nofilter\s*=.*|require_nofilter = $need_nofilter|" "$DNS_PROXY_CONF"
       if [[ "$need_nofilter" == "true" ]]; then
