@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.8.5"
+VERSION="v6.8.6"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -169,6 +169,15 @@ DNS_HEALTH_SERVICE="/etc/systemd/system/awg-dns-healthcheck.service"
 DNS_HEALTH_TIMER="/etc/systemd/system/awg-dns-healthcheck.timer"
 DNS_HEALTH_SCRIPT="/usr/local/bin/awg-dns-healthcheck.sh"
 DNS_HEALTH_LOG="/var/log/awg-dns-health.log"
+
+# Каскад (port forwarding на зарубежный сервер) — пункт меню 17
+CASCADE_DIR="/etc/awg-cascade"
+CASCADE_RULES="$CASCADE_DIR/rules.conf"
+CASCADE_SERVICE="/etc/systemd/system/awg-cascade.service"
+CASCADE_APPLY_SCRIPT="/usr/local/bin/awg-cascade-apply.sh"
+CASCADE_TAG="awg-cascade"
+CASCADE_LOG="/var/log/awg-cascade.log"
+CASCADE_LOG_MAX=1048576  # 1 MB — после превышения ротация
 
 # ── Логирование ────────────────────────────────────────────
 _log() {
@@ -1748,6 +1757,24 @@ show_menu() {
     echo -e "  ${C}16)${N} DNS-шифрование  ${D}○ установлен, выключен${N}"
   else
     echo -e "  ${C}16)${N} DNS-шифрование  ${D}○ не настроен${N}"
+  fi
+
+  echo ""
+
+  # === КАСКАД ===
+  echo -e "  ${C}▸ Каскад (проброс на зарубежный VPS):${N}"
+  local _casc_rules=0
+  if [[ -f "$CASCADE_RULES" ]]; then
+    # || true — grep -c вернёт exit 1 если нет матчей, что под set -e убивает скрипт
+    _casc_rules=$(grep -cvE '^\s*(#|$)' "$CASCADE_RULES" 2>/dev/null || true)
+    [[ "$_casc_rules" =~ ^[0-9]+$ ]] || _casc_rules=0
+  fi
+  if (( _casc_rules > 0 )) && systemctl is-enabled awg-cascade.service &>/dev/null; then
+    echo -e "  ${C}17)${N} Каскад  ${G}● активен${N} ${D}(${_casc_rules} правил)${N}"
+  elif (( _casc_rules > 0 )); then
+    echo -e "  ${C}17)${N} Каскад  ${Y}○ правила есть, persist выключен${N}"
+  else
+    echo -e "  ${C}17)${N} Каскад  ${D}○ не настроен${N}"
   fi
 
   echo ""
@@ -4604,49 +4631,7 @@ _warp_status() {
     return 0
   fi
 
-  if [[ -f "$WARP_ACCOUNT" ]]; then
-    local lic
-    lic=$(grep "^license_key" "$WARP_ACCOUNT" 2>/dev/null | cut -d"'" -f2 || true)
-    # Fallback на двойные кавычки (вдруг wgcf поменяет формат)
-    [[ -z "$lic" ]] && lic=$(grep "^license_key" "$WARP_ACCOUNT" 2>/dev/null | cut -d'"' -f2 || true)
-
-    if [[ -n "$lic" && ${#lic} -gt 10 ]]; then
-      # Сначала читаем кешированный тип (быстро, не дёргает Cloudflare API)
-      local acc_type=""
-      if [[ -f "$WARP_DIR/account_type" ]]; then
-        acc_type=$(cat "$WARP_DIR/account_type" 2>/dev/null | tr -d '[:space:]' || true)
-      fi
-      # Fallback: если кеша нет — опрашиваем Cloudflare (только тогда)
-      if [[ -z "$acc_type" ]]; then
-        # wgcf status требует wgcf-account.toml в текущей директории
-        acc_type=$(cd "$WARP_DIR" 2>/dev/null && timeout 5 wgcf status 2>/dev/null | grep -m1 -oP 'Account type\s*:\s*\K\S+' || true)
-        # Если получили — сохраняем
-        [[ -n "$acc_type" ]] && echo "$acc_type" > "$WARP_DIR/account_type" 2>/dev/null || true
-      fi
-
-      case "$acc_type" in
-        unlimited)
-          echo -e "  Аккаунт    : ${G}зарегистрирован${N} ${C}(Warp+ unlimited)${N}"
-          ;;
-        limited|premium)
-          echo -e "  Аккаунт    : ${G}зарегистрирован${N} ${C}(Warp+)${N}"
-          ;;
-        "")
-          # Ничего не вышло — Cloudflare недоступен или wgcf не отвечает
-          echo -e "  Аккаунт    : ${G}зарегистрирован${N} ${D}(статус Warp+ не проверен)${N}"
-          ;;
-        *)
-          # free или другой неактивный тип
-          echo -e "  Аккаунт    : ${G}зарегистрирован${N} ${Y}(WARP, ключ не активен)${N}"
-          ;;
-      esac
-    else
-      echo -e "  Аккаунт    : ${G}зарегистрирован${N} (WARP)"
-    fi
-  else
-    echo -e "  Аккаунт    : ${D}не зарегистрирован${N}"
-  fi
-
+  # Профиль
   if [[ -f "$WARP_CONF" ]]; then
     echo -e "  Профиль    : ${G}$WARP_CONF${N}"
   else
@@ -4655,12 +4640,52 @@ _warp_status() {
 
   if ip link show warp0 &>/dev/null; then
     echo -e "  Интерфейс  : ${G}● warp0 активен${N}"
+
+    # Один запрос — получаем сразу trace (warp+colo+ip)
+    local trace warp_state warp_colo warp_ip
+    trace=$(timeout 3 curl -s --interface warp0 -4 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+    warp_state=$(echo "$trace" | awk -F= '/^warp=/{print $2}' | head -1 | tr -d '\r\n ' || true)
+    warp_colo=$(echo "$trace" | awk -F= '/^colo=/{print $2}' | head -1 | tr -d '\r\n ' || true)
+    warp_ip=$(echo "$trace" | awk -F= '/^ip=/{print $2}' | head -1 | tr -d '\r\n ' || true)
+
+    # Кешированный тип аккаунта (для отображения Warp+ unlimited)
+    local acc_type=""
+    [[ -f "$WARP_DIR/account_type" ]] && \
+      acc_type=$(cat "$WARP_DIR/account_type" 2>/dev/null | tr -d '[:space:]' || true)
+
+    # Туннель — фактическое состояние из trace
+    local tun_label
+    case "$warp_state" in
+      plus)
+        case "$acc_type" in
+          unlimited) tun_label="${G}● Warp+ unlimited${N}" ;;
+          *)         tun_label="${G}● Warp+${N}" ;;
+        esac
+        [[ -n "$warp_colo" ]] && tun_label+=" ${D}· ${warp_colo}${N}"
+        ;;
+      on)
+        tun_label="${G}● WARP${N}"
+        [[ -n "$warp_colo" ]] && tun_label+=" ${D}· ${warp_colo}${N}"
+        ;;
+      off)
+        tun_label="${Y}▲ туннель есть, но трафик мимо WARP${N}"
+        ;;
+      "")
+        tun_label="${R}▲ Cloudflare недоступен${N}"
+        ;;
+      *)
+        tun_label="${Y}● ${warp_state}${N}"
+        ;;
+    esac
+    echo -e "  Туннель    : $tun_label"
+
+    [[ -n "$warp_ip" ]] && echo -e "  Warp IP    : ${C}$warp_ip${N}"
+
     # Подсчёт включённых клиентов
     local peer_count=0
     if [[ -f "$WARP_PEERS" ]]; then
       peer_count=$(grep -c '^[0-9]' "$WARP_PEERS" 2>/dev/null)
       peer_count="${peer_count:-0}"
-      # Убираем возможные переводы строки и пробелы
       peer_count=$(echo "$peer_count" | tr -d '\n\r ')
       [[ -z "$peer_count" ]] && peer_count=0
     fi
@@ -4668,13 +4693,9 @@ _warp_status() {
     total_clients=$(_warp_list_awg_clients 2>/dev/null | grep -c '^' || echo "0")
     total_clients=$(echo "$total_clients" | tr -d '\n\r ')
     [[ -z "$total_clients" ]] && total_clients=0
-    # Цвет числа: зелёный если есть, серый если 0
     local pc_color="$G"
     [[ "$peer_count" == "0" ]] && pc_color="$D"
     echo -e "  Через Warp : ${pc_color}${peer_count}${N} из ${C}${total_clients}${N} клиент(ов)"
-    local warp_ip
-    warp_ip=$(timeout 3 curl -s --interface warp0 -4 https://1.1.1.1/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/{print $2}' | head -1 || echo "")
-    [[ -n "$warp_ip" ]] && echo -e "  Warp IP    : ${C}$warp_ip${N}"
   else
     echo -e "  Интерфейс  : ${D}○ warp0 выключен${N}"
   fi
@@ -6103,6 +6124,1062 @@ fi
 log_info "=== AWG Toolza ${VERSION} запущен ==="
 
 # Trap EXIT/INT/TERM — cleanup временных файлов и кэшей
+# ═══════════════════════════════════════════════════════════════════
+# 🌉 КАСКАД — port forwarding на промежуточный сервер
+# ═══════════════════════════════════════════════════════════════════
+# РУ VPS принимает клиентов и форвардит трафик на ЕВРО VPS
+# (AmneziaWG / VLESS / любой L4-сервис). Клиент видит РУ IP.
+#
+# Persist: собственный systemd-сервис awg-cascade.service
+# Изоляция: все правила помечены comment "$CASCADE_TAG:<proto>-<port>"
+#   → flush трогает только свои, AWG/WARP/DNS не задеваются.
+# ═══════════════════════════════════════════════════════════════════
+
+_cascade_valid_ip() {
+  local ip="$1"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  local IFS='.'; local -a o=($ip)
+  local i
+  for i in 0 1 2 3; do
+    [[ "${o[$i]}" =~ ^[0-9]+$ ]] || return 1
+    (( ${o[$i]} <= 255 )) || return 1
+  done
+  return 0
+}
+
+_cascade_valid_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  (( p >= 1 && p <= 65535 ))
+}
+
+_cascade_rule_tag() {
+  local proto="$1" in_port="$2"
+  echo "${CASCADE_TAG}:${proto}-${in_port}"
+}
+
+# ── Логирование каскада ────────────────────────────────────
+# Уровни: INFO / WARN / ERROR. Пишет в $CASCADE_LOG с ротацией при >1MB.
+_cascade_log() {
+  local level="$1"; shift
+  local msg="$*"
+  local ts
+  ts=$(date '+%Y-%m-%d %H:%M:%S')
+  # Ротация
+  if [[ -f "$CASCADE_LOG" ]]; then
+    local size
+    size=$(stat -c%s "$CASCADE_LOG" 2>/dev/null || echo 0)
+    if (( size > CASCADE_LOG_MAX )); then
+      mv "$CASCADE_LOG" "${CASCADE_LOG}.old" 2>/dev/null || true
+    fi
+  fi
+  # Создаём с правами 600 если ещё нет
+  if [[ ! -f "$CASCADE_LOG" ]]; then
+    touch "$CASCADE_LOG" 2>/dev/null && chmod 600 "$CASCADE_LOG" 2>/dev/null || true
+  fi
+  printf '[%s] [%s] %s\n' "$ts" "$level" "$msg" >> "$CASCADE_LOG" 2>/dev/null || true
+}
+_cascade_log_info()  { _cascade_log "INFO"  "$@"; }
+_cascade_log_warn()  { _cascade_log "WARN"  "$@"; }
+_cascade_log_error() { _cascade_log "ERROR" "$@"; }
+
+_cascade_get_iface() {
+  local iface=""
+  iface=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+  if [[ -z "$iface" ]]; then
+    iface=$(ip -4 route show 2>/dev/null | awk '/^default|^0\.0\.0\.0/ {print $5; exit}')
+  fi
+  echo "${iface:-eth0}"
+}
+
+# ── UFW интеграция ─────────────────────────────────────────
+# Если UFW активен — каскад должен через него проходить, иначе
+# его правила FORWARD будут конфликтовать с нашими, особенно
+# после ufw reload или перезагрузки.
+
+_cascade_ufw_active() {
+  # Возвращает 0 если UFW установлен И активен
+  command -v ufw >/dev/null 2>&1 || return 1
+  ufw status 2>/dev/null | grep -qiE '^Status:\s*active' || return 1
+  return 0
+}
+
+_cascade_ufw_backup_dir() {
+  echo "${CASCADE_DIR}/ufw-backup"
+}
+
+# Сохраняет /etc/default/ufw перед изменениями (один раз)
+_cascade_ufw_backup_config() {
+  local bdir; bdir=$(_cascade_ufw_backup_dir)
+  mkdir -p "$bdir"
+  if [[ ! -f "$bdir/ufw.default.original" && -f /etc/default/ufw ]]; then
+    cp /etc/default/ufw "$bdir/ufw.default.original"
+    chmod 600 "$bdir/ufw.default.original"
+    _cascade_log_info "ufw: backed up /etc/default/ufw"
+  fi
+}
+
+# Меняет DEFAULT_FORWARD_POLICY на ACCEPT (нужно для NAT forwarding)
+# Возвращает 0 если изменили, 1 если уже было ACCEPT (ничего не делали)
+_cascade_ufw_enable_forward_policy() {
+  [[ -f /etc/default/ufw ]] || return 1
+  local current
+  current=$(grep -oE '^DEFAULT_FORWARD_POLICY="[^"]*"' /etc/default/ufw 2>/dev/null | head -1)
+  if [[ "$current" == 'DEFAULT_FORWARD_POLICY="ACCEPT"' ]]; then
+    return 1  # уже ACCEPT, ничего не меняли
+  fi
+  _cascade_ufw_backup_config
+  sed -i 's|^DEFAULT_FORWARD_POLICY="[^"]*"|DEFAULT_FORWARD_POLICY="ACCEPT"|' /etc/default/ufw
+  _cascade_log_info "ufw: DEFAULT_FORWARD_POLICY set to ACCEPT"
+  return 0
+}
+
+# Открывает входящий порт через ufw
+_cascade_ufw_allow_port() {
+  local proto="$1" port="$2"
+  if ufw status 2>/dev/null | grep -qE "^${port}/${proto}\s+ALLOW"; then
+    return 0  # уже открыт
+  fi
+  if ufw allow "${port}/${proto}" comment "${CASCADE_TAG}:${proto}-${port}" >/dev/null 2>&1; then
+    _cascade_log_info "ufw: allow ${port}/${proto}"
+    return 0
+  fi
+  _cascade_log_error "ufw: failed to allow ${port}/${proto}"
+  return 1
+}
+
+# Удаляет правило входящего порта
+_cascade_ufw_revoke_port() {
+  local proto="$1" port="$2"
+  ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true
+  _cascade_log_info "ufw: revoke ${port}/${proto}"
+}
+
+# Разрешает форвардинг к target через ufw route
+_cascade_ufw_allow_route() {
+  local proto="$1" target_ip="$2" out_port="$3"
+  # ufw route добавляет правило в FORWARD цепочку
+  if ufw route allow proto "$proto" from any to "$target_ip" port "$out_port" \
+       comment "${CASCADE_TAG}:route-${proto}-${out_port}" >/dev/null 2>&1; then
+    _cascade_log_info "ufw: route allow ${proto} -> ${target_ip}:${out_port}"
+    return 0
+  fi
+  _cascade_log_warn "ufw: route allow failed (старая версия ufw? попробую без comment)"
+  ufw route allow proto "$proto" from any to "$target_ip" port "$out_port" >/dev/null 2>&1 || true
+}
+
+_cascade_ufw_revoke_route() {
+  local proto="$1" target_ip="$2" out_port="$3"
+  ufw route delete allow proto "$proto" from any to "$target_ip" port "$out_port" >/dev/null 2>&1 || true
+  _cascade_log_info "ufw: revoke route ${proto} -> ${target_ip}:${out_port}"
+}
+
+# Главный entrypoint: интегрировать одно правило каскада с UFW
+# Вызывать ПОСЛЕ _cascade_save_to_file (нужны данные правила)
+_cascade_ufw_integrate_rule() {
+  local proto="$1" in_port="$2" target_ip="$3" out_port="$4"
+  if ! _cascade_ufw_active; then
+    return 0  # UFW не активен — нечего делать
+  fi
+  _cascade_ufw_enable_forward_policy
+  _cascade_ufw_allow_port "$proto" "$in_port"
+  _cascade_ufw_allow_route "$proto" "$target_ip" "$out_port"
+  # Применяем изменения политики (если поменяли)
+  ufw reload >/dev/null 2>&1 || true
+}
+
+# Откатить интеграцию одного правила
+_cascade_ufw_revoke_rule() {
+  local proto="$1" in_port="$2" target_ip="$3" out_port="$4"
+  if ! _cascade_ufw_active; then
+    return 0
+  fi
+  _cascade_ufw_revoke_port "$proto" "$in_port"
+  _cascade_ufw_revoke_route "$proto" "$target_ip" "$out_port"
+}
+
+# Полный откат UFW-интеграции (вызывается при uninstall модуля)
+_cascade_ufw_full_revoke() {
+  if ! command -v ufw >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Снести все port allow с нашим comment
+  local rule_num
+  while true; do
+    rule_num=$(ufw status numbered 2>/dev/null | grep -F "${CASCADE_TAG}:" | head -1 | grep -oE '^\[\s*[0-9]+\s*\]' | tr -d '[ ]')
+    [[ -z "$rule_num" ]] && break
+    echo "y" | ufw --force delete "$rule_num" >/dev/null 2>&1 || break
+  done
+
+  # Восстановить /etc/default/ufw из бэкапа
+  local bdir; bdir=$(_cascade_ufw_backup_dir)
+  if [[ -f "$bdir/ufw.default.original" ]]; then
+    cp "$bdir/ufw.default.original" /etc/default/ufw
+    _cascade_log_info "ufw: restored /etc/default/ufw from backup"
+  fi
+
+  if _cascade_ufw_active; then
+    ufw reload >/dev/null 2>&1 || true
+  fi
+}
+
+
+# БЕЗОПАСНЫЕ счётчики — через wc -l + явный echo "0" fallback.
+# Старая версия с grep -c | echo 0 давала многострочный "0\n0" → (( )) падал.
+_cascade_count_iptables() {
+  local n
+  n=$(iptables-save -t nat 2>/dev/null | grep -c "^-A PREROUTING.*${CASCADE_TAG}:" 2>/dev/null || true)
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  echo "$n"
+}
+
+_cascade_count_file() {
+  local n=0
+  if [[ -f "$CASCADE_RULES" ]]; then
+    n=$(grep -cvE '^\s*(#|$)' "$CASCADE_RULES" 2>/dev/null || true)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  fi
+  echo "$n"
+}
+
+_cascade_has_inport() {
+  local proto="$1" port="$2"
+  [[ -f "$CASCADE_RULES" ]] || return 1
+  grep -qE "^${proto}\|${port}\|" "$CASCADE_RULES" 2>/dev/null
+}
+
+_cascade_enable_forward() {
+  if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" != "1" ]]; then
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  fi
+  if ! grep -qE '^\s*net\.ipv4\.ip_forward\s*=\s*1' /etc/sysctl.conf 2>/dev/null && \
+     ! grep -rqE '^\s*net\.ipv4\.ip_forward\s*=\s*1' /etc/sysctl.d/ 2>/dev/null; then
+    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+  fi
+}
+
+_cascade_apply_one() {
+  local proto="$1" in_port="$2" target_ip="$3" out_port="$4"
+  local tag iface
+  tag=$(_cascade_rule_tag "$proto" "$in_port")
+  iface=$(_cascade_get_iface)
+
+  _cascade_log_info "apply: ${proto} ${in_port} -> ${target_ip}:${out_port} (iface=${iface}, tag=${tag})"
+
+  # АНТИ-ДУБЛЬ: сначала удаляем все существующие правила с этим тегом
+  # (в любом из 3 наборов: nat PREROUTING, filter FORWARD, nat POSTROUTING).
+  # Используем iptables-save (однострочный вывод) вместо iptables -S
+  # — последний в nf_tables-бэкенде ломает длинные правила на несколько строк.
+  local line del_cmd
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" != *"$tag"* ]] && continue
+    del_cmd="${line/-A /-D }"
+    # shellcheck disable=SC2086
+    iptables -t nat $del_cmd 2>/dev/null || true
+  done < <(iptables-save -t nat 2>/dev/null | grep -F "$tag" || true)
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" != *"$tag"* ]] && continue
+    del_cmd="${line/-A /-D }"
+    # shellcheck disable=SC2086
+    iptables $del_cmd 2>/dev/null || true
+  done < <(iptables-save 2>/dev/null | grep -F "$tag" || true)
+
+  # Теперь чисто — добавляем
+  if ! iptables -t nat -A PREROUTING -p "$proto" --dport "$in_port" \
+       -j DNAT --to-destination "${target_ip}:${out_port}" \
+       -m comment --comment "$tag" 2>/dev/null; then
+    _cascade_log_error "iptables DNAT failed: ${proto} ${in_port} -> ${target_ip}:${out_port}"
+    return 1
+  fi
+
+  if ! iptables -I FORWARD 1 -p "$proto" -d "$target_ip" --dport "$out_port" \
+       -j ACCEPT -m comment --comment "$tag" 2>/dev/null; then
+    _cascade_log_error "iptables FORWARD failed: ${proto} ${target_ip}:${out_port}"
+    return 1
+  fi
+
+  if ! iptables -t nat -A POSTROUTING -o "$iface" -p "$proto" -d "$target_ip" --dport "$out_port" \
+       -j MASQUERADE -m comment --comment "$tag" 2>/dev/null; then
+    _cascade_log_error "iptables MASQUERADE failed: ${proto} ${iface} ${target_ip}:${out_port}"
+    return 1
+  fi
+
+  _cascade_log_info "apply OK: ${tag}"
+  return 0
+}
+
+_cascade_remove_one() {
+  local proto="$1" in_port="$2"
+  local tag
+  tag=$(_cascade_rule_tag "$proto" "$in_port")
+  local removed=0
+
+  _cascade_log_info "remove: ${proto} ${in_port} (tag=${tag})"
+
+  # Достаём актуальные параметры правила из файла (target_ip, out_port)
+  # чтобы удалить ТОЧНО теми же аргументами что были при добавлении.
+  local target_ip="" out_port=""
+  if [[ -f "$CASCADE_RULES" ]]; then
+    local fp fin ftgt fout frest
+    while IFS='|' read -r fp fin ftgt fout frest; do
+      if [[ "$fp" == "$proto" && "$fin" == "$in_port" ]]; then
+        target_ip="$ftgt"
+        out_port="$fout"
+        break
+      fi
+    done < "$CASCADE_RULES"
+  fi
+
+  local iface
+  iface=$(_cascade_get_iface)
+
+  # Если знаем параметры — удаляем ТОЧНО как добавляли (idempotent, в цикле пока удаляется)
+  if [[ -n "$target_ip" && -n "$out_port" ]]; then
+    while iptables -t nat -D PREROUTING -p "$proto" --dport "$in_port" \
+        -j DNAT --to-destination "${target_ip}:${out_port}" \
+        -m comment --comment "$tag" 2>/dev/null; do
+      removed=$((removed + 1))
+    done
+    while iptables -D FORWARD -p "$proto" -d "$target_ip" --dport "$out_port" \
+        -j ACCEPT -m comment --comment "$tag" 2>/dev/null; do
+      removed=$((removed + 1))
+    done
+    while iptables -t nat -D POSTROUTING -o "$iface" -p "$proto" -d "$target_ip" --dport "$out_port" \
+        -j MASQUERADE -m comment --comment "$tag" 2>/dev/null; do
+      removed=$((removed + 1))
+    done
+  fi
+
+  # Fallback: если параметров нет (файл уже пуст) или таргет/порт изменились —
+  # ищем по тегу через iptables-save (одна строка = одно правило, в отличие от -S)
+  local line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" != *"$tag"* ]] && continue
+    local del_cmd="${line/-A /-D }"
+    # shellcheck disable=SC2086
+    if iptables -t nat $del_cmd 2>/dev/null; then
+      removed=$((removed + 1))
+    fi
+  done < <(iptables-save -t nat 2>/dev/null | grep -F "$tag" || true)
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" != *"$tag"* ]] && continue
+    local del_cmd="${line/-A /-D }"
+    # shellcheck disable=SC2086
+    if iptables $del_cmd 2>/dev/null; then
+      removed=$((removed + 1))
+    fi
+  done < <(iptables-save 2>/dev/null | grep -F "$tag" || true)
+
+  _cascade_log_info "remove result: tag=${tag}, removed=${removed}"
+  [[ $removed -gt 0 ]]
+}
+
+_cascade_flush_iptables() {
+  local removed=0
+  local iface; iface=$(_cascade_get_iface)
+
+  # ШАГ 1: если файл правил ещё существует — удаляем детерминированно
+  # (точные команды с теми же аргументами что использовали при добавлении)
+  if [[ -f "$CASCADE_RULES" ]]; then
+    local fp fin ftgt fout frest tag
+    while IFS='|' read -r fp fin ftgt fout frest; do
+      [[ -z "${fp:-}" || "${fp:0:1}" == "#" ]] && continue
+      [[ "$fp" != "tcp" && "$fp" != "udp" ]] && continue
+      [[ -z "${fin:-}" || -z "${ftgt:-}" || -z "${fout:-}" ]] && continue
+      tag="${CASCADE_TAG}:${fp}-${fin}"
+      while iptables -t nat -D PREROUTING -p "$fp" --dport "$fin" \
+          -j DNAT --to-destination "${ftgt}:${fout}" \
+          -m comment --comment "$tag" 2>/dev/null; do
+        removed=$((removed + 1))
+      done
+      while iptables -D FORWARD -p "$fp" -d "$ftgt" --dport "$fout" \
+          -j ACCEPT -m comment --comment "$tag" 2>/dev/null; do
+        removed=$((removed + 1))
+      done
+      while iptables -t nat -D POSTROUTING -o "$iface" -p "$fp" -d "$ftgt" --dport "$fout" \
+          -j MASQUERADE -m comment --comment "$tag" 2>/dev/null; do
+        removed=$((removed + 1))
+      done
+    done < "$CASCADE_RULES"
+  fi
+
+  # ШАГ 2: fallback — убираем всё что осталось с нашим тегом, парся iptables-save
+  # (iptables-save выводит правила однострочно, в отличие от iptables -S который в nftables-бэкенде ломает строки)
+  local line tag_only
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" != *"${CASCADE_TAG}:"* ]] && continue
+    # Строка вида: -A POSTROUTING -d 1.2.3.4/32 -o eth0 ... --comment "awg-cascade:udp-45172" -j MASQUERADE
+    # Преобразуем -A в -D и выполняем
+    local del_cmd="${line/-A /-D }"
+    # shellcheck disable=SC2086
+    iptables -t nat $del_cmd 2>/dev/null && removed=$((removed + 1)) || true
+  done < <(iptables-save -t nat 2>/dev/null | grep -F "${CASCADE_TAG}:" || true)
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" != *"${CASCADE_TAG}:"* ]] && continue
+    local del_cmd="${line/-A /-D }"
+    # shellcheck disable=SC2086
+    iptables $del_cmd 2>/dev/null && removed=$((removed + 1)) || true
+  done < <(iptables-save 2>/dev/null | grep -F "${CASCADE_TAG}:" || true)
+
+  _cascade_log_warn "flush all: removed=${removed}"
+  echo "$removed"
+}
+
+_cascade_save_to_file() {
+  local proto="$1" in_port="$2" target_ip="$3" out_port="$4" comment="${5:-}"
+  mkdir -p "$CASCADE_DIR"
+  touch "$CASCADE_RULES"
+  echo "${proto}|${in_port}|${target_ip}|${out_port}|${comment}" >> "$CASCADE_RULES"
+  _cascade_log_info "saved to file: ${proto}|${in_port}|${target_ip}|${out_port}|${comment}"
+}
+
+_cascade_delete_from_file() {
+  local proto="$1" in_port="$2"
+  [[ -f "$CASCADE_RULES" ]] || return 0
+  local tmp
+  tmp=$(mktemp) || return 1
+  grep -vE "^${proto}\|${in_port}\|" "$CASCADE_RULES" > "$tmp" 2>/dev/null || true
+  mv "$tmp" "$CASCADE_RULES"
+}
+
+_cascade_install_persist() {
+  mkdir -p "$CASCADE_DIR"
+
+  cat > "$CASCADE_APPLY_SCRIPT" << 'APPLY_EOF'
+#!/bin/bash
+# Авто-применение правил каскада при старте системы
+# Намеренно НЕ используем set -u — внутри while-read могут возникать
+# временно неинициализированные переменные на пустых выводах iptables.
+set +u
+RULES="/etc/awg-cascade/rules.conf"
+TAG_PREFIX="awg-cascade"
+LOG="/var/log/awg-cascade.log"
+
+# Хелпер логирования (с ротацией >1MB)
+_log() {
+  local level="$1"; shift
+  local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+  if [[ -f "$LOG" ]]; then
+    local sz; sz=$(stat -c%s "$LOG" 2>/dev/null || echo 0)
+    [[ "$sz" -gt 1048576 ]] && mv "$LOG" "${LOG}.old" 2>/dev/null
+  fi
+  [[ -f "$LOG" ]] || { touch "$LOG" 2>/dev/null && chmod 600 "$LOG" 2>/dev/null; }
+  printf '[%s] [%s] %s\n' "$ts" "$level" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+_log INFO "=== systemd apply-script started ==="
+
+[[ -f "$RULES" ]] || { _log INFO "no rules file, exit"; exit 0; }
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+
+get_iface() {
+  local i
+  i=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+  echo "${i:-eth0}"
+}
+IFACE=$(get_iface)
+_log INFO "iface=${IFACE}"
+
+applied=0
+failed=0
+while IFS='|' read -r proto in_port target_ip out_port comment; do
+  [[ -z "$proto" || "${proto:0:1}" == "#" ]] && continue
+  [[ -z "$in_port" || -z "$target_ip" || -z "$out_port" ]] && continue
+  TAG="${TAG_PREFIX}:${proto}-${in_port}"
+
+  # АНТИ-ДУБЛЬ: чистим все старые правила с этим тегом (если есть).
+  # Используем iptables-save (одна строка = одно правило) вместо iptables -S
+  # — последний в nf_tables-бэкенде ломает длинные правила на несколько строк.
+  line=""
+  del_cmd=""
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" != *"$TAG"* ]] && continue
+    del_cmd="${line/-A /-D }"
+    iptables -t nat $del_cmd 2>/dev/null || true
+  done < <(iptables-save -t nat 2>/dev/null | grep -F "$TAG" || true)
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" != *"$TAG"* ]] && continue
+    del_cmd="${line/-A /-D }"
+    iptables $del_cmd 2>/dev/null || true
+  done < <(iptables-save 2>/dev/null | grep -F "$TAG" || true)
+
+  # Применяем
+  err_count=0
+  if ! iptables -t nat -A PREROUTING -p "$proto" --dport "$in_port" \
+       -j DNAT --to-destination "${target_ip}:${out_port}" \
+       -m comment --comment "$TAG" 2>/dev/null; then
+    _log ERROR "DNAT failed: ${proto} ${in_port} -> ${target_ip}:${out_port}"
+    err_count=$((err_count + 1))
+  fi
+  if ! iptables -I FORWARD 1 -p "$proto" -d "$target_ip" --dport "$out_port" \
+       -j ACCEPT -m comment --comment "$TAG" 2>/dev/null; then
+    _log ERROR "FORWARD failed: ${proto} ${target_ip}:${out_port}"
+    err_count=$((err_count + 1))
+  fi
+  if ! iptables -t nat -A POSTROUTING -o "$IFACE" -p "$proto" -d "$target_ip" --dport "$out_port" \
+       -j MASQUERADE -m comment --comment "$TAG" 2>/dev/null; then
+    _log ERROR "MASQUERADE failed: ${proto} ${IFACE} ${target_ip}:${out_port}"
+    err_count=$((err_count + 1))
+  fi
+
+  if [[ $err_count -eq 0 ]]; then
+    _log INFO "applied: ${TAG} -> ${target_ip}:${out_port}"
+    applied=$((applied + 1))
+  else
+    failed=$((failed + 1))
+  fi
+done < "$RULES"
+
+_log INFO "=== apply done: applied=${applied} failed=${failed} ==="
+
+exit 0
+APPLY_EOF
+  chmod +x "$CASCADE_APPLY_SCRIPT"
+
+  cat > "$CASCADE_SERVICE" << SERVICE_EOF
+[Unit]
+Description=AmneziaWG Cascade (port forwarding rules)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$CASCADE_APPLY_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable awg-cascade.service >/dev/null 2>&1 || true
+}
+
+_cascade_status() {
+  local active file_count iface
+  active=$(_cascade_count_iptables)
+  file_count=$(_cascade_count_file)
+  iface=$(_cascade_get_iface)
+
+  echo -e "  ${D}Egress интерфейс:${N}  ${W}${iface}${N}"
+  echo -e "  ${D}Правил в файле:${N}    ${W}${file_count}${N}"
+  echo -e "  ${D}Правил в iptables:${N} ${W}${active}${N}"
+
+  # Сравнение БЕЗОПАСНО — счётчики гарантированно числа
+  if (( file_count != active )); then
+    echo -e "  ${Y}⚠ рассинхрон файла и iptables (пересоздать: меню → 5 → 1)${N}"
+  fi
+
+  if systemctl is-enabled awg-cascade.service &>/dev/null; then
+    echo -e "  ${D}Persist (systemd):${N}  ${G}● включён${N}"
+  else
+    echo -e "  ${D}Persist (systemd):${N}  ${D}○ выключен${N}"
+  fi
+
+  if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]]; then
+    echo -e "  ${D}IP forwarding:${N}     ${G}● включён${N}"
+  else
+    echo -e "  ${D}IP forwarding:${N}     ${R}○ выключен (требуется!)${N}"
+  fi
+
+  if command -v ufw >/dev/null 2>&1; then
+    if _cascade_ufw_active; then
+      local fwpol
+      fwpol=$(grep -oE '^DEFAULT_FORWARD_POLICY="[^"]*"' /etc/default/ufw 2>/dev/null | grep -oE '"[^"]*"' | tr -d '"')
+      if [[ "$fwpol" == "ACCEPT" ]]; then
+        echo -e "  ${D}UFW:${N}              ${G}● активен, FORWARD=ACCEPT (ок)${N}"
+      else
+        echo -e "  ${D}UFW:${N}              ${Y}⚠ активен, FORWARD=${fwpol:-?} (нужно ACCEPT)${N}"
+      fi
+    else
+      echo -e "  ${D}UFW:${N}              ${D}○ установлен, не активен${N}"
+    fi
+  fi
+}
+
+# Универсальный поток добавления правила
+# $1 = "standard" (один порт на вход/выход) | "custom" (разные)
+_cascade_add_rule_flow() {
+  local mode="$1"
+  local proto in_port target_ip out_port comment pchoice
+
+  echo ""
+  hdr "➕  Добавить правило каскада ($([[ "$mode" == "standard" ]] && echo "один порт" || echo "разные порты"))"
+  echo ""
+  echo -e "  ${D}→ Клиент будет подключаться к этому серверу на указанный порт,${N}"
+  echo -e "  ${D}→ а трафик прозрачно уйдёт на зарубежный сервер.${N}"
+  echo ""
+
+  # ─── Протокол: явный цикл с read, БЕЗ read_choice (там min/max диапазон) ───
+  while true; do
+    safe_read pchoice "$(echo -e "${C}  Протокол [udp/tcp/both] (Enter=udp): ${N}")"
+    pchoice="${pchoice,,}"
+    pchoice="${pchoice// /}"
+    [[ -z "$pchoice" ]] && pchoice="udp"
+    case "$pchoice" in
+      udp|u)    proto="udp"; break ;;
+      tcp|t)    proto="tcp"; break ;;
+      both|b|2) proto="both"; break ;;
+      *) err "Введи 'udp', 'tcp' или 'both'" ;;
+    esac
+  done
+
+  # ─── IP назначения ───
+  while true; do
+    safe_read target_ip "$(echo -e "${C}  IP конечного сервера: ${N}")"
+    target_ip="${target_ip// /}"
+    if _cascade_valid_ip "$target_ip"; then break; fi
+    err "Невалидный IPv4. Пример: 5.6.7.8"
+  done
+
+  # ─── Порты ───
+  if [[ "$mode" == "standard" ]]; then
+    while true; do
+      safe_read in_port "$(echo -e "${C}  Порт (одинаковый вход и выход): ${N}")"
+      in_port="${in_port// /}"
+      if _cascade_valid_port "$in_port"; then break; fi
+      err "Невалидный порт (1-65535)"
+    done
+    out_port="$in_port"
+  else
+    while true; do
+      safe_read in_port "$(echo -e "${C}  Локальный порт (на этом сервере): ${N}")"
+      in_port="${in_port// /}"
+      if _cascade_valid_port "$in_port"; then break; fi
+      err "Невалидный порт (1-65535)"
+    done
+    while true; do
+      safe_read out_port "$(echo -e "${C}  Порт конечного сервера: ${N}")"
+      out_port="${out_port// /}"
+      if _cascade_valid_port "$out_port"; then break; fi
+      err "Невалидный порт (1-65535)"
+    done
+  fi
+
+  # ─── Комментарий ───
+  safe_read comment "$(echo -e "${D}  Комментарий (Enter — пропустить): ${N}")"
+  comment="${comment//|/ }"
+
+  # ─── Применение ───
+  local protos=()
+  if [[ "$proto" == "both" ]]; then
+    protos=("udp" "tcp")
+  else
+    protos=("$proto")
+  fi
+
+  echo ""
+  _cascade_enable_forward
+
+  local p added=0 skipped=0 failed=0
+  for p in "${protos[@]}"; do
+    if _cascade_has_inport "$p" "$in_port"; then
+      warn "${p^^} ${in_port} → уже есть в файле, пропускаю"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    if _cascade_apply_one "$p" "$in_port" "$target_ip" "$out_port"; then
+      _cascade_save_to_file "$p" "$in_port" "$target_ip" "$out_port" "$comment"
+      _cascade_ufw_integrate_rule "$p" "$in_port" "$target_ip" "$out_port"
+      ok "Правило добавлено: ${p} ${in_port} → ${target_ip}:${out_port}"
+      added=$((added + 1))
+    else
+      err "Не удалось применить ${p^^} ${in_port}"
+      failed=$((failed + 1))
+    fi
+  done
+
+  echo ""
+  if [[ $added -gt 0 ]]; then
+    _cascade_install_persist
+    local pub_ip
+    pub_ip=$(get_public_ip 2>/dev/null || echo "<IP_этого_сервера>")
+    info "На клиенте в Endpoint укажи: ${W}${pub_ip}:${in_port}${N}"
+    if _cascade_ufw_active; then
+      info "UFW: открыт порт ${in_port}/${proto}, route allow добавлен"
+    fi
+  fi
+  if [[ $skipped -gt 0 || $failed -gt 0 ]]; then
+    echo -e "  ${D}Добавлено: ${added} | Пропущено: ${skipped} | Ошибок: ${failed}${N}"
+  fi
+}
+
+_cascade_add_standard() { _cascade_add_rule_flow "standard"; }
+_cascade_add_custom()   { _cascade_add_rule_flow "custom"; }
+
+_cascade_list() {
+  echo ""
+  hdr "📋  Активные маршруты"
+  echo ""
+
+  local file_count
+  file_count=$(_cascade_count_file)
+  if (( file_count == 0 )); then
+    info "Маршрутов нет"
+    return 0
+  fi
+
+  printf "  ${D}%-4s %-6s %-7s %-18s %-7s %s${N}\n" "#" "PROTO" "IN" "→ TARGET" "OUT" "COMMENT"
+  echo -e "  ${D}────────────────────────────────────────────────────────────────${N}"
+  local n=0 proto in_port target_ip out_port comment mark tag
+  while IFS='|' read -r proto in_port target_ip out_port comment; do
+    [[ -z "${proto:-}" || "${proto:0:1}" == "#" ]] && continue
+    n=$((n + 1))
+    tag=$(_cascade_rule_tag "$proto" "$in_port")
+    if iptables-save -t nat 2>/dev/null | grep -qF "$tag"; then
+      mark="${G}●${N}"
+    else
+      mark="${R}○${N}"
+    fi
+    printf "  %b %-2s %-6s %-7s %-18s %-7s %s\n" \
+      "$mark" "$n" "${proto^^}" "$in_port" "$target_ip" "$out_port" "${comment:-—}"
+  done < "$CASCADE_RULES"
+  echo ""
+  echo -e "  ${D}${G}●${D} — применено в iptables, ${R}○${D} — записано но не активно${N}"
+}
+
+_cascade_delete_one() {
+  _cascade_list
+  local count
+  count=$(_cascade_count_file)
+  (( count == 0 )) && return 0
+
+  echo ""
+  local num
+  safe_read num "$(echo -e "${C}  Номер для удаления (Enter — отмена): ${N}")"
+  [[ -z "${num// /}" ]] && return 0
+  [[ "$num" =~ ^[0-9]+$ ]] || { err "Нужно число"; return 1; }
+  (( num >= 1 && num <= count )) || { err "Номер вне диапазона"; return 1; }
+
+  local n=0 proto in_port target_ip out_port comment found=""
+  while IFS='|' read -r proto in_port target_ip out_port comment; do
+    [[ -z "${proto:-}" || "${proto:0:1}" == "#" ]] && continue
+    n=$((n + 1))
+    if (( n == num )); then
+      found="yes"
+      break
+    fi
+  done < "$CASCADE_RULES"
+
+  [[ -n "$found" ]] || { err "Не нашёл #$num"; return 1; }
+
+  echo ""
+  local confirm
+  read_yesno confirm "Удалить ${proto^^} ${in_port} → ${target_ip}:${out_port}? [y/N]: " "n"
+  [[ "$confirm" == "y" ]] || { info "Отмена"; return 0; }
+
+  if _cascade_remove_one "$proto" "$in_port"; then
+    _cascade_delete_from_file "$proto" "$in_port"
+    _cascade_ufw_revoke_rule "$proto" "$in_port" "$target_ip" "$out_port"
+    ok "Удалено"
+  else
+    _cascade_delete_from_file "$proto" "$in_port"
+    _cascade_ufw_revoke_rule "$proto" "$in_port" "$target_ip" "$out_port"
+    warn "В iptables не нашлось — почистил только файл"
+  fi
+}
+
+_cascade_flush() {
+  local file_count active
+  file_count=$(_cascade_count_file)
+  active=$(_cascade_count_iptables)
+
+  if (( file_count == 0 && active == 0 )); then
+    info "Каскад пуст"
+    return 0
+  fi
+
+  echo ""
+  warn "Будут удалены ВСЕ правила каскада (файл: ${file_count}, iptables: ${active})"
+  warn "AmneziaWG / WARP / DNS — НЕ затрагиваются"
+  echo ""
+  local confirm
+  read_yesno confirm "Точно сбросить все маршруты? [y/N]: " "n"
+  [[ "$confirm" == "y" ]] || { info "Отмена"; return 0; }
+
+  local removed
+  removed=$(_cascade_flush_iptables)
+  : > "$CASCADE_RULES" 2>/dev/null || true
+  # Снести все UFW-правила каскада
+  _cascade_ufw_full_revoke
+  ok "Удалено правил из iptables: $removed"
+  ok "Файл правил очищен"
+  if _cascade_ufw_active; then
+    ok "UFW-правила каскада удалены"
+  fi
+}
+
+_cascade_uninstall() {
+  echo ""
+  warn "Полное удаление модуля Каскад:"
+  echo -e "    • все правила iptables (с тегом ${CASCADE_TAG})"
+  echo -e "    • $CASCADE_RULES"
+  echo -e "    • systemd-сервис awg-cascade.service"
+  echo -e "    • $CASCADE_APPLY_SCRIPT"
+  echo ""
+  warn "AmneziaWG / WARP / DNS — НЕ затрагиваются"
+  echo ""
+  local confirm
+  read_yesno confirm "Удалить модуль полностью? [y/N]: " "n"
+  [[ "$confirm" == "y" ]] || { info "Отмена"; return 0; }
+
+  systemctl disable --now awg-cascade.service >/dev/null 2>&1 || true
+  rm -f "$CASCADE_SERVICE" "$CASCADE_APPLY_SCRIPT"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  local removed
+  removed=$(_cascade_flush_iptables)
+
+  # UFW: откат интеграции (восстановит /etc/default/ufw из бэкапа, если был)
+  _cascade_ufw_full_revoke
+
+  rm -rf "$CASCADE_DIR"
+
+  _cascade_log_warn "module uninstalled (removed=${removed})"
+
+  ok "Удалено правил из iptables: $removed"
+  if _cascade_ufw_active; then
+    ok "UFW-правила каскада удалены, /etc/default/ufw восстановлен"
+  fi
+  ok "Модуль Каскад снесён"
+}
+
+# ── Диагностика ────────────────────────────────────────────
+# Полный дамп состояния каскада. Удобно показать клиенту в чате
+# или одной командой собрать всё для отправки в поддержку.
+_cascade_diagnose() {
+  echo ""
+  hdr "🔍  Диагностика каскада"
+  echo ""
+
+  echo -e "${W}── Окружение ──${N}"
+  echo -e "  Hostname     : $(hostname 2>/dev/null || echo '?')"
+  echo -e "  IP сервера   : $(get_public_ip 2>/dev/null || echo '?')"
+  echo -e "  Интерфейс    : $(_cascade_get_iface)"
+  echo -e "  IP forward   : $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo '?')"
+  echo -e "  Дата/время   : $(date '+%Y-%m-%d %H:%M:%S')"
+  echo ""
+
+  echo -e "${W}── Systemd сервис ──${N}"
+  if systemctl is-enabled awg-cascade.service &>/dev/null; then
+    echo -e "  Enabled      : ${G}да${N}"
+  else
+    echo -e "  Enabled      : ${R}нет${N}"
+  fi
+  local active_status
+  active_status=$(systemctl is-active awg-cascade.service 2>/dev/null | tr -d '\n\r ' || echo "inactive")
+  [[ -z "$active_status" ]] && active_status="inactive"
+  echo -e "  Active       : $active_status (для oneshot 'inactive' = норма после отработки)"
+  echo ""
+
+  echo -e "${W}── Файл правил ($CASCADE_RULES) ──${N}"
+  if [[ -f "$CASCADE_RULES" ]]; then
+    local cnt; cnt=$(_cascade_count_file)
+    echo -e "  Правил       : $cnt"
+    if (( cnt > 0 )); then
+      echo -e "  ${D}Содержимое:${N}"
+      sed 's/^/    /' "$CASCADE_RULES"
+    fi
+  else
+    echo -e "  ${Y}Файл отсутствует${N}"
+  fi
+  echo ""
+
+  echo -e "${W}── iptables: nat PREROUTING (DNAT) ──${N}"
+  local nat_pre
+  nat_pre=$(iptables -t nat -L PREROUTING -n -v --line-numbers 2>/dev/null | grep -E "Chain|awg-cascade" || true)
+  if [[ -n "$nat_pre" ]]; then
+    echo "$nat_pre" | sed 's/^/  /'
+  else
+    echo -e "  ${D}(нет правил каскада)${N}"
+  fi
+  echo ""
+
+  echo -e "${W}── iptables: nat POSTROUTING (MASQUERADE) ──${N}"
+  local nat_post
+  nat_post=$(iptables -t nat -L POSTROUTING -n -v --line-numbers 2>/dev/null | grep -E "Chain|awg-cascade" || true)
+  if [[ -n "$nat_post" ]]; then
+    echo "$nat_post" | sed 's/^/  /'
+  else
+    echo -e "  ${D}(нет правил каскада)${N}"
+  fi
+  echo ""
+
+  echo -e "${W}── iptables: filter FORWARD ──${N}"
+  local fwd
+  fwd=$(iptables -L FORWARD -n -v --line-numbers 2>/dev/null | grep -E "Chain|awg-cascade" || true)
+  if [[ -n "$fwd" ]]; then
+    echo "$fwd" | sed 's/^/  /'
+  else
+    echo -e "  ${D}(нет правил каскада)${N}"
+  fi
+  echo ""
+
+  echo -e "${W}── Достижимость target IP ──${N}"
+  if [[ -f "$CASCADE_RULES" ]]; then
+    local checked=""
+    while IFS='|' read -r _p _ip ftgt _ _rest; do
+      [[ -z "${_p:-}" || "${_p:0:1}" == "#" ]] && continue
+      [[ -z "${ftgt:-}" ]] && continue
+      # пропускаем повторы
+      [[ ",${checked}," == *",${ftgt},"* ]] && continue
+      checked="${checked},${ftgt}"
+      if ping -c 1 -W 2 "$ftgt" >/dev/null 2>&1; then
+        echo -e "  ${G}●${N} $ftgt — ping OK"
+      else
+        echo -e "  ${R}✗${N} $ftgt — ping не отвечает (это норма если на target отключен ICMP)"
+      fi
+    done < "$CASCADE_RULES"
+    [[ -z "$checked" ]] && echo -e "  ${D}(нет target IP для проверки)${N}"
+  else
+    echo -e "  ${D}(нет правил)${N}"
+  fi
+  echo ""
+
+  echo -e "${W}── UFW (если установлен) ──${N}"
+  if command -v ufw >/dev/null 2>&1; then
+    local ufw_st; ufw_st=$(ufw status 2>/dev/null | head -1)
+    echo -e "  $ufw_st"
+    if _cascade_ufw_active; then
+      local fwpol
+      fwpol=$(grep -oE '^DEFAULT_FORWARD_POLICY="[^"]*"' /etc/default/ufw 2>/dev/null | head -1)
+      echo -e "  ${fwpol:-DEFAULT_FORWARD_POLICY=<не найден>}"
+      echo -e "  ${D}Правила UFW связанные с каскадом:${N}"
+      ufw status 2>/dev/null | grep -E "${CASCADE_TAG}:|^[0-9]+/" | grep -E "${CASCADE_TAG}:|ALLOW" | sed 's/^/    /' || echo "    (нет)"
+    fi
+  else
+    echo -e "  ${D}(UFW не установлен)${N}"
+  fi
+  echo ""
+
+  echo -e "${W}── Лог-файл ($CASCADE_LOG) ──${N}"
+  if [[ -f "$CASCADE_LOG" ]]; then
+    local lsz; lsz=$(stat -c%s "$CASCADE_LOG" 2>/dev/null || echo 0)
+    echo -e "  Размер       : ${lsz} байт"
+    echo -e "  ${D}Последние 20 строк:${N}"
+    tail -n 20 "$CASCADE_LOG" 2>/dev/null | sed 's/^/    /' || echo "    (пусто)"
+  else
+    echo -e "  ${D}(лог-файл ещё не создан)${N}"
+  fi
+  echo ""
+}
+
+# Экспорт диагностики в файл для отправки в поддержку
+_cascade_export_debug() {
+  local outfile="/tmp/cascade-debug-$(date +%Y%m%d-%H%M%S).txt"
+  echo ""
+  hdr "📤  Экспорт диагностики"
+  echo ""
+  info "Собираю информацию в $outfile..."
+
+  {
+    echo "═══════════════════════════════════════════════════════"
+    echo "  AWG Cascade — Debug Report"
+    echo "  Generated: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "═══════════════════════════════════════════════════════"
+    echo ""
+    # Прогоним диагностику и снимем ANSI коды для чистого текста
+    _cascade_diagnose 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
+    echo ""
+    echo "═══════════════════════════════════════════════════════"
+    echo "  Полный лог-файл (если есть)"
+    echo "═══════════════════════════════════════════════════════"
+    if [[ -f "$CASCADE_LOG" ]]; then
+      cat "$CASCADE_LOG"
+    else
+      echo "(нет лог-файла)"
+    fi
+    echo ""
+    echo "═══════════════════════════════════════════════════════"
+    echo "  systemctl status awg-cascade.service"
+    echo "═══════════════════════════════════════════════════════"
+    systemctl status awg-cascade.service --no-pager 2>&1 || true
+    echo ""
+    echo "═══════════════════════════════════════════════════════"
+    echo "  journalctl -u awg-cascade.service (последние 50)"
+    echo "═══════════════════════════════════════════════════════"
+    journalctl -u awg-cascade.service -n 50 --no-pager 2>&1 || echo "(journalctl недоступен)"
+    echo ""
+    echo "═══════════════════════════════════════════════════════"
+    echo "  ip route"
+    echo "═══════════════════════════════════════════════════════"
+    ip route 2>&1 || true
+    echo ""
+    echo "═══════════════════════════════════════════════════════"
+    echo "  Версия iptables"
+    echo "═══════════════════════════════════════════════════════"
+    iptables --version 2>&1 || true
+    echo ""
+    echo "=== END OF REPORT ==="
+  } > "$outfile" 2>&1
+
+  chmod 600 "$outfile" 2>/dev/null || true
+  local sz
+  sz=$(stat -c%s "$outfile" 2>/dev/null || echo "?")
+  ok "Готово: $outfile (${sz} байт)"
+  echo ""
+  info "Покажи файл командой:"
+  echo -e "  ${W}cat $outfile${N}"
+  info "Или скачай через scp / отправь содержимое в поддержку."
+  _cascade_log_info "exported debug report to $outfile"
+}
+
+do_cascade_menu() {
+  set +e
+  while true; do
+    clear
+    echo ""
+    hdr "🌉  Каскад (проброс портов на зарубежный VPS)"
+    echo ""
+    _cascade_status
+    echo ""
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "  1) Добавить правило ${D}(один порт)${N}"
+    echo -e "  2) Добавить кастомное правило ${D}(разные порты)${N}"
+    echo -e "  3) Список правил"
+    echo -e "  4) Удалить одно правило"
+    echo -e "  ${Y}5) Сбросить все правила каскада${N}"
+    echo -e "  ${C}6) Диагностика${N} ${D}(полный дамп для отладки)${N}"
+    echo -e "  ${C}7) Экспорт для поддержки${N} ${D}(собрать всё в один файл)${N}"
+    echo -e "  ${R}d) Удалить модуль каскада полностью${N}"
+    echo -e "  0) Назад в главное меню"
+    echo ""
+    local CASCADE_CHOICE
+    safe_read CASCADE_CHOICE "$(echo -e "${C}  Выбор: ${N}")"
+
+    case "${CASCADE_CHOICE:-}" in
+      1) _cascade_add_standard; read -rp "Enter..." ;;
+      2) _cascade_add_custom;   read -rp "Enter..." ;;
+      3) _cascade_list;         read -rp "Enter..." ;;
+      4) _cascade_delete_one;   read -rp "Enter..." ;;
+      5) _cascade_flush;        read -rp "Enter..." ;;
+      6) _cascade_diagnose;     read -rp "Enter..." ;;
+      7) _cascade_export_debug; read -rp "Enter..." ;;
+      d|D) _cascade_uninstall;  read -rp "Enter..." ;;
+      0|"")
+        set -e
+        return 0
+        ;;
+      *) warn "Неверный выбор"; sleep 1 ;;
+    esac
+  done
+  set -e
+}
+
 _global_cleanup() {
   rm -rf /tmp/awg_tmp_* /tmp/awg_ping_* 2>/dev/null || true
   # Кэш доменов оставляем (используется повторно в do_check_domains),
@@ -6136,6 +7213,7 @@ while true; do
     14)  do_self_update ;;
     15)  do_warp_menu ;;
     16)  do_dns_menu ;;
+    17)  do_cascade_menu ;;
     0)  log_info "Выход"
         echo -e "\n${G}  В путь! ${N}"
         echo -e "<< Подпишись на ТГ :) >>"
@@ -6153,7 +7231,7 @@ while true; do
       ;;
   esac
 
-  if [[ "${CHOICE:-}" =~ ^[0-9]+$ ]] && [[ "${CHOICE:-}" -le 16 ]]; then
+  if [[ "${CHOICE:-}" =~ ^[0-9]+$ ]] && [[ "${CHOICE:-}" -le 17 ]]; then
     ERROR_COUNT=0
   fi
 
