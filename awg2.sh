@@ -6408,7 +6408,7 @@ _xray_setup_balancer() {
     return 0
   fi
 
-  info "Настраиваем балансировщик (random) для следующих outbounds:"
+  info "Настраиваем балансировщик (leastping / fallback) для следующих outbounds:"
   echo "$tags" | sed 's/^/  - /'
 
   python3 -c "
@@ -6416,7 +6416,14 @@ import json, sys
 conf = json.load(open('$XRAY_CONF'))
 tags = sys.argv[1].strip().split('\n')
 conf.setdefault('routing', {})
-conf['routing']['balancers'] = [{'tag': 'balancer', 'selector': tags, 'strategy': {'type': 'random'}}]
+
+# Add leastping/random strategy
+strategy = {'type': 'leastping'}
+# If we have freedom outbound, use it for healthcheck
+if any(o.get('protocol') == 'freedom' for o in conf.get('outbounds', [])):
+    conf.setdefault('observatory', {'subjectSelector': tags, 'probeURL': 'http://cp.cloudflare.com/generate_204', 'probeInterval': '30s'})
+
+conf['routing']['balancers'] = [{'tag': 'balancer', 'selector': tags, 'strategy': strategy}]
 rules = conf['routing'].get('rules', [])
 proxy_rule = next((r for r in rules if (r.get('outboundTag') and r.get('outboundTag') != 'direct') or r.get('balancerTag') == 'balancer'), None)
 if proxy_rule:
@@ -6491,6 +6498,7 @@ _xray_up() {
   fi
 
   sysctl -w net.ipv4.conf.xray0.rp_filter=2 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.awg0.rp_filter=2 >/dev/null 2>&1 || true
 
   # Настройка маршрутизации для клиентов
   iptables -t nat -C POSTROUTING -s "$client_net" -o xray0 -j MASQUERADE 2>/dev/null || \
@@ -6500,7 +6508,8 @@ _xray_up() {
   iptables -C FORWARD -i xray0 -o awg0 -j ACCEPT 2>/dev/null || \
     iptables -A FORWARD -i xray0 -o awg0 -j ACCEPT
 
-  ip route add default dev xray0 table 201 2>/dev/null || true
+  ip route flush table 201 2>/dev/null || true
+  ip route add default dev xray0 src 172.16.250.1 table 201 2>/dev/null || true
 
   _xray_sync_peers 2>/dev/null || true
   if [[ ! -s "$XRAY_PEERS" ]]; then
