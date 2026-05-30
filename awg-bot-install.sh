@@ -44,15 +44,18 @@ self_update_installer() {
   local tmp
   tmp=$(mktemp /tmp/awg-bot-install.XXXXXX.sh) || { warn "mktemp не сработал — пропускаю самообновление"; return 0; }
 
-  if ! curl -fsSL "$INSTALLER_URL" -o "$tmp" 2>/dev/null; then
-    warn "Не удалось скачать с GitHub — обновляю из текущего файла"
+  local http_code
+  http_code=$(curl -fsSL -w "%{http_code}" "$INSTALLER_URL" -o "$tmp" 2>/dev/null || echo "000")
+
+  if [[ "$http_code" != "200" ]]; then
+    warn "GitHub недоступен (HTTP $http_code) — обновляю из текущего файла"
     rm -f "$tmp" 2>/dev/null || true
     return 0
   fi
 
   # Валидация: файл непустой, это bash-скрипт и синтаксис корректен
-  if [[ ! -s "$tmp" ]] || ! head -1 "$tmp" | grep -q '^#!/usr/bin/env bash' || ! bash -n "$tmp" 2>/dev/null; then
-    warn "Скачанный файл повреждён или это не скрипт — обновляю из текущего файла"
+  if [[ ! -s "$tmp" ]] || ! head -1 "$tmp" | grep -q '^#!' || ! bash -n "$tmp" 2>/dev/null; then
+    warn "Скачанный файл повреждён — обновляю из текущего файла"
     rm -f "$tmp" 2>/dev/null || true
     return 0
   fi
@@ -3209,6 +3212,13 @@ async def client_watchdog(app):
 
             for c in clients:
                 pk      = c["pubkey"]
+                note    = c.get("note", "")
+
+                # Мониторим только клиентов с тегом #watch в заметке
+                if "#watch" not in note.lower():
+                    state.pop(pk, None)   # чистим если тег убрали
+                    continue
+
                 last_hs = stats.get(pk, {}).get("last_hs", 0)
 
                 if not last_hs:
@@ -3222,8 +3232,9 @@ async def client_watchdog(app):
                 if prev == "online" and not is_online and not warmup:
                     name = _html.escape(c.get("name", pk[:8]))
                     ip   = _html.escape(c.get("ip", "?").split("/")[0])
-                    note = c.get("note", "")
-                    note_line = f"📝 {_html.escape(note)}\n" if note else ""
+                    # Показываем заметку без служебного тега #watch
+                    note_clean = note.replace("#watch", "").replace("#WATCH", "").strip()
+                    note_line = f"📝 {_html.escape(note_clean)}\n" if note_clean else ""
                     text = (
                         "🚨 <b>КЛИЕНТ ОТВАЛИЛСЯ!</b>\n\n"
                         f"❗️ <b>{name}</b>  ({ip})\n"
@@ -3235,7 +3246,7 @@ async def client_watchdog(app):
                         await app.bot.send_message(
                             chat_id=admin_id, text=text,
                             parse_mode=ParseMode.HTML,
-                            disable_notification=False,  # со звуком — пусть орёт
+                            disable_notification=False,
                         )
                         log.warning("watchdog: ОТВАЛ %s (%s)", c.get("name"), ip)
                     except Exception as e:
