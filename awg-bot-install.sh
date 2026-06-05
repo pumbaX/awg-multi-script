@@ -1887,10 +1887,25 @@ async def _cb_client_del(q, name: str, ctx):
 
             conf_text = Path(SERVER_CONF).read_text()
             blocks    = re.split(r"(?=\[Peer\])", conf_text)
-            filtered  = "".join(b for b in blocks if c["pubkey"] not in b)
-            tmp = Path(SERVER_CONF + ".tmp")
-            tmp.write_text(filtered)
-            tmp.rename(SERVER_CONF)
+            # Точное совпадение по PublicKey= чтобы не задеть header или
+            # случайное вхождение pubkey в другом поле (base64-коллизия).
+            pk_escaped = re.escape(c["pubkey"])
+            filtered  = "".join(
+                b for b in blocks
+                if not re.search(r"^PublicKey\s*=\s*" + pk_escaped + r"\s*$", b, re.M)
+            )
+            import tempfile as _tmpfile, os as _os
+            d = str(Path(SERVER_CONF).parent)
+            fd, tmp_path = _tmpfile.mkstemp(dir=d, prefix=".awg0.", suffix=".tmp")
+            try:
+                with _os.fdopen(fd, "w") as f_tmp:
+                    f_tmp.write(filtered)
+                _os.chmod(tmp_path, 0o600)
+                _os.rename(tmp_path, SERVER_CONF)
+            except Exception:
+                try: _os.unlink(tmp_path)
+                except Exception: pass
+                raise
 
             if c["file"] and Path(c["file"]).exists():
                 Path(c["file"]).unlink()
@@ -2842,9 +2857,11 @@ def rand_private_ip():
 # ── Аргументы ──────────────────────────────────────────
 # argv[1] = profile: quic|sip|dns
 # argv[2] = domain (опционально, иначе из пула)
+# argv[3] = --only-i1 (опционально) — генерировать только I1, без I2-I5
 ALLOWED_PROFILES = ("quic", "sip", "dns")
-PROFILE = sys.argv[1] if len(sys.argv) > 1 else "quic"
-DOMAIN  = sys.argv[2] if len(sys.argv) > 2 else ""
+PROFILE  = sys.argv[1] if len(sys.argv) > 1 else "quic"
+DOMAIN   = sys.argv[2] if len(sys.argv) > 2 else ""
+ONLY_I1  = len(sys.argv) > 3 and sys.argv[3] == "--only-i1"
 
 # Валидация PROFILE — защита от опечатки в вызывающем коде.
 # При неизвестном профиле фоллбэк на "quic" + warn в stderr (не прерываем,
@@ -2855,7 +2872,7 @@ if PROFILE not in ALLOWED_PROFILES:
 
 DOMAIN_POOL = [
     "google.com","github.com","gitlab.com","stackoverflow.com",
-    "microsoft.com","apple.com","amazon.com","wikipedia.org",
+    "microsoft.com","apple.com","amazon.com",
     "mozilla.org","cdn.jsdelivr.net","unpkg.com","pypi.org",
     "ubuntu.com","debian.org","hetzner.com","ovhcloud.com",
     "digitalocean.com",
@@ -2869,47 +2886,83 @@ SIP_POOL = [
     "sip.voys.nl","sip.antisip.com","sip.iptel.org","sip.voipgate.com",
 ]
 
+# ── Взвешенный выбор (криптостойкий) ───────────────────
+def _weighted_choice(items, weights):
+    total = sum(weights)
+    r = secrets.randbelow(total)
+    acc = 0
+    for item, w in zip(items, weights):
+        acc += w
+        if r < acc:
+            return item
+    return items[-1]
+
+# QUIC версии с весами (Chrome: v1 ~85%, v2 ~15%)
+_QUIC_VERSIONS    = [b"\x00\x00\x00\x01", b"\x6b\x33\x43\xcf"]
+_QUIC_VER_WEIGHTS = [85, 15]
+
 # ── I1: QUIC Long Header Initial, строго 1200 байт ─────
-# Chrome fingerprint: fb=0xC0/0xC3, DCID=8B, SCID=8B, token=0, pad до 1200
+# v1 (RFC 9000): fb=0xC0-0xC3; v2 (RFC 9369): fb=0xD0-0xD3
+# Chrome чаще шлёт v1, иногда v2; DCID=8B, SCID=8B, token=0
 def gen_quic_initial(domain=None):
-    TARGET = 1200
-    fb     = rc([0xC0, 0xC0, 0xC0, 0xC3])   # Chrome чаще шлёт 0xC0
-    pn_len = (fb & 0x03) + 1
-    dcid   = rh(8)
-    scid   = rh(8)
+    TARGET  = 1200
+    version = _weighted_choice(_QUIC_VERSIONS, _QUIC_VER_WEIGHTS)
+    if version == b"\x00\x00\x00\x01":
+        fb = rc([0xC0, 0xC0, 0xC0, 0xC3])   # v1: Initial type bits
+    else:
+        fb = rc([0xD0, 0xD0, 0xD0, 0xD3])   # v2: Initial type bits (RFC 9369 §3.2)
+    pn_len   = (fb & 0x03) + 1
+    dcid     = rh(8)
+    scid     = rh(8)
     # header = 1+4+1+8+1+8+1(tok)+2(varint plen) = 26
-    enc_size  = TARGET - 26 - pn_len
-    # Защита от отрицательного размера (на текущих параметрах невозможно,
-    # но защищаемся от будущих правок констант)
+    enc_size = TARGET - 26 - pn_len
     if enc_size < 1:
         enc_size = 1
     plen_val  = pn_len + enc_size
     pl_varint = u16(0x4000 | plen_val)
-    pn      = rh(pn_len)
+    pn        = rh(pn_len)
     # Payload: полностью случайный (имитация зашифрованного ClientHello)
-    # Chrome Initial не содержит блоков нулей — всё выглядит как шифротекст
-    payload = rh(enc_size)
-    pkt = (bytes([fb]) + b"\x00\x00\x00\x01" +
+    payload   = rh(enc_size)
+    pkt = (bytes([fb]) + version +
            bytes([8]) + dcid + bytes([8]) + scid +
            b"\x00" + pl_varint + pn + payload)
-    # Защита размера — без assert (assert удаляется при python3 -O)
     if len(pkt) != TARGET:
-        # Достраиваем или обрезаем до TARGET
-        if len(pkt) < TARGET:
-            pkt += rh(TARGET - len(pkt))
-        else:
-            pkt = pkt[:TARGET]
+        pkt = pkt[:TARGET] if len(pkt) > TARGET else pkt + rh(TARGET - len(pkt))
     return pkt
 
-# ── I2-I5: QUIC Short Header (1-RTT) ───────────────────
-# Chrome после Initial шлёт 1-RTT пакеты: Short Header 0x40-0x7F.
-# ВАЖНО: в реальном QUIC v1 биты spin/key_phase/pn_len МАСКИРУЮТСЯ
-# header protection (RFC 9001 §5.4) — DPI видит их как случайные.
-# Здесь они и так случайные, поэтому корректно имитируется HP-masked байт.
-# pn_len теперь 1-4 (Chrome чаще шлёт 2-4) для большей реалистичности.
+# ── I2: второй QUIC Initial ─────────────────────────────
+# Chrome шлёт второй Initial меньшего размера (300-600B) с тем же DCID.
+# Это реалистичнее Short Header сразу после первого Initial.
+def gen_quic_second_initial(first_pkt):
+    version = first_pkt[1:5]   # та же версия что в I1
+    if version == b"\x00\x00\x00\x01":
+        fb = rc([0xC0, 0xC0, 0xC3])
+    else:
+        fb = rc([0xD0, 0xD0, 0xD3])
+    pn_len   = (fb & 0x03) + 1
+    dcid     = first_pkt[6:14]  # тот же DCID что в I1
+    scid     = rh(8)
+    TARGET2  = ri(300, 600)
+    enc_size = TARGET2 - 26 - pn_len
+    if enc_size < 1:
+        enc_size = 1
+    plen_val  = pn_len + enc_size
+    pl_varint = u16(0x4000 | plen_val)
+    pn        = rh(pn_len)
+    payload   = rh(enc_size)
+    pkt = (bytes([fb]) + version +
+           bytes([8]) + dcid + bytes([8]) + scid +
+           b"\x00" + pl_varint + pn + payload)
+    if len(pkt) != TARGET2:
+        pkt = pkt[:TARGET2] if len(pkt) > TARGET2 else pkt + rh(TARGET2 - len(pkt))
+    return pkt
+
+# ── I3-I5: QUIC Short Header (1-RTT) ───────────────────
+# Chrome после двух Initial шлёт 1-RTT: Short Header 0x40-0x7F.
+# Биты spin/key_phase/pn_len маскируются HP (RFC 9001 §5.4) —
+# для DPI они выглядят случайными, здесь тоже случайные.
 def gen_quic_short():
     pn_len = ri(1, 4)
-    # Биты второго уровня — после HP они выглядят случайно для DPI
     spin   = ri(0, 1) << 5
     key    = ri(0, 1) << 2
     fb     = 0x40 | spin | key | (pn_len - 1)
@@ -2975,7 +3028,9 @@ def gen_dns(domain=None):
         lbl_b = lbl.encode()[:63]
         qn += bytes([len(lbl_b)]) + lbl_b
     qn += b"\x00"
-    qtype  = b"\x00\x01"   # A record
+    # Тип запроса: A(1) ~60%, AAAA(28) ~30%, TXT(16) ~10%
+    # Современные резолверы шлют все три типа — чистый A-only паттерн редок
+    qtype  = u16(_weighted_choice([1, 28, 16], [60, 30, 10]))
     qclass = b"\x00\x01"   # IN
     # EDNS0 OPT-RR (RFC 6891):
     #   NAME=root(0x00), TYPE=OPT(41=0x29), CLASS=UDP_size (1232/4096),
@@ -2988,23 +3043,31 @@ def gen_dns(domain=None):
 
 # ── Dispatch ─────────────────────────────────────────────
 if PROFILE == "sip":
+    # I1 = SIP REGISTER (основной)
     print(to_cps(gen_sip()))
-    print(""); print(""); print(""); print("")
+    if not ONLY_I1:
+        # I2-I5 = разные SIP пакеты для разнообразия паттерна
+        for _ in range(4):
+            print(to_cps(gen_sip()))
 
 elif PROFILE == "dns":
-    # DNS wire format: TXID(2b) + flags(2b) + counts(8b) + QNAME + QTYPE + QCLASS + OPT
-    # TXID рандомный через <r 2> — в начале каждого пакета
-    # Разные домены для I1-I5 чтобы не было паттерна
-    pool = DOMAIN_POOL.copy()
-    secure_shuffle(pool)
-    for i in range(5):
-        dom = pool[i % len(pool)]
-        print("<r 2><b 0x%s>" % gen_dns(dom).hex())
+    # I1 = DOMAIN (для Lite = icloud.com, для Pro = выбранный домен)
+    # I2-I5 = разные домены из пула (только если не ONLY_I1)
+    print("<r 2><b 0x%s>" % gen_dns(DOMAIN).hex())
+    if not ONLY_I1:
+        pool = DOMAIN_POOL.copy()
+        secure_shuffle(pool)
+        for i in range(4):
+            dom = pool[i % len(pool)]
+            print("<r 2><b 0x%s>" % gen_dns(dom).hex())
 
 else:  # quic (default)
-    print(to_cps(gen_quic_initial(DOMAIN)))
-    for _ in range(4):
-        print(to_cps(gen_quic_short()))
+    i1_pkt = gen_quic_initial(DOMAIN)
+    print(to_cps(i1_pkt))
+    if not ONLY_I1:
+        print(to_cps(gen_quic_second_initial(i1_pkt)))  # I2 = второй Initial (300-600B, тот же DCID)
+        for _ in range(3):                              # I3-I5 = Short Header 1-RTT
+            print(to_cps(gen_quic_short()))
 """
 
 
@@ -3095,20 +3158,23 @@ def add_client(name: str, profile: str, admin_id: str = "") -> tuple:
 
         i_params = ""
         if profile != "basic":
-            rc2, cps_out, _ = run(["python3", "-c", _CPS_CODE, profile])
+            # Читаем профиль сервера: для Lite/Standard нужен только I1 (--only-i1),
+            # для Pro и неизвестных профилей — полный I1-I5 без флага.
+            srv_profile_marker = ""
+            try:
+                for ln in Path(SERVER_CONF).read_text().splitlines():
+                    if ln.startswith("# AWG_PROFILE="):
+                        srv_profile_marker = ln.split("=", 1)[1].strip()
+                        break
+            except Exception:
+                pass
+            only_i1 = srv_profile_marker in ("lite", "standard")
+            cmd = ["python3", "-c", _CPS_CODE, profile]
+            if only_i1:
+                cmd.append("--only-i1")
+            rc2, cps_out, _ = run(cmd)
             if rc2 == 0 and cps_out.strip():
-                # Читаем профиль сервера: для Lite/Standard нужен только I1
-                # (как делает do_add_client в awg2.sh для этих профилей).
-                # Для Pro и неизвестных профилей — полный I1-I5.
-                srv_profile_marker = ""
-                try:
-                    for ln in Path(SERVER_CONF).read_text().splitlines():
-                        if ln.startswith("# AWG_PROFILE="):
-                            srv_profile_marker = ln.split("=", 1)[1].strip()
-                            break
-                except Exception:
-                    pass
-                max_i_packets = 1 if srv_profile_marker in ("lite", "standard") else 5
+                max_i_packets = 1 if only_i1 else 5
                 labels = ["I1", "I2", "I3", "I4", "I5"]
                 for i, line in enumerate(cps_out.strip().splitlines()[:max_i_packets]):
                     if line.strip():

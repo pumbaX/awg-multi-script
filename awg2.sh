@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.8.8"
+VERSION="v6.8.9"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -478,9 +478,11 @@ def rand_private_ip():
 # ── Аргументы ──────────────────────────────────────────
 # argv[1] = profile: quic|sip|dns
 # argv[2] = domain (опционально, иначе из пула)
+# argv[3] = --only-i1 (опционально) — генерировать только I1, без I2-I5
 ALLOWED_PROFILES = ("quic", "sip", "dns")
-PROFILE = sys.argv[1] if len(sys.argv) > 1 else "quic"
-DOMAIN  = sys.argv[2] if len(sys.argv) > 2 else ""
+PROFILE  = sys.argv[1] if len(sys.argv) > 1 else "quic"
+DOMAIN   = sys.argv[2] if len(sys.argv) > 2 else ""
+ONLY_I1  = len(sys.argv) > 3 and sys.argv[3] == "--only-i1"
 
 # Валидация PROFILE — защита от опечатки в вызывающем коде.
 # При неизвестном профиле фоллбэк на "quic" + warn в stderr (не прерываем,
@@ -505,47 +507,83 @@ SIP_POOL = [
     "sip.voys.nl","sip.antisip.com","sip.iptel.org","sip.voipgate.com",
 ]
 
+# ── Взвешенный выбор (криптостойкий) ───────────────────
+def _weighted_choice(items, weights):
+    total = sum(weights)
+    r = secrets.randbelow(total)
+    acc = 0
+    for item, w in zip(items, weights):
+        acc += w
+        if r < acc:
+            return item
+    return items[-1]
+
+# QUIC версии с весами (Chrome: v1 ~85%, v2 ~15%)
+_QUIC_VERSIONS    = [b"\x00\x00\x00\x01", b"\x6b\x33\x43\xcf"]
+_QUIC_VER_WEIGHTS = [85, 15]
+
 # ── I1: QUIC Long Header Initial, строго 1200 байт ─────
-# Chrome fingerprint: fb=0xC0/0xC3, DCID=8B, SCID=8B, token=0, pad до 1200
+# v1 (RFC 9000): fb=0xC0-0xC3; v2 (RFC 9369): fb=0xD0-0xD3
+# Chrome чаще шлёт v1, иногда v2; DCID=8B, SCID=8B, token=0
 def gen_quic_initial(domain=None):
-    TARGET = 1200
-    fb     = rc([0xC0, 0xC0, 0xC0, 0xC3])   # Chrome чаще шлёт 0xC0
-    pn_len = (fb & 0x03) + 1
-    dcid   = rh(8)
-    scid   = rh(8)
+    TARGET  = 1200
+    version = _weighted_choice(_QUIC_VERSIONS, _QUIC_VER_WEIGHTS)
+    if version == b"\x00\x00\x00\x01":
+        fb = rc([0xC0, 0xC0, 0xC0, 0xC3])   # v1: Initial type bits
+    else:
+        fb = rc([0xD0, 0xD0, 0xD0, 0xD3])   # v2: Initial type bits (RFC 9369 §3.2)
+    pn_len   = (fb & 0x03) + 1
+    dcid     = rh(8)
+    scid     = rh(8)
     # header = 1+4+1+8+1+8+1(tok)+2(varint plen) = 26
-    enc_size  = TARGET - 26 - pn_len
-    # Защита от отрицательного размера (на текущих параметрах невозможно,
-    # но защищаемся от будущих правок констант)
+    enc_size = TARGET - 26 - pn_len
     if enc_size < 1:
         enc_size = 1
     plen_val  = pn_len + enc_size
     pl_varint = u16(0x4000 | plen_val)
-    pn      = rh(pn_len)
+    pn        = rh(pn_len)
     # Payload: полностью случайный (имитация зашифрованного ClientHello)
-    # Chrome Initial не содержит блоков нулей — всё выглядит как шифротекст
-    payload = rh(enc_size)
-    pkt = (bytes([fb]) + b"\x00\x00\x00\x01" +
+    payload   = rh(enc_size)
+    pkt = (bytes([fb]) + version +
            bytes([8]) + dcid + bytes([8]) + scid +
            b"\x00" + pl_varint + pn + payload)
-    # Защита размера — без assert (assert удаляется при python3 -O)
     if len(pkt) != TARGET:
-        # Достраиваем или обрезаем до TARGET
-        if len(pkt) < TARGET:
-            pkt += rh(TARGET - len(pkt))
-        else:
-            pkt = pkt[:TARGET]
+        pkt = pkt[:TARGET] if len(pkt) > TARGET else pkt + rh(TARGET - len(pkt))
     return pkt
 
-# ── I2-I5: QUIC Short Header (1-RTT) ───────────────────
-# Chrome после Initial шлёт 1-RTT пакеты: Short Header 0x40-0x7F.
-# ВАЖНО: в реальном QUIC v1 биты spin/key_phase/pn_len МАСКИРУЮТСЯ
-# header protection (RFC 9001 §5.4) — DPI видит их как случайные.
-# Здесь они и так случайные, поэтому корректно имитируется HP-masked байт.
-# pn_len теперь 1-4 (Chrome чаще шлёт 2-4) для большей реалистичности.
+# ── I2: второй QUIC Initial ─────────────────────────────
+# Chrome шлёт второй Initial меньшего размера (300-600B) с тем же DCID.
+# Это реалистичнее Short Header сразу после первого Initial.
+def gen_quic_second_initial(first_pkt):
+    version = first_pkt[1:5]   # та же версия что в I1
+    if version == b"\x00\x00\x00\x01":
+        fb = rc([0xC0, 0xC0, 0xC3])
+    else:
+        fb = rc([0xD0, 0xD0, 0xD3])
+    pn_len   = (fb & 0x03) + 1
+    dcid     = first_pkt[6:14]  # тот же DCID что в I1
+    scid     = rh(8)
+    TARGET2  = ri(300, 600)
+    enc_size = TARGET2 - 26 - pn_len
+    if enc_size < 1:
+        enc_size = 1
+    plen_val  = pn_len + enc_size
+    pl_varint = u16(0x4000 | plen_val)
+    pn        = rh(pn_len)
+    payload   = rh(enc_size)
+    pkt = (bytes([fb]) + version +
+           bytes([8]) + dcid + bytes([8]) + scid +
+           b"\x00" + pl_varint + pn + payload)
+    if len(pkt) != TARGET2:
+        pkt = pkt[:TARGET2] if len(pkt) > TARGET2 else pkt + rh(TARGET2 - len(pkt))
+    return pkt
+
+# ── I3-I5: QUIC Short Header (1-RTT) ───────────────────
+# Chrome после двух Initial шлёт 1-RTT: Short Header 0x40-0x7F.
+# Биты spin/key_phase/pn_len маскируются HP (RFC 9001 §5.4) —
+# для DPI они выглядят случайными, здесь тоже случайные.
 def gen_quic_short():
     pn_len = ri(1, 4)
-    # Биты второго уровня — после HP они выглядят случайно для DPI
     spin   = ri(0, 1) << 5
     key    = ri(0, 1) << 2
     fb     = 0x40 | spin | key | (pn_len - 1)
@@ -611,7 +649,9 @@ def gen_dns(domain=None):
         lbl_b = lbl.encode()[:63]
         qn += bytes([len(lbl_b)]) + lbl_b
     qn += b"\x00"
-    qtype  = b"\x00\x01"   # A record
+    # Тип запроса: A(1) ~60%, AAAA(28) ~30%, TXT(16) ~10%
+    # Современные резолверы шлют все три типа — чистый A-only паттерн редок
+    qtype  = u16(_weighted_choice([1, 28, 16], [60, 30, 10]))
     qclass = b"\x00\x01"   # IN
     # EDNS0 OPT-RR (RFC 6891):
     #   NAME=root(0x00), TYPE=OPT(41=0x29), CLASS=UDP_size (1232/4096),
@@ -624,32 +664,41 @@ def gen_dns(domain=None):
 
 # ── Dispatch ─────────────────────────────────────────────
 if PROFILE == "sip":
+    # I1 = SIP REGISTER (основной)
     print(to_cps(gen_sip()))
-    print(""); print(""); print(""); print("")
+    if not ONLY_I1:
+        # I2-I5 = разные SIP пакеты для разнообразия паттерна
+        for _ in range(4):
+            print(to_cps(gen_sip()))
 
 elif PROFILE == "dns":
-    # DNS wire format: TXID(2b) + flags(2b) + counts(8b) + QNAME + QTYPE + QCLASS + OPT
-    # TXID рандомный через <r 2> — в начале каждого пакета
-    # Разные домены для I1-I5 чтобы не было паттерна
-    pool = DOMAIN_POOL.copy()
-    secure_shuffle(pool)
-    for i in range(5):
-        dom = pool[i % len(pool)]
-        print("<r 2><b 0x%s>" % gen_dns(dom).hex())
+    # I1 = DOMAIN (для Lite = icloud.com, для Pro = выбранный домен)
+    # I2-I5 = разные домены из пула (только если не ONLY_I1)
+    print("<r 2><b 0x%s>" % gen_dns(DOMAIN).hex())
+    if not ONLY_I1:
+        pool = DOMAIN_POOL.copy()
+        secure_shuffle(pool)
+        for i in range(4):
+            dom = pool[i % len(pool)]
+            print("<r 2><b 0x%s>" % gen_dns(dom).hex())
 
 else:  # quic (default)
-    print(to_cps(gen_quic_initial(DOMAIN)))
-    for _ in range(4):
-        print(to_cps(gen_quic_short()))
+    i1_pkt = gen_quic_initial(DOMAIN)
+    print(to_cps(i1_pkt))
+    if not ONLY_I1:
+        print(to_cps(gen_quic_second_initial(i1_pkt)))  # I2 = второй Initial (300-600B, тот же DCID)
+        for _ in range(3):                              # I3-I5 = Short Header 1-RTT
+            print(to_cps(gen_quic_short()))
 '
 
 
 # Генерация I1-I5 через Python
-# $1 = profile (quic|sip|dns), $2 = domain (опционально)
+# $1 = profile (quic|sip|dns), $2 = domain (опционально), $3 = --only-i1 (опционально)
 gen_cps_i1() {
   local profile="${1:-quic}"
   local domain="${2:-}"
-  python3 -c "$_CPS_GENERATOR" "$profile" "$domain"
+  local only_i1="${3:-}"
+  python3 -c "$_CPS_GENERATOR" "$profile" "$domain" ${only_i1:+"$only_i1"}
 }
 
 
@@ -674,12 +723,9 @@ choose_awg_profile() {
   AWG_PROFILE=""
   echo ""
   hdr "⚙  Профиль AmneziaWG"
-  echo -e "  ${G}1${N}  ${W}Lite${N}     — параметры оригинальной Amnezia"
-  echo -e "     ${D}Минимум junk, малые S/J. I1 = DNS (icloud.com). Макс совместимость.${N}"
-  echo -e "  ${G}2${N}  ${W}Standard${N} — сбалансированный набор"
-  echo -e "     ${D}Средние Jc/S. I1 = QUIC. Хороший баланс защита/совместимость.${N}"
-  echo -e "  ${G}3${N}  ${W}Pro${N}      — максимальная защита (текущий набор)"
-  echo -e "     ${D}Полные диапазоны. Опционально I1-I5 (выбор уровня + профиля).${N}"
+  echo -e "  ${G}1${N}  ${W}Lite${N}     — оригинальная Amnezia, DNS мимикрия"
+  echo -e "  ${G}2${N}  ${W}Standard${N} — сбалансированный, QUIC мимикрия"
+  echo -e "  ${G}3${N}  ${W}Pro${N}      — максимальная защита, I1-I5 на выбор"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   local _choice
   read_choice _choice "$(echo -e "${C}  Выбор [1-3] (Enter = 2): ${N}")" 1 3 2
@@ -689,10 +735,10 @@ choose_awg_profile() {
       AWG_PROFILE="lite"
       OBF_LEVEL=2                # клиентам кладём I1
       MIMICRY_PROFILE="dns"
-      # Фиксированный домен для Lite — как в оригинале Amnezia
-      info "Профиль: Lite (I1 = DNS / icloud.com)"
+      # Домен не передаём — Python выбирает случайный из DOMAIN_POOL
+      info "Профиль: Lite (I1 = DNS / случайный домен)"
       local cps_out
-      cps_out=$(gen_cps_i1 "dns" "icloud.com") || cps_out=""
+      cps_out=$(gen_cps_i1 "dns" "" "--only-i1") || cps_out=""
       I1=$(echo "$cps_out" | sed -n '1p')
       I2=""; I3=""; I4=""; I5=""
       if [[ -z "$I1" ]]; then
@@ -770,7 +816,7 @@ choose_mimicry_profile() {
 
   echo ""
   hdr "~  Профили мимикрии I1-I5"
-  echo -e "  ${G}1${N}  ${W}★ QUIC${N}  — Chrome-like Initial 1200B + Short Header I2-I5"
+  echo -e "  ${G}1${N}  ${W}QUIC${N}  — Chrome-like Initial 1200B + Short Header I2-I5"
   echo -e "     ${D}Лучший выбор для РФ. I1=1200B, I2-I5=50-90B.${N}"
   echo -e "  ${G}2${N}  SIP   — REGISTER запрос (VoIP мимикрия)"
   echo -e "     ${D}Только I1. Хорошо работает с SIP провайдерами.${N}"
@@ -1672,138 +1718,346 @@ show_header() {
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
 }
 
+# ══════════════════════════════════════════════════════════
+# ДВУХУРОВНЕВОЕ МЕНЮ
+# Уровень 1: show_menu      — 7 категорий (CHOICE)
+# Уровень 2: show_submenu_N — пункты внутри категории (SUB_CHOICE)
+# Выход из подменю: 0 → возврат в главное меню (не exit)
+# Выход из главного меню: 0 → exit 0
+# ══════════════════════════════════════════════════════════
+
 show_menu() {
   echo ""
-
-  # === ОСНОВНЫЕ ===
-  echo -e "  ${C}▸ Основные:${N}"
-  echo -e "  ${C}1)${N} Установка зависимостей и AmneziaWG"
-  if $HAS_AWG; then
-    echo -e "  ${C}2)${N} Создать сервер + первый клиент (с мимикрией)"
-  else
-    echo -e "  ${D}2) Создать сервер (нужен пункт 1)${N}"
-  fi
-  if $HAS_AWG && $HAS_SERVER_CONF; then
-    echo -e "  ${C}3)${N} Управление клиентами (добавить/rename/delete/QR)"
-  else
-    echo -e "  ${D}3) Управление клиентами (нужен пункт 2)${N}"
-  fi
-  if $HAS_AWG && $HAS_SERVER_CONF; then
-    echo -e "  ${C}4)${N} Активность клиентов"
-  else
-    echo -e "  ${D}4) Показать клиентов (нужен пункт 2)${N}"
-  fi
+  echo -e "  ${C}1)${N}  Сервер          ${D}— установка${N}"
+  echo -e "  ${C}2)${N}  Клиенты         ${D}— управление${N}"
+  echo -e "  ${C}3)${N}  Диагностика     ${D}— тест, домены${N}"
+  echo -e "  ${C}4)${N}  Бекапы          ${D}— создать, восстановить${N}"
+  echo -e "  ${C}5)${N}  Туннели и DNS   ${D}— Warp, DNS, каскад${N}"
+  echo -e "  ${C}6)${N}  Telegram-бот    ${D}— управление ботом${N}"
+  echo -e "  ${R}7)${N}  Удаление и сброс ${D}—  вроде понятно${N}"
+  echo -e "  ${M}8)${N}  Обновить скрипт  ${D}— загрузить с GitHub${N}"
   echo ""
-
-  # === УТИЛИТЫ ===
-  echo -e "  ${G}▸ Утилиты:${N}"
-  if $HAS_SERVER_CONF; then
-    echo -e "  ${G}5)${N} Перезапустить awg0"
-  else
-    echo -e "  ${D}5) Перезапустить awg0 (нужен пункт 2)${N}"
-  fi
-  echo -e "  ${G}6)${N} Проверить домены из пулов (TCP+ping)"
-  if $HAS_SERVER_CONF; then
-    echo -e "  ${G}7)${N} Тест DPI мимикрии (захват CPS пакета)"
-  else
-    echo -e "  ${D}7) Тест DPI мимикрии (нужен пункт 2)${N}"
-  fi
+  echo -e "  ${W}0)${N}  Выход"
   echo ""
+  safe_read CHOICE "$(echo -e "${C}  Выбор [0-8]: ${N}")"
+}
 
-  # === БЕКАПЫ ===
-  echo -e "  ${B}▸ Бекапы:${N}"
-  echo -e "  ${B}8)${N} Создать бекап (~/awg_backup/)"
-  if $HAS_BACKUPS; then
-    echo -e "  ${B}9)${N} Восстановить из бекапа"
-  else
-    echo -e "  ${D}9) Восстановить из бекапа (нет бекапов)${N}"
-  fi
-  echo ""
-
-  # === ОПАСНАЯ ЗОНА ===
-  echo -e "  ${R}▸ Опасная зона:${N}"
-  if $HAS_SERVER_CONF; then
-    echo -e "  ${Y}10)${N} Очистить всех клиентов (без удаления сервера)"
-  else
-    echo -e "  ${D}10) Очистить клиентов (нужен пункт 2)${N}"
-  fi
-  if $HAS_SERVER_CONF; then
-    echo -e "  ${Y}11)${N} Сбросить настройки сервера (чистая переустановка)"
-  else
-    echo -e "  ${D}11) Сбросить сервер (нет сервера)${N}"
-  fi
-  echo -e "  ${R}12)${N} Удалить всё (пакеты + конфиги)"
-  echo ""
-
-  # === СЕРВИС ===
-  echo -e "  ${M}▸ Сервис:${N}"
-  if $HAS_SERVER_CONF; then
-    echo -e "  ${M}13)${N} Проверить и починить awg0 (авторемонт)"
-  else
-    echo -e "  ${D}13) Авторемонт (нужен пункт 2)${N}"
-  fi
-  echo -e "  ${M}14)${N} Обновить скрипт с GitHub"
-  echo ""
-
-  # === WARP ТУННЕЛЬ ===
-  echo -e "  ${C}▸ Warp туннель:${N}"
-  if ip link show warp0 &>/dev/null; then
-    echo -e "  ${C}15)${N} Warp туннель  ${G}● включен${N}"
-  elif [[ -f "$WARP_CONF" ]]; then
-    echo -e "  ${C}15)${N} Warp туннель  ${D}○ настроен, выключен${N}"
-  else
-    echo -e "  ${C}15)${N} Warp туннель  ${D}○ не настроен${N}"
-  fi
-
-  echo ""
-
-  # === ШИФРОВАННЫЙ DNS ===
-  echo -e "  ${C}▸ Шифрованный DNS:${N}"
-  if systemctl is-active --quiet dnscrypt-proxy 2>/dev/null && \
-     iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR:-127.0.2.1}:${DNS_PROXY_PORT:-53}" 2>/dev/null; then
-    echo -e "  ${C}16)${N} DNS-шифрование  ${G}● включено${N} ${D}(DoH через Cloudflare/Google/Cisco)${N}"
-  elif command -v dnscrypt-proxy &>/dev/null; then
-    echo -e "  ${C}16)${N} DNS-шифрование  ${D}○ установлен, выключен${N}"
-  else
-    echo -e "  ${C}16)${N} DNS-шифрование  ${D}○ не настроен${N}"
-  fi
-
-  echo ""
-
-  # === КАСКАД ===
-  echo -e "  ${C}▸ Каскад (проброс на зарубежный VPS):${N}"
-  local _casc_rules=0
-  if [[ -f "$CASCADE_RULES" ]]; then
-    # || true — grep -c вернёт exit 1 если нет матчей, что под set -e убивает скрипт
-    _casc_rules=$(grep -cvE '^\s*(#|$)' "$CASCADE_RULES" 2>/dev/null || true)
-    [[ "$_casc_rules" =~ ^[0-9]+$ ]] || _casc_rules=0
-  fi
-  if (( _casc_rules > 0 )) && systemctl is-enabled awg-cascade.service &>/dev/null; then
-    echo -e "  ${C}17)${N} Каскад  ${G}● активен${N} ${D}(${_casc_rules} правил)${N}"
-  elif (( _casc_rules > 0 )); then
-    echo -e "  ${C}17)${N} Каскад  ${Y}○ правила есть, persist выключен${N}"
-  else
-    echo -e "  ${C}17)${N} Каскад  ${D}○ не настроен${N}"
-  fi
-
-  echo ""
-
-  # === TELEGRAM-БОТ ===
-  echo -e "  ${C}▸ Telegram-бот:${N}"
-  if [[ -f /usr/local/bin/awg-bot.py ]]; then
-    if systemctl is-active --quiet awg-bot 2>/dev/null; then
-      echo -e "  ${C}18)${N} Управление ботом  ${G}● запущен${N}"
+# ── Подменю 1: Сервер ──────────────────────────────────
+show_submenu_1() {
+  while true; do
+    check_deps
+    show_header
+    echo ""
+    hdr "Сервер"
+    echo ""
+    echo -e "  ${C}1)${N} Установка зависимостей и AmneziaWG"
+    if $HAS_AWG; then
+      echo -e "  ${C}2)${N} Создать сервер + первый клиент (с мимикрией)"
     else
-      echo -e "  ${C}18)${N} Управление ботом  ${D}○ установлен, выключен${N}"
+      echo -e "  ${D}2) Создать сервер (нужен пункт 1)${N}"
     fi
-  else
-    echo -e "  ${C}18)${N} Управление ботом  ${D}○ не установлен${N}"
-  fi
+    if $HAS_SERVER_CONF; then
+      echo -e "  ${C}3)${N} Перезапустить awg0"
+    else
+      echo -e "  ${D}3) Перезапустить awg0 (нужен пункт 2)${N}"
+    fi
+    if $HAS_SERVER_CONF; then
+      echo -e "  ${C}4)${N} Проверить и починить awg0 (авторемонт)"
+    else
+      echo -e "  ${D}4) Авторемонт (нужен пункт 2)${N}"
+    fi
+    if $HAS_SERVER_CONF; then
+      echo -e "  ${Y}5)${N} Сбросить настройки сервера (чистая переустановка)"
+    else
+      echo -e "  ${D}5) Сбросить сервер (нет сервера)${N}"
+    fi
+    echo ""
+    echo -e "  ${W}0)${N} ← Назад"
+    echo ""
+    safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-5]: ${N}")"
+    case "${SUB_CHOICE:-}" in
+      1) do_install ;;
+      2) do_gen ;;
+      3) do_restart ;;
+      4) do_repair ;;
+      5) do_reset_server ;;
+      0|"") return 0 ;;
+      *) warn "Неверный выбор" ;;
+    esac
+    echo ""
+    read -rp "$(echo -e "${C}  Enter для продолжения...${N}")" || return 0
+  done
+}
 
-  echo ""
-  echo -e "  ${W}0)${N} Выход"
-  echo ""
-  safe_read CHOICE "$(echo -e "${C}  Выбор: ${N}")"
+# ── Подменю 2: Клиенты ─────────────────────────────────
+show_submenu_2() {
+  while true; do
+    check_deps
+    show_header
+    echo ""
+    hdr "Клиенты"
+    echo ""
+    if $HAS_AWG && $HAS_SERVER_CONF; then
+      echo -e "  ${C}1)${N} Управление клиентами (добавить/rename/delete/QR)"
+    else
+      echo -e "  ${D}1) Управление клиентами (нужен пункт Сервер → 2)${N}"
+    fi
+    if $HAS_AWG && $HAS_SERVER_CONF; then
+      echo -e "  ${C}2)${N} Активность клиентов"
+    else
+      echo -e "  ${D}2) Активность клиентов (нужен пункт Сервер → 2)${N}"
+    fi
+    echo ""
+    echo -e "  ${W}0)${N} ← Назад"
+    echo ""
+    safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
+    case "${SUB_CHOICE:-}" in
+      1) do_manage_clients ;;
+      2) do_list_clients ;;
+      0|"") return 0 ;;
+      *) warn "Неверный выбор" ;;
+    esac
+    echo ""
+    read -rp "$(echo -e "${C}  Enter для продолжения...${N}")" || return 0
+  done
+}
+
+# ── Подменю 3: Диагностика ─────────────────────────────
+show_submenu_3() {
+  while true; do
+    check_deps
+    show_header
+    echo ""
+    hdr "Диагностика"
+    echo ""
+    echo -e "  ${G}1)${N} Проверить домены из пулов (TCP+ping)"
+    if $HAS_SERVER_CONF; then
+      echo -e "  ${G}2)${N} Тест DPI мимикрии (захват CPS пакета)"
+    else
+      echo -e "  ${D}2) Тест DPI мимикрии (нужен пункт Сервер → 2)${N}"
+    fi
+    echo ""
+    echo -e "  ${W}0)${N} ← Назад"
+    echo ""
+    safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
+    case "${SUB_CHOICE:-}" in
+      1) do_check_domains ;;
+      2) do_sniff_test ;;
+      0|"") return 0 ;;
+      *) warn "Неверный выбор" ;;
+    esac
+    echo ""
+    read -rp "$(echo -e "${C}  Enter для продолжения...${N}")" || return 0
+  done
+}
+
+# ── Подменю 4: Бекапы ──────────────────────────────────
+show_submenu_4() {
+  while true; do
+    check_deps
+    show_header
+    echo ""
+    hdr "Бекапы"
+    echo ""
+    echo -e "  ${B}1)${N} Создать бекап (~/awg_backup/)"
+    if $HAS_BACKUPS; then
+      echo -e "  ${B}2)${N} Восстановить из бекапа"
+    else
+      echo -e "  ${D}2) Восстановить из бекапа (нет бекапов)${N}"
+    fi
+    echo ""
+    echo -e "  ${W}0)${N} ← Назад"
+    echo ""
+    safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
+    case "${SUB_CHOICE:-}" in
+      1) do_backup ;;
+      2) do_restore ;;
+      0|"") return 0 ;;
+      *) warn "Неверный выбор" ;;
+    esac
+    echo ""
+    read -rp "$(echo -e "${C}  Enter для продолжения...${N}")" || return 0
+  done
+}
+
+# ── Подменю 5: Туннели и DNS ───────────────────────────
+show_submenu_5() {
+  while true; do
+    check_deps
+    show_header
+    echo ""
+    hdr "Туннели и DNS"
+    echo ""
+    # Warp статус
+    if ip link show warp0 &>/dev/null; then
+      echo -e "  ${C}1)${N} Warp туннель  ${G}● включен${N}"
+    elif [[ -f "$WARP_CONF" ]]; then
+      echo -e "  ${C}1)${N} Warp туннель  ${D}○ настроен, выключен${N}"
+    else
+      echo -e "  ${C}1)${N} Warp туннель  ${D}○ не настроен${N}"
+    fi
+    # DNS статус
+    if systemctl is-active --quiet dnscrypt-proxy 2>/dev/null && \
+       iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT \
+         --to-destination "${DNS_PROXY_ADDR:-127.0.2.1}:${DNS_PROXY_PORT:-53}" 2>/dev/null; then
+      echo -e "  ${C}2)${N} DNS-шифрование  ${G}● включено${N}"
+    elif command -v dnscrypt-proxy &>/dev/null; then
+      echo -e "  ${C}2)${N} DNS-шифрование  ${D}○ установлен, выключен${N}"
+    else
+      echo -e "  ${C}2)${N} DNS-шифрование  ${D}○ не настроен${N}"
+    fi
+    # Каскад статус
+    local _casc_rules=0
+    if [[ -f "$CASCADE_RULES" ]]; then
+      _casc_rules=$(grep -cvE '^\s*(#|$)' "$CASCADE_RULES" 2>/dev/null || true)
+      [[ "$_casc_rules" =~ ^[0-9]+$ ]] || _casc_rules=0
+    fi
+    if (( _casc_rules > 0 )) && systemctl is-enabled awg-cascade.service &>/dev/null; then
+      echo -e "  ${C}3)${N} Каскад  ${G}● активен${N} ${D}(${_casc_rules} правил)${N}"
+    elif (( _casc_rules > 0 )); then
+      echo -e "  ${C}3)${N} Каскад  ${Y}○ правила есть, persist выключен${N}"
+    else
+      echo -e "  ${C}3)${N} Каскад  ${D}○ не настроен${N}"
+    fi
+    echo ""
+    echo -e "  ${W}0)${N} ← Назад"
+    echo ""
+    safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-3]: ${N}")"
+    case "${SUB_CHOICE:-}" in
+      1) do_warp_menu ;;
+      2) do_dns_menu ;;
+      3) do_cascade_menu ;;
+      0|"") return 0 ;;
+      *) warn "Неверный выбор" ;;
+    esac
+    # do_warp_menu / do_dns_menu / do_cascade_menu имеют свой loop,
+    # после выхода из них мы уже здесь — не нужен read
+  done
+}
+
+# ── Подменю 6: Telegram-бот ────────────────────────────
+show_submenu_6() {
+  local BOT_INSTALL_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg-bot-install.sh"
+  local BOT_PY="/usr/local/bin/awg-bot.py"
+
+  while true; do
+    check_deps
+    show_header
+    echo ""
+    hdr "Telegram-бот управления"
+    echo ""
+
+    local installed=false
+    [[ -f "$BOT_PY" ]] && installed=true
+
+    if $installed; then
+      if systemctl is-active --quiet awg-bot 2>/dev/null; then
+        echo -e "  Статус: ${G}● запущен${N}"
+      else
+        echo -e "  Статус: ${Y}○ установлен, остановлен${N}"
+      fi
+    else
+      echo -e "  Статус: ${D}○ не установлен${N}"
+    fi
+    echo ""
+
+    if $installed; then
+      echo -e "  ${C}1)${N} Переустановить / обновить бота"
+      echo -e "  ${G}2)${N} Запустить"
+      echo -e "  ${G}3)${N} Остановить"
+      echo -e "  ${G}4)${N} Перезапустить"
+      echo -e "  ${C}5)${N} Логи (последние 40 строк)"
+    else
+      echo -e "  ${C}1)${N} Установить бота"
+    fi
+    echo -e "  ${W}0)${N} ← Назад"
+    echo ""
+
+    local _bc
+    safe_read _bc "$(echo -e "${C}  Выбор: ${N}")"
+
+    case "${_bc:-}" in
+      1)
+        if [[ $EUID -ne 0 ]]; then
+          err "Установка требует root. Запусти: ${W}sudo awg2${N}"
+        else
+          info "Скачиваю и запускаю установщик бота..."
+          if curl -fsSL "$BOT_INSTALL_URL" -o /tmp/awg-bot-install.sh; then
+            bash /tmp/awg-bot-install.sh || warn "Установщик завершился с ошибкой"
+            rm -f /tmp/awg-bot-install.sh 2>/dev/null || true
+          else
+            err "Не удалось скачать установщик с GitHub"
+            info "Проверь интернет/доступ к raw.githubusercontent.com"
+          fi
+        fi
+        ;;
+      2)
+        if $installed; then
+          systemctl start awg-bot 2>/dev/null && ok "Запущен" || err "Не удалось запустить"
+        else
+          warn "Бот не установлен — сначала пункт 1"
+        fi
+        ;;
+      3)
+        if $installed; then
+          systemctl stop awg-bot 2>/dev/null && ok "Остановлен" || err "Не удалось остановить"
+        else
+          warn "Бот не установлен"
+        fi
+        ;;
+      4)
+        if $installed; then
+          systemctl restart awg-bot 2>/dev/null && ok "Перезапущен" || err "Не удалось перезапустить"
+        else
+          warn "Бот не установлен"
+        fi
+        ;;
+      5)
+        if $installed; then
+          echo ""
+          journalctl -u awg-bot -n 40 --no-pager 2>/dev/null || \
+            tail -n 40 /var/log/awg-bot.log 2>/dev/null || \
+            warn "Логи недоступны"
+        else
+          warn "Бот не установлен"
+        fi
+        ;;
+      0|"") return 0 ;;
+      *) warn "Неверный выбор" ;;
+    esac
+
+    echo ""
+    read -rp "$(echo -e "${C}  Enter для продолжения...${N}")" || return 0
+  done
+}
+
+# ── Подменю 7: Опасная зона ────────────────────────────
+show_submenu_7() {
+  while true; do
+    check_deps
+    show_header
+    echo ""
+    hdr "Удаление и сброс"
+    echo ""
+    if $HAS_SERVER_CONF; then
+      echo -e "  ${Y}1)${N} Очистить всех клиентов (без удаления сервера)"
+    else
+      echo -e "  ${D}1) Очистить клиентов (нужен пункт Сервер → 2)${N}"
+    fi
+    echo -e "  ${R}2)${N} Удалить всё (пакеты + конфиги)"
+    echo ""
+    echo -e "  ${W}0)${N} ← Назад"
+    echo ""
+    safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
+    case "${SUB_CHOICE:-}" in
+      1) do_clean_clients ;;
+      2) do_uninstall ;;
+      0|"") return 0 ;;
+      *) warn "Неверный выбор" ;;
+    esac
+    echo ""
+    read -rp "$(echo -e "${C}  Enter для продолжения...${N}")" || return 0
+  done
 }
 
 choose_dns() {
@@ -2017,7 +2271,9 @@ do_install() {
   local OS_ID OS_VER OS_CODENAME
   if [[ -f /etc/os-release ]]; then
     # shellcheck disable=SC1091
+    local _SAVED_VERSION="$VERSION"
     . /etc/os-release
+    VERSION="$_SAVED_VERSION"
     OS_ID="${ID:-unknown}"
     OS_VER="${VERSION_ID:-0}"
     OS_CODENAME="${VERSION_CODENAME:-}"
@@ -2669,7 +2925,11 @@ _mgmt_scan_clients() {
       cur_name=""; cur_pk=""; cur_ip=""
     elif [[ $in_peer -eq 1 ]]; then
       if [[ "$line" =~ ^#[[:space:]](.+) ]]; then
-        cur_name="${BASH_REMATCH[1]}"
+        local _cmt="${BASH_REMATCH[1]}"
+        # Пропускаем служебные метки expires= и orig_ips=
+        if [[ "$_cmt" != expires=* && "$_cmt" != orig_ips=* ]]; then
+          cur_name="$_cmt"
+        fi
       elif [[ "$line" =~ ^PublicKey[[:space:]]=[[:space:]](.+) ]]; then
         cur_pk="${BASH_REMATCH[1]}"
       elif [[ "$line" =~ ^AllowedIPs[[:space:]]=[[:space:]](.+) ]]; then
@@ -2711,10 +2971,11 @@ do_manage_clients() {
     echo -e "  ${C}5)${N} Показать конфиг клиента (текст)"
     echo -e "  ${G}6)${N} Создать N клиентов (массово)"
     echo -e "  ${C}7)${N} Срок действия клиента"
+    echo -e "  ${C}8)${N} Активность клиентов"
     echo -e "  ${W}0)${N} Назад в главное меню"
     echo ""
     local MGMT_CHOICE
-    safe_read MGMT_CHOICE "$(echo -e "${C}  Выбор [0-7]: ${N}")"
+    safe_read MGMT_CHOICE "$(echo -e "${C}  Выбор [0-8]: ${N}")"
     case "${MGMT_CHOICE:-}" in
       1) do_add_client ;;
       2) do_rename_client ;;
@@ -2723,6 +2984,7 @@ do_manage_clients() {
       5) do_show_config ;;
       6) do_bulk_add_clients ;;
       7) do_expire_menu ;;
+      8) do_list_clients ;;
       0) return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -3078,7 +3340,7 @@ do_add_client() {
       # Lite-сервер: клиенту всегда I1=DNS (icloud.com), без I2-I5
       info "Профиль сервера: Lite — клиент получит I1=DNS (icloud.com)"
       local cps_out
-      cps_out=$(gen_cps_i1 "dns" "icloud.com") || cps_out=""
+      cps_out=$(gen_cps_i1 "dns" "icloud.com" "--only-i1") || cps_out=""
       I1=$(echo "$cps_out" | sed -n '1p')
       I2=""; I3=""; I4=""; I5=""
       [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
@@ -3315,7 +3577,7 @@ do_bulk_add_clients() {
     lite)
       info "Профиль сервера Lite — клиенты получат I1=DNS (icloud.com)"
       local cps_out
-      cps_out=$(gen_cps_i1 "dns" "icloud.com") || cps_out=""
+      cps_out=$(gen_cps_i1 "dns" "icloud.com" "--only-i1") || cps_out=""
       I1=$(echo "$cps_out" | sed -n '1p')
       I2=""; I3=""; I4=""; I5=""
       [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
@@ -3556,7 +3818,11 @@ do_list_clients() {
       i=$((i+1))
       name=""; pubkey=""; ip=""; tx_raw=0; rx_raw=0; handshake_time=""; endpoint=""
     elif [[ "$line" =~ ^#[[:space:]](.+) ]]; then
-      name="${BASH_REMATCH[1]}"
+      _cmt="${BASH_REMATCH[1]}"
+      # Пропускаем служебные метки expires= и orig_ips=
+      if [[ "$_cmt" != expires=* && "$_cmt" != orig_ips=* ]]; then
+        name="$_cmt"
+      fi
     elif [[ "$line" =~ ^PublicKey[[:space:]]=[[:space:]](.+) ]]; then
       pubkey="${BASH_REMATCH[1]}"
       local transfer_line
@@ -4176,7 +4442,7 @@ _warp_get_client_net() {
 _warp_list_awg_clients() {
   [[ ! -f "$SERVER_CONF" ]] && return 0
   awk '
-    /^# /{ name=$2 }
+    /^# /{ if ($2 !~ /^expires=/ && $2 !~ /^orig_ips=/) name=$2 }
     /^AllowedIPs/{
       if (name) {
         gsub(/\/32.*/, "", $3)
@@ -7354,7 +7620,7 @@ _cascade_uninstall() {
 # или одной командой собрать всё для отправки в поддержку.
 _cascade_diagnose() {
   echo ""
-  hdr "🔍  Диагностика каскада"
+  hdr "Диагностика каскада"
   echo ""
 
   echo -e "${W}── Окружение ──${N}"
@@ -8280,99 +8546,7 @@ _expire_ask_at_creation() {
   echo "$ts"
 }
 
-do_bot_menu() {
-  local BOT_INSTALL_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg-bot-install.sh"
-  local BOT_PY="/usr/local/bin/awg-bot.py"
 
-  while true; do
-    echo ""
-    hdr "🤖  Telegram-бот управления"
-    echo ""
-
-    local installed=false
-    [[ -f "$BOT_PY" ]] && installed=true
-
-    if $installed; then
-      if systemctl is-active --quiet awg-bot 2>/dev/null; then
-        echo -e "  Статус: ${G}● запущен${N}"
-      else
-        echo -e "  Статус: ${Y}○ установлен, остановлен${N}"
-      fi
-    else
-      echo -e "  Статус: ${D}○ не установлен${N}"
-    fi
-    echo ""
-
-    if $installed; then
-      echo -e "  ${C}1)${N} Переустановить / обновить бота"
-      echo -e "  ${G}2)${N} Запустить"
-      echo -e "  ${G}3)${N} Остановить"
-      echo -e "  ${G}4)${N} Перезапустить"
-      echo -e "  ${C}5)${N} Логи (последние 40 строк)"
-    else
-      echo -e "  ${C}1)${N} Установить бота"
-    fi
-    echo -e "  ${W}0)${N} Назад в главное меню"
-    echo ""
-
-    local _bc
-    safe_read _bc "$(echo -e "${C}  Выбор: ${N}")"
-
-    case "${_bc:-}" in
-      1)
-        if [[ $EUID -ne 0 ]]; then
-          err "Установка требует root. Запусти: ${W}sudo awg2${N}"
-        else
-          info "Скачиваю и запускаю установщик бота..."
-          # Качаем во временный файл и запускаем (как просил пользователь)
-          if curl -fsSL "$BOT_INSTALL_URL" -o /tmp/awg-bot-install.sh; then
-            bash /tmp/awg-bot-install.sh || warn "Установщик завершился с ошибкой"
-            rm -f /tmp/awg-bot-install.sh 2>/dev/null || true
-          else
-            err "Не удалось скачать установщик с GitHub"
-            info "Проверь интернет/доступ к raw.githubusercontent.com"
-          fi
-        fi
-        ;;
-      2)
-        if $installed; then
-          systemctl start awg-bot 2>/dev/null && ok "Запущен" || err "Не удалось запустить"
-        else
-          warn "Бот не установлен — сначала пункт 1"
-        fi
-        ;;
-      3)
-        if $installed; then
-          systemctl stop awg-bot 2>/dev/null && ok "Остановлен" || err "Не удалось остановить"
-        else
-          warn "Бот не установлен"
-        fi
-        ;;
-      4)
-        if $installed; then
-          systemctl restart awg-bot 2>/dev/null && ok "Перезапущен" || err "Не удалось перезапустить"
-        else
-          warn "Бот не установлен"
-        fi
-        ;;
-      5)
-        if $installed; then
-          echo ""
-          journalctl -u awg-bot -n 40 --no-pager 2>/dev/null || \
-            tail -n 40 /var/log/awg-bot.log 2>/dev/null || \
-            warn "Логи недоступны"
-        else
-          warn "Бот не установлен"
-        fi
-        ;;
-      0) return 0 ;;
-      *) warn "Неверный выбор" ;;
-    esac
-
-    echo ""
-    read -rp "$(echo -e "${C}  Enter для продолжения...${N}")" || return 0
-  done
-}
 
 
 _global_cleanup() {
@@ -8389,32 +8563,26 @@ while true; do
   check_deps
   show_header
   show_menu
-  # show_menu уже читает CHOICE, дополнительный read не нужен
+  # show_menu уже читает CHOICE через safe_read
 
   case "${CHOICE:-}" in
-    1)   do_install ;;
-    2)   do_gen ;;
-    3)   do_manage_clients ;;
-    4)   do_list_clients ;;
-    5)   do_restart ;;
-    6)   do_check_domains ;;
-    7)   do_sniff_test ;;
-    8)   do_backup ;;
-    9)   do_restore ;;
-    10)  do_clean_clients ;;
-    11)  do_reset_server ;;
-    12)  do_uninstall ;;
-    13)  do_repair ;;
-    14)  do_self_update ;;
-    15)  do_warp_menu ;;
-    16)  do_dns_menu ;;
-    17)  do_cascade_menu ;;
-    18)  do_bot_menu ;;
-    0)  log_info "Выход"
-        echo -e "\n${G}  В путь! ${N}"
-        echo -e "<< Подпишись на ТГ :) >>"
-        echo -e "<< https://t.me/awgToolza >>\n"
-        exit 0 ;;
+    1) show_submenu_1 ;;
+    2) do_manage_clients ;;
+    3) show_submenu_3 ;;
+    4) show_submenu_4 ;;
+    5) show_submenu_5 ;;
+    6) show_submenu_6 ;;
+    7) show_submenu_7 ;;
+    8) do_self_update ;;
+    0)
+      log_info "Выход"
+      echo -e "\n${G}  В путь! ${N}"
+      echo -e "<< Подпишись на ТГ :) >>"
+      echo -e "<< https://t.me/awgToolza >>\n"
+      exit 0 ;;
+    "")
+      # Пустой Enter — перерисовать меню, не выходить
+      ;;
     *)
       warn "Неверный выбор"
       ERROR_COUNT=$((ERROR_COUNT + 1))
@@ -8427,13 +8595,10 @@ while true; do
       ;;
   esac
 
-  if [[ "${CHOICE:-}" =~ ^[0-9]+$ ]] && [[ "${CHOICE:-}" -le 18 ]]; then
+  if [[ "${CHOICE:-}" =~ ^[1-8]$ ]]; then
     ERROR_COUNT=0
   fi
 
-  # Сбрасываем CHOICE — защита от повторного срабатывания предыдущего выбора
-  # при следующем show_menu (если пользователь нажмёт Enter без ввода)
+  # Сбрасываем CHOICE — защита от повторного срабатывания
   CHOICE=""
-  echo ""
-  read -rp "$(echo -e "${C}  Enter для продолжения...${N}")" || break
 done
