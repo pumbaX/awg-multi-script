@@ -151,7 +151,7 @@ prompt_retry() {
 SERVER_CONF="/etc/amnezia/amneziawg/awg0.conf"
 LOG_FILE="/var/log/awg-manager.log"
 
-# Warp туннель (Cloudflare wgcf) — пункт меню 15
+# Warp туннель (Cloudflare wgcf) — Туннели (5)
 WARP_DIR="/etc/wgcf"
 WARP_CONF="/etc/wireguard/warp0.conf"
 WARP_ACCOUNT="$WARP_DIR/wgcf-account.toml"
@@ -163,8 +163,7 @@ WARP_HEALTH_SCRIPT="/usr/local/bin/awg-warp-healthcheck.sh"
 WARP_HEALTH_TIMER="/etc/systemd/system/awg-warp-healthcheck.timer"
 WARP_HEALTH_SERVICE="/etc/systemd/system/awg-warp-healthcheck.service"
 
-# Шифрованный DNS (dnscrypt-proxy) — пункт меню 16
-# Шифрованный DNS (dnscrypt-proxy) — пункт меню 16
+# Шифрованный DNS (dnscrypt-proxy) — Туннели (5)
 # Используем системный сокет Debian/Ubuntu: 127.0.2.1:53 (socket activation)
 # Это работает "из коробки" — не боремся с systemd
 DNS_PROXY_ADDR="127.0.2.1"
@@ -179,7 +178,7 @@ DNS_HEALTH_TIMER="/etc/systemd/system/awg-dns-healthcheck.timer"
 DNS_HEALTH_SCRIPT="/usr/local/bin/awg-dns-healthcheck.sh"
 DNS_HEALTH_LOG="/var/log/awg-dns-health.log"
 
-# Каскад (port forwarding на зарубежный сервер) — пункт меню 17
+# Каскад (port forwarding на зарубежный сервер) — Туннели (5)
 CASCADE_DIR="/etc/awg-cascade"
 CASCADE_RULES="$CASCADE_DIR/rules.conf"
 CASCADE_SERVICE="/etc/systemd/system/awg-cascade.service"
@@ -1005,7 +1004,7 @@ do_sniff_test() {
   fi
 
   if [[ ! -f "$SERVER_CONF" ]]; then
-    warn "Сервер не настроен (пункт 2)"
+    warn "Сервер не настроен (Сервер → п.2)"
     return 0
   fi
 
@@ -1357,7 +1356,7 @@ do_repair() {
   # 2. Конфиг
   if [[ ! -f "$SERVER_CONF" ]]; then
     err "Серверный конфиг не найден: $SERVER_CONF"
-    info "Сначала пункт 2 — создать сервер"
+    info "Сначала Сервер (1) → п.2 — создать сервер"
     return 1
   fi
   ok "Серверный конфиг на месте"
@@ -2065,10 +2064,10 @@ choose_dns() {
   hdr "◎  DNS для клиента"
   echo ""
 
-  # Если включено DNS-шифрование (пункт 16) — показать подсказку
+  # Если включено DNS-шифрование (п.5 → Туннели и DNS) — показать подсказку
   if systemctl is-active --quiet dnscrypt-proxy 2>/dev/null && \
      iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR:-127.0.2.1}:${DNS_PROXY_PORT:-53}" 2>/dev/null; then
-    echo -e "  ${G}⚡ Шифрованный DNS включён${N} ${D}(пункт 16 главного меню)${N}"
+    echo -e "  ${G}⚡ Шифрованный DNS включён${N} ${D}(п.5 → Туннели и DNS)${N}"
     echo -e "  ${D}→ Любой выбор будет автоматически перенаправлен через DoH${N}"
     echo -e "  ${D}→ Реальные запросы пойдут через Cloudflare/Google/Cisco${N}"
     echo ""
@@ -2583,15 +2582,15 @@ EOF
   # Поднимаем expire-таймер (срок действия клиентов работает с момента установки)
   _expire_install || true
 
-  info "Следующий шаг: пункт меню 2 — Создать сервер"
+  info "Следующий шаг: Сервер (1) → п.2 — Создать сервер"
   break
   done
 }
 
 do_gen() {
   log_info "do_gen: старт"
-  command -v awg &>/dev/null || { err "awg не найден. Сначала пункт 1"; return 1; }
-  command -v python3 &>/dev/null || { err "python3 не найден — нужен для генерации параметров"; info "Запусти пункт 1 или: apt-get install python3"; return 1; }
+  command -v awg &>/dev/null || { err "awg не найден. Сначала Сервер (1) → п.1"; return 1; }
+  command -v python3 &>/dev/null || { err "python3 не найден — нужен для генерации параметров"; info "Запусти Сервер (1) → п.1 или: apt-get install python3"; return 1; }
 
   # ── Защита: сервер уже установлен? ──
   if [[ -f "$SERVER_CONF" ]]; then
@@ -2603,9 +2602,9 @@ do_gen() {
     warn "Текущий профиль: ${W}${_current_profile}${N}"
     echo ""
     info "Для смены профиля сначала удали текущий сервер:"
-    info "  • Пункт 11 — Сбросить настройки сервера (чистая переустановка)"
-    info "  • Пункт 12 — Удалить всё (пакеты + конфиги)"
-    info "После этого выбери пункт 2 заново и укажи нужный профиль."
+    info "  • Сервер (1) → п.5 — Сбросить настройки сервера (чистая переустановка)"
+    info "  • Удаление (7) → п.2 — Удалить всё (пакеты + конфиги)"
+    info "После этого выбери Сервер (1) → п.2 заново и укажи нужный профиль."
     return 0
   fi
 
@@ -2844,7 +2843,7 @@ do_gen() {
     echo ""
     echo -e "  ${Y}→ Возможные причины:${N}"
     echo -e "  ${Y}  • Модуль amneziawg не загружен → reboot${N}"
-    echo -e "  ${Y}  • Конфликт iptables правил → пункт 11 (сброс сервера) и заново${N}"
+    echo -e "  ${Y}  • Конфликт iptables правил → Сервер (1) → п.5 (сброс сервера) и заново${N}"
     echo -e "  ${Y}  • Порт $PORT заблокирован → ufw allow $PORT/udp${N}"
     if [[ -n "$bak_ts" && -f "$bak_ts" ]]; then
       echo -e "  ${Y}  • Предыдущий конфиг сохранён: $bak_ts${N}"
@@ -2958,7 +2957,7 @@ _mgmt_print_list() {
 }
 
 do_manage_clients() {
-  [[ ! -f "$SERVER_CONF" ]] && { warn "Конфиг сервера не найден. Сначала пункт 2"; return 0; }
+  [[ ! -f "$SERVER_CONF" ]] && { warn "Конфиг сервера не найден. Сначала Сервер (1) → п.2"; return 0; }
   command -v awg &>/dev/null || { warn "awg не найден"; return 0; }
 
   while true; do
@@ -3260,7 +3259,7 @@ do_delete_client() {
 }
 
 do_add_client() {
-  [[ ! -f "$SERVER_CONF" ]] && { warn "Конфиг сервера не найден. Сначала пункт 2 — возврат в главное меню"; return 0; }
+  [[ ! -f "$SERVER_CONF" ]] && { warn "Конфиг сервера не найден. Сначала Сервер (1) → п.2"; return 0; }
   command -v awg &>/dev/null || { warn "awg не найден — возврат в главное меню"; return 0; }
 
   local server_net base_ip client_addr
@@ -3449,7 +3448,7 @@ do_add_client() {
 
   # Применяем через syncconf (без разрыва других клиентов)
   info "Применяем конфиг..."
-  _apply_config 2>/dev/null || warn "syncconf не удался, может потребоваться перезапуск (пункт 5)"
+  _apply_config 2>/dev/null || warn "syncconf не удался, может потребоваться перезапуск (Сервер → п.3)"
 
   # Срок действия (после создания, по согласованному UX)
   local _expire_ts
@@ -3475,7 +3474,7 @@ do_add_client() {
 }
 
 # ─────────────────────────────────────────────────────────────
-# Массовое создание клиентов (пункт 6 меню)
+# Массовое создание клиентов (п.6 меню клиентов)
 # - Префикс + N клиентов, имя <prefix>-NNN (3 цифры)
 # - DNS, MTU, профиль I1 спрашиваются ОДИН раз
 # - В цикле: find_free_ip, ключи, запись в SERVER_CONF, awg set, файл клиента
@@ -3484,7 +3483,7 @@ do_add_client() {
 # - SIGINT корректно прерывает и применяет накопленное
 # ─────────────────────────────────────────────────────────────
 do_bulk_add_clients() {
-  [[ ! -f "$SERVER_CONF" ]] && { warn "Конфиг сервера не найден. Сначала пункт 2 — возврат"; return 0; }
+  [[ ! -f "$SERVER_CONF" ]] && { warn "Конфиг сервера не найден. Сначала Сервер (1) → п.2"; return 0; }
   command -v awg &>/dev/null || { warn "awg не найден — возврат"; return 0; }
   awg show awg0 public-key &>/dev/null || { err "awg0 не поднят. Запусти: awg-quick up $SERVER_CONF"; return 1; }
 
@@ -3761,7 +3760,7 @@ do_bulk_add_clients() {
   # ── Один apply в конце ──
   echo ""
   info "Применяем конфиг (один раз для всех)..."
-  _apply_config 2>/dev/null || warn "syncconf не удался, может потребоваться перезапуск (пункт 5)"
+  _apply_config 2>/dev/null || warn "syncconf не удался, может потребоваться перезапуск (Сервер → п.3)"
 
   # Применяем срок ко всем созданным (если указан)
   if [[ -n "$_bulk_expire_ts" && ${#_bulk_created[@]} -gt 0 ]]; then
@@ -3977,8 +3976,8 @@ do_restart() {
   if [[ ! -f "$SERVER_CONF" ]]; then
     err "Конфиг сервера не найден"
     echo -e "  ${Y}→ Возможно, AmneziaWG ещё не установлен${N}"
-    echo -e "  ${Y}→ Выбери пункт 1 для установки зависимостей${N}"
-    echo -e "  ${Y}→ Затем пункт 2 для создания сервера${N}"
+    echo -e "  ${Y}→ Сервер (1) → п.1 — установка зависимостей${N}"
+    echo -e "  ${Y}→ Сервер (1) → п.2 — создать сервер${N}"
     echo ""
     local CONFIRM_INSTALL
     read_yesno CONFIRM_INSTALL "$(echo -e "${G}  Установить сейчас? [y/N]: ${N}")" "n"
@@ -4011,7 +4010,7 @@ do_restart() {
 
 # 10. СБРОС СЕРВЕРА (чистая переустановка)
 # Удаляет конфиги и правила firewall, но НЕ трогает пакеты/бинарники.
-# После сброса можно сразу пункт 2 — создать новый сервер.
+# После сброса можно сразу Сервер (1) → п.2 — создать новый сервер.
 do_reset_server() {
   echo ""
   hdr "↺  Сброс настроек сервера (чистая переустановка)"
@@ -4029,7 +4028,7 @@ do_reset_server() {
   echo -e "  ${G}✓${N} Лог /var/log/awg-Toolza.log"
   echo -e "  ${G}✓${N} Бекапы в ~/awg_backup/"
   echo ""
-  echo -e "${C}  После сброса можно сразу пункт 2 — создать новый сервер.${N}"
+  echo -e "${C}  После сброса: Сервер (1) → п.2 — создать новый сервер.${N}"
   echo ""
 
   local CONFIRM_RST
@@ -4099,7 +4098,7 @@ do_reset_server() {
   echo ""
   hdr "√ Сервер сброшен"
   echo -e "${G}  Конфиги удалены, пакеты сохранены${N}"
-  echo -e "${C}  Теперь можно пункт 2 — создать новый сервер${N}"
+  echo -e "${C}  Теперь можно Сервер (1) → п.2 — создать новый сервер${N}"
   echo ""
   log_info "do_reset_server: сброс выполнен"
 }
@@ -4802,7 +4801,7 @@ _warp_up() {
 
   if [[ -z "$client_net" ]]; then
     err "AWG сервер не настроен"
-    info "Сначала создай AWG сервер (пункт 2), потом включай Warp"
+    info "Сначала создай AWG сервер (Сервер → п.2), потом включай Warp"
     return 1
   fi
 
@@ -4939,7 +4938,7 @@ EOF
 
   ok "Split-tunnel активен: $peer_count клиент(ов) через Warp"
   info "SSH и серверный трафик идут напрямую"
-  info "Управление клиентами в Warp: пункт 6 в меню"
+  info "Управление клиентами в Warp: Туннели (5) → Warp → п.6"
 
   # ── Автозапуск после ребута ──────────────────────────────
   # Создаём systemd-юнит который при загрузке вызовет awg2 и тот
@@ -5513,7 +5512,7 @@ do_warp_menu() {
           echo -e "  блокирует регистрацию с российских IP-адресов."
           echo ""
           echo -e "  ${G}Решение:${N} зарегистрируй аккаунт на другом сервере"
-          echo -e "  и импортируй сюда через ${W}пункт 8${N} в этом меню."
+          echo -e "  и импортируй сюда через ${W}п.8${N} в этом меню."
           echo ""
           echo -e "  ${C}Подробная инструкция:${N} меню 15 → ${W}8${N}"
           echo ""
@@ -5547,7 +5546,7 @@ do_warp_menu() {
 }
 
 
-# ── Шифрованный DNS (dnscrypt-proxy) — пункт меню 16 ────────────
+# ── Шифрованный DNS (dnscrypt-proxy) — Туннели (5) ─────────────
 
 # Проверка статуса dnscrypt-proxy
 _dns_proxy_status() {
@@ -5612,7 +5611,7 @@ _dns_proxy_install() {
   # 1. AWG интерфейс существует
   if ! ip link show awg0 &>/dev/null; then
     err "Интерфейс awg0 не найден"
-    info "Сначала установи AWG (пункт 2 главного меню), затем включи DNS-шифрование"
+    info "Сначала установи AWG (Сервер → п.2), затем включи DNS-шифрование"
     return 1
   fi
 
@@ -6253,7 +6252,7 @@ _dns_proxy_change_upstream() {
   return $rc
 }
 
-# Меню шифрованного DNS — пункт 16
+# Меню шифрованного DNS — п.5 → Туннели и DNS
 do_dns_menu() {
   set +e
   while true; do
@@ -6280,7 +6279,7 @@ do_dns_menu() {
       1)
         # Проверим что AWG установлен
         if ! ip link show awg0 &>/dev/null; then
-          warn "Сначала создай AWG сервер (пункт 2 главного меню)"
+          warn "Сначала создай AWG сервер (Сервер → п.2)"
           read -rp "Enter..."
           continue
         fi
@@ -8238,7 +8237,7 @@ _expire_fmt() {
   fi
 }
 
-# Меню срока действия клиента (пункт 7 в do_manage_clients)
+# Меню срока действия клиента (п.7 в do_manage_clients)
 do_expire_menu() {
   [[ ! -f "$SERVER_CONF" ]] && { warn "Конфиг сервера не найден"; return 0; }
 
