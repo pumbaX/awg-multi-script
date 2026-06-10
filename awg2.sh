@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.9.5"
+VERSION="v6.9.0"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -983,7 +983,7 @@ def detect(p):
     # TLS ChangeCipherSpec (0x14)
     if p[0] == 0x14 and p[1] == 0x03 and p[2] in (0x01, 0x03):
         return ("tls-ccs", f"TLS ChangeCipherSpec ({len(p)}B)")
-    # (Правило tls-cke по одному байту 0x10 убрано в v6.9.5: оно ловило
+    # (Правило tls-cke по одному байту 0x10 убрано в v6.9.0: оно ловило
     #  ~1/256 случайных AWG data-пакетов как ложный ClientKeyExchange.
     #  Наш CPS-генератор CKE не создаёт, а настоящий CKE неотличим от
     #  обфусцированного AWG-пакета по первому байту — поэтому не детектим.)
