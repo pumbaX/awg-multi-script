@@ -1,7 +1,8 @@
+
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.9.0"
+VERSION="v6.9.1"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -29,11 +30,6 @@ EXPIRE_SUSPEND_IP="127.0.0.2/32"        # AllowedIPs у заблокирован
 EXPIRE_BOT_CONF="/etc/awg-bot.conf"     # для опциональных Telegram-уведомлений
 EXPIRE_STATE_DIR="/var/lib/awg2-expire" # флаги "уже уведомили" по pubkey
 EXPIRE_LOG="/var/log/awg2-expire.log"
-
-# Межпроцессный лок на мутации SERVER_CONF.
-# ВАЖНО: тот же файл использует Telegram-бот (fcntl.flock в awg-bot.py),
-# поэтому CLI и бот не могут одновременно править awg0.conf.
-CONF_LOCK_FILE="/run/awg-bot.lock"
 
 [[ $EUID -ne 0 ]] && { echo -e "${R}× Запускай от root${N}"; exit 1; }
 
@@ -639,56 +635,46 @@ def gen_sip():
 
 # ── TLS 1.3 ClientHello (RFC 8446) ─────────────────────
 # I1 имитирует начало TLS-рукопожатия браузера (Chrome/Firefox-like).
-# Это самый устойчивый паттерн на 2026: DPI не режет TLS ClientHello
-# на произвольном порту, иначе встал бы весь HTTPS. В отличие от QUIC
-# (который в РФ ловят по сигнатуре Initial), TLS-CH выглядит как обычный
-# заход на сайт. SNI берётся из пула легитимных доменов.
+# Самый устойчивый паттерн в РФ 2026: DPI не режет TLS ClientHello на
+# произвольном порту — выглядит как обычный заход на сайт. SNI берётся
+# из пула легитимных доменов.
 def gen_tls_clienthello(domain=None):
     host = (domain or DOMAIN).encode()
     exts = b""
-    # server_name (0x0000)
     sni_entry = b"\x00" + u16(len(host)) + host
     sni_list  = u16(len(sni_entry)) + sni_entry
     exts += u16(0x0000) + u16(len(sni_list)) + sni_list
-    # supported_groups (0x000a): x25519, secp256r1, secp384r1
     groups = b"\x00\x1d" + b"\x00\x17" + b"\x00\x18"
     sg = u16(len(groups)) + groups
     exts += u16(0x000a) + u16(len(sg)) + sg
-    # ec_point_formats (0x000b): uncompressed
     epf = b"\x01\x00"
     exts += u16(0x000b) + u16(len(epf)) + epf
-    # signature_algorithms (0x000d)
     sigs = b"\x04\x03\x08\x04\x04\x01\x05\x03\x08\x05\x05\x01\x08\x06\x06\x01\x02\x01"
     sa = u16(len(sigs)) + sigs
     exts += u16(0x000d) + u16(len(sa)) + sa
-    # supported_versions (0x002b): TLS 1.3 + 1.2
     sv = b"\x04" + b"\x03\x04" + b"\x03\x03"
     exts += u16(0x002b) + u16(len(sv)) + sv
-    # key_share (0x0033): x25519 pubkey 32B (случайный — имитация)
     ks_entry = b"\x00\x1d" + u16(32) + rh(32)
     ks = u16(len(ks_entry)) + ks_entry
     exts += u16(0x0033) + u16(len(ks)) + ks
-    # ALPN (0x0010): h2 + http/1.1
     alpn_protos = b"\x02h2\x08http/1.1"
     alpn = u16(len(alpn_protos)) + alpn_protos
     exts += u16(0x0010) + u16(len(alpn)) + alpn
-    # padding (0x0015): варьируем длину пакета, чтобы не было фикс-сигнатуры
     pad_len = ri(0, 140)
     exts += u16(0x0015) + u16(pad_len) + (b"\x00" * pad_len)
-    # ── тело ClientHello ──
-    legacy_version = b"\x03\x03"        # TLS 1.2 для совместимости (RFC 8446)
+    legacy_version = b"\x03\x03"
     random_bytes   = rh(32)
     session_id     = rh(32)
     sid            = bytes([len(session_id)]) + session_id
-    ciphers = (b"\x13\x01\x13\x02\x13\x03"          # TLS1.3 AEAD
-               b"\xc0\x2b\xc0\x2f\xc0\x2c\xc0\x30"  # ECDHE
-               b"\xcc\xa9\xcc\xa8"                  # ChaCha20
+    ciphers = (b"\x13\x01\x13\x02\x13\x03"
+               b"\xc0\x2b\xc0\x2f\xc0\x2c\xc0\x30"
+               b"\xcc\xa9\xcc\xa8"
                b"\xc0\x13\xc0\x14\x00\x9c\x00\x9d\x00\x2f\x00\x35")
     cs   = u16(len(ciphers)) + ciphers
-    comp = b"\x01\x00"                  # compression: null
+    comp = b"\x01\x00"
     body = legacy_version + random_bytes + sid + cs + comp + u16(len(exts)) + exts
-    hs   = b"\x01" + u24(len(body)) + body            # Handshake: ClientHello
-    rec  = b"\x16" + b"\x03\x01" + u16(len(hs)) + hs  # TLS record: handshake
+    hs   = b"\x01" + u24(len(body)) + body
+    rec  = b"\x16" + b"\x03\x01" + u16(len(hs)) + hs
     return rec
 
 # ── DNS Query c EDNS0 ───────────────────────────────────
@@ -741,8 +727,6 @@ elif PROFILE == "dns":
             print("<r 2><b 0x%s>" % gen_dns(dom).hex())
 
 elif PROFILE == "tls":
-    # I1 = TLS ClientHello (выбранный/случайный домен в SNI)
-    # I2-I5 = ClientHello к другим доменам из пула (разнообразим SNI)
     print(to_cps(gen_tls_clienthello(DOMAIN)))
     if not ONLY_I1:
         pool = DOMAIN_POOL.copy()
@@ -983,10 +967,8 @@ def detect(p):
     # TLS ChangeCipherSpec (0x14)
     if p[0] == 0x14 and p[1] == 0x03 and p[2] in (0x01, 0x03):
         return ("tls-ccs", f"TLS ChangeCipherSpec ({len(p)}B)")
-    # (Правило tls-cke по одному байту 0x10 убрано в v6.9.0: оно ловило
-    #  ~1/256 случайных AWG data-пакетов как ложный ClientKeyExchange.
-    #  Наш CPS-генератор CKE не создаёт, а настоящий CKE неотличим от
-    #  обфусцированного AWG-пакета по первому байту — поэтому не детектим.)
+    # (Правило tls-cke по одному байту 0x10 убрано: ловило ~1/256 случайных
+    #  AWG data-пакетов ложно; наш CPS-генератор CKE не создаёт.)
     # DTLS
     if p[0] == 0x16 and p[1:3] in (b"\xfe\xfd", b"\xfe\xff"):
         return ("dtls", f"DTLS handshake ({len(p)}B)")
@@ -1006,12 +988,8 @@ def detect(p):
         if ver in known and 1 <= dcid_len <= 20:
             pt = {0:"Initial",1:"0-RTT",2:"Handshake"}.get((fb>>4)&3,"?")
             return ("quic", f"QUIC {pt} {known[ver]} ({len(p)}B)")
-    # QUIC Short Header (0x40-0x7f) — ПРЕДВАРИТЕЛЬНО.
-    # Эвристика широкая: ~25% случайных AWG data-пакетов (рандомный первый
-    # байт из-за H-обфускации) попадают в 0x40-0x7F. Настоящий QUIC Short
-    # Header не появляется без предшествующего QUIC Initial (Long Header),
-    # поэтому ниже (в Main) переклассифицируем в AWG data, если в захвате
-    # не было ни одного quic-long.
+    # QUIC Short Header (0x40-0x7f) — ПРЕДВАРИТЕЛЬНО (см. пост-обработку):
+    # ~25% случайных AWG data-пакетов попадают сюда из-за H-обфускации.
     if 0x40 <= fb <= 0x7f and len(p) > 20:
         return ("quic-short?", f"QUIC Short Header? ({len(p)}B)")
     return (None, None)
@@ -1032,14 +1010,9 @@ for i, p in enumerate(payloads):
     else:
         awg_data += 1
 
-# ── Пост-обработка: разрешаем предварительный 'quic-short?' ──
-# Правило quic-short (первый байт 0x40-0x7F) ложно срабатывает на ~25%
-# случайных AWG data-пакетов из-за H-обфускации. Настоящий QUIC Short
-# Header (1-RTT) идёт только ПОСЛЕ QUIC Initial (Long Header), поэтому
-# подтверждаем quic-short только при наличии quic-long в захвате —
-# иначе это AWG data, а не CPS.
+# Пост-обработка: quic-short? подтверждаем только если есть настоящий
+# QUIC Initial (Long Header) — иначе это AWG data, ложно попавший в 0x40-0x7F.
 has_quic_long = any(t == "quic" for _, t, _ in detected)
-
 _resolved = []
 for i, t, d in detected:
     if t == "quic-short?":
@@ -1312,90 +1285,7 @@ rand_range() {
   local lo="$1" hi="$2"
   # Защита: если lo > hi, возвращаем lo (избегаем ошибки python randint)
   if [[ "$lo" -gt "$hi" ]]; then echo "$lo"; return 0; fi
-  # Быстрый путь: bash 5.1+ имеет $SRANDOM (32-бит, /dev/urandom) — без форка python
-  if [[ -n "${SRANDOM:-}" ]]; then
-    echo $(( lo + SRANDOM % (hi - lo + 1) ))
-    return 0
-  fi
   python3 -c "import random; print(random.randint($lo, $hi))"
-}
-
-# ── conf_lock / conf_unlock ────────────────────────────────
-# Межпроцессный лок на мутации SERVER_CONF (fd 9, flock).
-# Совместим с fcntl.flock в Telegram-боте: оба используют syscall flock(2)
-# на одном файле $CONF_LOCK_FILE — CLI и бот не правят конфиг одновременно.
-# Использование:
-#   conf_lock || { warn "..."; return 1; }
-#   ... мутация конфига ...
-#   conf_unlock
-# При сбое открытия файла лока — продолжаем без лока (не блокируем работу),
-# при таймауте ожидания (30с) — возвращаем 1, чтобы вызывающий мог отменить.
-_CONF_LOCK_HELD=0
-conf_lock() {
-  # Реентерабельность: повторный вызов при уже взятом локе — no-op
-  # (иначе exec 9>> закрыл бы fd и сбросил уже взятый flock)
-  [[ "$_CONF_LOCK_HELD" == "1" ]] && return 0
-  local lock_file="$CONF_LOCK_FILE"
-  # /run может отсутствовать (контейнеры) — fallback в /tmp
-  if ! exec 9>>"$lock_file" 2>/dev/null; then
-    lock_file="/tmp/awg-bot.lock"
-    exec 9>>"$lock_file" 2>/dev/null || { _CONF_LOCK_HELD=0; return 0; }
-  fi
-  chmod 600 "$lock_file" 2>/dev/null || true
-  if ! command -v flock &>/dev/null; then
-    _CONF_LOCK_HELD=0
-    return 0
-  fi
-  if ! flock -w 30 9; then
-    exec 9>&- 2>/dev/null || true
-    _CONF_LOCK_HELD=0
-    err "Конфиг занят другим процессом (Telegram-бот?) — не дождался лока за 30с"
-    return 1
-  fi
-  _CONF_LOCK_HELD=1
-  return 0
-}
-conf_unlock() {
-  [[ "$_CONF_LOCK_HELD" == "1" ]] && { exec 9>&- 2>/dev/null || true; }
-  _CONF_LOCK_HELD=0
-  return 0
-}
-
-# ── _rotate_backups ────────────────────────────────────────
-# Удаляет старые бэкапы, оставляя N свежих по mtime.
-# Бэкапы содержат приватные ключи — бесконечное накопление недопустимо.
-# Использование: _rotate_backups "/etc/amnezia/amneziawg/awg0.conf.pre_delete." 5
-_rotate_backups() {
-  local prefix="$1" keep="${2:-5}"
-  local f
-  # ls -t сортирует по mtime (новые первыми); хвост после keep — удаляем
-  while IFS= read -r f; do
-    [[ -f "$f" ]] && rm -f "$f" 2>/dev/null
-  done < <(ls -1t "${prefix}"* 2>/dev/null | tail -n +"$((keep + 1))")
-  return 0
-}
-
-# ── _valid_client_ip ───────────────────────────────────────
-# Проверяет формат IP клиента: A.B.C.D или A.B.C.D/32, октеты 0-255.
-# Возвращает нормализованный вид "A.B.C.D/32" в stdout. Код 1 — невалидно.
-_valid_client_ip() {
-  local input="$1" ip o
-  input="${input// /}"
-  # Допускаем ввод без маски — допишем /32
-  if [[ "$input" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})(/32)?$ ]]; then
-    ip="${BASH_REMATCH[1]}"
-  else
-    return 1
-  fi
-  local IFS='.'
-  for o in $ip; do
-    # Ведущие нули запрещены ("08"): часть парсеров читает их как octal
-    [[ "$o" =~ ^0[0-9]+ ]] && return 1
-    # 10# — принудительно десятичное
-    (( 10#$o >= 0 && 10#$o <= 255 )) 2>/dev/null || return 1
-  done
-  echo "${ip}/32"
-  return 0
 }
 
 # Форматирует секунды в человеческий вид: 5с / 3м12с / 2ч15м / 3д4ч
@@ -1752,28 +1642,19 @@ do_self_update() {
   echo -e "  ${W}Новая    : ${N}$new_ver"
   echo ""
 
- # Хеш для отладки (помогает понять — реально ли разные версии)
-if command -v sha256sum &>/dev/null; then
+  # Хеш для отладки (помогает понять — реально ли разные версии)
+  if command -v sha256sum &>/dev/null; then
     local cur_hash new_hash
     cur_hash=$(sha256sum "$target" 2>/dev/null | cut -c1-12)
     new_hash=$(sha256sum "$tmp_file" 2>/dev/null | cut -c1-12)
-
     echo -e "  ${D}Хеши:    $cur_hash → $new_hash${N}"
-
     if [[ "$cur_hash" == "$new_hash" ]]; then
-        echo ""
-        echo -e "${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-        echo -e "  ${W}Обновление не требуется${N}"
-        echo -e "  Текущая версия : ${VERSION}"
-        echo -e "  Последняя версия: ${new_ver}"
-        echo -e "${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-        read -rp "Enter для возврата в меню..."
-        rm -f "$tmp_file"
-        return 0
+      info "Файлы идентичны (тот же hash) — обновление не требуется"
+      rm -f "$tmp_file"
+      return 0
     fi
-
     echo ""
-fi
+  fi
 
   # ───── 5. Сравнение версий ─────
   local cur_num new_num
@@ -1825,8 +1706,6 @@ fi
   backup="${target}.bak.$(date +%s)"
   if cp "$target" "$backup" 2>/dev/null; then
     info "Резервная копия: $backup"
-    # Ротация: храним только 3 свежих бэкапа скрипта
-    _rotate_backups "${target}.bak." 3
   else
     warn "Не удалось создать резервную копию (продолжаем)"
   fi
@@ -1967,11 +1846,11 @@ show_submenu_1() {
     echo ""
     safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-5]: ${N}")"
     case "${SUB_CHOICE:-}" in
-      1) do_install || true ;;
-      2) do_gen || true ;;
-      3) do_restart || true ;;
-      4) do_repair || true ;;
-      5) do_reset_server || true ;;
+      1) do_install ;;
+      2) do_gen ;;
+      3) do_restart ;;
+      4) do_repair ;;
+      5) do_reset_server ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -2003,8 +1882,8 @@ show_submenu_2() {
     echo ""
     safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
     case "${SUB_CHOICE:-}" in
-      1) do_manage_clients || true ;;
-      2) do_list_clients || true ;;
+      1) do_manage_clients ;;
+      2) do_list_clients ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -2032,8 +1911,8 @@ show_submenu_3() {
     echo ""
     safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
     case "${SUB_CHOICE:-}" in
-      1) do_check_domains || true ;;
-      2) do_sniff_test || true ;;
+      1) do_check_domains ;;
+      2) do_sniff_test ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -2061,8 +1940,8 @@ show_submenu_4() {
     echo ""
     safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
     case "${SUB_CHOICE:-}" in
-      1) do_backup || true ;;
-      2) do_restore || true ;;
+      1) do_backup ;;
+      2) do_restore ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -2115,9 +1994,9 @@ show_submenu_5() {
     echo ""
     safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-3]: ${N}")"
     case "${SUB_CHOICE:-}" in
-      1) do_warp_menu || true ;;
-      2) do_dns_menu || true ;;
-      3) do_cascade_menu || true ;;
+      1) do_warp_menu ;;
+      2) do_dns_menu ;;
+      3) do_cascade_menu ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -2241,8 +2120,8 @@ show_submenu_7() {
     echo ""
     safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
     case "${SUB_CHOICE:-}" in
-      1) do_clean_clients || true ;;
-      2) do_uninstall || true ;;
+      1) do_clean_clients ;;
+      2) do_uninstall ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -3168,14 +3047,14 @@ do_manage_clients() {
     local MGMT_CHOICE
     safe_read MGMT_CHOICE "$(echo -e "${C}  Выбор [0-8]: ${N}")"
     case "${MGMT_CHOICE:-}" in
-      1) do_add_client || true ;;
-      2) do_rename_client || true ;;
-      3) do_delete_client || true ;;
-      4) do_show_qr || true ;;
-      5) do_show_config || true ;;
-      6) do_bulk_add_clients || true ;;
-      7) do_expire_menu || true ;;
-      8) do_list_clients || true ;;
+      1) do_add_client ;;
+      2) do_rename_client ;;
+      3) do_delete_client ;;
+      4) do_show_qr ;;
+      5) do_show_config ;;
+      6) do_bulk_add_clients ;;
+      7) do_expire_menu ;;
+      8) do_list_clients ;;
       0) return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -3254,16 +3133,10 @@ do_rename_client() {
     info "Имя не изменилось"; return 0
   fi
 
-  # ── Лок конфига (общий с Telegram-ботом) ──
-  conf_lock || { err "Не удалось получить лок — попробуй позже"; return 1; }
-
   # Бекап + обновление SERVER_CONF
   local bak
   bak="${SERVER_CONF}.pre_rename.$(date +%s)"
   cp "$SERVER_CONF" "$bak"
-  chmod 600 "$bak" 2>/dev/null || true
-  # Ротация: храним только 5 свежих бэкапов
-  _rotate_backups "${SERVER_CONF}.pre_rename." 5
 
   # Ищем блок [Peer] с нужным PublicKey и обновляем комментарий
   # Заменяем ТОЛЬКО комментарий-имя (первый # без = после [Peer]),
@@ -3337,13 +3210,11 @@ do_rename_client() {
     err "awk не смог обработать конфиг, восстанавливаю из бекапа"
     mv "$bak" "$SERVER_CONF"
     rm -f "$tmp_conf"
-    conf_unlock
     return 1
   fi
 
   mv "$tmp_conf" "$SERVER_CONF"
   chmod 600 "$SERVER_CONF"
-  conf_unlock
 
   # Переименование файла клиента если он существует
   local old_file="/root/${old_name}_awg2.conf"
@@ -3385,16 +3256,10 @@ do_delete_client() {
   safe_read CONFIRM "$(echo -e "${R}  Подтвердить удаление? [y/N]: ${N}")"
   [[ ! "$CONFIRM" =~ ^[Yy]$ ]] && { info "Отменено"; return 0; }
 
-  # ── Лок конфига (общий с Telegram-ботом) ──
-  conf_lock || { err "Не удалось получить лок — попробуй позже"; return 1; }
-
   # Бекап
   local bak
   bak="${SERVER_CONF}.pre_delete.$(date +%s)"
   cp "$SERVER_CONF" "$bak"
-  chmod 600 "$bak" 2>/dev/null || true
-  # Ротация: бэкапы содержат приватные ключи, храним только 5 свежих
-  _rotate_backups "${SERVER_CONF}.pre_delete." 5
 
   # Удаляем peer из runtime
   awg set awg0 peer "$del_pk" remove 2>/dev/null || warn "Не удалось удалить peer из runtime"
@@ -3435,13 +3300,11 @@ do_delete_client() {
     err "awk не смог обработать конфиг, восстанавливаю из бекапа"
     mv "$bak" "$SERVER_CONF"
     rm -f "$tmp_conf"
-    conf_unlock
     return 1
   fi
 
   mv "$tmp_conf" "$SERVER_CONF"
   chmod 600 "$SERVER_CONF"
-  conf_unlock
 
   # Удаляем файл клиента
   local del_file="/root/${del_name}_awg2.conf"
@@ -3489,44 +3352,13 @@ do_add_client() {
     return 0
   fi
 
-  # Дубликат имени в конфиге сервера — запрещаем (иначе два peer'а
-  # с одним именем и затёртый файл первого клиента)
-  if grep -qE "^#[[:space:]]+${client_name}[[:space:]]*$" "$SERVER_CONF" 2>/dev/null; then
-    warn "Клиент с именем '$client_name' уже есть в конфиге сервера"
-    info "Используй другое имя, либо переименуй/удали существующего (меню Клиенты)"
-    return 0
-  fi
-
   local client_file="/root/${client_name}_awg2.conf"
   if [[ -f "$client_file" ]]; then warn "Файл $client_file уже существует — будет перезаписан"; fi
 
-  local CONFIRM_IP
   read_yesno CONFIRM_IP "$(echo -e "${C}  Использовать IP $client_addr? [Y/n]: ${N}")" "y"
   if [[ "$CONFIRM_IP" != "y" ]]; then
-    local manual_ip normalized_ip
-    while true; do
-      read -rp "  IP вручную (пример: ${base_ip}.5/32, 0 = отмена): " manual_ip
-      [[ -z "$manual_ip" || "$manual_ip" == "0" ]] && { warn "IP не введён — возврат"; return 0; }
-      # Формат A.B.C.D[/32], октеты 0-255
-      if ! normalized_ip=$(_valid_client_ip "$manual_ip"); then
-        warn "Некорректный IP: '$manual_ip'. Формат: A.B.C.D или A.B.C.D/32"
-        continue
-      fi
-      # IP не должен быть занят (peer или служебный orig_ips)
-      if grep -qF "$normalized_ip" "$SERVER_CONF" 2>/dev/null; then
-        warn "IP $normalized_ip уже занят другим клиентом"
-        continue
-      fi
-      # IP не должен совпадать с адресом сервера
-      local _srv_self_ip
-      _srv_self_ip=$(echo "$server_net" | cut -d/ -f1)
-      if [[ "${normalized_ip%/32}" == "$_srv_self_ip" ]]; then
-        warn "Это адрес самого сервера ($_srv_self_ip) — нельзя"
-        continue
-      fi
-      client_addr="$normalized_ip"
-      break
-    done
+    read -rp "  IP вручную (пример: ${base_ip}.5/32): " client_addr
+    [[ -z "$client_addr" ]] && { warn "IP не введён — возврат"; return 0; }
   fi
 
   choose_dns
@@ -3636,22 +3468,6 @@ do_add_client() {
   cli_pub=$(echo "$cli_priv" | awg pubkey)
   psk=$(awg genpsk)
 
-  # ── Лок конфига (общий с Telegram-ботом) ──
-  conf_lock || { err "Не удалось получить лок — попробуй позже"; return 1; }
-
-  # Пока пользователь заполнял меню, бот мог занять выбранный IP — перепроверяем
-  if grep -qF "$client_addr" "$SERVER_CONF" 2>/dev/null; then
-    warn "IP $client_addr заняли, пока шёл диалог — беру следующий свободный"
-    client_addr=$(find_free_ip "$base_ip") || { conf_unlock; warn "Подсеть заполнена — возврат"; return 0; }
-    info "Новый IP: $client_addr"
-  fi
-  # Аналогично — имя (бот мог создать клиента с таким же)
-  if grep -qE "^#[[:space:]]+${client_name}[[:space:]]*$" "$SERVER_CONF" 2>/dev/null; then
-    conf_unlock
-    warn "Клиент '$client_name' появился в конфиге, пока шёл диалог (бот?) — возврат"
-    return 0
-  fi
-
   {
     echo ""
     echo "[Peer]"
@@ -3672,18 +3488,8 @@ do_add_client() {
     allowed-ips "$client_addr" && awg_set_ok=1
   rm -f "$psk_tmp"
   if [[ $awg_set_ok -eq 0 ]]; then
-    # Откат: удаляем только что дописанный блок (6 строк)
-    local _total_lines
-    _total_lines=$(wc -l < "$SERVER_CONF" 2>/dev/null || echo 0)
-    if (( _total_lines > 6 )); then
-      head -n $((_total_lines - 6)) "$SERVER_CONF" > "${SERVER_CONF}.tmp" \
-        && mv "${SERVER_CONF}.tmp" "$SERVER_CONF" \
-        && chmod 600 "$SERVER_CONF"
-    fi
-    conf_unlock
-    err "не удалось добавить peer в runtime (запись откатена)"; return 1
+    err "не удалось добавить peer в runtime"; return 1
   fi
-  conf_unlock
 
   # Исправлено: читаем параметры только из секции [Interface]
   local awg_params_from_srv
@@ -3910,9 +3716,6 @@ do_bulk_add_clients() {
   local awg_params_from_srv
   awg_params_from_srv=$(sed -n '/^\[Peer\]/q; p' "$SERVER_CONF" | grep -E "^(Jc|Jmin|Jmax|S[1-4]|H[1-4]) = " | grep -v "^#" || true)
 
-  # ── Лок конфига на весь цикл (общий с Telegram-ботом) ──
-  conf_lock || { err "Не удалось получить лок — попробуй позже"; return 1; }
-
   # ── SIGINT handler ──
   _bulk_interrupted=0
   trap '_bulk_interrupted=1' INT
@@ -4022,9 +3825,8 @@ do_bulk_add_clients() {
     fi
   done
 
-  # Снимаем trap и лок
+  # Снимаем trap
   trap - INT
-  conf_unlock
 
   # ── Один apply в конце ──
   echo ""
@@ -8145,12 +7947,10 @@ notify_tg() {
   token=$(grep -E '^BOT_TOKEN=' "$BOT_CONF" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' || true)
   chat_id=$(grep -E '^ADMIN_CHAT_ID=' "$BOT_CONF" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' || true)
   [[ -z "$token" || -z "$chat_id" ]] && return 0
-  # Токен и chat_id передаём через --config (stdin), а не в argv —
-  # иначе они видны в `ps`/ /proc/*/cmdline на время запроса
-  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\ndata = "chat_id=%s"\ndata = "parse_mode=HTML"\n' \
-      "$token" "$chat_id" | \
-    curl -sf --max-time 5 --config - \
-      --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+  curl -sf --max-time 5 "https://api.telegram.org/bot${token}/sendMessage" \
+    -d "chat_id=${chat_id}" \
+    -d "parse_mode=HTML" \
+    --data-urlencode "text=${text}" >/dev/null 2>&1 || true
 }
 
 # Питон делает всю работу: парсит, мутирует конфиг атомарно, syncconf, conntrack
@@ -8377,8 +8177,6 @@ PYEOF
 # Аргументы: client_name expire_ts
 _expire_set_client() {
   local name="$1" ts="$2"
-  local _had_lock="$_CONF_LOCK_HELD" _rc=0
-  conf_lock || return 1
   python3 - "$SERVER_CONF" "$name" "$ts" << 'PYEOF'
 import sys, re, os, pathlib, tempfile
 conf, target, ts = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -8422,17 +8220,12 @@ except Exception as e:
     except: pass
     print(f"write failed: {e}", file=sys.stderr); sys.exit(3)
 PYEOF
-  _rc=$?
-  [[ "$_had_lock" != "1" ]] && conf_unlock
-  return $_rc
 }
 
 # Снять срок действия (удалить # expires= и # orig_ips=).
 # Если клиент был suspended — также вернуть оригинальный IP.
 _expire_clear_client() {
   local name="$1"
-  local _had_lock="$_CONF_LOCK_HELD" _rc=0
-  conf_lock || return 1
   python3 - "$SERVER_CONF" "$name" "$EXPIRE_SUSPEND_IP" << 'PYEOF'
 import sys, re, os, pathlib, tempfile
 conf, target, suspend = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -8479,9 +8272,6 @@ except Exception as e:
     except: pass
     print(f"write failed: {e}", file=sys.stderr); sys.exit(3)
 PYEOF
-  _rc=$?
-  [[ "$_had_lock" != "1" ]] && conf_unlock
-  return $_rc
 }
 
 # Применить изменения серверного конфига через syncconf (без рестарта awg0)
@@ -8538,11 +8328,11 @@ do_expire_menu() {
     local EXP_CHOICE
     safe_read EXP_CHOICE "$(echo -e "${C}  Выбор [0-5]: ${N}")"
     case "${EXP_CHOICE:-}" in
-      1) _expire_action_set || true ;;
-      2) _expire_action_clear || true ;;
-      3) _expire_action_unban || true ;;
-      4) _expire_action_list || true ;;
-      5) _expire_action_purge || true ;;
+      1) _expire_action_set ;;
+      2) _expire_action_clear ;;
+      3) _expire_action_unban ;;
+      4) _expire_action_list ;;
+      5) _expire_action_purge ;;
       0) return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -8846,16 +8636,14 @@ while true; do
   # show_menu уже читает CHOICE через safe_read
 
   case "${CHOICE:-}" in
-    # `|| true` обязателен: под set -e любой return 1 из хендлера
-    # иначе молча убивает весь скрипт (баг до v6.9.0)
-    1) show_submenu_1 || true ;;
-    2) do_manage_clients || true ;;
-    3) show_submenu_3 || true ;;
-    4) show_submenu_4 || true ;;
-    5) show_submenu_5 || true ;;
-    6) show_submenu_6 || true ;;
-    7) show_submenu_7 || true ;;
-    8) do_self_update || true ;;
+    1) show_submenu_1 ;;
+    2) do_manage_clients ;;
+    3) show_submenu_3 ;;
+    4) show_submenu_4 ;;
+    5) show_submenu_5 ;;
+    6) show_submenu_6 ;;
+    7) show_submenu_7 ;;
+    8) do_self_update ;;
     0)
       log_info "Выход"
       echo -e "\n${G}  В путь! ${N}"
