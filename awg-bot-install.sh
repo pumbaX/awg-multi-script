@@ -2730,8 +2730,18 @@ async def handle_any_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         stats = get_live_stats()
-        lines = ["👥 <b>Клиенты:</b>\n"]
-        for c in clients:
+        # Пагинация в тексте — как в _cb_clients, иначе при многих клиентах
+        # "\n".join(lines) превышает лимит Telegram (4096 симв.) -> 400 Bad Request.
+        total = len(clients)
+        pages = max(1, (total + CLIENTS_PER_PAGE - 1) // CLIENTS_PER_PAGE)
+        page  = 0
+        start = page * CLIENTS_PER_PAGE
+        chunk = clients[start:start + CLIENTS_PER_PAGE]
+        header = f"👥 <b>Клиенты ({total}):</b>"
+        if pages > 1:
+            header += f"  стр. {page+1}/{pages}"
+        lines = [header + "\n"]
+        for c in chunk:
             s    = stats.get(c["pubkey"], {})
             hs   = s.get("last_hs", 0)
             icon = online_icon(hs)
@@ -2742,7 +2752,7 @@ async def handle_any_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         await update.message.reply_text(
             "\n".join(lines), parse_mode=ParseMode.HTML,
-            reply_markup=kb.clients(clients, stats)
+            reply_markup=kb.clients(clients, stats, page)
         )
 
     elif text == "📊 Статус":
