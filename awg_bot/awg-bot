@@ -3,7 +3,7 @@
 # Ставится в /usr/local/bin/awg-bot. Запуск: sudo awg-bot
 set -euo pipefail
 
-VERSION="1.9.3"
+VERSION="1.9.5"
 
 # ── откуда тянуть обновления (по аналогии с awg2 UPDATE_URL) ──
 # Можно переопределить в /etc/awg-bot.conf строкой:  REPO_URL=https://github.com/USER/REPO
@@ -233,7 +233,18 @@ case "${1:-}" in
   restart)   do_restart;   exit 0 ;;
   status)    do_status;    exit 0 ;;
   logs)      do_logs;      exit 0 ;;
-  uninstall) do_uninstall; exit 0 ;;
+  uninstall)
+    if [[ "${2:-}" == "--yes" || "${2:-}" == "-y" ]]; then
+      # неинтерактивное удаление (вызов из бота): без вопросов, конфиг сохраняем
+      systemctl stop "$SERVICE" 2>/dev/null || true
+      systemctl disable "$SERVICE" 2>/dev/null || true
+      rm -f "/etc/systemd/system/$SERVICE"
+      systemctl daemon-reload
+      rm -rf "$DEST"
+      rm -f /usr/local/bin/awg-bot.py
+      exit 0
+    fi
+    do_uninstall; exit 0 ;;
 esac
 
 while true; do
