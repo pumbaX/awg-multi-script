@@ -2,7 +2,7 @@
 
 # **AWG Toolza**
 
-**Менеджер AmneziaWG 2.0** — VPN с DPI-обходом одной командой.<br>
+**Менеджер AmneziaWG 2.0** — одной командой.<br>
 3 уровня обфускации, профили мимикрии (TLS / DNS / SIP / QUIC), локальный CPS-генератор, **Warp туннель Cloudflare**, DPI-тест.
 
 <br>
@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20only-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-6.9.0-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-6.9.3-ff6b00?style=flat-square)](#)
 
 <br>
 
