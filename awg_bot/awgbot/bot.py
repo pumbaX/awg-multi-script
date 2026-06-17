@@ -924,14 +924,25 @@ async def cb_bot_update_ok(cq: CallbackQuery) -> None:
         return await deny(cq)
     await cq.answer("Обновляю бота из GitHub…")
     await safe_edit(cq, "⏳ Тяну свежую версию и перезапускаю бота…\n"
-                        "Через ~15-20 сек нажми /start — увидишь новую версию.", None)
-    # ВАЖНО: update останавливает сервис в процессе, что убивает и нас.
-    # Поэтому запускаем его отвязанным процессом (setsid), который переживёт
-    # остановку бота и докатит обновление с рестартом до конца.
-    await asyncio.to_thread(
+                        "Через ~20-30 сек нажми /start — увидишь новую версию.\n\n"
+                        "Если бот не ответит за минуту — подними вручную:\n"
+                        "<code>sudo systemctl restart awg-bot</code>", None)
+    # ВАЖНО: обновление останавливает наш же сервис в процессе. setsid не спасает —
+    # systemd гасит весь cgroup сервиса. Поэтому запускаем обновление как
+    # ОТДЕЛЬНЫЙ transient-юнит через systemd-run: он живёт вне cgroup awg-bot,
+    # переживает остановку бота и докатывает деплой+рестарт до конца.
+    ok, out, err = await asyncio.to_thread(
         core.run,
-        ["bash", "-c", "setsid awg-bot update >/var/log/awg-bot-update.log 2>&1 &"]
+        ["systemd-run", "--collect", "--unit=awg-bot-selfupdate",
+         "--property=Type=oneshot",
+         "bash", "-lc", "awg-bot update >/var/log/awg-bot-update.log 2>&1"]
     )
+    if not ok:
+        # запасной путь, если systemd-run недоступен
+        await asyncio.to_thread(
+            core.run,
+            ["bash", "-c", "setsid awg-bot update >/var/log/awg-bot-update.log 2>&1 &"]
+        )
 
 
 @dp.callback_query(F.data == "bot_restart_confirm")
