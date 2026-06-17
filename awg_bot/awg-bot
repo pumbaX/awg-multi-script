@@ -3,7 +3,7 @@
 # Ставится в /usr/local/bin/awg-bot. Запуск: sudo awg-bot
 set -euo pipefail
 
-VERSION="1.9.8"
+VERSION="1.9.9"
 
 # ── откуда тянуть обновления (по аналогии с awg2 UPDATE_URL) ──
 # Можно переопределить в /etc/awg-bot.conf строкой:  REPO_URL=https://github.com/USER/REPO
@@ -129,14 +129,20 @@ do_update() {
   local bak="${DEST}.bak.$(date +%s)"
   cp -r "$DEST" "$bak" 2>/dev/null && info "Бэкап старой версии: $bak"
   systemctl stop "$SERVICE" 2>/dev/null || true
+  sleep 4   # даём Telegram отпустить getUpdates-сессию (иначе Conflict у нового процесса)
   deploy_code "$src"
   rm -rf "$tmp"
   # зависимости (вдруг добавились новые)
   "$DEST/venv/bin/pip" install -q --upgrade pip
   "$DEST/venv/bin/pip" install -q -r "$DEST/requirements.txt"
   systemctl restart "$SERVICE"
-  sleep 2
-  if systemctl is-active --quiet "$SERVICE"; then
+  # ждём старта до 15 секунд (несколько проверок)
+  local up=0 i
+  for i in 1 2 3 4 5 6 7; do
+    sleep 2
+    if systemctl is-active --quiet "$SERVICE"; then up=1; break; fi
+  done
+  if [[ "$up" == 1 ]]; then
     ok "Обновлено. Токен и ID сохранены (${CONF} не тронут)."
     # подчистим старые бэкапы, оставив 3 последних
     ls -dt "${DEST}".bak.* 2>/dev/null | tail -n +4 | xargs -r rm -rf
