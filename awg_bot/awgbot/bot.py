@@ -75,6 +75,7 @@ class Flow(StatesGroup):
     rename = State()
     expire_date = State()
     note_text = State()
+    await_backup = State()
 
 
 # ───────────────────────── auth ─────────────────────────
@@ -997,10 +998,22 @@ async def cb_bot_uninstall_ok(cq: CallbackQuery) -> None:
 
 
 @dp.callback_query(F.data == "backup")
-async def cb_backup(cq: CallbackQuery) -> None:
+async def cb_backup_menu(cq: CallbackQuery) -> None:
     if not authorized(cq.from_user.id):
         return await deny(cq)
-    # Простой надёжный бэкап: tar конфигов сервера + клиентов
+    await safe_edit(cq,
+        "<b>💾 Бэкап / Восстановление</b>\n\n"
+        "📥 <b>Создать</b> — бот пришлёт архив с конфигом сервера и всеми клиентами.\n"
+        "📤 <b>Восстановить</b> — пришли ранее сохранённый архив, бот вернёт конфиги.\n\n"
+        "⚠️ Архив содержит приватные ключи — храни в надёжном месте.",
+        kb.backup_menu())
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "backup_create")
+async def cb_backup_create(cq: CallbackQuery) -> None:
+    if not authorized(cq.from_user.id):
+        return await deny(cq)
     import tarfile
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -1016,6 +1029,59 @@ async def cb_backup(cq: CallbackQuery) -> None:
         caption="💾 Бэкап: конфиг сервера + все клиенты.\n⚠️ Содержит приватные ключи.",
     )
     await cq.answer("Бэкап готов")
+
+
+@dp.callback_query(F.data == "backup_restore")
+async def cb_backup_restore(cq: CallbackQuery, state: FSMContext) -> None:
+    if not authorized(cq.from_user.id):
+        return await deny(cq)
+    await state.set_state(Flow.await_backup)
+    await safe_edit(cq,
+        "📤 <b>Восстановление</b>\n\n"
+        "Пришли сюда файл бэкапа <code>awg_backup_*.tar.gz</code> "
+        "(тот, что бот присылал при создании).\n\n"
+        "⚠️ Текущий конфиг сервера и клиенты будут заменены содержимым архива. "
+        "Перед заменой бот сделает резервную копию для отката.\n\n"
+        "Для отмены нажми «Назад».",
+        kb.back_button("backup"))
+    await cq.answer()
+
+
+@dp.message(Flow.await_backup, F.document)
+async def msg_backup_file(msg: Message, state: FSMContext) -> None:
+    if not authorized(msg.from_user.id):
+        return await deny(msg)
+    await state.clear()
+    doc = msg.document
+    if not doc.file_name.endswith(".tar.gz"):
+        await msg.answer("❌ Это не похоже на бэкап (нужен .tar.gz). Попробуй ещё раз "
+                         "через Бэкап → Восстановить.")
+        return
+    if doc.file_size and doc.file_size > 10 * 1024 * 1024:
+        await msg.answer("❌ Файл слишком большой (>10 МБ) — это вряд ли наш бэкап.")
+        return
+    wait = await msg.answer("⏳ Скачиваю и восстанавливаю…")
+    try:
+        file = await bot.get_file(doc.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file.file_path, buf)
+        data = buf.getvalue()
+    except Exception as e:
+        await wait.edit_text(f"❌ Не удалось скачать файл: {esc(str(e))}")
+        return
+    ok, res = await asyncio.to_thread(core.restore_backup, data)
+    await wait.edit_text(("✅ " if ok else "❌ ") + esc(res))
+    if ok:
+        peers = core.list_peers()
+        await msg.answer(f"<b>👥 Клиенты ({len(peers)})</b>", reply_markup=kb.clients_menu(peers))
+
+
+@dp.message(Flow.await_backup)
+async def msg_backup_notfile(msg: Message, state: FSMContext) -> None:
+    if not authorized(msg.from_user.id):
+        return await deny(msg)
+    await msg.answer("Жду файл бэкапа (.tar.gz). Пришли его как документ "
+                     "или нажми «Назад» в меню бэкапа для отмены.")
 
 
 # ───────────────────────── запуск ─────────────────────────

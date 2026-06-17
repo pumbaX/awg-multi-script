@@ -188,6 +188,15 @@ def tunnels_menu() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+def backup_menu() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="📥 Создать бэкап", callback_data="backup_create")
+    b.button(text="📤 Восстановить из файла", callback_data="backup_restore")
+    b.button(text="‹ Назад", callback_data="menu")
+    b.adjust(1, 1, 1)
+    return b.as_markup()
+
+
 def maint_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📄 Конфиг сервера (скачать)", callback_data="show_server_conf")

@@ -226,6 +226,78 @@ def get_peer(name: str) -> Peer | None:
 
 
 # ───────────────────────── atomic conf write ─────────────────────────
+def restore_backup(archive_bytes: bytes) -> tuple[bool, str]:
+    """
+    Восстанавливает конфиг сервера и клиентов из .tar.gz бэкапа (формат нашего
+    cb_backup: awg0.conf + clients/*_awg2.conf). Перед заменой делает бэкап
+    текущего состояния для отката. Возвращает (ok, сообщение).
+    """
+    import tarfile, io as _io, shutil, time as _t
+    # 1) распаковка во временную папку с проверкой содержимого
+    tmp = tempfile.mkdtemp(prefix="awg-restore.")
+    try:
+        try:
+            with tarfile.open(fileobj=_io.BytesIO(archive_bytes), mode="r:gz") as tar:
+                # безопасная распаковка: только обычные файлы, без путей наружу
+                members = []
+                for m in tar.getmembers():
+                    if not m.isfile():
+                        continue
+                    name = m.name.lstrip("./")
+                    if name.startswith("/") or ".." in name.split("/"):
+                        continue
+                    if name == "awg0.conf" or (name.startswith("clients/") and name.endswith("_awg2.conf")):
+                        members.append(m)
+                if not members:
+                    return False, "В архиве нет awg0.conf или клиентов — это не бэкап awgToolza."
+                tar.extractall(tmp, members=members)
+        except (tarfile.TarError, OSError) as e:
+            return False, f"Не удалось распаковать архив: {e}"
+
+        new_server = os.path.join(tmp, "awg0.conf")
+        if not os.path.isfile(new_server):
+            return False, "В архиве нет серверного конфига awg0.conf."
+
+        # 2) бэкап текущего состояния (для отката)
+        bak = f"/var/lib/awg-bot/restore-rollback-{int(_t.time())}"
+        os.makedirs(bak, exist_ok=True)
+        if os.path.isfile(SERVER_CONF):
+            shutil.copy2(SERVER_CONF, os.path.join(bak, "awg0.conf"))
+
+        # 3) применяем: серверный конфиг
+        new_text = open(new_server, encoding="utf-8").read()
+        _write_conf_atomic(new_text)
+
+        # 4) клиенты
+        cli_dir = os.path.join(tmp, "clients")
+        restored = 0
+        if os.path.isdir(cli_dir):
+            for f in os.listdir(cli_dir):
+                if f.endswith("_awg2.conf"):
+                    shutil.copy2(os.path.join(cli_dir, f), os.path.join(CLIENT_DIR, f))
+                    os.chmod(os.path.join(CLIENT_DIR, f), 0o600)
+                    restored += 1
+
+        # 5) применяем конфиг к интерфейсу
+        ok, msg = apply_syncconf()
+        if not ok:
+            # откат серверного конфига
+            if os.path.isfile(os.path.join(bak, "awg0.conf")):
+                _write_conf_atomic(open(os.path.join(bak, "awg0.conf")).read())
+                apply_syncconf()
+            return False, f"Конфиг не применился, откатил назад. {msg}"
+
+        peers = len(list_peers(with_runtime=False))
+        return True, (f"Восстановлено: сервер + {restored} клиентских конфигов. "
+                      f"Активно пиров: {peers}. {msg}")
+    finally:
+        try:
+            import shutil as _sh
+            _sh.rmtree(tmp, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def _write_conf_atomic(text: str) -> None:
     d = os.path.dirname(SERVER_CONF)
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".awg0.", suffix=".tmp")
