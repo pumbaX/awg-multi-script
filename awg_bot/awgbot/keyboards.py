@@ -182,9 +182,10 @@ def tunnels_menu() -> InlineKeyboardMarkup:
     b.button(text="🛡 WARP: установить", callback_data="t_warp_install")
     b.button(text="🌐 DNS: удалить", callback_data="t_dns_remove")
     b.button(text="🛡 WARP: удалить", callback_data="t_warp_remove")
+    b.button(text="🔄 WARP Hard Restart", callback_data="t_warp_restart")
     b.button(text="🔀 DNS: сменить резолверы", callback_data="dns_upstream")
     b.button(text="‹ Назад", callback_data="menu")
-    b.adjust(2, 2, 2, 1, 1)
+    b.adjust(2, 2, 2, 1, 1, 1)
     return b.as_markup()
 
 

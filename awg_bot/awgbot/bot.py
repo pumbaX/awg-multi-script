@@ -791,6 +791,15 @@ async def cb_warp_status(cq: CallbackQuery) -> None:
     txt = await asyncio.to_thread(core.warp_status)
     await safe_edit(cq, f"<b>🌐 WARP</b>\n\n{esc(txt)}", kb.tunnels_menu())
 
+@dp.callback_query(F.data == "t_warp_restart")
+async def cb_warp_restart(cq: CallbackQuery) -> None:
+    if not authorized(cq.from_user.id):
+        return await deny(cq)
+    await cq.answer("Жёсткий рестарт WARP…")
+    ok, msg = await asyncio.to_thread(core.warp_hard_restart)
+    icon = "✅" if ok else "❌"
+    await safe_edit(cq, f"<b>{icon} WARP рестарт</b>\n\n<pre>{esc(msg)}</pre>", kb.tunnels_menu())
+
 
 @dp.callback_query(F.data == "t_dns_status")
 async def cb_dns_status(cq: CallbackQuery) -> None:

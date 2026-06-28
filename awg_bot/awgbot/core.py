@@ -1054,6 +1054,158 @@ def warp_status() -> str:
     return "\n".join(lines)
 
 
+def warp_hard_restart() -> tuple[bool, str]:
+    """Жёсткий перезапуск WARP без pexpect: down → parse conf → up."""
+    WARP_CONF  = "/etc/wireguard/warp0.conf"
+    WARP_STATE = "/etc/wgcf/state"
+    WARP_TABLE = "200"
+
+    if not os.path.isfile(WARP_CONF):
+        return False, "WARP не установлен (нет warp0.conf)"
+
+    log: list[str] = []
+
+    # ── 1. DOWN ───────────────────────────────────────────────
+    client_net, iface = "", ""
+    if os.path.isfile(WARP_STATE):
+        for line in Path(WARP_STATE).read_text().splitlines():
+            if line.startswith("client_net="):
+                client_net = line.split("=", 1)[1].strip()
+            elif line.startswith("iface="):
+                iface = line.split("=", 1)[1].strip()
+
+    for ip in _warp_peers_set():
+        run(["ip", "rule", "del", "from", ip, "lookup", WARP_TABLE])
+    if client_net:
+        run(["ip", "rule", "del", "from", client_net, "lookup", WARP_TABLE])
+        run(["ip", "rule", "del", "from", client_net, "table",  WARP_TABLE])
+    run(["ip", "route", "flush", "table", WARP_TABLE])
+
+    if client_net:
+        run(["iptables", "-t", "nat", "-D", "POSTROUTING", "-s", client_net, "-o", "warp0", "-j", "MASQUERADE"])
+        run(["iptables", "-D", "FORWARD", "-i", "awg0", "-o", "warp0", "-j", "ACCEPT"])
+        run(["iptables", "-D", "FORWARD", "-i", "warp0", "-o", "awg0", "-j", "ACCEPT"])
+        if iface:
+            rc, _, _ = run(["iptables", "-t", "nat", "-C", "POSTROUTING", "-s", client_net, "-o", iface, "-j", "MASQUERADE"])
+            if rc != 0:
+                run(["iptables", "-t", "nat", "-A", "POSTROUTING", "-s", client_net, "-o", iface, "-j", "MASQUERADE"])
+
+    rc_del, _, _ = run(["ip", "link", "delete", "warp0"])
+    log.append("warp0 снят" if rc_del == 0 else "warp0 уже отсутствовал")
+    try:
+        Path(WARP_STATE).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    # ── 2. Парсим конфиг ─────────────────────────────────────
+    def _field(key: str, text: str) -> str:
+        m = re.search(rf"^{key}\s*=\s*(.+)$", text, re.MULTILINE)
+        return m.group(1).strip() if m else ""
+
+    conf_text = Path(WARP_CONF).read_text()
+    warp_priv = _field("PrivateKey", conf_text)
+    warp_pub  = _field("PublicKey",  conf_text)
+    warp_ep   = _field("Endpoint",   conf_text)
+    warp_mtu  = _field("MTU",        conf_text) or "1280"
+    addr_line = _field("Address",    conf_text)
+    warp_addr4 = next((p.strip() for p in addr_line.split(",") if "." in p and ":" not in p), "")
+
+    if not all([warp_priv, warp_pub, warp_ep, warp_addr4]):
+        return False, f"Не удалось распарсить warp0.conf (priv={bool(warp_priv)} pub={bool(warp_pub)} ep={bool(warp_ep)} addr={bool(warp_addr4)})"
+
+    # AWG client_net из wg show или /etc/wireguard/awg0.conf
+    client_net = ""
+    rc, awg_dump, _ = run(["wg", "show", "awg0", "allowed-ips"]) if have("wg") else (1, "", "")
+    if rc == 0 and awg_dump.strip():
+        for line in awg_dump.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                for n in parts[1].split(","):
+                    n = n.strip()
+                    if n and "/" in n and "." in n and not n.startswith("0.0.0.0"):
+                        client_net = n; break
+            if client_net:
+                break
+    if not client_net:
+        awg_conf = "/etc/wireguard/awg0.conf"
+        if os.path.isfile(awg_conf):
+            m = re.search(r"Address\s*=\s*([\d./]+)", Path(awg_conf).read_text())
+            client_net = m.group(1) if m else "10.0.0.0/24"
+        else:
+            client_net = "10.0.0.0/24"
+
+    # WAN iface
+    _, rt_out, _ = run(["ip", "route"])
+    iface = "eth0"
+    for line in rt_out.splitlines():
+        if line.startswith("default") and "dev" in line:
+            parts = line.split()
+            iface = parts[parts.index("dev") + 1]
+            break
+
+    # ── 3. UP ─────────────────────────────────────────────────
+    rc, _, err = run(["ip", "link", "add", "dev", "warp0", "type", "wireguard"])
+    if rc != 0:
+        return False, f"Не удалось создать warp0: {err.strip()}"
+
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as tf:
+        tf.write(f"[Interface]\nPrivateKey = {warp_priv}\n\n[Peer]\nPublicKey = {warp_pub}\nAllowedIPs = 0.0.0.0/0\nEndpoint = {warp_ep}\n")
+        tmp_path = tf.name
+
+    rc, _, err = run(["wg", "setconf", "warp0", tmp_path])
+    Path(tmp_path).unlink(missing_ok=True)
+    if rc != 0:
+        run(["ip", "link", "delete", "warp0"])
+        return False, f"wg setconf failed: {err.strip()}"
+
+    run(["ip", "-4", "address", "add", warp_addr4, "dev", "warp0"])
+    rc, _, err = run(["ip", "link", "set", "mtu", warp_mtu, "up", "dev", "warp0"])
+    if rc != 0:
+        run(["ip", "link", "delete", "warp0"])
+        return False, f"ip link set up failed: {err.strip()}"
+
+    log.append("warp0 поднят")
+
+    # iptables + policy routing
+    rc, _, _ = run(["iptables", "-t", "nat", "-C", "POSTROUTING", "-s", client_net, "-o", iface, "-j", "MASQUERADE"])
+    if rc != 0:
+        run(["iptables", "-t", "nat", "-A", "POSTROUTING", "-s", client_net, "-o", iface, "-j", "MASQUERADE"])
+
+    rc, _, _ = run(["iptables", "-t", "nat", "-C", "POSTROUTING", "-s", client_net, "-o", "warp0", "-j", "MASQUERADE"])
+    if rc != 0:
+        run(["iptables", "-t", "nat", "-A", "POSTROUTING", "-s", client_net, "-o", "warp0", "-j", "MASQUERADE"])
+
+    rc, _, _ = run(["iptables", "-C", "FORWARD", "-i", "awg0", "-o", "warp0", "-j", "ACCEPT"])
+    if rc != 0:
+        run(["iptables", "-A", "FORWARD", "-i", "awg0", "-o", "warp0", "-j", "ACCEPT"])
+
+    rc, _, _ = run(["iptables", "-C", "FORWARD", "-i", "warp0", "-o", "awg0", "-j", "ACCEPT"])
+    if rc != 0:
+        run(["iptables", "-A", "FORWARD", "-i", "warp0", "-o", "awg0", "-j", "ACCEPT"])
+
+    run(["sysctl", "-w", "net.ipv4.conf.warp0.rp_filter=2"])
+    run(["sysctl", "-w", "net.ipv4.conf.awg0.rp_filter=2"])
+
+    run(["ip", "route", "flush", "table", WARP_TABLE])
+    run(["ip", "route", "add", "default", "dev", "warp0", "src", warp_addr4.split("/")[0], "table", WARP_TABLE])
+
+    # ip rules для всех клиентов из peers.list
+    peer_count = 0
+    for ip in _warp_peers_set():
+        run(["ip", "rule", "del", "from", ip, "lookup", WARP_TABLE])
+        rc, _, _ = run(["ip", "rule", "add", "from", ip, "lookup", WARP_TABLE])
+        if rc == 0:
+            peer_count += 1
+
+    # Сохраняем state
+    os.makedirs("/etc/wgcf", exist_ok=True)
+    Path(WARP_STATE).write_text(f"active\nclient_net={client_net}\niface={iface}\n")
+
+    log.append(f"split-tunnel: {peer_count} клиент(ов) через WARP")
+    return True, "\n".join(log)
+
+
 def dns_status() -> str:
     """Состояние dnscrypt-proxy напрямую."""
     lines = []
