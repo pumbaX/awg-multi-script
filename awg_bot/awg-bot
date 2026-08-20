@@ -3,7 +3,7 @@
 # Ставится в /usr/local/bin/awg-bot. Запуск: sudo awg-bot
 set -euo pipefail
 
-VERSION="2.1.0"
+VERSION="2.1.4"
 
 # ── откуда тянуть обновления (по аналогии с awg2 UPDATE_URL) ──
 # Можно переопределить в /etc/awg-bot.conf строкой:  REPO_URL=https://github.com/USER/REPO
