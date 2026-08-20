@@ -32,9 +32,6 @@ sudo curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/a
 sudo awg2
 ```
 
-История версий — [CHANGELOG.md](CHANGELOG.md), тексты релизов для канала —
-[docs/releases](docs/releases).
-
 ### Канал обновлений
 
 По умолчанию скрипт обновляется из основного репозитория (`pumbaX/awg-multi-script`) —
