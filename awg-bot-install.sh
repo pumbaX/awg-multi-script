@@ -13,7 +13,10 @@
 #      (awg2 проверяет именно его, чтобы показать «бот установлен»)
 set -euo pipefail
 
-REPO_URL="https://github.com/pumbaX/awg-multi-script"
+# Репозиторий кода бота. По умолчанию — стабильный. awg2 передаёт сюда
+# AWG_REPO_URL своего канала обновлений, чтобы бот и скрипт ехали из одного
+# репозитория (на бета-канале — из бета-репозитория).
+REPO_URL="${AWG_REPO_URL:-https://github.com/pumbaX/awg-multi-script}"
 REPO_SUBDIR="awg_bot"
 DEST="/opt/awg-bot"
 CONF="/etc/awg-bot.conf"
@@ -140,12 +143,15 @@ fi
 # и накатит его поверх локальной сборки — то есть откатит правки, которых в
 # репозитории ещё нет. Ставили локально → обновляемся оттуда же.
 touch "$CONF"; chmod 600 "$CONF"
-sed -i '/^LOCAL_SRC=/d' "$CONF"
+sed -i '/^LOCAL_SRC=/d;/^REPO_URL=/d' "$CONF"
 if [[ -n "$LOCAL_SRC" ]]; then
   echo "LOCAL_SRC=${SRC}" >> "$CONF"
   ok "Обновления будут браться из ${SRC}"
   info "Переключить на GitHub: awg-bot src --github"
 else
+  # Запоминаем репозиторий: `awg-bot update` и проверка версий в боте должны
+  # смотреть туда же, откуда бот приехал, а не в зашитый по умолчанию.
+  echo "REPO_URL=${REPO_URL}" >> "$CONF"
   info "Обновления будут браться с GitHub (${REPO_URL})"
 fi
 

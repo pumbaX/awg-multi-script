@@ -1,9 +1,69 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.8"
-UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
+VERSION="v0.7.18"
 SCRIPT_PATH="/usr/local/bin/awg2"
+
+# ── Канал обновлений ───────────────────────────────────────
+# stable — основной репозиторий проекта, оттуда обновляются все по умолчанию.
+# beta   — репозиторий с ранними сборками: правки приезжают туда раньше и могут
+#          быть сырыми. Переключается в меню «Обновить скрипт» (пункт 8).
+# Выбор хранится в файле, чтобы переживать перезапуск и само обновление.
+UPDATE_REPO_STABLE="pumbaX/awg-multi-script"
+UPDATE_REPO_BETA="genaRijoff/awg-multi-script"
+UPDATE_CHANNEL_FILE="/var/lib/awg2/channel"
+
+# Кэш фоновой проверки версии — свой у каждого канала. Общий кэш после
+# переключения сравнивал бы текущую версию с версией чужого репозитория
+# (см. update_check_async).
+UPDATE_CACHE_STABLE="/var/lib/awg2/update_check"
+UPDATE_CACHE_BETA="/var/lib/awg2/update_check.beta"
+
+# Выставляет UPDATE_CHANNEL и все производные от него URL. Единственное место,
+# где собираются адреса репозитория, — менять источник надо здесь.
+update_channel_apply() {
+  case "${1:-stable}" in
+    beta)
+      UPDATE_CHANNEL="beta"
+      UPDATE_REPO="$UPDATE_REPO_BETA"
+      UPDATE_CACHE="$UPDATE_CACHE_BETA"
+      ;;
+    *)
+      UPDATE_CHANNEL="stable"
+      UPDATE_REPO="$UPDATE_REPO_STABLE"
+      UPDATE_CACHE="$UPDATE_CACHE_STABLE"
+      ;;
+  esac
+  UPDATE_REPO_GIT="https://github.com/${UPDATE_REPO}"
+  UPDATE_URL="https://raw.githubusercontent.com/${UPDATE_REPO}/main/awg2.sh"
+  BOT_INSTALL_URL="https://raw.githubusercontent.com/${UPDATE_REPO}/main/awg-bot-install.sh"
+}
+
+# Читает сохранённый канал. Любое неизвестное/битое значение — stable.
+update_channel_read() {
+  local ch=""
+  if [[ -f "$UPDATE_CHANNEL_FILE" ]]; then
+    ch=$(tr -d '[:space:]' < "$UPDATE_CHANNEL_FILE" 2>/dev/null || true)
+  fi
+  [[ "$ch" == "beta" ]] && echo "beta" || echo "stable"
+}
+
+# Сохраняет канал на диск и сразу применяет его в текущем процессе.
+update_channel_set() {
+  local ch="$1"
+  [[ "$ch" == "beta" || "$ch" == "stable" ]] || return 1
+  mkdir -p "$(dirname "$UPDATE_CHANNEL_FILE")" 2>/dev/null || return 1
+  printf '%s\n' "$ch" > "$UPDATE_CHANNEL_FILE" 2>/dev/null || return 1
+  update_channel_apply "$ch"
+}
+
+# Человекочитаемое имя канала для меню и шапки.
+update_channel_label() {
+  [[ "${1:-$UPDATE_CHANNEL}" == "beta" ]] && echo "бета" || echo "стабильный"
+}
+
+# AWG2_UPDATE_CHANNEL=beta — разовый запуск на другом канале, без записи файла.
+update_channel_apply "${AWG2_UPDATE_CHANNEL:-$(update_channel_read)}"
 
 # ── Цвета ──────────────────────────────────────────────────
 # shellcheck disable=SC2034  # цветовая палитра — часть публичного API функций
@@ -518,6 +578,28 @@ select_random_domain() {
 # [PATCHED v3] TLS+QUIC из payloadGen: GREASE, Chrome-fingerprint, реальное
 # шифрование QUIC (RFC9001+fallback), лёгкий TLS-паддинг (доставка I5),
 # --only-i1 распознаётся в любой позиции argv. Контракт вывода не изменён.
+#
+# [v4] Компактный режим по умолчанию. I1-I5 уходят перед КАЖДЫМ рукопожатием,
+# поэтому лишние сотни байт — это и трафик, и время установки, и раздутый
+# клиентский конфиг (плотный QR). Урезано только то, что не ломает разбор
+# пакета его же протоколом:
+#   TLS  ~340 → ~220 Б: пустой legacy_session_id (разрешён TLS 1.3), без
+#        padding-расширения и Chrome-специфики (ALPS, compress_certificate,
+#        status_request, SCT), без legacy-шифров. SNI, key_share x25519,
+#        supported_versions, sigalgs, ALPN и GREASE на месте.
+#   SIP  ~540 → ~390 Б: остаётся обязательный минимум RFC 3261 плюс Contact и
+#        Expires; выброшены необязательные Allow/Supported и длинный User-Agent.
+#   QUIC ~1800 → ~1500 Б суммарно: I1 остаётся 1200 Б — RFC 9000 §14.1 требует
+#        этого от любой клиентской датаграммы с Initial, короткий Initial
+#        сервер обязан отбросить, а для DPI это готовая аномалия. Вместо
+#        второго Initial (был 300-600 Б, то есть невалидный) идёт 1-RTT пакет.
+#   DNS  без изменений — 39-46 Б и так минимум.
+# AWG_CPS_FULL=1 возвращает прежние размеры (флаг --full генератору).
+#
+# CPS_GENERATOR_BEGIN v1 — якорь для awg_bot/awgbot/cps.py: бот вырезает тело
+# генератора из установленного awg2, чтобы не дублировать криптологику у себя.
+# Маркеры BEGIN/END не удалять и не переименовывать; при несовместимом
+# изменении контракта вывода поднимать номер версии в обоих маркерах.
 _CPS_GENERATOR='
 import sys, secrets, struct, random, signal
 try:
@@ -526,6 +608,15 @@ except Exception:
     pass
 
 # == Utilities ==
+_WARNED = set()
+def _warn_once(msg):
+    # Один и тот же дефект не должен засорять вывод: генератор строит до 5
+    # пакетов за запуск, а причина деградации у них общая.
+    if msg in _WARNED:
+        return
+    _WARNED.add(msg)
+    sys.stderr.write("[CPS] WARN: %s\n" % msg)
+
 def rh(n):  return secrets.token_bytes(n)
 def ri(a, b):
     if a > b: a, b = b, a
@@ -535,6 +626,45 @@ def u16(v): return struct.pack(">H", v & 0xFFFF)
 def u32(v): return struct.pack(">I", v & 0xFFFFFFFF)
 def u24(v): return struct.pack(">I", v)[1:]
 def to_cps(raw): return "<b 0x%s>" % raw.hex()
+
+def to_cps_parts(parts):
+    """
+    Собирает цепочку I-пакета из кусков. Кусок — это либо bytes (уходит как
+    <b 0x..>), либо ("r"|"rc"|"rd", n) — модификатор, который КЛИЕНТ заполняет
+    заново при каждой отправке: <r> случайными байтами, <rc> латинскими
+    буквами, <rd> цифрами.
+
+    Зачем: пакет, целиком записанный как <b 0x..>, уходит байт в байт одинаковым
+    перед каждым рукопожатием — это межсессионная сигнатура, ровно то, от чего
+    мимикрия и защищает. Модификаторы делают его каждый раз другим, не меняя ни
+    длины, ни структуры, и попутно резко укорачивают строку в конфиге: <r 900>
+    вместо 1800 hex-символов.
+
+    Теги b/r/rc/rd понимают оба известных движка (amneziawg-go device/obf.go и
+    ядерный модуль src/junk.c). <c> есть только у ядра, <d>/<ds>/<dz> только у
+    go, поэтому здесь их нет: незнакомый тег отвергается вместе со всем пакетом,
+    а не сам по себе. Порядок кусков сохраняется (jp_spec_setup собирает список
+    в обратном порядке вставки, то есть в порядке записи).
+    """
+    out = []
+    for p in parts:
+        if isinstance(p, tuple):
+            out.append("<%s %d>" % (p[0], p[1]))
+        elif p:
+            out.append("<b 0x%s>" % p.hex())
+    return "".join(out)
+
+
+# Смещение поля random в ClientHello: record(5) + handshake(4) + legacy_version(2).
+# 32 байта, которые настоящий клиент разыгрывает на каждое соединение.
+_TLS_RANDOM_OFFSET = 11
+_TLS_RANDOM_LEN = 32
+
+def tls_chain(domain=None):
+    pkt = gen_tls_clienthello(domain)
+    head = _TLS_RANDOM_OFFSET
+    tail = head + _TLS_RANDOM_LEN
+    return to_cps_parts([pkt[:head], ("r", _TLS_RANDOM_LEN), pkt[tail:]])
 
 def secure_shuffle(lst):
     for i in range(len(lst) - 1, 0, -1):
@@ -568,7 +698,10 @@ def _weighted_choice(items, weights):
 ALLOWED_PROFILES = ("quic", "sip", "dns", "tls")
 _args = sys.argv[1:]
 ONLY_I1 = "--only-i1" in _args
-_pos = [a for a in _args if a != "--only-i1"]
+# Компактный режим — по умолчанию: пакеты короче, но остаются валидными для
+# своего протокола. --full возвращает прежние «толстые» пакеты.
+COMPACT = "--full" not in _args
+_pos = [a for a in _args if not a.startswith("--")]
 PROFILE = _pos[0] if len(_pos) > 0 else "dns"
 DOMAIN  = _pos[1] if len(_pos) > 1 else ""
 
@@ -617,6 +750,10 @@ def gen_tls_clienthello(domain=None):
     # ClientHello ciphers: GREASE first, then Chrome real order
     cipher_list = [0x1301,0x1302,0x1303,0xC02B,0xC02F,0xC02C,0xC030,
                    0xCCA9,0xCCA8,0xC013,0xC014,0x009C,0x009D,0x002F,0x0035]
+    if COMPACT:
+        # только TLS 1.3 + современные ECDHE-наборы: клиент без legacy-шифров
+        # выглядит обычно и экономит 12 байт
+        cipher_list = [0x1301,0x1302,0x1303,0xC02B,0xC02F,0xCCA9,0xCCA8]
     ciphers = u16(g1)
     for c in cipher_list:
         ciphers += u16(c)
@@ -633,7 +770,9 @@ def gen_tls_clienthello(domain=None):
     # renegotiation_info (1 byte len=0)
     exts += _ext(0xff01, b"\x00")
     # supported_groups: GREASE + x25519 + secp256r1 + secp384r1
-    groups = u16(grease()) + b"\x00\x1d" + b"\x00\x17" + b"\x00\x18"
+    groups = u16(grease()) + b"\x00\x1d" + b"\x00\x17"
+    if not COMPACT:
+        groups += b"\x00\x18"
     exts += _ext(0x000a, u16(len(groups)) + groups)
     # ec_point_formats: uncompressed
     exts += _ext(0x000b, b"\x01\x00")
@@ -642,15 +781,20 @@ def gen_tls_clienthello(domain=None):
     # alpn: h2, http/1.1
     alpn_protos = b"\x02h2\x08http/1.1"
     exts += _ext(0x0010, u16(len(alpn_protos)) + alpn_protos)
-    # status_request: OCSP
-    exts += _ext(0x0005, b"\x01\x00\x00\x00\x00")
+    # status_request: OCSP (Chrome-only, в компактном режиме не нужен)
+    if not COMPACT:
+        exts += _ext(0x0005, b"\x01\x00\x00\x00\x00")
     # signature_algorithms
+    _sig_list = [0x0403,0x0804,0x0401,0x0503,0x0805,0x0501,0x0806,0x0601]
+    if COMPACT:
+        _sig_list = _sig_list[:5]
     sigs = b""
-    for s in [0x0403,0x0804,0x0401,0x0503,0x0805,0x0501,0x0806,0x0601]:
+    for s in _sig_list:
         sigs += u16(s)
     exts += _ext(0x000d, u16(len(sigs)) + sigs)
     # signed_certificate_timestamp (empty)
-    exts += _ext(0x0012, b"")
+    if not COMPACT:
+        exts += _ext(0x0012, b"")
     # supported_versions: GREASE + TLS1.3 + TLS1.2
     sv = u16(grease()) + b"\x03\x04" + b"\x03\x03"
     exts += _ext(0x002b, bytes([len(sv)]) + sv)
@@ -661,24 +805,26 @@ def gen_tls_clienthello(domain=None):
     exts += _ext(0x0033, u16(len(ks_list)) + ks_list)
     # psk_key_exchange_modes: psk_dhe_ke
     exts += _ext(0x002d, b"\x01\x01")
-    # compress_certificate: brotli
-    exts += _ext(0x001b, b"\x02\x00\x02")
-    # application_settings (ALPS): h2
-    alps = b"\x03\x02h2"
-    exts += _ext(0x4469, alps)
+    if not COMPACT:
+        # compress_certificate: brotli
+        exts += _ext(0x001b, b"\x02\x00\x02")
+        # application_settings (ALPS): h2
+        exts += _ext(0x4469, b"\x03\x02h2")
     # secondary grease (empty)
     exts += _ext(g2, b"")
     # Light padding (like real Chrome): small random, NO fill to 512.
     # Filling to 512 produced ~200 zero bytes per packet -> large I packets
     # that mobile AWG does not always deliver (especially I5), plus the long
     # zero tail is itself a signature. Chrome only pads slightly.
-    pad_len = ri(0, 48)
+    pad_len = 0 if COMPACT else ri(0, 48)
     if pad_len > 0:
         exts += _ext(0x0015, b"\x00" * pad_len)
 
     legacy_version = b"\x03\x03"
     random_bytes   = rh(32)
-    session_id     = rh(32)
+    # TLS 1.3 разрешает пустой legacy_session_id; 32 байта Chrome шлёт ради
+    # режима совместимости с 1.2. В компактном режиме экономим 32 байта.
+    session_id     = b"" if COMPACT else rh(32)
     sid            = bytes([len(session_id)]) + session_id
     comp = b"\x01\x00"
     body = legacy_version + random_bytes + sid + u16(len(ciphers)) + ciphers + comp + u16(len(exts)) + exts
@@ -715,6 +861,9 @@ def _try_quic_encrypt(dcid, header_wo_pn, pn, pn_len, payload):
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
         import hmac as _hmac, hashlib as _hashlib
     except Exception:
+        _warn_once("нет python3-cryptography — QUIC Initial уйдёт БЕЗ шифрования "
+                   "(payload не похож на шифротекст, DPI отличит от Chrome). "
+                   "Ставится так: apt-get install -y python3-cryptography")
         return None
     try:
         INITIAL_SALT = bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
@@ -744,7 +893,9 @@ def _try_quic_encrypt(dcid, header_wo_pn, pn, pn_len, payload):
         first = header_wo_pn[0] ^ (mask[0] & 0x0f)
         prot_pn = bytes(pn[i] ^ mask[1 + i] for i in range(pn_len))
         return bytes([first]) + header_wo_pn[1:] + prot_pn + ct
-    except Exception:
+    except Exception as e:
+        _warn_once("сбой QUIC-шифрования (%s: %s) — Initial уйдёт БЕЗ шифрования, "
+                   "мимикрия слабее" % (type(e).__name__, e))
         return None
 
 def gen_quic_initial(domain=None):
@@ -776,10 +927,14 @@ def gen_quic_initial(domain=None):
     return pkt, dcid, _QUIC_VERSION
 
 def gen_quic_second_initial(dcid, version):
+    # RFC 9000 §14.1: любая клиентская датаграмма с Initial-пакетом обязана
+    # быть не меньше 1200 байт, иначе сервер её отбрасывает, а DPI видит
+    # аномалию. Раньше здесь было 300-600 байт — то есть заведомо неправильный
+    # пакет. Дополняем до 1200 (в компактном режиме этот пакет не шлётся вовсе).
     fb = rc([0xC0, 0xC0, 0xC3])
     pn_len = (fb & 0x03) + 1
     scid = rh(8)
-    TARGET2 = ri(300, 600)
+    TARGET2 = 1200
     enc_size = TARGET2 - 26 - pn_len
     if enc_size < 1:
         enc_size = 1
@@ -806,17 +961,32 @@ SIP_UA_POOL = [
     "Linphone/5.2.5 (belle-sip/5.2.0)", "Zoiper rv2.10.20.4",
     "MicroSIP/3.21.4", "Bria 6.5.1", "PortSIP UA 16.4",
 ]
+# Плейсхолдер под тег-модификатор внутри текстового сообщения. Байт 0x01 в
+# SIP-запросе появиться не может, поэтому по нему безопасно резать.
+_SIP_MARK = "\x01"
+
 def gen_sip():
     host = rc(SIP_POOL)
     user = rc(["alice","bob","100","200","sip","user","client"]) + str(ri(10,9999))
     lip = rand_private_ip()
     lport = rc([5060, 5062, 5080, 5160, ri(10000, 65000)])
-    branch = "z9hG4bK" + secrets.token_hex(7)
-    tag = secrets.token_hex(4)
-    callid = "%s@%s" % (secrets.token_hex(8), host)
+    # branch, tag и Call-ID — токены, уникальные для каждой транзакции. Если
+    # запечь их в <b 0x..>, клиент будет слать один и тот же Call-ID перед
+    # каждым рукопожатием: для наблюдателя это отпечаток устройства, заметный
+    # лучше, чем сам факт VPN. Уходят тегами <rc N> — буквы допустимы в token
+    # по RFC 3261 §25.1.
+    branch_len, tag_len, callid_len = 14, 8, 16
+    branch = "z9hG4bK" + _SIP_MARK
+    tag = _SIP_MARK
+    callid = "%s@%s" % (_SIP_MARK, host)
     cseq = ri(1, 50)
     transport = rc(["udp","udp","udp","udp","tcp"])
     ua = rc(SIP_UA_POOL)
+    # Обязательный минимум RFC 3261 §8.1.1 для REGISTER: request-line, Via с
+    # branch, Max-Forwards, From с tag, To, Call-ID, CSeq, Content-Length.
+    # Contact и Expires тоже оставляем — без них REGISTER бессмысленный и
+    # выглядит поддельным. Allow/Supported/длинный User-Agent — необязательные
+    # заголовки: в компактном режиме их не шлём, экономя ~170 байт.
     lines = [
         "REGISTER sip:%s SIP/2.0" % host,
         "Via: SIP/2.0/%s %s:%d;branch=%s;rport" % (transport.upper(), lip, lport, branch),
@@ -826,13 +996,40 @@ def gen_sip():
         "Call-ID: %s" % callid,
         "CSeq: %d REGISTER" % cseq,
         "Contact: <sip:%s@%s:%d;transport=%s>" % (user, lip, lport, transport),
-        "User-Agent: %s" % ua,
-        "Allow: INVITE, ACK, CANCEL, BYE, REFER, OPTIONS, NOTIFY, SUBSCRIBE, PRACK, MESSAGE, INFO, UPDATE",
-        "Supported: replaces, outbound, gruu, path",
-        "Expires: %d" % rc([300,600,1800,3600]),
-        "Content-Length: 0", "", ""
     ]
-    return "\r\n".join(lines).encode()
+    if COMPACT:
+        lines += [
+            "User-Agent: %s" % ua.split("/")[0],
+            "Expires: %d" % rc([300,600,1800,3600]),
+        ]
+    else:
+        lines += [
+            "User-Agent: %s" % ua,
+            "Allow: INVITE, ACK, CANCEL, BYE, REFER, OPTIONS, NOTIFY, SUBSCRIBE, PRACK, MESSAGE, INFO, UPDATE",
+            "Supported: replaces, outbound, gruu, path",
+            "Expires: %d" % rc([300,600,1800,3600]),
+        ]
+    # Тело из случайных букв: клиент заполняет его заново на каждую отправку,
+    # поэтому одинаковых REGISTER подряд не бывает. Длина объявлена в
+    # Content-Length честно, иначе сообщение перестанет быть валидным.
+    body_len = ri(16, 48)
+    lines += ["Content-Length: %d" % body_len, "", ""]
+
+    # Режем текст по плейсхолдерам и вставляем модификаторы на их места.
+    # Порядок совпадает с порядком появления: branch, tag, Call-ID.
+    text = "\r\n".join(lines)
+    specs = [("rc", branch_len), ("rc", tag_len), ("rc", callid_len)]
+    chunks = text.split(_SIP_MARK)
+    if len(chunks) != len(specs) + 1:
+        # плейсхолдер потерялся — отдаём сообщение целиком, без модификаторов
+        return [text.replace(_SIP_MARK, "").encode(), ("rc", body_len)]
+    parts = []
+    for i, chunk in enumerate(chunks):
+        parts.append(chunk.encode())
+        if i < len(specs):
+            parts.append(specs[i])
+    parts.append(("rc", body_len))
+    return parts
 
 # ================================================================
 # DNS Query w/ EDNS0 (unchanged from legacy engine)
@@ -855,10 +1052,12 @@ def gen_dns(domain=None):
 
 # == Dispatch (identical contract: 1 line per packet, up to 5) ==
 if PROFILE == "sip":
-    print(to_cps(gen_sip()))
+    def _sip_line():
+        return to_cps_parts(gen_sip())
+    print(_sip_line())
     if not ONLY_I1:
         for _ in range(4):
-            print(to_cps(gen_sip()))
+            print(_sip_line())
 
 elif PROFILE == "dns":
     print("<r 2><b 0x%s>" % gen_dns(DOMAIN).hex())
@@ -869,21 +1068,44 @@ elif PROFILE == "dns":
             print("<r 2><b 0x%s>" % gen_dns(pool[i % len(pool)]).hex())
 
 elif PROFILE == "tls":
-    print(to_cps(gen_tls_clienthello(DOMAIN)))
+    print(tls_chain(DOMAIN))
     if not ONLY_I1:
         pool = DOMAIN_POOL.copy()
         secure_shuffle(pool)
         for i in range(4):
-            print(to_cps(gen_tls_clienthello(pool[i % len(pool)])))
+            print(tls_chain(pool[i % len(pool)]))
 
 else:  # quic
+    def _quic_initial_line(pkt):
+        # Всё после заголовка и первых байт шифротекста — для наблюдателя
+        # неразличимый шум (AEAD), поэтому хвост отдаём тегом <r>: пакет
+        # остаётся ровно 1200 байт и валидным по RFC 9000 §14.1, но каждый раз
+        # другим, а строка в конфиге короче примерно вчетверо.
+        tail = ri(700, 1000)
+        return to_cps_parts([pkt[:len(pkt) - tail], ("r", tail)])
+
+    def _quic_short_line():
+        # У короткого заголовка структурный только первый байт (fixed bit,
+        # spin, key phase, длина номера пакета) — остальное шум.
+        pkt = gen_quic_short()
+        return to_cps_parts([pkt[:1], ("r", len(pkt) - 1)])
+
     i1_pkt, dcid, ver = gen_quic_initial(DOMAIN)
-    print(to_cps(i1_pkt))
+    print(_quic_initial_line(i1_pkt))
     if not ONLY_I1:
-        print(to_cps(gen_quic_second_initial(dcid, ver)))
+        # RFC 9000 §14.1: КЛИЕНТСКАЯ датаграмма с Initial-пакетом обязана быть
+        # не меньше 1200 байт. Короткий второй Initial — не «экономия», а
+        # заметная аномалия: раньше здесь уходили 300-600 байт. В компактном
+        # режиме вместо него идёт 1-RTT пакет с коротким заголовком: он
+        # валиден при любой длине и вчетверо короче.
+        if COMPACT:
+            print(_quic_short_line())
+        else:
+            print(_quic_initial_line(gen_quic_second_initial(dcid, ver)))
         for _ in range(3):
-            print(to_cps(gen_quic_short()))
+            print(_quic_short_line())
 '
+# CPS_GENERATOR_END v1
 
 
 # Генерация I1-I5 через Python
@@ -892,16 +1114,20 @@ gen_cps_i1() {
   local profile="${1:-quic}"
   local domain="${2:-}"
   local only_i1="${3:-}"
-  python3 -c "$_CPS_GENERATOR" "$profile" "$domain" ${only_i1:+"$only_i1"}
+  # AWG_CPS_FULL=1 — прежние «толстые» пакеты (см. [v4] выше)
+  local full=""
+  [[ -n "${AWG_CPS_FULL:-}" ]] && full="--full"
+  python3 -c "$_CPS_GENERATOR" "$profile" "$domain" ${only_i1:+"$only_i1"} ${full:+"$full"}
 }
 
 
 # Алгоритм:
 # 1. Профиль 1-4: выбираем домен из пула через scan_pool → select_random_domain
-#    Fallback-каскад: если целевой пул пуст → пробуем следующий → ... → none
-#    Порядок fallback: tls → dtls → sip → none (профиль 1),
-#                       dtls → tls → sip → none (профиль 2),
-#                       sip → tls → dtls → none (профиль 3)
+#    Fallback при пустом пуле: домен НЕ подменяется на другой профиль — в
+#    генератор уходит пустая строка, и он берёт случайный домен из своего
+#    встроенного DOMAIN_POOL. Профиль мимикрии (tls/dtls/sip/quic) при этом
+#    сохраняется: смена профиля из-за недоступности пула поменяла бы сигнатуру
+#    на протокол, который пользователь не выбирал.
 # 2. Профиль 5: ручной ввод домена + выбор CPS-профиля (tls/dtls/sip/dns)
 # 3. OBF_LEVEL=1 отключает мимикрию (I1="", MIMICRY_PROFILE="none")
 #
@@ -913,8 +1139,93 @@ gen_cps_i1() {
 #   - уровень обфускации (OBF_LEVEL)
 #   - профиль мимикрии (MIMICRY_PROFILE)
 # Маркер пишется первой строкой awg0.conf: "# AWG_PROFILE=<value>"
+# ── Целевой клиент ────────────────────────────────────────
+# От клиента зависит не «сколько параметров он потянет», а что он вообще
+# читает. Здесь только проверенное:
+#  • WireSock (форк BoringTun под Windows) не читает I1-I5 совсем. По
+#    документации вендора поля «silently ignored»: туннель поднимется, мимикрии
+#    в трафике не будет, ошибки тоже не будет. Худший вид поломки — тихий.
+#  • Keenetic OS 4.x: чем именно разбирается цепочка, по исходникам установить
+#    не удалось, поэтому цепочку держим короткой (I1, профиль DNS).
+#  • AmneziaWG для Windows до v2.0.2 не принимал H выше 2^31-1. Мы и так
+#    генерируем внутри этой границы, отдельного действия не нужно.
+#  • Теги b/r/rc/rd читают оба известных движка (amneziawg-go device/obf.go и
+#    модуль ядра src/junk.c), поэтому цепочка переносима между всеми
+#    клиентами, которые её вообще разбирают.
+# Диапазоны Jc/S/H — параметры УСТРОЙСТВА: они одинаковы у сервера и всех
+# клиентов, поэтому клиентом их не сузить. Выбор влияет только на I1-I5.
+TARGET_CLIENT="amnezia"
+
+_target_client_label() {
+  case "${1:-${TARGET_CLIENT:-amnezia}}" in
+    kmod)     echo "Linux / OpenWrt (модуль ядра)" ;;
+    keenetic) echo "Keenetic (нативный AmneziaWG)" ;;
+    wiresock) echo "WireSock (Windows)" ;;
+    mixed)    echo "разные клиенты" ;;
+    *)        echo "Amnezia VPN / AmneziaWG" ;;
+  esac
+}
+
+# Ложь, если выбранный клиент цепочку I1-I5 не читает.
+_target_client_reads_cps() {
+  [[ "${TARGET_CLIENT:-amnezia}" != "wiresock" ]]
+}
+
+# Печатает предупреждение и возвращает 0, если CPS для этого клиента бесполезен.
+# Вызывающий в этом случае обязан оставить конфиг без I1-I5. Текст печатается
+# один раз на выбор клиента: он длинный, а проверка стоит в нескольких местах.
+_warn_cps_unsupported() {
+  _target_client_reads_cps && return 1
+  [[ -n "${_CPS_UNSUPPORTED_WARNED:-}" ]] && return 0
+  _CPS_UNSUPPORTED_WARNED=1
+  echo ""
+  warn "WireSock не читает I1-I5 — по документации вендора поля молча игнорируются"
+  warn "Туннель поднимется, мимикрии в трафике не будет, и об этом никто не сообщит"
+  info "Поэтому конфиг делается без CPS. Обфускация H/S/Jc у WireSock работает полностью"
+  return 0
+}
+
+# Спрашивает, куда поедет конфиг. Влияет только на цепочку I1-I5.
+choose_target_client() {
+  TARGET_CLIENT="amnezia"
+  _CPS_UNSUPPORTED_WARNED=""
+  echo ""
+  hdr "▣  Куда поедет конфиг"
+  echo -e "  ${G}1${N}  ${W}Amnezia VPN / AmneziaWG${N} ${D}— Android, iOS, Windows, macOS, Linux${N} ${C}(по умолчанию)${N}"
+  echo -e "  ${G}2${N}  ${W}Linux / OpenWrt${N} ${D}— модуль ядра amneziawg${N}"
+  echo -e "  ${G}3${N}  ${W}Keenetic${N} ${D}— нативный AmneziaWG в KeeneticOS 4.x${N}"
+  echo -e "  ${R}4${N}  ${W}WireSock${N} ${D}— Windows; мимикрию I1-I5 не поддерживает${N}"
+  echo -e "  ${G}5${N}  Не знаю / разные клиенты"
+  echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  local _tc
+  read_choice _tc "$(echo -e "${C}  Выбор [1-5] (Enter = 1): ${N}")" 1 5 1
+  case "$_tc" in
+    2) TARGET_CLIENT="kmod" ;;
+    3) TARGET_CLIENT="keenetic" ;;
+    4) TARGET_CLIENT="wiresock" ;;
+    5) TARGET_CLIENT="mixed" ;;
+    *) TARGET_CLIENT="amnezia" ;;
+  esac
+  ok "Клиент: $(_target_client_label)"
+
+  case "$TARGET_CLIENT" in
+    keenetic)
+      info "Длинная цепочка на Keenetic ненадёжна — предложу I1 и профиль DNS"
+      ;;
+    wiresock)
+      _warn_cps_unsupported || true
+      ;;
+    mixed)
+      info "Цепочка будет из тегов, которые читают оба движка — она переносима"
+      ;;
+  esac
+  log_info "TARGET_CLIENT=$TARGET_CLIENT"
+  return 0
+}
+
 choose_awg_profile() {
   AWG_PROFILE=""
+  choose_target_client
   echo ""
   hdr "⚙  Профиль AmneziaWG"
   echo -e "  ${G}3${N}  ${W}Pro${N}      — максимальная защита, I1-I5 на выбор ${C}(рекомендуется)${N}"
@@ -927,6 +1238,12 @@ choose_awg_profile() {
   case "$_choice" in
     1)
       AWG_PROFILE="lite"
+      if _warn_cps_unsupported; then
+        OBF_LEVEL=1; MIMICRY_PROFILE="none"
+        I1=""; I2=""; I3=""; I4=""; I5=""
+        info "Профиль: Lite без CPS (клиент его не читает)"
+        return 0
+      fi
       OBF_LEVEL=2                # клиентам кладём I1
       MIMICRY_PROFILE="dns"
       # Домен не передаём — Python выбирает случайный из DOMAIN_POOL
@@ -943,6 +1260,12 @@ choose_awg_profile() {
       ;;
     2)
       AWG_PROFILE="standard"
+      if _warn_cps_unsupported; then
+        OBF_LEVEL=1; MIMICRY_PROFILE="none"
+        I1=""; I2=""; I3=""; I4=""; I5=""
+        info "Профиль: Standard без CPS (клиент его не читает)"
+        return 0
+      fi
       OBF_LEVEL=2                # клиентам кладём I1
       MIMICRY_PROFILE="tls"
       info "Профиль: Standard (I1 = TLS ClientHello)"
@@ -975,16 +1298,34 @@ choose_obf_level() {
   #   2 = +I1 — добавить только I1 (снимок протокола)
   #   3 = +I1-I5 — полный CPS chain (максимум DPI bypass)
   OBF_LEVEL=""
+
+  # У WireSock цепочки не будет вовсе, у Keenetic длинная ненадёжна — меняем
+  # предложение по умолчанию, но выбор оставляем за человеком.
+  local _lvl_default=3
+  if _warn_cps_unsupported; then
+    OBF_LEVEL=1; MIMICRY_PROFILE="none"
+    I1=""; I2=""; I3=""; I4=""; I5=""
+    ok "Уровень обфускации: Базовый (H/S/Jc), без I1-I5"
+    return 0
+  fi
+  if [[ "${TARGET_CLIENT:-amnezia}" == "keenetic" ]]; then
+    _lvl_default=2
+  fi
+
   echo ""
   hdr "⛊  Уровень обфускации"
   echo -e "  ${G}3${N}  + I1-I5 полный CPS chain ${C}(рекомендуется)${N}"
-  echo -e "     ${D}Максимум DPI bypass. QR не влезет — конфиг раздаётся текстом.${N}"
+  echo -e "     ${D}Максимум DPI bypass. Конфиг длинный — в QR может не влезть.${N}"
   echo -e "  ${D}2   + I1 — добавляет 1 сигнатурный пакет${N}"
   echo -e "     ${D}I1 = снимок реального TLS/QUIC/DTLS протокола${N}"
   echo -e "  ${D}1   Базовый — H ranges + S1-S4 + Jc junk, без I1-I5${N}"
   echo -e "     ${D}Максимальная совместимость со старыми клиентами.${N}"
+  if [[ "${TARGET_CLIENT:-amnezia}" == "keenetic" ]]; then
+    echo -e "  ${Y}  Keenetic: чем он разбирает цепочку — по исходникам неизвестно.${N}"
+    echo -e "  ${Y}  Надёжнее уровень 2 (один I1), поэтому он и предложен.${N}"
+  fi
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  read_choice OBF_LEVEL "$(echo -e "${C}  Выбор [1-3] (Enter = 3 полный CPS): ${N}")" 1 3 3
+  read_choice OBF_LEVEL "$(echo -e "${C}  Выбор [1-3] (Enter = ${_lvl_default}): ${N}")" 1 3 "$_lvl_default"
   local label
   case $OBF_LEVEL in
     1) label="Базовый (без CPS)" ;;
@@ -1010,22 +1351,34 @@ choose_mimicry_profile() {
 
   echo ""
   hdr "~  Профили мимикрии I1-I5"
-  echo -e "  ${G}1${N}  ${W}TLS${N}   — браузерный ClientHello (Chrome-like)"
-  echo -e "     ${D}Рекомендуется в РФ 2026. Выглядит как заход на сайт.${N}"
-  echo -e "  ${G}2${N}  ${W}DNS${N}   — DNS Query с EDNS0 + рандомный TXID"
-  echo -e "     ${D}Компактный, надёжный. Хорошая альтернатива TLS.${N}"
-  echo -e "  ${G}3${N}  SIP   — REGISTER запрос (VoIP мимикрия)"
-  echo -e "     ${D}Только I1. Хорошо работает с SIP провайдерами.${N}"
-  echo -e "  ${Y}4${N}  QUIC  — Chrome-like Initial 1200B + Short Header"
-  echo -e "     ${D}⚠ В РФ ловят по сигнатуре Initial — используй с осторожностью.${N}"
+  echo -e "  ${G}1${N}  ${W}QUIC${N}  — Initial 1200 Б по RFC 9000 + короткие заголовки"
+  echo -e "     ${D}Единственный из четырёх, где содержимое — шифротекст: смотреть${N}"
+  echo -e "     ${D}DPI не на что. По UDP это настоящий протокол.${N}"
+  echo -e "  ${G}2${N}  ${W}DNS${N}   — DNS Query с EDNS0 + случайный TXID"
+  echo -e "     ${D}Тоже настоящий UDP-протокол и самый компактный: 40 байт.${N}"
+  echo -e "  ${Y}3${N}  ${W}TLS${N}   — ClientHello (Chrome-подобный)"
+  echo -e "     ${D}⚠ TLS-записи поверх UDP не существует: настоящий UDP-TLS — это${N}"
+  echo -e "     ${D}DTLS, а у него другой формат. Плюс SNI уходит открытым текстом${N}"
+  echo -e "     ${D}и не совпадает с IP сервера. Сообщение из поля: конфиг с этим${N}"
+  echo -e "     ${D}профилем не работал в РФ, но работал в ЕС.${N}"
+  echo -e "  ${Y}4${N}  SIP   — REGISTER-запрос (VoIP)"
+  echo -e "     ${D}Настоящий UDP-протокол, но целиком открытый текст.${N}"
   echo ""
-  read_choice PROFILE_CHOICE "$(echo -e "${C}  Выбор [1-4] (Enter = 1): ${N}")" 1 4 1
+  local _mim_default=1
+  if [[ "${TARGET_CLIENT:-amnezia}" == "keenetic" ]]; then
+    # Keenetic чувствителен к длинному I1, а DNS — самый короткий пакет
+    _mim_default=2
+    echo -e "  ${Y}  Keenetic чувствителен к I1: DNS — самый короткий пакет${N}"
+    echo -e "  ${Y}  из четырёх, поэтому он и предложен.${N}"
+    echo ""
+  fi
+  read_choice PROFILE_CHOICE "$(echo -e "${C}  Выбор [1-4] (Enter = ${_mim_default}): ${N}")" 1 4 "$_mim_default"
 
   case $PROFILE_CHOICE in
-    1) MIMICRY_PROFILE="tls"  ;;
+    1) MIMICRY_PROFILE="quic" ;;
     2) MIMICRY_PROFILE="dns"  ;;
-    3) MIMICRY_PROFILE="sip"  ;;
-    4) MIMICRY_PROFILE="quic" ;;
+    3) MIMICRY_PROFILE="tls"  ;;
+    4) MIMICRY_PROFILE="sip"  ;;
   esac
 
   # Выбираем домен из пула под профиль
@@ -1056,7 +1409,7 @@ choose_mimicry_profile() {
       [[ -n "$I3" ]] && nonempty=$((nonempty+1))
       [[ -n "$I4" ]] && nonempty=$((nonempty+1))
       [[ -n "$I5" ]] && nonempty=$((nonempty+1))
-      echo -e "${G}  √ ${nonempty}/5 пакетов: I1=${#I1} I2=${#I2} I3=${#I3} I4=${#I4} I5=${#I5}${N}"
+      echo -e "${G}  √ ${nonempty}/5 пакетов ${D}(символов строки)${G}: I1=${#I1} I2=${#I2} I3=${#I3} I4=${#I4} I5=${#I5}${N}"
     else
       I2=""; I3=""; I4=""; I5=""
       echo -e "${G}  √ I1 готов (${#I1} сим)${N}"
@@ -1679,6 +2032,23 @@ _port_holder() {
   ss -lunp 2>/dev/null | grep -E "[:.]${p}\b" || true
 }
 
+# Возвращает список S-параметров конфига, нарушающих требование ядра
+# (S1-S4 >= AWG_HP_MIN_S при заданном HeaderProtectionKey). Пусто = всё в
+# порядке. Код возврата 1, если нарушения есть — удобно для if.
+awg_check_hp_min_s() {
+  local conf="${1:-$SERVER_CONF}" key val bad=""
+  [[ -f "$conf" ]] || return 0
+  grep -q '^HeaderProtectionKey = ' "$conf" 2>/dev/null || return 0
+  for key in S1 S2 S3 S4; do
+    val=$(grep -m1 "^${key} = " "$conf" 2>/dev/null | awk '{print $3}')
+    [[ "$val" =~ ^[0-9]+$ ]] || continue
+    (( val < AWG_HP_MIN_S )) && bad+=" ${key}=${val}"
+  done
+  [[ -z "$bad" ]] && return 0
+  echo "$bad"
+  return 1
+}
+
 # Разбирает вывод неудавшегося awg-quick up и называет причину.
 #
 # Смысл в том, чтобы человек не гадал: сообщения awg-quick короткие, но
@@ -1697,11 +2067,16 @@ awg_diagnose_up_failure() {
     bad=$(printf '%s' "$out" | grep -oiE 'line unrecognized: .?([A-Za-z0-9_]+)' \
           | head -1 | grep -oE '[A-Za-z0-9_]+$' || true)
     err "amneziawg-tools не понимает параметр ${bad:-из конфига}"
-    if [[ -n "$bad" ]] && [[ "$bad" =~ ^(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts)$ ]]; then
-      info "Это параметр AWG 3.0 — установленный awg собран без его поддержки"
+    if [[ -n "$bad" ]] && [[ "$bad" =~ ^${AWG3_KEYS_RE}$ ]]; then
+      if [[ "$bad" =~ ^${AWG31_KEYS_RE}$ ]]; then
+        info "Это параметр AWG 3.1 — установленный awg собран без его поддержки"
+        info "Нужны amneziawg-tools/модуль v3.1.20260812 или новее"
+      else
+        info "Это параметр AWG 3.0 — установленный awg собран без его поддержки"
+      fi
       info "Варианты:"
       info "  • обновить компоненты: Сервер (1) → п.1 (пересборка tools и модуля)"
-      info "  • вернуть сервер на 2.0: Сервер (1) → п.5 → выбрать AWG 2.0"
+      info "  • понизить версию: Сервер (1) → п.5 → выбрать AWG 3.0 или 2.0"
     else
       info "Смотри строку в конфиге: grep -n '${bad:-=}' $conf"
     fi
@@ -1712,8 +2087,23 @@ awg_diagnose_up_failure() {
   # Так выглядит рассинхрон «tools из master + модуль от прошлой установки».
   if [[ "$low" == *"unable to modify interface"* || "$low" == *"invalid argument"* ]]; then
     err "Ядро отвергло параметры интерфейса"
-    if grep -qE '^(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts) ' "$conf" 2>/dev/null; then
-      info "В конфиге параметры AWG 3.0, а загруженный модуль их не поддерживает"
+
+    # Первая по частоте причина, и она не про версию модуля: при заданном
+    # HeaderProtectionKey ядро требует S1-S4 >= AWG_HP_MIN_S. Проверяем до
+    # разговоров о пересборке — иначе человек идёт пересобирать исправный DKMS.
+    local _bad_s
+    _bad_s=$(awg_check_hp_min_s "$conf" || true)
+    if [[ -n "$_bad_s" ]]; then
+      info "Причина: при защите заголовков (AWG 3.x) ядро требует"
+      info "S1-S4 не меньше ${AWG_HP_MIN_S} — в этот паддинг прячется nonce."
+      info "В конфиге меньше:${_bad_s}"
+      info "Лечится перегенерацией параметров: Сервер (1) → п.5"
+      info "(в версиях до v0.7.14 генератор мог выдать S ниже границы)"
+      return 0
+    fi
+
+    if grep -qE "^${AWG3_KEYS_RE} " "$conf" 2>/dev/null; then
+      info "В конфиге параметры AWG 3.x, а загруженный модуль их не поддерживает"
       if awg_module_stale 2>/dev/null; then
         info "На диске модуль новее того, что сейчас в памяти ядра — быстрее всего:"
         info "  rmmod amneziawg && modprobe amneziawg"
@@ -1722,7 +2112,7 @@ awg_diagnose_up_failure() {
         info "Модуль в DKMS мог остаться от прошлой установки — пересобери его:"
         info "  Сервер (1) → п.1 (переустановка компонентов)"
       fi
-      info "Либо верни сервер на 2.0: Сервер (1) → п.5 → выбрать AWG 2.0"
+      info "Либо понизь версию: Сервер (1) → п.5 → выбрать AWG 3.0 или 2.0"
     else
       info "Проверь параметры обфускации в $conf (Jc/Jmin/Jmax, S1-S4, H1-H4)"
       info "Подробности ядра: dmesg | tail -20"
@@ -1821,90 +2211,113 @@ awg_up_diag() {
   return "$rc"
 }
 
-# Проверяет, тянет ли текущая пара tools+модуль параметры AWG 3.0.
+# Проверяет, тянет ли текущая пара tools+модуль параметры AWG 3.0 или 3.1.
+# $1 = версия ("3.0" по умолчанию, "3.1"). Результат кэшируется на запуск:
+# проба создаёт временный интерфейс, дёргать её из меню в цикле нельзя.
 #
 # Коды: 0 — поддерживает, 1 — точно НЕ поддерживает, 2 — проверить не удалось.
 #
 # Единственный признак, по которому можно уверенно сказать «нет» — бинарник awg
-# не знает ключа 3.0: он парсит конфиг сам, и без ключа в нём ни один сервер
-# 3.0 не поднимется. Всё остальное — свидетельства в пользу «да»:
-#   • работающий awg0, в котором 3.0-параметры уже применены;
+# не знает ключа версии (3.0 — HeaderProtectionKey, 3.1 — RandomTrailers): он
+# парсит конфиг сам, и без ключа в нём такой сервер не поднимется. Всё
+# остальное — свидетельства в пользу «да»:
+#   • работающий awg0, в котором эти параметры уже применены;
 #   • успешный setconf на временном интерфейсе.
 # Неудача этих проверок означает ровно «не смогли убедиться» (код 2), а не
 # «не поддерживает»: временный интерфейс может не создаться, setconf — упасть
 # по причинам, к версии протокола отношения не имеющим. Ошибочное «не
 # поддерживает» пугает на пустом месте, поэтому этот вывод здесь запрещён.
-awg_probe_awg3() {
-  [[ -n "${_AWG3_PROBE:-}" ]] && return "$_AWG3_PROBE"
+awg_probe_proto() {
+  local proto="${1:-3.0}" key val cache_var cached
+  case "$proto" in
+    3.1) key="RandomTrailers";     val="on"  ; cache_var="_AWG31_PROBE" ;;
+    *)   proto="3.0"; key="HeaderProtectionKey"; val=""; cache_var="_AWG3_PROBE" ;;
+  esac
+  cached="${!cache_var:-}"
+  [[ -n "$cached" ]] && return "$cached"
 
   # Имя интерфейса ограничено 15 символами — короткий префикс плюс PID влезает
-  local awg_bin dev="awgprb$$" tmp key hpk out rc
-  awg_bin=$(command -v awg 2>/dev/null) || { _AWG3_PROBE=2; return 2; }
+  local awg_bin dev="awgprb$$" tmp pkey out rc
+  awg_bin=$(command -v awg 2>/dev/null) || { printf -v "$cache_var" '%s' 2; return 2; }
 
-  # 1. Знает ли сам бинарник ключ 3.0 — единственный надёжный «нет»
-  if ! grep -qa 'HeaderProtectionKey' "$awg_bin" 2>/dev/null; then
-    log_info "awg_probe_awg3: в $awg_bin нет HeaderProtectionKey → tools без 3.0"
-    _AWG3_PROBE=1; return 1
+  # 1. Знает ли сам бинарник ключ этой версии — единственный надёжный «нет»
+  if ! grep -qa "$key" "$awg_bin" 2>/dev/null; then
+    log_info "awg_probe_proto $proto: в $awg_bin нет $key → tools без $proto"
+    printf -v "$cache_var" '%s' 1; return 1
   fi
 
-  # 2. Живой awg0 с применёнными параметрами 3.0 — доказательство сильнее пробы
-  if awg showconf awg0 2>/dev/null | grep -qE '^HeaderProtectionKey'; then
-    log_info "awg_probe_awg3: awg0 уже работает с параметрами 3.0"
-    _AWG3_PROBE=0; return 0
+  # 2. Живой awg0 с применёнными параметрами — доказательство сильнее пробы
+  if awg showconf awg0 2>/dev/null | grep -qE "^${key}"; then
+    log_info "awg_probe_proto $proto: awg0 уже работает с параметрами $proto"
+    printf -v "$cache_var" '%s' 0; return 0
   fi
 
   # 3. Проба на временном интерфейсе
   if ! ip link add dev "$dev" type amneziawg 2>/dev/null; then
-    log_info "awg_probe_awg3: не удалось создать $dev — проверка невозможна"
-    _AWG3_PROBE=2; return 2
+    log_info "awg_probe_proto $proto: не удалось создать $dev — проверка невозможна"
+    printf -v "$cache_var" '%s' 2; return 2
   fi
-  tmp=$(mktemp) || { ip link del "$dev" &>/dev/null; _AWG3_PROBE=2; return 2; }
-  key=$(awg genkey 2>/dev/null) || key=""
-  hpk=$(awg genkey 2>/dev/null) || hpk=""
-  printf '[Interface]\nPrivateKey = %s\nHeaderProtectionKey = %s\n' "$key" "$hpk" > "$tmp"
+  tmp=$(mktemp) || { ip link del "$dev" &>/dev/null; printf -v "$cache_var" '%s' 2; return 2; }
+  pkey=$(awg genkey 2>/dev/null) || pkey=""
+  # У 3.0 значение ключа — сам ключ (32 байта base64), у 3.1 — булево "on"
+  [[ -n "$val" ]] || val=$(awg genkey 2>/dev/null) || val=""
+  printf '[Interface]\nPrivateKey = %s\n%s = %s\n' "$pkey" "$key" "$val" > "$tmp"
   out=$(awg setconf "$dev" "$tmp" 2>&1) && rc=0 || rc=2
   rm -f "$tmp"
   ip link del "$dev" &>/dev/null || true
 
   # Причину неудачи пишем в лог: она понадобится, если сервер потом не встанет
   if [[ $rc -ne 0 ]]; then
-    log_info "awg_probe_awg3: setconf не прошёл — $(printf '%s' "$out" | tr '\n' ';')"
-    # «Line unrecognized» на 3.0-ключе — уже приговор, а не неясность
-    if [[ "$out" == *"Line unrecognized"* && "$out" == *"HeaderProtectionKey"* ]]; then
-      _AWG3_PROBE=1; return 1
+    log_info "awg_probe_proto $proto: setconf не прошёл — $(printf '%s' "$out" | tr '\n' ';')"
+    # «Line unrecognized» на ключе версии — уже приговор, а не неясность
+    if [[ "$out" == *"Line unrecognized"* && "$out" == *"$key"* ]]; then
+      printf -v "$cache_var" '%s' 1; return 1
     fi
   else
-    log_info "awg_probe_awg3: setconf прошёл — 3.0 поддерживается"
+    log_info "awg_probe_proto $proto: setconf прошёл — $proto поддерживается"
   fi
-  _AWG3_PROBE=$rc
+  printf -v "$cache_var" '%s' "$rc"
   return "$rc"
 }
 
-# Предупреждает, если сервер собираются переводить на 3.0 на компонентах,
-# которые этого точно не умеют. Возвращает 1, если пользователь отказался.
-awg3_compat_gate() {
-  awg_probe_awg3
-  case $? in
+# Обратно совместимые обёртки: 3.0 проверяется в нескольких местах.
+awg_probe_awg3()  { awg_probe_proto "3.0"; }
+awg_probe_awg31() { awg_probe_proto "3.1"; }
+
+# Предупреждает, если сервер собираются переводить на 3.x на компонентах,
+# которые этого точно не умеют. $1 = версия. Возвращает 1, если пользователь
+# отказался продолжать.
+awg_compat_gate() {
+  local proto="${1:-3.0}" hint="" rc=0
+  # Голый вызов не годится: под set -e код 1/2 завершил бы весь скрипт — то
+  # есть ровно в том случае, ради которого проба и написана.
+  awg_probe_proto "$proto" || rc=$?
+  case $rc in
     0) return 0 ;;
     2)
-      # Проверить не смогли — это не повод пугать: серверы на 3.0 поднимаются
+      # Проверить не смогли — это не повод пугать: серверы на 3.x поднимаются
       # и там, где проба не сработала. Если что-то пойдёт не так, причину
       # назовёт awg_up_diag при подъёме.
-      log_info "awg3_compat_gate: поддержка 3.0 не подтверждена, продолжаем молча"
+      log_info "awg_compat_gate: поддержка $proto не подтверждена, продолжаем молча"
       return 0
       ;;
   esac
 
+  [[ "$proto" == "3.1" ]] && hint="Нужны amneziawg-tools и модуль v3.1.20260812 или новее"
+
   echo ""
-  err "Установленный awg не знает параметров AWG 3.0"
-  info "Он сам разбирает конфиг, поэтому сервер 3.0 с ним не поднимется"
+  err "Установленный awg не знает параметров AWG ${proto}"
+  info "Он сам разбирает конфиг, поэтому сервер ${proto} с ним не поднимется"
+  [[ -n "$hint" ]] && info "$hint"
   info "Обнови компоненты: Сервер (1) → п.1 (пересборка tools и модуля)"
   echo ""
   local _go
-  read_yesno _go "$(echo -e "${Y}  Всё равно продолжить с 3.0? [y/N]: ${N}")" "n"
+  read_yesno _go "$(echo -e "${Y}  Всё равно продолжить с ${proto}? [y/N]: ${N}")" "n"
   [[ "$_go" == "y" ]] && return 0
   return 1
 }
+
+awg3_compat_gate() { awg_compat_gate "3.0"; }
 
 # Проверяет состояние awg0 и пытается починить:
 #   - конфиг есть, но интерфейс не запущен → awg-quick up
@@ -2028,22 +2441,39 @@ do_repair() {
     ok "Маркер уровня CPS на месте ($(grep -m1 '^# AWG_OBF_LEVEL=' "$SERVER_CONF" | cut -d= -f2))"
   fi
 
-  # 2.5. Конфиг просит 3.0 — умеют ли это установленные tools и модуль?
+  # 2.4. S1-S4 против требования ядра к защите заголовков. Конфиг с таким
+  # нарушением не поднимется никогда — и по сообщению awg-quick это не видно.
+  local _hp_bad
+  _hp_bad=$(awg_check_hp_min_s "$SERVER_CONF" || true)
+  if [[ -n "$_hp_bad" ]]; then
+    err "S-параметры ниже минимума для AWG 3.x:${_hp_bad} (нужно >= ${AWG_HP_MIN_S})"
+    issues=$((issues+1))
+    info "Ядро отвергнет такой конфиг: в паддинг S1-S4 прячется nonce защиты заголовков"
+    info "Починка: Сервер (1) → п.5 (перегенерировать параметры)"
+  else
+    [[ -f "$SERVER_CONF" ]] && grep -q '^HeaderProtectionKey = ' "$SERVER_CONF" 2>/dev/null && \
+      ok "S1-S4 не ниже минимума для защиты заголовков (${AWG_HP_MIN_S})"
+  fi
+
+  # 2.5. Конфиг просит 3.x — умеют ли это установленные tools и модуль?
   # Проверяем до попытки подъёма: иначе видно только «awg-quick up провалился»,
-  # а настоящая причина — что модуль или awg старее конфига.
-  if grep -qE '^(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts) ' "$SERVER_CONF" 2>/dev/null; then
-    awg_probe_awg3
-    case $? in
-      0) ok "Компоненты поддерживают AWG 3.0 (как в конфиге)" ;;
+  # а настоящая причина — что модуль или awg старее конфига. Версию берём из
+  # самих ключей, а не из маркера: маркер могли потерять при ручной правке.
+  if grep -qE "^${AWG3_KEYS_RE} " "$SERVER_CONF" 2>/dev/null; then
+    local _need="3.0" _rc=0
+    grep -qE "^${AWG31_KEYS_RE} " "$SERVER_CONF" 2>/dev/null && _need="3.1"
+    awg_probe_proto "$_need" || _rc=$?
+    case $_rc in
+      0) ok "Компоненты поддерживают AWG ${_need} (как в конфиге)" ;;
       1)
-        err "Конфиг на AWG 3.0, но установленный awg не знает его параметров"
+        err "Конфиг на AWG ${_need}, но установленный awg не знает его параметров"
         issues=$((issues+1))
         info "Интерфейс с такими параметрами не поднимется. Варианты:"
         info "  • обновить компоненты: Сервер (1) → п.1 (пересборка tools и модуля)"
-        info "  • вернуть сервер на 2.0: Сервер (1) → п.5 → выбрать AWG 2.0"
+        info "  • понизить версию: Сервер (1) → п.5 → выбрать AWG 3.0 или 2.0"
         ;;
       # Проверить не смогли — молчим: ложная тревога здесь хуже пропущенной
-      *) log_info "do_repair: поддержка AWG 3.0 не подтверждена пробой" ;;
+      *) log_info "do_repair: поддержка AWG ${_need} не подтверждена пробой" ;;
     esac
   fi
 
@@ -2181,7 +2611,8 @@ ver_num() {
 # Про релизы узнавали только из телеграма. Теперь скрипт сам раз в 6 часов
 # смотрит версию на GitHub — в фоне, чтобы запуск не ждал сеть, — и кладёт
 # ответ в кэш. Шапка читает кэш, никуда не обращаясь.
-UPDATE_CACHE="/var/lib/awg2/update_check"   # "<версия> <unixtime>"
+# UPDATE_CACHE ("<версия> <unixtime>") задаётся update_channel_apply в шапке —
+# у каждого канала обновлений свой файл кэша.
 UPDATE_CHECK_TTL=21600                      # 6 часов
 
 update_check_async() {
@@ -2269,10 +2700,10 @@ download_with_progress() {
       (( pct > 100 )) && pct=100
       filled=$(( pct * width / 100 ))
       bar=$(printf '%*s' "$filled" '' | tr ' ' '#')$(printf '%*s' $(( width - filled )) '' | tr ' ' '.')
-      printf '\r  %s[%s]%s %3d%%  %s KB' "$G" "$bar" "$N" "$pct" \
+      printf '\r  %b[%s]%b %3d%%  %s KB' "$G" "$bar" "$N" "$pct" \
         "$(awk -v b="$got" 'BEGIN{printf "%.0f", b/1024}')"
     else
-      printf '\r  %sСкачано: %s KB%s' "$C" \
+      printf '\r  %bСкачано: %s KB%b' "$C" \
         "$(awk -v b="$got" 'BEGIN{printf "%.0f", b/1024}')" "$N"
     fi
     sleep 0.2
@@ -2284,7 +2715,7 @@ download_with_progress() {
   got=$(stat -c%s "$dest" 2>/dev/null || echo 0)
   if [[ $rc -eq 0 ]]; then
     bar=$(printf '%*s' "$width" '' | tr ' ' '#')
-    printf '\r  %s[%s]%s 100%%  %s KB\n' "$G" "$bar" "$N" \
+    printf '\r  %b[%s]%b 100%%  %s KB\n' "$G" "$bar" "$N" \
       "$(awk -v b="$got" 'BEGIN{printf "%.0f", b/1024}')"
   else
     printf '\r%*s\r' 60 ''   # стираем недорисованную шкалу
@@ -2317,6 +2748,7 @@ do_self_update() {
     return 1
   fi
 
+  info "Канал: $(update_channel_label) ${D}(${UPDATE_REPO})${N}"
   info "URL: $UPDATE_URL"
   info "Файл: $target"
   echo ""
@@ -2420,8 +2852,6 @@ do_self_update() {
     if cmp -s "$target" "$tmp_file"; then
       ok "У тебя уже последняя версия ($VERSION) — обновление не требуется"
       rm -f "$tmp_file"
-      echo ""
-      read -rp "$(echo -e "${D}  Нажми Enter для возврата в меню...${N}")" _ || true
       return 0
     fi
     info "Версия совпадает, но содержимое отличается (обновление через git без bump VERSION?)"
@@ -2537,12 +2967,15 @@ show_header() {
   fi
 
   # Бейдж новой версии — из кэша, без обращения к сети (см. update_check_async)
-  local _upd _ver_line
+  local _upd _ver_line _ch_badge=""
+  # На бета-канале это должно быть видно с первого экрана — иначе непонятно,
+  # откуда приехала версия, которой нет у остальных.
+  [[ "$UPDATE_CHANNEL" == "beta" ]] && _ch_badge=" ${Y}[beta]${N}"
   _upd=$(update_available || true)
   if [[ -n "$_upd" ]]; then
-    _ver_line="  ${W}AwgToolza $VERSION${N}   ${G}⬆ есть $_upd${N} ${D}— пункт 8${N}"
+    _ver_line="  ${W}AwgToolza $VERSION${N}${_ch_badge}   ${G}⬆ есть $_upd${N} ${D}— пункт 8${N}"
   else
-    _ver_line="  ${W}AwgToolza $VERSION${N}"
+    _ver_line="  ${W}AwgToolza $VERSION${N}${_ch_badge}"
   fi
 
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
@@ -2574,7 +3007,11 @@ show_menu() {
   echo -e "  ${C}5)${N}  Туннели и DNS   ${D}— Warp, DNS, каскад${N}"
   echo -e "  ${C}6)${N}  Telegram-бот    ${D}— управление ботом${N}"
   echo -e "  ${R}7)${N}  Удаление и сброс ${D}—  вроде понятно${N}"
-  echo -e "  ${M}8)${N}  Обновить скрипт  ${D}— загрузить с GitHub${N}"
+  if [[ "$UPDATE_CHANNEL" == "beta" ]]; then
+    echo -e "  ${M}8)${N}  Обновить скрипт  ${D}— GitHub, канал:${N} ${Y}бета${N}"
+  else
+    echo -e "  ${M}8)${N}  Обновить скрипт  ${D}— загрузить с GitHub${N}"
+  fi
   echo ""
   echo -e "  ${W}0)${N}  Выход"
   echo ""
@@ -2786,7 +3223,7 @@ show_submenu_5() {
 
 # ── Подменю 6: Telegram-бот ────────────────────────────
 show_submenu_6() {
-  local BOT_INSTALL_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg-bot-install.sh"
+  # BOT_INSTALL_URL — глобальный, зависит от канала обновлений (см. шапку)
   local BOT_PY="/usr/local/bin/awg-bot.py"
 
   while true; do
@@ -2866,9 +3303,12 @@ show_submenu_6() {
               fi
             fi
           else
-            info "Скачиваю и запускаю установщик бота..."
+            info "Скачиваю и запускаю установщик бота... ${D}(канал: $(update_channel_label))${N}"
             if curl -fsSL "$BOT_INSTALL_URL" -o /tmp/awg-bot-install.sh; then
-              bash /tmp/awg-bot-install.sh || warn "Установщик завершился с ошибкой"
+              # Код бота берём из того же репозитория, что и сам скрипт: иначе на
+              # бета-канале бот приедет из стабильного репо и разъедется с awg2.
+              AWG_REPO_URL="$UPDATE_REPO_GIT" bash /tmp/awg-bot-install.sh || \
+                warn "Установщик завершился с ошибкой"
               rm -f /tmp/awg-bot-install.sh 2>/dev/null || true
             else
               err "Не удалось скачать установщик с GitHub"
@@ -2955,6 +3395,88 @@ show_submenu_7() {
   done
 }
 
+# ── Подменю 8: Обновление скрипта ──────────────────────
+# Раньше пункт 8 сразу качал обновление. Теперь здесь же переключается канал
+# источника — чтобы не плодить пункты в главном меню.
+do_switch_update_channel() {
+  local target label
+  if [[ "$UPDATE_CHANNEL" == "beta" ]]; then target="stable"; else target="beta"; fi
+  label=$(update_channel_label "$target")
+
+  echo ""
+  if [[ "$target" == "beta" ]]; then
+    warn "Бета-канал — ранние сборки из ${UPDATE_REPO_BETA}"
+    warn "Они не проходят полный цикл проверки: на боевом сервере — на свой риск"
+    echo ""
+    if ! read_confirm "$(echo -e "${Y}  Переключиться на бета-канал? (введи yes): ${N}")"; then
+      info "Отменено — канал прежний ($(update_channel_label))"
+      return 0
+    fi
+  else
+    local _yn
+    read_yesno _yn "$(echo -e "${C}  Вернуться на стабильный канал? [Y/n]: ${N}")" "y"
+    if [[ ! "$_yn" =~ ^[Yy]$ ]]; then
+      info "Отменено — канал прежний ($(update_channel_label))"
+      return 0
+    fi
+  fi
+
+  if update_channel_set "$target"; then
+    ok "Канал обновлений: ${label} ${D}(${UPDATE_REPO})${N}"
+    log_info "Канал обновлений переключён на ${target} (${UPDATE_REPO})"
+    if [[ "$target" == "stable" ]]; then
+      info "Если текущая версия новее стабильной — обновление предложит откат"
+    fi
+    # Кэш у каждого канала свой, поэтому бейдж в шапке обновится только после
+    # проверки нового канала — запускаем её сразу, в фоне.
+    update_check_async || true
+  else
+    err "Не удалось сохранить канал в ${UPDATE_CHANNEL_FILE}"
+    info "Проверь права на /var/lib/awg2"
+    return 1
+  fi
+  return 0
+}
+
+show_submenu_8() {
+  while true; do
+    check_deps
+    show_header
+    echo ""
+    hdr "Обновление скрипта"
+    echo ""
+    echo -e "  Текущая версия : ${W}${VERSION}${N}"
+    if [[ "$UPDATE_CHANNEL" == "beta" ]]; then
+      echo -e "  Канал          : ${Y}бета${N} ${D}(${UPDATE_REPO})${N}"
+    else
+      echo -e "  Канал          : ${G}стабильный${N} ${D}(${UPDATE_REPO})${N}"
+    fi
+    local _upd
+    _upd=$(update_available || true)
+    [[ -n "$_upd" ]] && echo -e "  Доступна       : ${G}${_upd}${N}"
+    echo ""
+    echo -e "  ${C}1)${N} Обновить скрипт ${D}— скачать с GitHub${N}"
+    if [[ "$UPDATE_CHANNEL" == "beta" ]]; then
+      echo -e "  ${C}2)${N} Вернуться на стабильный канал"
+    else
+      echo -e "  ${C}2)${N} Переключиться на бета-канал ${D}(ранние сборки)${N}"
+    fi
+    echo ""
+    echo -e "  ${W}0)${N} ← Назад"
+    echo ""
+    local _uc
+    read_choice _uc "$(echo -e "${C}  Выбор [0-2]: ${N}")" 0 2 "0"
+    case "${_uc:-}" in
+      1) do_self_update || true ;;
+      2) do_switch_update_channel || true ;;
+      0|"") return 0 ;;
+      *) warn "Неверный выбор" ;;
+    esac
+    echo ""
+    read -rp "$(echo -e "${C}  Enter для продолжения...${N}")" || return 0
+  done
+}
+
 choose_dns() {
   CLIENT_DNS=""
   hdr "◎  DNS для клиента"
@@ -2995,7 +3517,7 @@ choose_dns() {
 # действуют на весь интерфейс сразу. Отдельному клиенту свою версию выдать
 # нельзя: включив 3.0, сервер перестаёт принимать клиентов на 2.0. Поэтому
 # спрашиваем один раз при создании и пишем маркер в awg0.conf.
-# Результат: глобальная AWG_PROTO = "2.0" | "3.0"
+# Результат: глобальная AWG_PROTO = "2.0" | "3.0" | "3.1"
 choose_awg_proto() {
   AWG_PROTO="2.0"
   echo ""
@@ -3010,17 +3532,27 @@ choose_awg_proto() {
   echo -e "     ${D}содержимого и рандомизация таймингов рукопожатий —${N}"
   echo -e "     ${D}то есть скрывает не только размеры, но и временные паттерны.${N}"
   echo ""
-  echo -e "  ${Y}  Требует клиента с поддержкой 3.0. Версия задаётся на ВЕСЬ${N}"
-  echo -e "  ${Y}  сервер: клиенты на 2.0 подключиться к нему не смогут.${N}"
+  echo -e "  ${G}3)${N} ${W}AWG 3.1${N} ${C}(новейшая, самая узкая совместимость)${N}"
+  echo -e "     ${D}Всё из 3.0 плюс RandomTrailers — случайный «хвост» у пакетов${N}"
+  echo -e "     ${D}рукопожатия, из-за чего их длина перестаёт быть постоянной,${N}"
+  echo -e "     ${D}и DisableCookies — сервер не отвечает cookie-пакетами.${N}"
+  echo -e "     ${D}Нужны amneziawg-tools и модуль v3.1.20260812 или новее${N}"
+  echo -e "     ${D}И НА СЕРВЕРЕ, И НА КЛИЕНТЕ: старый клиент такой конфиг${N}"
+  echo -e "     ${D}даже не прочитает.${N}"
+  echo ""
+  echo -e "  ${Y}  Требует клиента с поддержкой выбранной версии. Версия задаётся${N}"
+  echo -e "  ${Y}  на ВЕСЬ сервер: клиенты на 2.0 к серверу 3.x не подключатся.${N}"
   echo ""
   local _proto_choice
-  read_choice _proto_choice "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" 1 2 "1"
+  read_choice _proto_choice "$(echo -e "${C}  Выбор [1-3] (Enter = 1): ${N}")" 1 3 "1"
   case "$_proto_choice" in
-    2)
+    2|3)
       # Проверяем до генерации конфигов: с несовместимыми tools/модулем
-      # сервер 3.0 просто не поднимется, а конфиги уже будут перезаписаны.
-      if awg3_compat_gate; then
-        AWG_PROTO="3.0"; ok "Выбран AmneziaWG 3.0"
+      # сервер 3.x просто не поднимется, а конфиги уже будут перезаписаны.
+      local _want="3.0"
+      [[ "$_proto_choice" == "3" ]] && _want="3.1"
+      if awg_compat_gate "$_want"; then
+        AWG_PROTO="$_want"; ok "Выбран AmneziaWG $_want"
       else
         AWG_PROTO="2.0"; info "Остаёмся на AmneziaWG 2.0"
       fi
@@ -3079,7 +3611,7 @@ _replace_awg_params() {
 # На 2.0 — фиксированные 25 секунд, как было: старые клиенты диапазон могут не
 # понять, а выигрыша там всё равно нет.
 #
-# На 3.0 — диапазон. Это не косметика: ядро выбирает значение заново на каждой
+# На 3.0 и 3.1 — диапазон. Это не косметика: ядро выбирает значение заново на каждой
 # отправке (u16_range_pick_one в timers.c), а фиксированные 25 дают пакет ровно
 # раз в 25 секунд — идеально стабильную временную сигнатуру. Рандомизировать
 # рекеи и оставить keepalive константой значит наполовину обесценить 3.0.
@@ -3093,17 +3625,166 @@ awg_keepalive_value() {
   if [[ -z "$proto" && -f "$SERVER_CONF" ]]; then
     proto=$(grep -m1 '^# AWG_PROTO=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
   fi
-  if [[ "${proto:-2.0}" == "3.0" ]]; then
+  if [[ "${proto:-2.0}" == "3.0" || "${proto:-2.0}" == "3.1" ]]; then
     echo "$(rand_range 18 24)-$(rand_range 26 34)"
   else
     echo "25"
   fi
 }
 
+# Ключи параметров AmneziaWG уровня УСТРОЙСТВА, появившиеся в 3.x. Они обязаны
+# совпадать у сервера и всех клиентов, и по ним же диагностика понимает, что
+# конфиг требует компонентов новее.
+#   3.0 — HeaderProtectionKey, ContentPaddingAddition и таймеры;
+#   3.1 — RandomTrailers и DisableCookies (amneziawg-tools v3.1.20260812).
+AWG3_KEYS_RE="(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|RandomTrailers|DisableCookies)"
+# Ключи, которые отличают именно 3.1: по ним выбирается версия пробы.
+AWG31_KEYS_RE="(RandomTrailers|DisableCookies)"
+
+# Нижняя граница S1-S4 при включённой защите заголовков.
+# Ядро (netlink.c модуля: «S1 must be more then %d to use headerProtection»)
+# отвергает setconf, если при заданном HeaderProtectionKey хоть одно из S1-S4
+# меньше HEADER_PROTECTION_NONCE_SIZE — в этот паддинг прячется nonce защиты
+# заголовков (header_protection.h: NONCE_SIZE = 12). Наружу это выглядит как
+# «Unable to modify interface: Invalid argument» при подъёме awg0.
+AWG_HP_MIN_S=12
+
+# Размеры сообщений WireGuard до паддинга (messages.h модуля). S1-S3
+# прибавляются к ним, поэтому два типа сообщений становятся ОДНОЙ длины, когда
+# S отличаются ровно на разницу базовых размеров:
+#   148 + S1 == 92 + S2  →  S2 = S1 + 56   (initiation против response)
+#   148 + S1 == 64 + S3  →  S3 = S1 + 84   (initiation против cookie)
+#    92 + S2 == 64 + S3  →  S3 = S2 + 28   (response против cookie)
+# Совпавшая длина возвращает наблюдателю ровно то, что паддинг прятал, — тип
+# пакета. Раньше проверялось только первое совпадение, а третье достижимо в
+# профиле Pro примерно в одной генерации из 350.
+AWG_S_DELTA_INIT_RESP=56
+AWG_S_DELTA_INIT_COOKIE=84
+AWG_S_DELTA_RESP_COOKIE=28
+AWG_S_GAP=10                # запас с каждой стороны от совпадения
+
+# Потолки из реализаций, а не из советов:
+#   S4  — amneziawg-tools src/config.c
+#   Jc  — модуль принимает 0..128; свыше 64 рукопожатие заметно медленнее,
+#         потому что все junk-пакеты уходят перед initiation
+AWG_S4_MAX=32
+AWG_JC_MAX=128
+AWG_JC_SLOW=64
+
 # Все ключи параметров AmneziaWG, которые клиент обязан получить от сервера.
 # Единый источник: любой новый параметр добавляется здесь, а не в трёх местах.
-# 2.0 — Jc/Jmin/Jmax, S1-S4, H1-H4. 3.0 — защита заголовков, паддинг, таймеры.
-AWG_PARAM_KEYS_RE="(Jc|Jmin|Jmax|S[1-4]|H[1-4]|HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts)"
+# 2.0 — Jc/Jmin/Jmax, S1-S4, H1-H4. 3.x — см. AWG3_KEYS_RE.
+AWG_PARAM_KEYS_RE="(Jc|Jmin|Jmax|S[1-4]|H[1-4]|HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|RandomTrailers|DisableCookies)"
+
+# Диапазон S по профилю — единственное место, где эти числа записаны.
+# Раньше они дублировались: один набор в блоке профиля, второй — в цикле
+# коррекции S2, и разойтись им ничто не мешало.
+_awg_rand_s() {
+  case "${AWG_PROFILE:-pro}" in
+    lite)
+      # Образец оригинальной Amnezia: S1=102, S2=22, S3=21, S4=7 (±5)
+      case "$1" in
+        S1) rand_range 97 107 ;; S2) rand_range 17 27 ;;
+        S3) rand_range 16 26 ;;  S4) rand_range 4 10 ;;
+      esac ;;
+    standard)
+      case "$1" in
+        S1) rand_range 30 80 ;; S2) rand_range 30 80 ;;
+        S3) rand_range 15 32 ;; S4) rand_range 10 20 ;;
+      esac ;;
+    pro|*)
+      case "$1" in
+        S1) rand_range 15 150 ;; S2) rand_range 15 150 ;;
+        S3) rand_range 8 64 ;;  S4) rand_range 6 31 ;;
+      esac ;;
+  esac
+}
+
+# Истина, если два числа ближе друг к другу, чем AWG_S_GAP.
+_s_too_close() {
+  local d=$(( $1 - $2 ))
+  (( d < 0 )) && d=$(( -d ))
+  (( d < AWG_S_GAP ))
+}
+
+# Разводит S1-S3 от всех трёх совпадений длин (см. AWG_S_DELTA_*).
+# Сначала перебор в рамках профиля — так значения остаются характерными для
+# него; если за 20 попыток не сошлось (узкие диапазоны Lite/Standard), доводим
+# детерминированным сдвигом вверх. Порядок важен: сперва S2 относительно S1,
+# потом S3 относительно обоих, иначе правка S2 ломает уже разведённый S3.
+_awg_fix_s_collisions() {
+  local tries=0
+  while (( tries < 20 )); do
+    _s_too_close $(( S1 + AWG_S_DELTA_INIT_RESP ))   "$S2" || \
+    _s_too_close $(( S1 + AWG_S_DELTA_INIT_COOKIE )) "$S3" || \
+    _s_too_close $(( S2 + AWG_S_DELTA_RESP_COOKIE )) "$S3" || break
+    S2=$(_awg_rand_s S2)
+    S3=$(_awg_rand_s S3)
+    _awg_apply_hp_min_s
+    tries=$(( tries + 1 ))
+  done
+
+  local guard=0 shifted=""
+  while (( guard < 30 )) && _s_too_close $(( S1 + AWG_S_DELTA_INIT_RESP )) "$S2"; do
+    S2=$(( S2 + AWG_S_GAP )); guard=$(( guard + 1 )); shifted="S2=$S2"
+  done
+  guard=0
+  while (( guard < 30 )) && \
+        { _s_too_close $(( S1 + AWG_S_DELTA_INIT_COOKIE )) "$S3" || \
+          _s_too_close $(( S2 + AWG_S_DELTA_RESP_COOKIE )) "$S3"; }; do
+    S3=$(( S3 + AWG_S_GAP )); guard=$(( guard + 1 )); shifted="${shifted} S3=$S3"
+  done
+
+  if (( tries > 0 )) || [[ -n "$shifted" ]]; then
+    log_info "gen_awg_params: разведение длин (попыток=$tries${shifted:+, сдвиг: $shifted}) — S1=$S1 S2=$S2 S3=$S3"
+  fi
+  return 0
+}
+
+# Прижимает параметры к потолкам реализаций. Наши диапазоны в них укладываются,
+# но правка диапазона не должна тихо выпускать конфиг, который отвергнет клиент.
+_awg_clamp_limits() {
+  if (( S4 > AWG_S4_MAX )); then
+    log_info "gen_awg_params: S4=$S4 выше потолка tools ($AWG_S4_MAX) — прижат"
+    S4=$AWG_S4_MAX
+  fi
+  if (( Jc > AWG_JC_MAX )); then
+    log_info "gen_awg_params: Jc=$Jc выше потолка модуля ($AWG_JC_MAX) — прижат"
+    Jc=$AWG_JC_MAX
+  elif (( Jc > AWG_JC_SLOW )); then
+    log_info "gen_awg_params: Jc=$Jc — рукопожатие будет заметно медленнее (>$AWG_JC_SLOW)"
+  fi
+  # Jmax больше MTU означает фрагментацию junk-пакетов: на части маршрутов это
+  # рвёт связь и само по себе заметно.
+  local _mtu="${MTU:-1280}"
+  if [[ "$_mtu" =~ ^[0-9]+$ ]] && (( Jmax >= _mtu )); then
+    log_info "gen_awg_params: Jmax=$Jmax не меньше MTU=$_mtu — junk будет фрагментироваться"
+  fi
+  return 0
+}
+
+# Поднимает S1-S4 до минимума, который требует ядро при защите заголовков.
+# Работает только на 3.x: на 2.0 HeaderProtectionKey нет и ограничения тоже.
+# Значение не прибивается к 12 гвоздями — иначе у всех серверов 3.x получался
+# бы одинаковый паддинг, то есть сигнатура. Берём случайное из [12; 24].
+_awg_apply_hp_min_s() {
+  case "${AWG_PROTO:-2.0}" in
+    3.0|3.1) ;;
+    *) return 0 ;;
+  esac
+  local name val raised=""
+  for name in S1 S2 S3 S4; do
+    val="${!name}"
+    [[ "$val" =~ ^[0-9]+$ ]] || continue
+    if (( val < AWG_HP_MIN_S )); then
+      printf -v "$name" '%s' "$(rand_range "$AWG_HP_MIN_S" $((AWG_HP_MIN_S + 12)))"
+      raised+=" ${name}: ${val}→${!name}"
+    fi
+  done
+  [[ -n "$raised" ]] && \
+    log_info "gen_awg_params: S под 3.x подняты до >= ${AWG_HP_MIN_S} —${raised}"
+  return 0
+}
 
 gen_awg_params() {
   AWG_PARAMS_LINES=""
@@ -3124,67 +3805,51 @@ gen_awg_params() {
       Jc=$(rand_range 3 5)              # 4 ±1
       Jmin=$(rand_range 5 15)           # 10 ±5
       Jmax=$(rand_range 45 55)          # 50 ±5
-      S1=$(rand_range 97 107)           # 102 ±5
-      S2=$(rand_range 17 27)            # 22 ±5
-      S3=$(rand_range 16 26)            # 21 ±5
-      S4=$(rand_range 4 10)             # 7 ±3 (нельзя ±5: ниже 0 уйдём)
+      S1=$(_awg_rand_s S1); S2=$(_awg_rand_s S2)
+      S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
     standard)
       # ── Standard: промежуточные значения ──
       Jc=$(rand_range 5 8)
       Jmin=$(rand_range 30 80)
       Jmax=$(rand_range 100 250)
-      S1=$(rand_range 30 80)
-      S2=$(rand_range 30 80)
-      S3=$(rand_range 15 32)
-      S4=$(rand_range 10 20)
+      S1=$(_awg_rand_s S1); S2=$(_awg_rand_s S2)
+      S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
     pro|*)
       # ── Pro: текущие полные диапазоны (без изменений) ──
       Jc=$(rand_range 4 16)
       Jmin=$(rand_range 50 256)
       Jmax=$(rand_range 300 1000)
-      S1=$(rand_range 15 150)
-      S2=$(rand_range 15 150)
-      S3=$(rand_range 8 64)
-      S4=$(rand_range 6 31)
+      S1=$(_awg_rand_s S1); S2=$(_awg_rand_s S2)
+      S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
   esac
 
   # ── Инварианты мануала (применяются для всех профилей) ──
+
+  # Нижняя граница S1-S4 для 3.x — жёсткое требование ядра, а не рекомендация.
+  # Диапазоны профилей его не гарантировали: Pro брал S3 от 8 и S4 от 6, Lite —
+  # S4 в 4..10. То есть сервер 3.x создавался через раз, а на Lite не
+  # создавался вовсе: awg-quick падал на «Invalid argument» уже после того, как
+  # конфиги записаны.
+  _awg_apply_hp_min_s
 
   # Jmin < Jmax
   if [[ $Jmin -ge $Jmax ]]; then
     Jmax=$((Jmin + $(rand_range 100 500)))
   fi
 
-  # S1 + 56 ≠ S2 (требование мануала). Усиливаем: gap >= 10
-  # для защиты от off-by-one в реализации awg.
-  # Если за 10 попыток не вышло — оставляем последнее значение
-  # (математически в наших диапазонах такого не должно случиться,
-  # но логируем для отладки).
-  local tries=0 max_tries=10 gap=10
-  local S1_plus_56=$((S1 + 56))
-  while [[ $tries -lt $max_tries ]]; do
-    local diff=$((S1_plus_56 - S2))
-    [[ $diff -lt 0 ]] && diff=$((-diff))
-    [[ $diff -ge $gap ]] && break
-    # Перегенерируем S2 в рамках того же профиля
-    case "${AWG_PROFILE:-pro}" in
-      lite)     S2=$(rand_range 17 27) ;;
-      standard) S2=$(rand_range 30 80) ;;
-      pro|*)    S2=$(rand_range 15 150) ;;
-    esac
-    tries=$((tries + 1))
-  done
-  if [[ $tries -gt 0 ]]; then
-    log_info "gen_awg_params: S1+56=$S1_plus_56 vs S2=$S2 — корректировка за $tries попыток (gap=$gap)"
-  fi
-  # Финальная страховка от прямого равенства S1+56==S2
-  if [[ $S1_plus_56 -eq $S2 ]]; then
-    S2=$((S2 + gap))
-    log_info "gen_awg_params: применён ручной сдвиг S2 → $S2 (страховка от S1+56=S2)"
-  fi
+  # Длины сообщений не должны совпадать ни в одной из трёх пар (см.
+  # AWG_S_DELTA_*). Раньше проверялась только пара initiation/response.
+  _awg_fix_s_collisions
+
+  # Разведение перегенерировало S2/S3 — граница ядра проверяется ещё раз,
+  # чтобы правка диапазонов профиля не вернула ошибку setconf незаметно.
+  _awg_apply_hp_min_s
+
+  # Потолки реализаций (S4, Jc) и фрагментация junk по MTU
+  _awg_clamp_limits
 
   # ── H1-H4: уникальные диапазоны в рамках recommended [5 .. 2^31-1] ──
   # Мануал: H1/H2/H3/H4 must be unique, recommended range 5 ≤ H ≤ 2147483647
@@ -3223,14 +3888,14 @@ gen_awg_params() {
 
   AWG_PARAMS_LINES="Jc = $Jc\nJmin = $Jmin\nJmax = $Jmax\nS1 = $S1\nS2 = $S2\nS3 = $S3\nS4 = $S4\nH1 = $H1\nH2 = $H2\nH3 = $H3\nH4 = $H4"
 
-  # ── AWG 3.0: защита заголовков и рандомизация таймингов ──
-  # Включается только если AWG_PROTO=3.0. Параметры уровня УСТРОЙСТВА, то есть
+  # ── AWG 3.x: защита заголовков и рандомизация таймингов ──
+  # Включается на AWG_PROTO=3.0 и 3.1. Параметры уровня УСТРОЙСТВА, то есть
   # действуют на весь интерфейс сразу — клиент на 2.0 к такому серверу уже не
   # подключится. Отсюда выбор версии при создании сервера, а не на клиента.
-  if [[ "${AWG_PROTO:-2.0}" == "3.0" ]]; then
+  if [[ "${AWG_PROTO:-2.0}" == "3.0" || "${AWG_PROTO:-2.0}" == "3.1" ]]; then
     local _p3
-    _p3=$(gen_awg3_params) || { err "Не удалось сгенерировать параметры AWG 3.0"; return 1; }
-    [[ -n "$_p3" ]] || { err "Параметры AWG 3.0 пусты"; return 1; }
+    _p3=$(gen_awg3_params) || { err "Не удалось сгенерировать параметры AWG ${AWG_PROTO}"; return 1; }
+    [[ -n "$_p3" ]] || { err "Параметры AWG ${AWG_PROTO} пусты"; return 1; }
     AWG_PARAMS_LINES+="\n${_p3}"
   fi
 }
@@ -3284,8 +3949,25 @@ gen_awg3_params() {
   rkt=5
   mha=$(rand_range 16 20)
 
-  printf 'HeaderProtectionKey = %s\nContentPaddingAddition = %s\nRekeyAfterTime = %s-%s\nRekeyTimeout = %s\nRejectAfterTime = %s-%s\nKeepaliveTimeout = %s-%s\nMaxHandshakeAttempts = %s' \
-    "$hp_key" "$cpa" "$rat_lo" "$rat_hi" "$rkt" "$rjt_lo" "$rjt_hi" "$ka_lo" "$ka_hi" "$mha"
+  # ── Добавка AWG 3.1 ──
+  # RandomTrailers — параметр устройства, обязан совпадать на обоих концах:
+  # при нём приёмник принимает пакеты рукопожатия длиннее ожидаемой (в
+  # receive.c проверка длины становится >= вместо ==), а сторона без него
+  # такой пакет отбросит. На транспортные пакеты он влияет только когда
+  # ContentPaddingAddition нулевой (send.c: CPA имеет приоритет), поэтому у
+  # нас эффект остаётся на рукопожатиях — так же, как в конфигах Amnezia,
+  # где заданы оба.
+  # DisableCookies — сервер не отвечает cookie-пакетом на рукопожатие под
+  # нагрузкой. Эффект односторонний, но это отключает штатную защиту
+  # WireGuard от флуда рукопожатиями: платим ей за то, что в трафике не
+  # появляется отдельный тип пакета.
+  local extra=""
+  if [[ "${AWG_PROTO:-}" == "3.1" ]]; then
+    extra=$'\nRandomTrailers = on\nDisableCookies = on'
+  fi
+
+  printf 'HeaderProtectionKey = %s\nContentPaddingAddition = %s\nRekeyAfterTime = %s-%s\nRekeyTimeout = %s\nRejectAfterTime = %s-%s\nKeepaliveTimeout = %s-%s\nMaxHandshakeAttempts = %s%s' \
+    "$hp_key" "$cpa" "$rat_lo" "$rat_hi" "$rkt" "$rjt_lo" "$rjt_hi" "$ka_lo" "$ka_hi" "$mha" "$extra"
 }
 
 _apply_config() {
@@ -3302,42 +3984,48 @@ _apply_config() {
   awg-quick up "$SERVER_CONF" 2>/dev/null
 }
 
-# Стратегия:
-#   - Конфиг БЕЗ I1-I5 → QR код (компактный, влезает)
-#   - Конфиг С I1-I5 → только текст конфига (QR не делаем — слишком большой)
+# Выдаёт готовый конфиг. $1 = файл, $2 = "qr" — показать QR вместо текста.
+#
+# По умолчанию печатается ТЕКСТ: после создания клиента нужен именно он —
+# скопировать, положить в файл, отправить. QR остаётся отдельным осознанным
+# действием (Клиенты → «Показать QR клиента»), а не тем, что заслоняет собой
+# конфиг в половине случаев.
 _share_config() {
-  local conf_file="$1"
+  local conf_file="$1" mode="${2:-text}"
   [[ -f "$conf_file" ]] || return 1
 
-  # Проверяем наличие I1-I5 в конфиге и общий размер
-  local has_i1 conf_size
-  has_i1=$(grep -cE "^I[1-5] = " "$conf_file" 2>/dev/null || echo 0)
+  local conf_size
   conf_size=$(wc -c < "$conf_file")
 
-  # QR лимит (с запасом) ~2800 байт
-  local qr_fits=1
-  [[ "$conf_size" -gt 2800 ]] && qr_fits=0
-
-  if [[ "$qr_fits" -eq 1 ]] && command -v qrencode &>/dev/null; then
-    # Влезает в QR
+  if [[ "$mode" == "qr" ]]; then
+    # QR-лимит (с запасом) ~2800 байт: выше начинается версия символа, которую
+    # камеры телефонов уже не берут с экрана терминала.
+    if [[ "$conf_size" -le 2800 ]] && command -v qrencode &>/dev/null; then
+      echo ""
+      qrencode -t ansiutf8 -s 1 -m 1 < "$conf_file"
+      echo -e "${D}  ↑ QR-код конфига (${conf_size} байт) — сканируй в AmneziaVPN${N}"
+      return 0
+    fi
     echo ""
-    qrencode -t ansiutf8 -s 1 -m 1 < "$conf_file"
-    echo -e "${D}  ↑ QR-код конфига (${conf_size} байт) — сканируй в AmneziaVPN${N}"
-  else
-    # Большой конфиг → только текст
-    echo ""
-    echo -e "${Y}  ──────────────────────────────────────────────${N}"
-    echo -e "${W}  ≡ Текст конфига (сохрани как client.conf):${N}"
-    echo -e "${Y}  ──────────────────────────────────────────────${N}"
-    echo ""
-    cat "$conf_file"
-    echo ""
-    echo -e "${Y}  ──────────────────────────────────────────────${N}"
-    echo -e "${D}  (QR не показан: конфиг ${conf_size} байт > 2800 лимит)${N}"
-    if [[ "$has_i1" -gt 0 ]]; then
-      echo -e "${D}  Используй DNS или SIP профиль — у них I1 значительно меньше${N}"
+    if ! command -v qrencode &>/dev/null; then
+      warn "qrencode не установлен — показываю текст конфига"
+    else
+      warn "Конфиг ${conf_size} байт > 2800 — в читаемый QR не влезет, показываю текст"
+      local has_i1
+      has_i1=$(grep -cE "^I[1-5] = " "$conf_file" 2>/dev/null || echo 0)
+      [[ "$has_i1" -gt 0 ]] && \
+        info "Уменьшить: профиль DNS или уровень «+I1» — цепочка станет короче"
     fi
   fi
+
+  echo ""
+  echo -e "${Y}  ──────────────────────────────────────────────${N}"
+  echo -e "${W}  ≡ Текст конфига (сохрани как client.conf):${N}"
+  echo -e "${Y}  ──────────────────────────────────────────────${N}"
+  echo ""
+  cat "$conf_file"
+  echo ""
+  echo -e "${Y}  ──────────────────────────────────────────────${N}"
 }
 
 # Удаляет остатки APT-репозиториев от версий, когда установка шла через PPA.
@@ -3659,17 +4347,34 @@ EOF
   local running_k newest_k k
   running_k="$(uname -r)"
   newest_k=""
+  local _kernels=()
   for k in /lib/modules/*/; do
     k=${k%/}; k=${k##*/}
     [[ -e "/boot/vmlinuz-$k" ]] || continue
     # заголовки нужны, иначе DKMS не соберёт
     [[ -d "/lib/modules/$k/build" ]] || apt-get install -y -q "linux-headers-$k" >/dev/null 2>&1 || true
-    newest_k="$k"
+    _kernels+=("$k")
   done
+  # Самое новое ядро — по ВЕРСИИ, а не по алфавиту. Раньше брался последний
+  # элемент glob: "6.8.0-31-generic" сортируется строкой после "6.8.0-137",
+  # и скрипт объявлял старое ядро новым, а заодно не замечал настоящее новое.
+  if (( ${#_kernels[@]} > 0 )); then
+    newest_k=$(printf '%s\n' "${_kernels[@]}" | sort -V | tail -1)
+  fi
   if dkms autoinstall >/dev/null 2>&1; then
     ok "Модуль собран под все установленные ядра"
   else
     warn "dkms autoinstall отработал с ошибкой — проверь: dkms status"
+  fi
+
+  # autoinstall молча пропускает ядро без заголовков, поэтому «всё собрано»
+  # проверяем по факту, а не по коду возврата
+  if [[ -n "$newest_k" ]] && ! dkms status 2>/dev/null | grep -q "$newest_k"; then
+    if dkms autoinstall -k "$newest_k" >/dev/null 2>&1; then
+      ok "Модуль дособран под $newest_k"
+    else
+      warn "Модуль под $newest_k собрать не удалось (нет linux-headers-$newest_k?)"
+    fi
   fi
 
   # Если загружено не самое новое ядро — предупреждаем прямо, а не постфактум
@@ -3970,7 +4675,7 @@ do_gen() {
   echo -e "  ${W}Обфускация : ${N}$obf_label"
   echo -e "  ${W}DNS        : ${N}$CLIENT_DNS"
   echo -e "  ${W}Мимикрия   : ${N}${MIMICRY_PROFILE:-none}"
-  echo -e "  ${W}I1         : ${N}${I1:+получен (${#I1} байт)}"
+  echo -e "  ${W}I1         : ${N}${I1:+получен (${#I1} симв. ≈ $(( (${#I1} - 8) / 2 )) байт пакета)}"
   echo -e "  ${W}Клиент     : ${N}$CLIENT_ADDR"
   echo -e "  ${W}Сервер     : ${N}$SERVER_ADDR"
   echo -e "  ${W}MTU        : ${N}$MTU"
@@ -4040,7 +4745,7 @@ do_gen() {
 
   {
     echo "# AWG_PROFILE=${AWG_PROFILE:-pro}"
-    echo "# AmneziaWG Toolza — AWG 2.0 server config"
+    echo "# AmneziaWG Toolza — AWG ${AWG_PROTO:-2.0} server config"
     echo "# Region: ${SERVER_REGION:-world}"
     echo "# AWG_PROTO=${AWG_PROTO:-2.0}"
     # Сколько CPS-пакетов получает клиент (1 = без I1-I5, 2 = только I1,
@@ -4166,16 +4871,21 @@ EOF
 # Проверяем не факт установки, а реальную поддержку: у обновлённого бота
 # предупреждать не о чем, а лишний алярм после каждого создания сервера злит.
 _warn_bot_needs_update() {
-  [[ "${AWG_PROTO:-2.0}" == "3.0" ]] || return 0
+  local proto="${AWG_PROTO:-2.0}" need_key
+  case "$proto" in
+    3.0) need_key="HeaderProtectionKey" ;;
+    3.1) need_key="RandomTrailers" ;;
+    *)   return 0 ;;
+  esac
   [[ -f "/usr/local/bin/awg-bot.py" ]] || return 0   # маркер установленного бота
 
   local bot_core="/opt/awg-bot/awgbot/core.py"
   [[ -f "$bot_core" ]] || return 0
-  grep -q 'HeaderProtectionKey' "$bot_core" 2>/dev/null && return 0
+  grep -q "$need_key" "$bot_core" 2>/dev/null && return 0
 
   echo ""
-  warn "Telegram-бот установлен, но его версия не знает про AWG 3.0."
-  warn "Клиенты, выданные ботом, получат конфиг 2.0 и НЕ подключатся."
+  warn "Telegram-бот установлен, но его версия не знает про AWG ${proto}."
+  warn "Клиенты, выданные ботом, получат неполный конфиг и НЕ подключатся."
   info "Обнови: главное меню → 6) Telegram-бот → Обновить"
 }
 
@@ -4250,10 +4960,11 @@ do_manage_clients() {
     echo -e "  ${C}7)${N} Срок действия клиента"
     echo -e "  ${C}8)${N} Активность клиентов"
     echo -e "  ${C}9)${N} Экспорт конфигов (zip)"
+    echo -e "  ${C}10)${N} Сменить мимикрию у клиента ${D}— если конфиг не проходит у провайдера${N}"
     echo -e "  ${W}0)${N} Назад в главное меню"
     echo ""
     local MGMT_CHOICE
-    read_choice MGMT_CHOICE "$(echo -e "${C}  Выбор [0-9]: ${N}")" 0 9 "0"
+    read_choice MGMT_CHOICE "$(echo -e "${C}  Выбор [0-10]: ${N}")" 0 10 "0"
     case "${MGMT_CHOICE:-}" in
       1) do_add_client || true ;;
       2) do_rename_client || true ;;
@@ -4264,6 +4975,7 @@ do_manage_clients() {
       7) do_expire_menu || true ;;
       8) do_list_clients || true ;;
       9) do_export_configs || true ;;
+      10) do_change_client_mimicry || true ;;
       0) return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -4732,12 +5444,27 @@ do_add_client() {
 
   local i1_line="" i2_line="" i3_line="" i4_line="" i5_line=""
 
+  # Цепочка I1-I5 — клиентская: у каждого устройства она своя, поэтому
+  # спрашиваем на каждого клиента, а не один раз на сервер.
+  choose_target_client
+
   # Читаем профиль сервера — определяет поведение для клиентского I1
   local _srv_profile
   _srv_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
   _srv_profile="${_srv_profile:-pro}"
 
+  # Клиент, который цепочку не читает, делает профиль сервера неважным:
+  # генерировать I1-I5 не для кого.
+  if ! _target_client_reads_cps; then
+    _warn_cps_unsupported || true
+    _srv_profile="nocps"
+  fi
+
   case "$_srv_profile" in
+    nocps)
+      I1=""; I2=""; I3=""; I4=""; I5=""
+      i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
+      ;;
     lite)
       # Lite-сервер: клиенту всегда I1=DNS (icloud.com), без I2-I5
       info "Профиль сервера: Lite — клиент получит I1=DNS (icloud.com)"
@@ -4825,7 +5552,7 @@ do_add_client() {
 
   # Исправлено: читаем параметры только из секции [Interface]
   local awg_params_from_srv
-  # Список включает и параметры AWG 3.0 (HeaderProtectionKey, паддинг,
+  # Список включает и параметры AWG 3.x (HeaderProtectionKey, паддинг,
   # таймеры). Без них клиент, добавленный к серверу 3.0 уже после создания,
   # молча получил бы конфиг 2.0 и не подключился бы вовсе.
   awg_params_from_srv=$(sed -n '/^\[Peer\]/q; p' "$SERVER_CONF" | grep -E "^${AWG_PARAM_KEYS_RE} = " | grep -v "^#" || true)
@@ -4869,7 +5596,7 @@ do_add_client() {
     fi
   fi
 
-  # Раздача конфига (QR без I1-I5 или текст)
+  # Выдаём текст конфига; QR — отдельным пунктом меню, если понадобится
   _share_config "$client_file"
 
   echo ""
@@ -5050,7 +5777,17 @@ do_bulk_add_clients() {
   # ── I1 (один раз для всех) ──
   local i1_line="" i2_line="" i3_line="" i4_line="" i5_line=""
 
+  choose_target_client
+  if ! _target_client_reads_cps; then
+    _warn_cps_unsupported || true
+    _srv_profile="nocps"
+  fi
+
   case "$_srv_profile" in
+    nocps)
+      I1=""; I2=""; I3=""; I4=""; I5=""
+      i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
+      ;;
     lite)
       info "Профиль сервера Lite — клиенты получат I1=DNS (icloud.com)"
       local cps_out
@@ -5126,7 +5863,7 @@ do_bulk_add_clients() {
 
   # awg-параметры из секции [Interface] сервера — считаем один раз
   local awg_params_from_srv
-  # Список включает и параметры AWG 3.0 (HeaderProtectionKey, паддинг,
+  # Список включает и параметры AWG 3.x (HeaderProtectionKey, паддинг,
   # таймеры). Без них клиент, добавленный к серверу 3.0 уже после создания,
   # молча получил бы конфиг 2.0 и не подключился бы вовсе.
   awg_params_from_srv=$(sed -n '/^\[Peer\]/q; p' "$SERVER_CONF" | grep -E "^${AWG_PARAM_KEYS_RE} = " | grep -v "^#" || true)
@@ -5509,6 +6246,114 @@ _print_client_info() {
   echo -e "  ${W}└─────────────────────────────────────────────────────────────────────────${N}"
 }
 
+# Смена мимикрии у уже выданного клиента.
+#
+# I1-I5 живут только в клиентском конфиге, поэтому профиль меняется у одного
+# устройства, не задевая сервер и остальных клиентов. Это нужная операция, а не
+# удобство: один и тот же конфиг проходит у одного провайдера и не проходит у
+# другого, и перебрать профиль должно быть дешевле, чем пересоздавать клиента.
+_detect_mimicry() {           # $1 = строка I1
+  local line="$1"
+  case "$line" in
+    *"<b 0x16"*)        echo "tls" ;;
+    *"<b 0x52454749"*)  echo "sip" ;;      # "REGI" в hex
+    *"<b 0xc"*|*"<b 0x4"*) echo "quic" ;;
+    *"<r 2><b 0x"*)     echo "dns" ;;
+    "")                 echo "нет" ;;
+    *)                  echo "неизвестно" ;;
+  esac
+}
+
+do_change_client_mimicry() {
+  local found_files=()
+  while IFS= read -r -d '' f; do
+    found_files+=("$f")
+  done < <(find /root -maxdepth 1 -name "*_awg2.conf" -print0 2>/dev/null)
+  [[ ${#found_files[@]} -eq 0 ]] && { err "Конфиги клиентов не найдены в /root/"; return 1; }
+
+  local unique
+  mapfile -t unique < <(printf "%s\n" "${found_files[@]}" | sort -u)
+
+  hdr "~  Сменить мимикрию у клиента"
+  echo ""
+  echo -e "  ${D}Меняются только I1-I5 в конфиге этого клиента.${N}"
+  echo -e "  ${D}Сервер и другие клиенты не затрагиваются — переподключать их не надо.${N}"
+  echo ""
+  local i=0 f
+  for f in "${unique[@]}"; do
+    i=$((i+1))
+    local _cur
+    _cur=$(_detect_mimicry "$(grep -m1 '^I1 = ' "$f" 2>/dev/null | cut -d' ' -f3-)")
+    printf "  %d) %-28s ${D}сейчас: %s${N}\n" "$i" "$(basename "$f")" "$_cur"
+  done
+  echo ""
+  local _sel
+  read_choice _sel "$(echo -e "${C}  Выбор [1-${i}] (0 = отмена): ${N}")" 0 "$i" "0"
+  [[ "$_sel" == "0" ]] && { info "Отменено"; return 0; }
+  local chosen="${unique[$((_sel - 1))]}"
+  [[ -f "$chosen" ]] || { warn "Файл не найден"; return 0; }
+
+  # Профиль сервера (Lite/Standard) фиксирует уровень, Pro даёт выбор
+  local _srv_profile
+  _srv_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
+  _srv_profile="${_srv_profile:-pro}"
+
+  I1=""; I2=""; I3=""; I4=""; I5=""
+  choose_target_client
+  if ! _target_client_reads_cps; then
+    _warn_cps_unsupported || true
+  else
+    if [[ "$_srv_profile" == "pro" ]]; then
+      choose_obf_level
+    else
+      OBF_LEVEL=2
+      info "Профиль сервера ${_srv_profile}: у клиента только I1"
+    fi
+    choose_mimicry_profile || return 1
+  fi
+
+  # Собираем новые строки. Пустые не пишем: строка «I2 = » ломает разбор.
+  local new_lines="" k v
+  for k in I1 I2 I3 I4 I5; do
+    v="${!k}"
+    [[ -n "$v" ]] || continue
+    new_lines+="${k} = ${v}"$'\n'
+  done
+  new_lines="${new_lines%$'\n'}"
+
+  local bak tmp
+  bak="${chosen}.bak.$(date +%s)"
+  cp "$chosen" "$bak" 2>/dev/null || warn "Резервную копию сделать не удалось"
+  tmp=$(mktemp) || { err "mktemp провалился"; return 1; }
+
+  # Старые I-строки выбрасываем, новые вставляем перед [Peer] — там же, где
+  # они стояли, и внутри секции [Interface], которой они принадлежат.
+  awk -v ins="$new_lines" '
+    /^\[Peer\]/ && !inserted { if (ins != "") print ins; inserted = 1 }
+    !/^I[1-5] = / { print }
+    END { if (!inserted && ins != "") print ins }
+  ' "$chosen" > "$tmp"
+
+  if [[ ! -s "$tmp" ]] || ! grep -q '^\[Interface\]' "$tmp"; then
+    err "Перезапись конфига не удалась — файл не тронут"
+    rm -f "$tmp"
+    return 1
+  fi
+  cat "$tmp" > "$chosen" && rm -f "$tmp"
+  chmod 600 "$chosen" 2>/dev/null || true
+
+  local _n
+  _n=$(grep -cE '^I[1-5] = ' "$chosen" 2>/dev/null || echo 0)
+  ok "Мимикрия обновлена: ${MIMICRY_PROFILE:-нет}, пакетов I: ${_n}"
+  info "Резервная копия: $bak"
+  echo ""
+  warn "Клиенту нужен НОВЫЙ конфиг — до замены он подключается по старому"
+  _share_config "$chosen"
+  echo ""
+  echo -e "${D}  Конфиг: $chosen${N}"
+  return 0
+}
+
 do_show_qr() {
   # found_files, а не found: в других функциях found — скалярный счётчик,
   # и от одноимённого массива shellcheck путает области видимости.
@@ -5541,7 +6386,8 @@ do_show_qr() {
   local chosen="${unique[$((QR_CHOICE - 1))]}"
   [[ -f "$chosen" ]] || { warn "Файл не найден"; return 0; }
 
-  _share_config "$chosen"
+  # Пункт меню «Показать QR» — единственное место, где QR запрашивают явно
+  _share_config "$chosen" qr
   echo ""
   echo -e "${D}  Конфиг: $chosen${N}"
 }
@@ -5701,31 +6547,38 @@ do_rotate_awg_params() {
   echo -e "  Текущая версия протокола: ${W}AWG ${cur_proto}${N}"
   echo ""
   echo -e "  ${D}Меняются Jc/Jmin/Jmax, S1-S4, H1-H4${N}"
-  [[ "$cur_proto" == "3.0" ]] &&     echo -e "  ${D}плюс HeaderProtectionKey, паддинг и таймеры 3.0${N}"
+  [[ "$cur_proto" == "3.0" || "$cur_proto" == "3.1" ]] && \
+    echo -e "  ${D}плюс HeaderProtectionKey, паддинг и таймеры 3.0${N}"
+  [[ "$cur_proto" == "3.1" ]] && \
+    echo -e "  ${D}плюс RandomTrailers/DisableCookies 3.1${N}"
   echo -e "  ${D}Ключи, IP, имена, сроки и мимикрия I1-I5 сохраняются.${N}"
   echo ""
 
   # Раз конфиги всё равно переписываются — предлагаем сменить и версию
   echo -e "  ${W}Версия протокола после перегенерации:${N}"
-  echo -e "  ${G}1)${N} Оставить AWG ${cur_proto}"
-  if [[ "$cur_proto" == "3.0" ]]; then
-    echo -e "  ${G}2)${N} Перейти на AWG 2.0 ${D}(шире совместимость клиентов)${N}"
-  else
-    echo -e "  ${G}2)${N} Перейти на AWG 3.0 ${D}(нужен клиент с поддержкой 3.0)${N}"
-  fi
+  echo -e "  ${G}1)${N} AWG 2.0 ${D}(шире совместимость клиентов)${N}"
+  echo -e "  ${G}2)${N} AWG 3.0 ${D}(защита заголовков, паддинг, таймеры)${N}"
+  echo -e "  ${G}3)${N} AWG 3.1 ${D}(плюс RandomTrailers/DisableCookies, нужен свежий клиент)${N}"
+  echo -e "  ${D}Enter — оставить текущую (AWG ${cur_proto})${N}"
   echo ""
-  local _pc
-  read_choice _pc "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" 1 2 "1"
-  if [[ "$_pc" == "2" ]]; then
-    [[ "$cur_proto" == "3.0" ]] && new_proto="2.0" || new_proto="3.0"
-  else
-    new_proto="$cur_proto"
-  fi
+  local _pc _def
+  case "$cur_proto" in
+    3.1) _def="3" ;;
+    3.0) _def="2" ;;
+    *)   _def="1" ;;
+  esac
+  read_choice _pc "$(echo -e "${C}  Выбор [1-3] (Enter = ${_def}): ${N}")" 1 3 "$_def"
+  case "$_pc" in
+    3) new_proto="3.1" ;;
+    2) new_proto="3.0" ;;
+    *) new_proto="2.0" ;;
+  esac
 
-  # Переход на 3.0 на несовместимых компонентах положит рабочий сервер:
+  # Переход на 3.x на несовместимых компонентах положит рабочий сервер:
   # конфиги перепишутся, а awg-quick up на них упадёт. Проверяем заранее.
-  if [[ "$new_proto" == "3.0" && "$cur_proto" != "3.0" ]]; then
-    awg3_compat_gate || { info "Отменено — сервер остался на AWG ${cur_proto}"; return 0; }
+  # Переход 3.0 → 3.1 тоже проверяем: 3.1-ключей старые tools не знают.
+  if [[ "$new_proto" != "2.0" && "$new_proto" != "$cur_proto" ]]; then
+    awg_compat_gate "$new_proto" || { info "Отменено — сервер остался на AWG ${cur_proto}"; return 0; }
   fi
 
   # Считаем клиентов, которых это заденет
@@ -5776,7 +6629,7 @@ do_rotate_awg_params() {
   for f in ${clients[@]+"${clients[@]}"}; do
     if _replace_awg_params "$f" "$params"; then
       # PersistentKeepalive живёт в секции [Peer] и зависит от версии:
-      # на 3.0 это диапазон, на 2.0 — фиксированные 25.
+      # на 3.x это диапазон, на 2.0 — фиксированные 25.
       sed -i "s|^PersistentKeepalive = .*|PersistentKeepalive = ${ka}|" "$f"
       updated=$((updated + 1))
     else
@@ -6059,7 +6912,11 @@ USQUE_DOWN_HOOK="$USQUE_DIR/on-disconnect.sh"
 USQUE_SERVICE="/etc/systemd/system/awg-usque.service"
 USQUE_SYSCTL="/etc/sysctl.d/99-awg-usque.conf"
 USQUE_LOG="/var/log/awg-usque.log"
-USQUE_FALLBACK_VER="4.2.1"   # если GitHub API недоступен
+# Версия на случай недоступного GitHub API. Сверена с последним релизом
+# Diniboy1123/usque 2026-08-13. Проверять при каждом релизе awg2:
+#   curl -s https://api.github.com/repos/Diniboy1123/usque/releases/latest | jq -r .tag_name
+# Протухшее значение здесь не ломает установку сразу, но тянет старый бинарь.
+USQUE_FALLBACK_VER="4.2.1"
 
 warp_usque_iface() { echo "$WARP_IFACE_NAME"; }
 
@@ -9353,7 +10210,7 @@ do_uninstall() {
   # мусор, из которого awg2 запускается снова и выглядит как «не удалилось».
   trash "Удаляем лог и следы установки..."
   rm -f "$LOG_FILE" 2>/dev/null || true
-  rm -rf /var/lib/awg2 2>/dev/null || true   # кэш проверки обновлений
+  rm -rf /var/lib/awg2 2>/dev/null || true   # кэш проверки обновлений и канал
   rm -f /root/awg-toolza-*.run 2>/dev/null || true
   rm -rf /opt/awg-toolza-* 2>/dev/null || true
   rm -f /tmp/awg_domain_cache.txt 2>/dev/null || true
@@ -11656,7 +12513,7 @@ while true; do
     5) show_submenu_5 ;;
     6) show_submenu_6 ;;
     7) show_submenu_7 ;;
-    8) do_self_update || true ;;
+    8) show_submenu_8 ;;
     0)
       log_info "Выход"
       echo -e "\n${G}  В путь! ${N}"
