@@ -942,18 +942,23 @@ async def cb_bot_update_ok(cq: CallbackQuery) -> None:
     # systemd гасит весь cgroup сервиса. Поэтому запускаем обновление как
     # ОТДЕЛЬНЫЙ transient-юнит через systemd-run: он живёт вне cgroup awg-bot,
     # переживает остановку бота и докатывает деплой+рестарт до конца.
-    ok, out, err = await asyncio.to_thread(
+    # core.run возвращает rc (0 — успех), а не булев флаг.
+    rc, out, err = await asyncio.to_thread(
         core.run,
         ["systemd-run", "--collect", "--unit=awg-bot-selfupdate",
          "--property=Type=oneshot",
          "bash", "-lc", "awg-bot update >/var/log/awg-bot-update.log 2>&1"]
     )
-    if not ok:
-        # запасной путь, если systemd-run недоступен
-        await asyncio.to_thread(
-            core.run,
-            ["bash", "-c", "setsid awg-bot update >/var/log/awg-bot-update.log 2>&1 &"]
-        )
+    if rc != 0:
+        # Запасного пути здесь нет: по причине выше любой потомок бота будет
+        # убит на середине деплоя, а оборванное обновление хуже неначатого.
+        # Прежний код к тому же проверял `if not ok` на rc, из-за чего setsid
+        # запускался ровно при УСПЕХЕ systemd-run — деплой шёл в два процесса.
+        log.error("bot_update: systemd-run недоступен: %s", (err or out or "").strip())
+        await safe_edit(cq, "❌ Не удалось запустить обновление: <code>systemd-run</code> недоступен.\n\n"
+                            "Обнови вручную по SSH:\n"
+                            "<code>sudo awg-bot update</code>\n\n"
+                            "Бот остался на текущей версии, ничего не сломано.", None)
 
 
 @dp.callback_query(F.data == "bot_restart_confirm")

@@ -6,6 +6,11 @@ cps.py — генерация I1 (CPS-мимикрия) тем же кодом, 
 и выполняем его. Так I1 всегда соответствует версии awg2 на сервере и
 обновляется вместе со скриптом.
 
+Границы блока awg2 размечает якорями «# CPS_GENERATOR_BEGIN v1» /
+«# CPS_GENERATOR_END v1» — это контракт между двумя файлами, а не догадка
+по кавычкам. Для awg2 старее v0.7.9 остались прежние эвристики, а любой
+извлечённый блок проверяется compile() перед запуском.
+
 Контракт генератора (как в awg2):
     python3 -c "<код>" <profile> [<domain>] [--only-i1]
     profile ∈ {tls, dns, sip, quic}
@@ -14,15 +19,26 @@ cps.py — генерация I1 (CPS-мимикрия) тем же кодом, 
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
 import subprocess
 
+log = logging.getLogger("awgbot.cps")
+
 AWG2_BIN = shutil.which("awg2") or "/usr/local/bin/awg2"
 
 # профили, которые поддерживает CPS-генератор awg2
 PROFILES = ("tls", "dns", "sip", "quic")
+
+# Якоря, которые awg2 (v0.7.9+) ставит вокруг генератора специально для нас.
+# Версия в маркере поднимается вместе с несовместимым изменением контракта
+# вывода — тогда старый бот честно не найдёт блок вместо генерации мусора.
+_MARKER_RE = re.compile(
+    r"# CPS_GENERATOR_BEGIN v1\b.*?^_CPS_GENERATOR='\n(.*?)\n'\n# CPS_GENERATOR_END v1\b",
+    re.S | re.M,
+)
 
 _cached_code: str | None = None
 _cache_mtime: float = 0.0
@@ -48,17 +64,32 @@ def _extract_generator() -> str | None:
     except OSError:
         return None
 
-    # _CPS_GENERATOR='...многострочный python...'
-    # значение в одинарных кавычках; берём до закрывающей одиночной кавычки,
-    # стоящей в начале строки (как оформлено в awg2).
-    m = re.search(r"_CPS_GENERATOR='\n(.*?)\n'\n", text, re.S)
+    # Порядок важен: сначала явные якоря awg2 (v0.7.9+), они не зависят от
+    # оформления кавычек; затем — старые эвристики, чтобы бот продолжал
+    # работать с уже установленными на серверах версиями awg2 без маркеров.
+    m = _MARKER_RE.search(text)
+    if not m:
+        # _CPS_GENERATOR='...многострочный python...'
+        # значение в одинарных кавычках; берём до закрывающей одиночной кавычки,
+        # стоящей в начале строки (как оформлено в awg2).
+        m = re.search(r"_CPS_GENERATOR='\n(.*?)\n'\n", text, re.S)
     if not m:
         # запасной вариант: до строки, состоящей только из закрывающей кавычки
         m = re.search(r"_CPS_GENERATOR='(.*?)'\s*$", text, re.S | re.M)
     if not m:
+        log.warning("CPS: в %s не найден блок _CPS_GENERATOR — I1 генерироваться не будет", AWG2_BIN)
         return None
 
-    _cached_code = m.group(1)
+    code = m.group(1)
+    # Захват мог зацепить лишнее (чужая кавычка, обрезанный файл). Выполнять
+    # такой код нельзя: лучше остаться без мимикрии, чем скормить python мусор.
+    try:
+        compile(code, "<awg2:_CPS_GENERATOR>", "exec")
+    except SyntaxError as exc:
+        log.warning("CPS: блок из %s не компилируется (%s) — I1 отключён", AWG2_BIN, exc)
+        return None
+
+    _cached_code = code
     _cache_mtime = mtime
     return _cached_code
 
