@@ -347,7 +347,7 @@ sudo journalctl -u awg-bot -f       # живые логи
 - **Текст** — Клиенты → 5 для больших конфигов (с I1–I5) → копируй в буфер
 - **Файл** — `Добавить туннель → Из файла` → передай `/root/<имя>_awg2.conf` через scp
 
-[**AmneziaWG3.0**](https://github.com/amnezia-vpn/amneziawg-android/actions/runs/31790249876) — официальное приложение протокола AmneziaWG:
+[**AmneziaWG3.0**](https://github.com/amnezia-vpn/amneziawg-android/actions/) — официальное приложение протокола AmneziaWG:
 - [**Android**](https://play.google.com/store/apps/details?id=org.amnezia.awg)
 - [**iOS**](https://apps.apple.com/app/amneziawg/id6478942365)
 - [**Windows**](https://github.com/amnezia-vpn/amneziawg-windows-client/releases/tag/2.0.0)
