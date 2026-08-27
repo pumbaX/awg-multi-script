@@ -81,8 +81,14 @@ def _is_offline(p: core.Peer) -> bool:
     return (time.time() - p.last_handshake) >= OFFLINE_AFTER
 
 
-async def monitor_loop(bot, admin_ids: set[int]) -> None:
-    """Бесконечный цикл мониторинга. Запускается как фоновая asyncio-задача."""
+async def monitor_loop(bot, admins_src) -> None:
+    """
+    Бесконечный цикл мониторинга. Запускается как фоновая asyncio-задача.
+
+    admins_src — набор ID получателей либо функция, возвращающая такой набор.
+    Функция нужна, чтобы приглашённый админ начал получать уведомления сразу,
+    без перезапуска бота.
+    """
     log.info("Мониторинг активности запущен (маркер %s, порог %d мин)",
              core.MONITOR_TAG, OFFLINE_AFTER // 60)
     state = _load_state()
@@ -93,6 +99,12 @@ async def monitor_loop(bot, admin_ids: set[int]) -> None:
 
     while True:
         try:
+            try:
+                admin_ids = admins_src() if callable(admins_src) else admins_src
+            except Exception as e:
+                log.warning("Не смог получить список админов: %s", e)
+                admin_ids = set()
+
             # 0) применяем истёкшие сроки (блокируем просроченных)
             try:
                 blocked = await asyncio.to_thread(core.enforce_expirations)
