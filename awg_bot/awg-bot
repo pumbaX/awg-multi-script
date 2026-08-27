@@ -3,13 +3,25 @@
 # Ставится в /usr/local/bin/awg-bot. Запуск: sudo awg-bot
 set -euo pipefail
 
-VERSION="2.1.4"
+VERSION="2.1.5"
 
 # ── откуда тянуть обновления (по аналогии с awg2 UPDATE_URL) ──
 # Можно переопределить в /etc/awg-bot.conf строкой:  REPO_URL=https://github.com/USER/REPO
 # Код бота лежит в подпапке awg_bot репозитория awg-multi-script
 # (там же, где сам awg2.sh). Структура подпапки: awgbot/, run.py, requirements.txt, ...
-DEFAULT_REPO_URL="https://github.com/pumbaX/awg-multi-script"
+#
+# Канал обновлений — тот же, что у awg2 (см. шапку awg2.sh):
+#   stable — основной репозиторий, оттуда обновляются все по умолчанию;
+#   beta   — ранние сборки, могут быть сырыми.
+# Канал хранится в /etc/awg-bot.conf строкой UPDATE_CHANNEL=, а REPO_URL при
+# переключении переписывается на репозиторий канала: так и клонирование здесь,
+# и сравнение версий в самом боте (core.py читает REPO_URL) смотрят в одно место.
+UPDATE_REPO_STABLE="https://github.com/pumbaX/awg-multi-script"
+UPDATE_REPO_BETA="https://github.com/genaRijoff/awg-multi-script"
+# Канал awg2 — им пользуемся, пока у бота свой канал не выбран явно: бот и
+# скрипт должны обновляться из одного репозитория, иначе они разъедутся.
+AWG2_CHANNEL_FILE="/var/lib/awg2/channel"
+DEFAULT_REPO_URL="$UPDATE_REPO_STABLE"
 # Подпапка с кодом бота внутри репо (пусто = корень репо).
 # Переопределяется строкой REPO_SUBDIR=... в /etc/awg-bot.conf
 DEFAULT_REPO_SUBDIR="awg_bot"
@@ -44,6 +56,70 @@ get_repo_subdir() {
   local s=""
   [[ -f "$CONF" ]] && s=$(grep -m1 '^REPO_SUBDIR=' "$CONF" 2>/dev/null | cut -d= -f2- | tr -d '"'"'"' ' || true)
   echo "${s:-$DEFAULT_REPO_SUBDIR}"
+}
+
+# ── Канал обновлений ──
+# Приводит адрес репозитория к виду github.com/user/repo — чтобы сравнивать
+# https/git-варианты, с .git и завершающим слэшем.
+norm_repo() {
+  local u="${1,,}"
+  u="${u#https://}"; u="${u#http://}"; u="${u#git@}"
+  u="${u%/}"; u="${u%.git}"; u="${u%/}"
+  u="${u/://}"
+  echo "$u"
+}
+
+channel_repo() {
+  [[ "${1:-stable}" == "beta" ]] && echo "$UPDATE_REPO_BETA" || echo "$UPDATE_REPO_STABLE"
+}
+
+channel_label() {
+  [[ "${1:-stable}" == "beta" ]] && echo "бета" || echo "стабильный"
+}
+
+# Канал бота: явная настройка → вывод из REPO_URL → канал awg2 → stable.
+channel_read() {
+  local ch="" url=""
+  if [[ -f "$CONF" ]]; then
+    ch=$(grep -m1 '^UPDATE_CHANNEL=' "$CONF" 2>/dev/null | cut -d= -f2- | tr -d '"'"'"' ' || true)
+    [[ "$ch" == "beta" || "$ch" == "stable" ]] && { echo "$ch"; return 0; }
+    url=$(grep -m1 '^REPO_URL=' "$CONF" 2>/dev/null | cut -d= -f2- | tr -d '"'"'"' ' || true)
+    if [[ -n "$url" ]]; then
+      # бота ставил awg2 с бета-канала — REPO_URL уже указывает на бета-репозиторий
+      [[ "$(norm_repo "$url")" == "$(norm_repo "$UPDATE_REPO_BETA")" ]] && { echo "beta"; return 0; }
+      echo "stable"; return 0
+    fi
+  fi
+  if [[ -f "$AWG2_CHANNEL_FILE" ]]; then
+    ch=$(tr -d '[:space:]' < "$AWG2_CHANNEL_FILE" 2>/dev/null || true)
+    [[ "$ch" == "beta" ]] && { echo "beta"; return 0; }
+  fi
+  echo "stable"
+}
+
+# true — REPO_URL указывает на репозиторий, которого нет среди каналов (форк).
+# Такой адрес переключение канала перезапишет, поэтому о нём предупреждаем.
+channel_repo_is_custom() {
+  local url=""
+  [[ -f "$CONF" ]] || return 1
+  url=$(grep -m1 '^REPO_URL=' "$CONF" 2>/dev/null | cut -d= -f2- | tr -d '"'"'"' ' || true)
+  [[ -z "$url" ]] && return 1
+  local n; n=$(norm_repo "$url")
+  [[ "$n" == "$(norm_repo "$UPDATE_REPO_STABLE")" || "$n" == "$(norm_repo "$UPDATE_REPO_BETA")" ]] && return 1
+  return 0
+}
+
+channel_set() {
+  local ch="$1" repo
+  [[ "$ch" == "beta" || "$ch" == "stable" ]] || { err "Канал бывает stable или beta"; return 1; }
+  repo=$(channel_repo "$ch")
+  touch "$CONF" 2>/dev/null || { err "Нет доступа к ${CONF}"; return 1; }
+  chmod 600 "$CONF"
+  sed -i '/^UPDATE_CHANNEL=/d;/^REPO_URL=/d' "$CONF" || { err "Не смог записать ${CONF}"; return 1; }
+  { echo "UPDATE_CHANNEL=${ch}"; echo "REPO_URL=${repo}"; } >> "$CONF"
+  ok "Канал обновлений бота: $(channel_label "$ch") ${D}(${repo})${N}"
+  [[ -n "$(get_local_src)" ]] &&     warn "Но код берётся из локального каталога — канал заработает после «awg-bot src --github»"
+  return 0
 }
 
 # Проверяет, что в каталоге есть файлы бота. Возвращает 0/1.
@@ -127,7 +203,7 @@ resolve_src() {
 clone_repo() {
   local tmp="$1" url subdir src
   url=$(get_repo_url); subdir=$(get_repo_subdir)
-  info "Клонирую ${url}…" >&2
+  info "Клонирую ${url} ${D}(канал: $(channel_label "$(channel_read)"))${N}…" >&2
   if ! git clone --depth 1 "$url" "$tmp/repo" >/dev/null 2>&1; then
     err "git clone не удался. Проверь REPO_URL в ${CONF} или доступ к сети." >&2
     return 1
@@ -180,7 +256,7 @@ do_reinstall() {
   "$DEST/venv/bin/pip" install -q -r "$DEST/requirements.txt"
   # токен/ID
   read -rp "$(echo -e "${C}  Токен бота (@BotFather): ${N}")" BOT_TOKEN
-  read -rp "$(echo -e "${C}  Твой Telegram ID (@userinfobot): ${N}")" ADMIN_ID
+  read -rp "$(echo -e "${C}  Твой Telegram ID (@userinfobot; несколько — через запятую): ${N}")" ADMIN_ID
   touch "$CONF"; chmod 600 "$CONF"
   sed -i '/^BOT_TOKEN=/d;/^ADMIN_ID=/d' "$CONF"
   { echo "BOT_TOKEN=${BOT_TOKEN}"; echo "ADMIN_ID=${ADMIN_ID}"; } >> "$CONF"
@@ -240,6 +316,8 @@ do_status() {
   systemctl is-active --quiet "$SERVICE" && echo -e "  Сервис: ${G}● активен${N}" || echo -e "  Сервис: ${R}○ остановлен${N}"
   systemctl is-enabled --quiet "$SERVICE" 2>/dev/null && echo -e "  Автозапуск: ${G}включён${N}" || echo -e "  Автозапуск: ${Y}выключен${N}"
   echo -e "  Версия awg-bot: ${W}${VERSION}${N}"
+  local _ch; _ch=$(channel_read)
+  echo -e "  Канал обновлений: ${W}$(channel_label "$_ch")${N} ${D}($(channel_repo "$_ch"))${N}"
   echo -e "  Код: ${D}${DEST}${N}"
   local _ls; _ls=$(get_local_src)
   if [[ -n "$_ls" ]]; then
@@ -375,9 +453,54 @@ do_src_menu() {
   esac
 }
 
+# ── 8) Канал обновлений ──
+do_channel_menu() {
+  hdr "Канал обновлений бота"
+  local cur target; cur=$(channel_read); target="beta"
+  [[ "$cur" == "beta" ]] && target="stable"
+  echo -e "  Сейчас: ${W}$(channel_label "$cur")${N} ${D}($(channel_repo "$cur"))${N}"
+  if channel_repo_is_custom; then
+    warn "REPO_URL в ${CONF} указывает на свой репозиторий —"
+    warn "переключение канала перезапишет этот адрес"
+  fi
+  [[ -n "$(get_local_src)" ]] && \
+    warn "Код сейчас берётся из локального каталога — канал ни на что не влияет"
+  echo ""
+  if [[ "$target" == "beta" ]]; then
+    echo -e "  ${D}Бета — ранние сборки из ${UPDATE_REPO_BETA}.${N}"
+    echo -e "  ${D}Они не проходят полный цикл проверки: на боевом сервере — на свой риск.${N}"
+  else
+    echo -e "  ${D}Стабильный канал — основной репозиторий ${UPDATE_REPO_STABLE}.${N}"
+    echo -e "  ${D}Если стоит бета-версия новее стабильной, обновление её не тронет.${N}"
+  fi
+  echo ""
+  echo -e "  ${C}1)${N} Переключить на «$(channel_label "$target")»"
+  echo -e "  ${C}0)${N} Отмена"
+  echo ""
+  local ch
+  read -rp "$(echo -e "${C}  Выбор [0-1]: ${N}")" ch
+  case "$ch" in
+    1)
+      if [[ "$target" == "beta" ]]; then
+        read -rp "$(echo -e "${Y}  Точно на бета-канал? (введи yes): ${N}")" c
+        [[ "$c" == "yes" ]] || { warn "Отмена — канал прежний"; return 0; }
+      fi
+      channel_set "$target" && info "Дальше: пункт 2 «Обновить» — код приедет из нового канала"
+      ;;
+    *) warn "Отмена" ;;
+  esac
+}
+
 show_menu() {
   clear 2>/dev/null || true
   hdr "awgToolza Bot — управление  (v${VERSION})"
+  echo ""
+  local _ch; _ch=$(channel_read)
+  if [[ "$_ch" == "beta" ]]; then
+    echo -e "  Канал обновлений: ${Y}бета${N} ${D}($(channel_repo beta))${N}"
+  else
+    echo -e "  Канал обновлений: ${G}стабильный${N} ${D}($(channel_repo stable))${N}"
+  fi
   echo ""
   echo -e "  ${C}1)${N} Переустановить (с нуля, спросит токен)"
   echo -e "  ${C}2)${N} Обновить (сохраняя токен и chat_id)"
@@ -386,6 +509,7 @@ show_menu() {
   echo -e "  ${C}5)${N} Логи (последние 50 строк)"
   echo -e "  ${C}6)${N} Удалить"
   echo -e "  ${C}7)${N} Источник кода (локальный каталог / GitHub)"
+  echo -e "  ${C}8)${N} Канал обновлений (стабильный / бета)"
   echo -e "  ${C}0)${N} Выход"
   echo ""
 }
@@ -404,6 +528,14 @@ done
 case "${1:-}" in
   reinstall) do_reinstall "$_once_src"; exit 0 ;;
   update)    do_update "$_once_src";    exit 0 ;;
+  channel)
+    # awg-bot channel                  → показать текущий канал
+    # awg-bot channel stable|beta      → переключить
+    if [[ -z "${2:-}" ]]; then
+      _ch=$(channel_read); echo "$_ch $(channel_repo "$_ch")"
+      exit 0
+    fi
+    channel_set "$2"; exit $? ;;
   src)
     # awg-bot src                → показать текущий источник
     # awg-bot src <каталог>      → запомнить локальный источник
@@ -437,7 +569,7 @@ esac
 
 while true; do
   show_menu
-  read -rp "$(echo -e "${C}  Выбор [0-7]: ${N}")" CH
+  read -rp "$(echo -e "${C}  Выбор [0-8]: ${N}")" CH
   case "$CH" in
     1) do_reinstall ;;
     2) do_update ;;
@@ -446,6 +578,7 @@ while true; do
     5) do_logs ;;
     6) do_uninstall; exit 0 ;;
     7) do_src_menu ;;
+    8) do_channel_menu ;;
     0) exit 0 ;;
     *) warn "Неверный выбор" ;;
   esac

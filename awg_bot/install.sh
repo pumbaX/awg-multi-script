@@ -61,7 +61,7 @@ chmod +x /usr/local/bin/awg-bot.py
 if [[ ! -f "$CONF" ]] || ! grep -q '^BOT_TOKEN=' "$CONF" 2>/dev/null; then
   echo ""
   read -rp "$(echo -e "${C}  Вставь токен бота от @BotFather: ${N}")" BOT_TOKEN
-  read -rp "$(echo -e "${C}  Твой Telegram ID (узнать у @userinfobot): ${N}")" ADMIN_ID
+  read -rp "$(echo -e "${C}  Твой Telegram ID (@userinfobot; несколько — через запятую): ${N}")" ADMIN_ID
   # сохраняем, не затирая возможные awg2-настройки уведомлений
   touch "$CONF"; chmod 600 "$CONF"
   sed -i '/^BOT_TOKEN=/d;/^ADMIN_ID=/d' "$CONF"
