@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.18"
+VERSION="v0.7.27"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -335,6 +335,78 @@ log_info()  { _log "INFO"  "$@"; }
 log_warn()  { _log "WARN"  "$@"; }
 log_err()   { _log "ERROR" "$@"; }
 
+# ── Компактный вывод длинных шагов ─────────────────────────
+# Установка тянет apt, git, make и dkms. Каждый из них выдаёт сотни строк, в
+# которых тонет и порядок шагов, и настоящая ошибка: на экране остаётся хвост
+# распаковки пакетов, а не место, где сломалось. run_step прячет весь вывод в
+# $INSTALL_LOG и оставляет одну строку на шаг, а при провале показывает хвост
+# лога — то есть ровно то, что нужно.
+#
+# Полосы выполнения тут быть не может: ни apt, ни dkms не отдают долю
+# сделанного в машиночитаемом виде, а рисовать проценты «на глаз» — врать.
+# Поэтому индикатор честный: крутилка, пока шаг идёт, и его длительность после.
+INSTALL_LOG="/var/log/awg2-install.log"
+
+# Кадры крутилки — ASCII: вывод читают и через PuTTY, и через веб-консоль
+# хостера, где UTF-8 настроен не всегда.
+_SPIN_FRAMES='-\|/'
+_RUN_STEP_PID=""
+
+# Ctrl+C во время шага не должен оставить apt или dkms работать в фоне.
+_run_step_abort() {
+  [[ -n "${_RUN_STEP_PID:-}" ]] && kill "$_RUN_STEP_PID" 2>/dev/null
+  printf '\r\033[K'
+  echo ""
+  warn "Прервано пользователем"
+  exit 130          # общую уборку сделает EXIT-трап
+}
+
+# run_step "Название шага" команда [аргументы...]
+# Код возврата — команды. В терминал уходит только строка результата.
+run_step() {
+  local title="$1"; shift
+  # Хвост при провале показываем только за ЭТОТ шаг: лог общий на всю
+  # установку, и «последние 15 строк» иначе приезжают из предыдущего шага.
+  local from_line=0
+  [[ -f "$INSTALL_LOG" ]] && from_line=$(wc -l < "$INSTALL_LOG" 2>/dev/null || echo 0)
+  printf '[%s] [STEP] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$title" >> "$INSTALL_LOG"
+
+  local t0=$SECONDS rc=0
+  if [[ -t 1 ]]; then
+    # stdin закрываем: за спрятанным выводом никто не должен ждать ответа
+    # Подоболочка обязательна: шаги сборки делают cd, и без неё каталог
+    # менялся бы у самого скрипта.
+    ( "$@" ) </dev/null >>"$INSTALL_LOG" 2>&1 &
+    _RUN_STEP_PID=$!
+    trap '_run_step_abort' INT
+    local i=0
+    while kill -0 "$_RUN_STEP_PID" 2>/dev/null; do
+      printf '\r  %b%s%b %s ' "$C" "${_SPIN_FRAMES:i++%4:1}" "$N" "$title"
+      sleep 0.2
+    done
+    wait "$_RUN_STEP_PID" || rc=$?
+    trap - INT
+    _RUN_STEP_PID=""
+    printf '\r\033[K'
+  else
+    ( "$@" ) </dev/null >>"$INSTALL_LOG" 2>&1 || rc=$?
+  fi
+
+  local secs=$((SECONDS - t0))
+  if (( rc == 0 )); then
+    printf '  %b√%b %s %b(%dс)%b\n' "$G" "$N" "$title" "$D" "$secs" "$N"
+    return 0
+  fi
+
+  printf '  %b×%b %s %b(код %d, %dс)%b\n' "$R" "$N" "$title" "$D" "$rc" "$secs" "$N"
+  echo ""
+  warn "Последние строки шага:"
+  tail -n "+$((from_line + 2))" "$INSTALL_LOG" 2>/dev/null | tail -n 15 | sed 's/^/    /'
+  echo ""
+  info "Полный вывод шага: $INSTALL_LOG"
+  return "$rc"
+}
+
 # Универсальный пул — домены работают И в РФ (не в реестре РКН), И в мире.
 # Используются как для SNI/мимикри TLS, так и для QUIC/SIP/DTLS.
 # RU и WORLD массивы оставлены идентичными — choose_region сохранён для совместимости
@@ -388,6 +460,25 @@ QUIC_DOMAINS_RU=(
   # РФ-домены с подтверждённой поддержкой HTTP/3
   "ozon.ru"
 )
+
+# РЕЗЕРВНЫЙ пул доменов для автогенерации I1-I5.
+#
+# Прежний список (ya.ru, mail.ru, vk.com, ozon.ru, gosuslugi.ru, ...) взят из
+# payloadGen и одинаков у всех, кто пользуется тем же генератором. Одинаковый
+# у всех набор SNI/QNAME — это уже не маскировка, а признак: DPI учится по нему
+# быстрее всего, и «плохой домен» ломает подключение ещё до вопросов о скорости.
+# Поэтому здесь инфраструктурные хосты (CDN, статика, телеметрия): фоновый
+# трафик к ним идёт постоянно, а страничного профиля у них нет.
+#
+# Пул именно резервный. Свой домен пользователя всегда лучше — меню домена
+# предлагает его первым; список ниже используется, только если человек выбрал
+# автоподбор, и перед выдачей проверяется на доступность (scan_pool).
+CPS_RU_DOMAINS=(
+  "yastatic.net" "mc.yandex.ru" "avatars.mds.yandex.net"
+  "ok.ru" "st.mycdn.me" "vk.ru"
+  "kinopoisk.ru" "hh.ru" "2gis.ru" "lenta.ru" "mos.ru" "citilink.ru"
+)
+
 
 # WORLD — универсальный пул (мировые сайты без РФ-специфики)
 TLS_DOMAINS_WORLD=(
@@ -574,717 +665,1752 @@ select_random_domain() {
   fi
 }
 
-# Единый Python генератор для всех профилей мимикрии
-# [PATCHED v3] TLS+QUIC из payloadGen: GREASE, Chrome-fingerprint, реальное
-# шифрование QUIC (RFC9001+fallback), лёгкий TLS-паддинг (доставка I5),
-# --only-i1 распознаётся в любой позиции argv. Контракт вывода не изменён.
+# Генератор I1-I5 — порт payloadGen (github.com/Sketchystan1/payloadGen).
+# Пакеты собираются той же логикой, что и в веб-версии генератора: структура,
+# порядок полей и порядок TLS-расширений (то есть отпечаток JA3/JA4) повторены
+# байт в байт, отличается только источник случайности.
 #
-# [v4] Компактный режим по умолчанию. I1-I5 уходят перед КАЖДЫМ рукопожатием,
-# поэтому лишние сотни байт — это и трафик, и время установки, и раздутый
-# клиентский конфиг (плотный QR). Урезано только то, что не ломает разбор
-# пакета его же протоколом:
-#   TLS  ~340 → ~220 Б: пустой legacy_session_id (разрешён TLS 1.3), без
-#        padding-расширения и Chrome-специфики (ALPS, compress_certificate,
-#        status_request, SCT), без legacy-шифров. SNI, key_share x25519,
-#        supported_versions, sigalgs, ALPN и GREASE на месте.
-#   SIP  ~540 → ~390 Б: остаётся обязательный минимум RFC 3261 плюс Contact и
-#        Expires; выброшены необязательные Allow/Supported и длинный User-Agent.
-#   QUIC ~1800 → ~1500 Б суммарно: I1 остаётся 1200 Б — RFC 9000 §14.1 требует
-#        этого от любой клиентской датаграммы с Initial, короткий Initial
-#        сервер обязан отбросить, а для DPI это готовая аномалия. Вместо
-#        второго Initial (был 300-600 Б, то есть невалидный) идёт 1-RTT пакет.
-#   DNS  без изменений — 39-46 Б и так минимум.
-# AWG_CPS_FULL=1 возвращает прежние размеры (флаг --full генератору).
+# Что даёт порт по сравнению с прежним движком:
+#   • профилей мимикрии девять вместо четырёх: quic, curl_quic, dns, stun,
+#     webrtc, sip, ntp, rtp, ssdp — все они настоящие UDP-протоколы;
+#   • профиль tls убран: TLS-записи поверх UDP не существует (по UDP это DTLS
+#     с другим форматом), поэтому старое имя tls теперь алиас на quic;
+#   • QUIC Initial шифруется по RFC 9001, а у curl_quic ClientHello уезжает
+#     внутри ECH (HPKE, RFC 9180) — наружу видно только public_name;
+#   • строки I1-I5 отдаются чистым hex, как в веб-версии, без модификаторов.
 #
-# CPS_GENERATOR_BEGIN v1 — якорь для awg_bot/awgbot/cps.py: бот вырезает тело
+# Зависимость python3-cryptography опциональна: без неё QUIC уходит без
+# шифрования, ECH отключается, и генератор пишет об этом в stderr.
+#
+# CPS_GENERATOR_BEGIN v2 — якорь для awg_bot/awgbot/cps.py: бот вырезает тело
 # генератора из установленного awg2, чтобы не дублировать криптологику у себя.
 # Маркеры BEGIN/END не удалять и не переименовывать; при несовместимом
 # изменении контракта вывода поднимать номер версии в обоих маркерах.
 _CPS_GENERATOR='
-import sys, secrets, struct, random, signal
+import sys, os, struct, secrets, signal, time
+
 try:
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # чистое поведение при обрыве пайпа
 except Exception:
     pass
 
-# == Utilities ==
+# ================================================================
+# Порт payloadGen (github.com/Sketchystan1/payloadGen) на Python.
+# Соответствие файлам оригинала:
+#   app.js       -> CONFIG, DOMAIN_POOL, chunk_payload, формат вывода
+#   generators.js-> генераторы пакетов и сборка TLS ClientHello
+#   crypto.js    -> HPKE (ECH) и защита QUIC Initial (RFC 9001)
+# Структура пакетов и порядок полей повторяют оригинал байт в байт;
+# отличается только источник случайности (secrets вместо WebCrypto).
+# ================================================================
+
 _WARNED = set()
+
 def _warn_once(msg):
-    # Один и тот же дефект не должен засорять вывод: генератор строит до 5
-    # пакетов за запуск, а причина деградации у них общая.
+    # Генератор строит до 5 пакетов за запуск, причина деградации у них общая:
+    # один и тот же дефект не должен засорять stderr пять раз.
     if msg in _WARNED:
         return
     _WARNED.add(msg)
     sys.stderr.write("[CPS] WARN: %s\n" % msg)
 
-def rh(n):  return secrets.token_bytes(n)
-def ri(a, b):
-    if a > b: a, b = b, a
+# == Utilities (generators.js: randomBytes/u16/u24/u32/concatBytes) ==
+def rb(n):
+    return secrets.token_bytes(max(0, int(n)))
+
+def zeros(n):
+    return b"\x00" * max(0, int(n))
+
+def ri(max_exclusive):
+    # randomIntExclusive: 0 <= x < max_exclusive
+    if max_exclusive <= 1:
+        return 0
+    return secrets.randbelow(int(max_exclusive))
+
+def rr(a, b):
+    # включительный диапазон [a, b]
+    if a > b:
+        a, b = b, a
     return a + secrets.randbelow(b - a + 1)
-def rc(lst): return lst[secrets.randbelow(len(lst))]
-def u16(v): return struct.pack(">H", v & 0xFFFF)
-def u32(v): return struct.pack(">I", v & 0xFFFFFFFF)
-def u24(v): return struct.pack(">I", v)[1:]
-def to_cps(raw): return "<b 0x%s>" % raw.hex()
 
-def to_cps_parts(parts):
-    """
-    Собирает цепочку I-пакета из кусков. Кусок — это либо bytes (уходит как
-    <b 0x..>), либо ("r"|"rc"|"rd", n) — модификатор, который КЛИЕНТ заполняет
-    заново при каждой отправке: <r> случайными байтами, <rc> латинскими
-    буквами, <rd> цифрами.
+def rc(items):
+    return items[ri(len(items))]
 
-    Зачем: пакет, целиком записанный как <b 0x..>, уходит байт в байт одинаковым
-    перед каждым рукопожатием — это межсессионная сигнатура, ровно то, от чего
-    мимикрия и защищает. Модификаторы делают его каждый раз другим, не меняя ни
-    длины, ни структуры, и попутно резко укорачивают строку в конфиге: <r 900>
-    вместо 1800 hex-символов.
+def ru32():
+    return int.from_bytes(rb(4), "big")
 
-    Теги b/r/rc/rd понимают оба известных движка (amneziawg-go device/obf.go и
-    ядерный модуль src/junk.c). <c> есть только у ядра, <d>/<ds>/<dz> только у
-    go, поэтому здесь их нет: незнакомый тег отвергается вместе со всем пакетом,
-    а не сам по себе. Порядок кусков сохраняется (jp_spec_setup собирает список
-    в обратном порядке вставки, то есть в порядке записи).
-    """
-    out = []
-    for p in parts:
-        if isinstance(p, tuple):
-            out.append("<%s %d>" % (p[0], p[1]))
-        elif p:
-            out.append("<b 0x%s>" % p.hex())
-    return "".join(out)
+def u16(v):
+    return struct.pack(">H", v & 0xFFFF)
 
+def u24(v):
+    return struct.pack(">I", v & 0xFFFFFF)[1:]
 
-# Смещение поля random в ClientHello: record(5) + handshake(4) + legacy_version(2).
-# 32 байта, которые настоящий клиент разыгрывает на каждое соединение.
-_TLS_RANDOM_OFFSET = 11
-_TLS_RANDOM_LEN = 32
+def u32(v):
+    return struct.pack(">I", v & 0xFFFFFFFF)
 
-def tls_chain(domain=None):
-    pkt = gen_tls_clienthello(domain)
-    head = _TLS_RANDOM_OFFSET
-    tail = head + _TLS_RANDOM_LEN
-    return to_cps_parts([pkt[:head], ("r", _TLS_RANDOM_LEN), pkt[tail:]])
+def enc_text(s):
+    return str(s).encode("utf-8")
 
-def secure_shuffle(lst):
-    for i in range(len(lst) - 1, 0, -1):
-        j = secrets.randbelow(i + 1)
-        lst[i], lst[j] = lst[j], lst[i]
-    return lst
+def to_hex(b):
+    return b.hex()
 
-def rand_private_ip():
-    kind = secrets.randbelow(3)
-    if kind == 0:
-        return "10.%d.%d.%d" % (ri(1, 254), ri(0, 255), ri(2, 254))
-    elif kind == 1:
-        return "172.%d.%d.%d" % (ri(16, 31), ri(0, 255), ri(2, 254))
-    else:
-        return "192.168.%d.%d" % (ri(0, 255), ri(2, 254))
+def read_u16(b, off):
+    return (b[off] << 8) | b[off + 1]
 
-def _weighted_choice(items, weights):
-    total = sum(weights)
-    r = secrets.randbelow(total)
-    acc = 0
-    for item, w in zip(items, weights):
-        acc += w
-        if r < acc:
-            return item
-    return items[-1]
+def quic_varint(value):
+    # encodeQuicVarInt (RFC 9000 §16)
+    if value < 0:
+        raise ValueError("QUIC varint cannot encode a negative value")
+    if value < 64:
+        return bytes([value])
+    if value < 16384:
+        return bytes([0x40 | ((value >> 8) & 0x3F), value & 0xFF])
+    if value < 1073741824:
+        return bytes([0x80 | ((value >> 24) & 0x3F), (value >> 16) & 0xFF,
+                      (value >> 8) & 0xFF, value & 0xFF])
+    raise ValueError("QUIC value is too large to encode in this utility")
 
-# == Args ==
-# profile = argv[1]; --only-i1 может прийти в любой позиции (Тулза шлёт argv[3],
-# бот шлёт argv[2] без domain). Domain = первый позиционный аргумент после
-# profile, который не является флагом --only-i1.
-ALLOWED_PROFILES = ("quic", "sip", "dns", "tls")
-_args = sys.argv[1:]
-ONLY_I1 = "--only-i1" in _args
-# Компактный режим — по умолчанию: пакеты короче, но остаются валидными для
-# своего протокола. --full возвращает прежние «толстые» пакеты.
-COMPACT = "--full" not in _args
-_pos = [a for a in _args if not a.startswith("--")]
-PROFILE = _pos[0] if len(_pos) > 0 else "dns"
-DOMAIN  = _pos[1] if len(_pos) > 1 else ""
+def crc32_stun(data):
+    # crc32 из generators.js (полином 0xEDB88320, тот же, что в zlib)
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xEDB88320 if crc & 1 else crc >> 1
+    return (~crc) & 0xFFFFFFFF
 
-if PROFILE not in ALLOWED_PROFILES:
-    sys.stderr.write("[CPS] WARN: unknown profile %s, fallback=dns\n" % PROFILE)
-    PROFILE = "dns"
+def ntp_timestamp(epoch_seconds=None):
+    # encodeNtpTimestamp: секунды с 1900 + дробная часть в 2^-32
+    ms = int((epoch_seconds if epoch_seconds is not None else time.time()) * 1000)
+    seconds = (ms // 1000) + 2208988800
+    fraction = int(((ms % 1000) / 1000.0) * 0x100000000) & 0xFFFFFFFF
+    return u32(seconds) + u32(fraction)
 
-DOMAIN_POOL = [
-    "google.com","github.com","gitlab.com","stackoverflow.com",
-    "microsoft.com","apple.com","amazon.com",
-    "mozilla.org","cdn.jsdelivr.net","unpkg.com","pypi.org",
-    "ubuntu.com","debian.org","hetzner.com","ovhcloud.com",
-    "digitalocean.com",
-]
-if not DOMAIN:
-    DOMAIN = rc(DOMAIN_POOL)
+def random_private_ipv4():
+    pools = [
+        [10, ri(256), ri(256), 10 + ri(200)],
+        [172, 16 + ri(16), ri(256), 10 + ri(200)],
+        [192, 168, ri(256), 10 + ri(200)],
+    ]
+    return ".".join(str(x) for x in rc(pools))
 
-SIP_POOL = [
-    "sipgate.de","sip.ovh.net","sip.voipfone.co.uk","sip.linphone.org",
-    "sip.zadarma.com","sip.dus.net","sip.easybell.de","sip.1und1.de",
-    "sip.voys.nl","sip.antisip.com","sip.iptel.org","sip.voipgate.com",
+# == Константы (app.js: CONFIG / CHROME_BROWSER_DATA, generators.js: пулы) ==
+DEFAULT_HOST = "yastatic.net"          # запасной хост, если домен не передали
+DEFAULT_MTU = 1280                     # CONFIG.defaultMtu
+MAX_OUTPUT_LINES = 5                   # CONFIG.maxOutputLines (I1-I5)
+
+# Резервный пул на случай, когда домен не передали (например, вызов из бота).
+# Список payloadGen (ya.ru, gosuslugi.ru, vk.com, ...) отсюда убран намеренно:
+# он одинаков у всех пользователей того генератора, поэтому сам является
+# признаком. Здесь — инфраструктурные хосты с постоянным фоновым трафиком.
+# Тот же список продублирован в awg2 как CPS_RU_DOMAINS, где он ещё и
+# проверяется на доступность перед генерацией.
+RU_DOMAIN_POOL = [
+    "yastatic.net", "mc.yandex.ru", "avatars.mds.yandex.net",
+    "ok.ru", "st.mycdn.me", "vk.ru",
+    "kinopoisk.ru", "hh.ru", "2gis.ru", "lenta.ru", "mos.ru", "citilink.ru",
 ]
 
-# GREASE values (RFC 8701) - Chrome inserts these to keep middleboxes honest
+CHROME_DEFAULT_VERSION = "147.0.7727.50"   # CHROME_BROWSER_DATA.defaultVersion
+
+SSDP_SEARCH_TARGETS = [
+    "ssdp:all",
+    "upnp:rootdevice",
+    "urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+    "urn:schemas-upnp-org:service:WANIPConnection:1",
+    "urn:schemas-upnp-org:device:MediaServer:1",
+]
+SSDP_USER_AGENTS = [
+    "Microsoft-Windows/10.0 UPnP/1.0 SSDP-Discovery/1.0",
+    "macOS/14.7.6 UPnP/1.1 ControlPoint/1.0",
+    "Linux/6.8 UPnP/1.1 Portable SDK for UPnP devices/1.14.18",
+]
+
+DNS_QUERY_TYPES = [0x0001, 0x001C, 0x0041]
+
+TWILIO_STUN_SERVERS = ["global.stun.twilio.com"]
+TWILIO_TURN_SERVERS = [
+    "global.turn.twilio.com", "de01-1.turn.twilio.com", "de01-2.turn.twilio.com",
+    "sg01-1.turn.twilio.com", "sg01-2.turn.twilio.com", "us1-1.turn.twilio.com",
+    "us1-2.turn.twilio.com", "us2-1.turn.twilio.com", "us2-2.turn.twilio.com",
+    "ie01-1.turn.twilio.com", "ie01-2.turn.twilio.com", "jp01-1.turn.twilio.com",
+    "jp01-2.turn.twilio.com", "au01-1.turn.twilio.com", "br01-1.turn.twilio.com",
+    "in01-1.turn.twilio.com",
+]
+TWILIO_TURN_USERNAME_PREFIXES = [
+    "a1b2c3d4e5f6g7h8i9j0", "1a2b3c4d5e6f7g8h9i0j",
+    "abcdef1234567890abcd", "1234567890abcdef1234",
+]
+TWILIO_REALM = "twilio.com"
+GOOGLE_STUN_SERVERS = [
+    "stun.l.google.com", "stun1.l.google.com", "stun2.l.google.com",
+    "stun3.l.google.com", "stun4.l.google.com", "stun.services.googleapis.com",
+    "stun.phonebox.google.com", "stun.stunprotocol.org",
+]
+CLOUDFLARE_WEBRTC_SERVERS = [
+    "turn.cloudflare.com", "webrtc.cloudflare.net",
+    "spectrum.cloudflare.com", "calls.cloudflare.com",
+]
+CLOUDFLARE_REALM = "cloudflare.com"
+META_WEBRTC_SERVERS = [
+    "turn.instagram.com", "stun.whatsapp.com", "edge-turn.whatsapp.com",
+    "turn-messenger.whatsapp.com", "star.c10r.facebook.com",
+    "turn.dnsalias.com", "edge-chat.facebook.com",
+]
+META_REALM = "facebook.com"
+
+SIP_USER_AGENTS = [
+    "Linphone/5.2.5 (belle-sip/5.3.90)", "Zoiper rv2.10.15-mod",
+    "MicroSIP/3.21.6", "baresip 3.8.0", "Blink 6.0.4 (Windows)",
+    "Asterisk PBX 20.7.0",
+]
+SIP_SERVER_NAMES = [
+    "Kamailio (5.8.1)", "OpenSIPS (3.5.1)", "Asterisk PBX (20.7.0)",
+    "FreeSWITCH (1.10.12)", "Yate SIP Router (7.0.0)",
+]
+SIP_DISPLAY_NAMES = [
+    "Alice Carter", "Bob Smith", "Support Desk", "Sales Queue",
+    "NOC Bridge", "Reception", "Operator", "Dispatch",
+]
+SIP_ACCEPT_LANGUAGES = [
+    "en", "en-US", "en-US,en;q=0.9",
+    "tr-TR,tr;q=0.9,en;q=0.7", "de-DE,de;q=0.8,en;q=0.6",
+]
+SIP_SUPPORTED_HEADERS = [
+    "replaces, outbound, path, timer",
+    "outbound, path, gruu, 100rel",
+    "timer, replaces, resource-priority",
+    "gruu, outbound, path, sec-agree",
+]
+SIP_ALLOW_HEADERS = [
+    "INVITE, ACK, CANCEL, OPTIONS, BYE, REFER, NOTIFY, INFO, MESSAGE, SUBSCRIBE",
+    "INVITE, ACK, CANCEL, OPTIONS, BYE, UPDATE, MESSAGE",
+    "INVITE, ACK, CANCEL, OPTIONS, BYE, PRACK, UPDATE",
+]
+SIP_ALLOW_EVENTS_HEADERS = [
+    "presence, message-summary, refer",
+    "dialog, presence, refer",
+    "presence, kpml, talk",
+]
+SIP_DOMAIN_PREFIXES = ["sip", "voip", "pbx", "edge", "gw", "proxy", "media", "trunk"]
+SIP_DOMAIN_BASES = ["biloxi", "atlanta", "voicehub", "carriernet", "softswitch",
+                    "callbridge", "telecloud", "voiplab"]
+SIP_DOMAIN_SUFFIXES = ["com", "net", "org", "io", "cloud"]
+SIP_LOCAL_PORTS = [5060, 5062, 5070, 5080, 5160]
+SIP_AUDIO_CODEC_PROFILES = [
+    {"payloads": ["0 PCMU/8000", "8 PCMA/8000", "96 opus/48000/2",
+                  "101 telephone-event/8000"], "formatList": "0 8 96 101"},
+    {"payloads": ["0 PCMU/8000", "18 G729/8000", "101 telephone-event/8000"],
+     "formatList": "0 18 101"},
+    {"payloads": ["8 PCMA/8000", "97 iLBC/8000", "101 telephone-event/8000"],
+     "formatList": "8 97 101"},
+]
+
+# QUIC v1 (RFC 9000/9001): версия на проводе и база первого байта Initial
+QUIC_WIRE_VERSION = 0x00000001
+QUIC_INITIAL_HEADER_BASE = 0xC0
+QUIC_V1_INITIAL_SALT = bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
+CURL_QUIC_PROFILE_ID = "curl_h3"
+
+# ================================================================
+# Криптография (порт crypto.js). Всё опционально: без python3-cryptography
+# генератор продолжает работать, но QUIC Initial уходит без шифрования,
+# а ECH — без реального HPKE. Об этом честно пишется в stderr.
+# ================================================================
+_CRYPTO_OK = True
+try:
+    import hmac as _hmac
+    import hashlib as _hashlib
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (
+        X25519PrivateKey, X25519PublicKey)
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+except Exception:
+    _CRYPTO_OK = False
+
+def crypto_available():
+    if not _CRYPTO_OK:
+        _warn_once("нет python3-cryptography: QUIC Initial уйдёт без шифрования, "
+                   "ECH — без HPKE. Ставится так: apt-get install -y python3-cryptography")
+    return _CRYPTO_OK
+
+def hkdf_extract(salt, ikm):
+    return _hmac.new(salt, ikm, _hashlib.sha256).digest()
+
+def hkdf_expand(prk, info, length):
+    # RFC 5869 HKDF-Expand на SHA-256
+    out = b""
+    block = b""
+    counter = 1
+    while len(out) < length:
+        block = _hmac.new(prk, block + info + bytes([counter]), _hashlib.sha256).digest()
+        out += block
+        counter += 1
+    return out[:length]
+
+def hkdf_expand_label(secret, label, context, length):
+    # RFC 8446 §7.1 HKDF-Expand-Label
+    label_bytes = enc_text("tls13 " + label)
+    info = u16(length) + bytes([len(label_bytes)]) + label_bytes + \
+           bytes([len(context)]) + context
+    return hkdf_expand(secret, info, length)
+
+def aes_gcm_encrypt(key, nonce, plaintext, aad):
+    return AESGCM(key).encrypt(nonce, plaintext, aad)
+
+def aes_ecb_encrypt_block(key, block):
+    enc = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+    return (enc.update(block) + enc.finalize())[:16]
+
+# -- HPKE (RFC 9180), режим base, DHKEM(X25519, HKDF-SHA256) --
+HPKE_VERSION_LABEL = b"HPKE-v1"
+HPKE_SUITE_PREFIX = b"HPKE"
+HPKE_KEM_PREFIX = b"KEM"
+HPKE_MODE_BASE = 0x00
+
+def _hpke_aead_params(aead_id):
+    if aead_id == 0x0001:
+        return 16, 12, 16     # AES-128-GCM
+    if aead_id == 0x0002:
+        return 32, 12, 16     # AES-256-GCM
+    raise ValueError("unsupported HPKE AEAD id: %s" % aead_id)
+
+def _hpke_labeled_extract(salt, suite_id, label, ikm):
+    return hkdf_extract(salt, HPKE_VERSION_LABEL + suite_id + enc_text(label) + ikm)
+
+def _hpke_labeled_expand(prk, suite_id, label, info, length):
+    return hkdf_expand(prk, u16(length) + HPKE_VERSION_LABEL + suite_id +
+                       enc_text(label) + info, length)
+
+def hpke_setup_base_sender(recipient_public_key, info, kem_id, kdf_id, aead_id):
+    """
+    Возвращает контекст отправителя: enc (эфемерный публичный ключ), key,
+    base_nonce. Порт hpkeSetupBaseSender из crypto.js.
+    """
+    if kem_id != 0x0020 or kdf_id != 0x0001:
+        raise ValueError("unsupported HPKE KEM/KDF: %s/%s" % (kem_id, kdf_id))
+    key_len, nonce_len, tag_len = _hpke_aead_params(aead_id)
+    suite_id = HPKE_SUITE_PREFIX + u16(kem_id) + u16(kdf_id) + u16(aead_id)
+    kem_suite_id = HPKE_KEM_PREFIX + u16(kem_id)
+
+    private_key = X25519PrivateKey.generate()
+    enc = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    shared = private_key.exchange(
+        X25519PublicKey.from_public_bytes(recipient_public_key))
+
+    eae_prk = _hpke_labeled_extract(b"", kem_suite_id, "eae_prk", shared)
+    shared_secret = _hpke_labeled_expand(eae_prk, kem_suite_id, "shared_secret",
+                                         enc + recipient_public_key, 32)
+    psk_id_hash = _hpke_labeled_extract(b"", suite_id, "psk_id_hash", b"")
+    info_hash = _hpke_labeled_extract(b"", suite_id, "info_hash", info)
+    key_schedule_context = bytes([HPKE_MODE_BASE]) + psk_id_hash + info_hash
+    secret = _hpke_labeled_extract(shared_secret, suite_id, "secret", b"")
+
+    return {
+        "enc": enc,
+        "key": _hpke_labeled_expand(secret, suite_id, "key", key_schedule_context, key_len),
+        "base_nonce": _hpke_labeled_expand(secret, suite_id, "base_nonce",
+                                           key_schedule_context, nonce_len),
+        "tag_length": tag_len,
+    }
+
+def hpke_seal(context, aad, plaintext):
+    return aes_gcm_encrypt(context["key"], context["base_nonce"], plaintext, aad)
+
+# ================================================================
+# TLS ClientHello (generators.js: buildClientHelloBody + build*Extension)
+# Порядок расширений задаётся отпечатком (extensionOrder) — именно он и есть
+# JA3/JA4 клиента, поэтому переставлять их нельзя.
+# ================================================================
 GREASE_VALUES = [
     0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A,
     0x8A8A, 0x9A9A, 0xAAAA, 0xBABA, 0xCACA, 0xDADA, 0xEAEA, 0xFAFA,
 ]
-def grease(excluded=None):
-    pool = [v for v in GREASE_VALUES if v != excluded] or GREASE_VALUES
-    return rc(pool)
 
-# ================================================================
-# TLS 1.3 ClientHello - Chrome-like fingerprint (ported from payloadGen)
-# Upgrades over the legacy engine: GREASE in ciphers + first/last ext,
-# full Chrome extension set in Chrome order, padding to 512B.
-# ================================================================
-def _ext(etype, data):
-    return u16(etype) + u16(len(data)) + data
+def select_grease_value(excluded=None):
+    filtered = [v for v in GREASE_VALUES if v != excluded] or GREASE_VALUES
+    return rc(filtered)
 
-def gen_tls_clienthello(domain=None):
-    host = (domain or DOMAIN).encode()
-    g1 = grease()
-    g2 = grease(g1)
+def chrome_fingerprint(is_quic):
+    # resolveTlsFingerprint: профиль Chrome (браузерный ClientHello)
+    return {
+        "useGrease": True,
+        "useSecondaryGrease": True,
+        "cipherSuites": [0x1301, 0x1302, 0x1303] if is_quic else [
+            0x1301, 0x1302, 0x1303, 0xC02B, 0xC02F, 0xC02C, 0xC030, 0xCCA9,
+            0xCCA8, 0xC013, 0xC014, 0x009C, 0x009D, 0x002F, 0x0035],
+        "extensionOrder": [
+            "grease", "sni", "supported_groups", "alpn", "status_request",
+            "signature_algorithms", "sct", "supported_versions", "key_share",
+            "psk_modes", "quic_transport_parameters", "compress_certificate",
+            "secondary_grease", "padding",
+        ] if is_quic else [
+            "grease", "sni", "extended_master_secret", "renegotiation_info",
+            "supported_groups", "ec_point_formats", "session_ticket", "alpn",
+            "status_request", "signature_algorithms", "sct", "supported_versions",
+            "key_share", "psk_modes", "compress_certificate",
+            "application_settings", "secondary_grease", "padding",
+        ],
+        "supportedGroups": [0x001D, 0x0017, 0x0018],
+        "signatureAlgorithms": [0x0403, 0x0804, 0x0401, 0x0503, 0x0805,
+                                0x0501, 0x0806, 0x0601, 0x0807],
+        "supportedVersions": [0x0304] if is_quic else [0x0304, 0x0303],
+        "keyShares": [0x001D],
+        "compressCertificateAlgorithms": [0x0002],
+        "includeApplicationSettings": True,
+        "paddingTarget": 512,
+        "encryptedClientHello": None,
+        "maxUdpPayloadSize": 1472,
+        "activeConnectionIdLimit": 8,
+    }
 
-    # ClientHello ciphers: GREASE first, then Chrome real order
-    cipher_list = [0x1301,0x1302,0x1303,0xC02B,0xC02F,0xC02C,0xC030,
-                   0xCCA9,0xCCA8,0xC013,0xC014,0x009C,0x009D,0x002F,0x0035]
-    if COMPACT:
-        # только TLS 1.3 + современные ECDHE-наборы: клиент без legacy-шифров
-        # выглядит обычно и экономит 12 байт
-        cipher_list = [0x1301,0x1302,0x1303,0xC02B,0xC02F,0xCCA9,0xCCA8]
-    ciphers = u16(g1)
-    for c in cipher_list:
-        ciphers += u16(c)
+def curl_quic_fingerprint():
+    # createCapturedCurlQuicFingerprint: снятый с curl --http3 ClientHello.
+    # Без GREASE и с другим порядком transport parameters — это отдельный
+    # отпечаток, а не вариация Chrome.
+    return {
+        "useGrease": False,
+        "useSecondaryGrease": False,
+        "cipherSuites": [0x1301],
+        "extensionOrder": [
+            "sni", "supported_versions", "supported_groups",
+            "signature_algorithms", "alpn", "key_share", "psk_modes",
+            "quic_transport_parameters", "compress_certificate",
+            "encrypted_client_hello",
+        ],
+        "supportedGroups": [0x001D, 0x0017, 0x0018],
+        "signatureAlgorithms": [0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806],
+        "supportedVersions": [0x0304],
+        "keyShares": [0x001D],
+        "compressCertificateAlgorithms": [0x0002],
+        "includeApplicationSettings": False,
+        "paddingTarget": 0,
+        "encryptedClientHello": None,
+        "quicTransportParameterOrder": [0x03, 0x07, 0x05, 0x09, 0x01,
+                                        0x08, 0x0F, 0x0E, 0x06, 0x04],
+        "maxIdleTimeout": 30000,
+        "maxUdpPayloadSize": 1472,
+        "initialMaxData": 10485760,
+        "initialMaxStreamDataBidiLocal": 5242880,
+        "initialMaxStreamDataBidiRemote": 5242880,
+        "initialMaxStreamDataUni": 5242880,
+        "initialMaxStreamsBidi": 100,
+        "initialMaxStreamsUni": 100,
+        "activeConnectionIdLimit": 2,
+    }
 
-    # --- build extensions in Chrome order ---
-    exts = b""
-    # grease (empty)
-    exts += _ext(g1, b"")
-    # sni
-    sni_entry = b"\x00" + u16(len(host)) + host
-    exts += _ext(0x0000, u16(len(sni_entry)) + sni_entry)
-    # extended_master_secret (empty)
-    exts += _ext(0x0017, b"")
-    # renegotiation_info (1 byte len=0)
-    exts += _ext(0xff01, b"\x00")
-    # supported_groups: GREASE + x25519 + secp256r1 + secp384r1
-    groups = u16(grease()) + b"\x00\x1d" + b"\x00\x17"
-    if not COMPACT:
-        groups += b"\x00\x18"
-    exts += _ext(0x000a, u16(len(groups)) + groups)
-    # ec_point_formats: uncompressed
-    exts += _ext(0x000b, b"\x01\x00")
-    # session_ticket (empty)
-    exts += _ext(0x0023, b"")
-    # alpn: h2, http/1.1
-    alpn_protos = b"\x02h2\x08http/1.1"
-    exts += _ext(0x0010, u16(len(alpn_protos)) + alpn_protos)
-    # status_request: OCSP (Chrome-only, в компактном режиме не нужен)
-    if not COMPACT:
-        exts += _ext(0x0005, b"\x01\x00\x00\x00\x00")
-    # signature_algorithms
-    _sig_list = [0x0403,0x0804,0x0401,0x0503,0x0805,0x0501,0x0806,0x0601]
-    if COMPACT:
-        _sig_list = _sig_list[:5]
-    sigs = b""
-    for s in _sig_list:
-        sigs += u16(s)
-    exts += _ext(0x000d, u16(len(sigs)) + sigs)
-    # signed_certificate_timestamp (empty)
-    if not COMPACT:
-        exts += _ext(0x0012, b"")
-    # supported_versions: GREASE + TLS1.3 + TLS1.2
-    sv = u16(grease()) + b"\x03\x04" + b"\x03\x03"
-    exts += _ext(0x002b, bytes([len(sv)]) + sv)
-    # key_share: GREASE(empty) + x25519(32B)
-    gks = u16(grease()) + u16(0)
-    ks_entry = b"\x00\x1d" + u16(32) + rh(32)
-    ks_list = gks + ks_entry
-    exts += _ext(0x0033, u16(len(ks_list)) + ks_list)
-    # psk_key_exchange_modes: psk_dhe_ke
-    exts += _ext(0x002d, b"\x01\x01")
-    if not COMPACT:
-        # compress_certificate: brotli
-        exts += _ext(0x001b, b"\x02\x00\x02")
-        # application_settings (ALPS): h2
-        exts += _ext(0x4469, b"\x03\x02h2")
-    # secondary grease (empty)
-    exts += _ext(g2, b"")
-    # Light padding (like real Chrome): small random, NO fill to 512.
-    # Filling to 512 produced ~200 zero bytes per packet -> large I packets
-    # that mobile AWG does not always deliver (especially I5), plus the long
-    # zero tail is itself a signature. Chrome only pads slightly.
-    pad_len = 0 if COMPACT else ri(0, 48)
-    if pad_len > 0:
-        exts += _ext(0x0015, b"\x00" * pad_len)
+def resolve_tls_fingerprint(is_quic, profile_id=None):
+    if is_quic and profile_id == CURL_QUIC_PROFILE_ID:
+        return curl_quic_fingerprint()
+    return chrome_fingerprint(is_quic)
 
-    legacy_version = b"\x03\x03"
-    random_bytes   = rh(32)
-    # TLS 1.3 разрешает пустой legacy_session_id; 32 байта Chrome шлёт ради
-    # режима совместимости с 1.2. В компактном режиме экономим 32 байта.
-    session_id     = b"" if COMPACT else rh(32)
-    sid            = bytes([len(session_id)]) + session_id
-    comp = b"\x01\x00"
-    body = legacy_version + random_bytes + sid + u16(len(ciphers)) + ciphers + comp + u16(len(exts)) + exts
-    hs   = b"\x01" + u24(len(body)) + body
-    rec  = b"\x16" + b"\x03\x01" + u16(len(hs)) + hs
-    return rec
+def _fp_num(fingerprint, key, default_value):
+    value = fingerprint.get(key)
+    return value if isinstance(value, int) else default_value
 
-# ================================================================
-# QUIC Initial - ported from payloadGen (real CRYPTO frame + ClientHello)
-# Optional real encryption if the cryptography lib is present, else masked payload.
-# ================================================================
-_QUIC_VERSION = b"\x00\x00\x00\x01"  # QUIC v1 (RFC 9000)
+def ext(ext_type, data):
+    return u16(ext_type) + u16(len(data)) + data
 
-def _quic_varint(v):
-    if v < 64:
-        return bytes([v])
-    elif v < 16384:
-        return bytes([0x40 | ((v >> 8) & 0x3f), v & 0xff])
-    elif v < 1073741824:
-        return bytes([0x80 | ((v >> 24) & 0x3f), (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff])
-    else:
-        return bytes([0xc0 | ((v >> 56) & 0x3f)]) + struct.pack(">Q", v)[1:]
+def ext_server_name(host):
+    host_bytes = enc_text(host)
+    server_name = b"\x00" + u16(len(host_bytes)) + host_bytes
+    return ext(0x0000, u16(len(server_name)) + server_name)
 
-def _quic_crypto_frame(ch):
-    # CRYPTO frame: type=0x06, offset=0, length, data
-    return b"\x06" + _quic_varint(0) + _quic_varint(len(ch)) + ch
+def ext_alpn(protocols):
+    entries = b""
+    for protocol in protocols:
+        pb = enc_text(protocol)
+        entries += bytes([len(pb)]) + pb
+    return ext(0x0010, u16(len(entries)) + entries)
 
-def _try_quic_encrypt(dcid, header_wo_pn, pn, pn_len, payload):
-    # Real QUIC Initial protection (RFC 9001). Returns protected packet or None.
-    try:
-        from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        import hmac as _hmac, hashlib as _hashlib
-    except Exception:
-        _warn_once("нет python3-cryptography — QUIC Initial уйдёт БЕЗ шифрования "
-                   "(payload не похож на шифротекст, DPI отличит от Chrome). "
-                   "Ставится так: apt-get install -y python3-cryptography")
-        return None
-    try:
-        INITIAL_SALT = bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
-        def hkdf_extract(salt, ikm):
-            return _hmac.new(salt, ikm, _hashlib.sha256).digest()
-        def hkdf_expand_label(secret, label, length):
-            full = b"tls13 " + label
-            info = u16(length) + bytes([len(full)]) + full + b"\x00"
-            hk = HKDFExpand(algorithm=hashes.SHA256(), length=length, info=info)
-            return hk.derive(secret)
-        initial_secret = hkdf_extract(INITIAL_SALT, dcid)
-        client_secret = hkdf_expand_label(initial_secret, b"client in", 32)
-        key = hkdf_expand_label(client_secret, b"quic key", 16)
-        iv  = hkdf_expand_label(client_secret, b"quic iv", 12)
-        hp  = hkdf_expand_label(client_secret, b"quic hp", 16)
-        # nonce = iv XOR pn (pn right-aligned)
-        pn_int = int.from_bytes(pn, "big")
-        nonce = bytearray(iv)
-        pn_bytes_full = pn_int.to_bytes(12, "big")
-        nonce = bytes(a ^ b for a, b in zip(nonce, pn_bytes_full))
-        aad = header_wo_pn + pn
-        ct = AESGCM(key).encrypt(nonce, payload, aad)
-        # header protection
-        sample = ct[4 - pn_len:4 - pn_len + 16]
-        enc = Cipher(algorithms.AES(hp), modes.ECB()).encryptor()
-        mask = enc.update(sample) + enc.finalize()
-        first = header_wo_pn[0] ^ (mask[0] & 0x0f)
-        prot_pn = bytes(pn[i] ^ mask[1 + i] for i in range(pn_len))
-        return bytes([first]) + header_wo_pn[1:] + prot_pn + ct
-    except Exception as e:
-        _warn_once("сбой QUIC-шифрования (%s: %s) — Initial уйдёт БЕЗ шифрования, "
-                   "мимикрия слабее" % (type(e).__name__, e))
-        return None
+def ext_supported_versions(grease_value, versions):
+    body = b""
+    if grease_value is not None:
+        body += u16(grease_value)
+    for version in (versions or [0x0304, 0x0303]):
+        body += u16(version)
+    return u16(0x002B) + u16(len(body) + 1) + bytes([len(body)]) + body
 
-def gen_quic_initial(domain=None):
-    TARGET = 1200
-    ch = gen_tls_clienthello(domain)        # reuse Chrome ClientHello as QUIC CRYPTO
-    crypto_frame = _quic_crypto_frame(ch)
-    dcid = rh(8)
-    scid = rh(8)
-    pn_len = 4
-    pn = rh(pn_len)
-    # header before length+pn:  first | ver | dcidlen | dcid | scidlen | scid | tokenlen
-    pre = bytes([0xC0 | (pn_len - 1)]) + _QUIC_VERSION + bytes([8]) + dcid + bytes([8]) + scid + b"\x00"
-    # pad CRYPTO frame with PADDING(0x00) to fill the 1200B datagram
-    overhead = len(pre) + 2 + pn_len + 16  # +2 varint length, +16 AEAD tag
-    pad = TARGET - overhead - len(crypto_frame)
-    payload = crypto_frame + (b"\x00" * pad if pad > 0 else b"")
-    length_field = pn_len + len(payload) + 16
-    header_wo_pn = pre + u16(0x4000 | length_field)
-    enc = _try_quic_encrypt(dcid, header_wo_pn, pn, pn_len, payload)
-    if enc is not None:
-        pkt = enc
-    else:
-        # masked fallback: plain header + pn + payload, random-padded to TARGET
-        pkt = header_wo_pn + pn + payload
-    if len(pkt) < TARGET:
-        pkt = pkt + rh(TARGET - len(pkt))
-    elif len(pkt) > TARGET:
-        pkt = pkt[:TARGET]
-    return pkt, dcid, _QUIC_VERSION
+def ext_supported_groups(grease_value, groups):
+    body = b""
+    if grease_value is not None:
+        body += u16(grease_value)
+    for group in (groups or [0x001D, 0x0017, 0x0018]):
+        body += u16(group)
+    return u16(0x000A) + u16(len(body) + 2) + u16(len(body)) + body
 
-def gen_quic_second_initial(dcid, version):
-    # RFC 9000 §14.1: любая клиентская датаграмма с Initial-пакетом обязана
-    # быть не меньше 1200 байт, иначе сервер её отбрасывает, а DPI видит
-    # аномалию. Раньше здесь было 300-600 байт — то есть заведомо неправильный
-    # пакет. Дополняем до 1200 (в компактном режиме этот пакет не шлётся вовсе).
-    fb = rc([0xC0, 0xC0, 0xC3])
-    pn_len = (fb & 0x03) + 1
-    scid = rh(8)
-    TARGET2 = 1200
-    enc_size = TARGET2 - 26 - pn_len
-    if enc_size < 1:
-        enc_size = 1
-    plen_val = pn_len + enc_size
-    pl_varint = u16(0x4000 | plen_val)
-    pn = rh(pn_len)
-    payload = rh(enc_size)
-    pkt = bytes([fb]) + version + bytes([8]) + dcid + bytes([8]) + scid + b"\x00" + pl_varint + pn + payload
-    if len(pkt) != TARGET2:
-        pkt = pkt[:TARGET2] if len(pkt) > TARGET2 else pkt + rh(TARGET2 - len(pkt))
-    return pkt
+def ext_signature_algorithms(signature_algorithms=None):
+    body = b""
+    for algorithm in (signature_algorithms or [0x0403, 0x0804, 0x0401, 0x0503,
+                                               0x0805, 0x0501, 0x0806, 0x0601, 0x0807]):
+        body += u16(algorithm)
+    return u16(0x000D) + u16(len(body) + 2) + u16(len(body)) + body
 
-def gen_quic_short():
-    pn_len = ri(1, 4)
-    spin = ri(0, 1) << 5
-    key  = ri(0, 1) << 2
-    fb   = 0x40 | spin | key | (pn_len - 1)
-    return bytes([fb]) + rh(8) + rh(pn_len) + rh(ri(40, 90))
+def ext_ec_point_formats():
+    return u16(0x000B) + u16(2) + b"\x01\x00"
 
-# ================================================================
-# SIP REGISTER (unchanged from legacy engine)
-# ================================================================
-SIP_UA_POOL = [
-    "Linphone/5.2.5 (belle-sip/5.2.0)", "Zoiper rv2.10.20.4",
-    "MicroSIP/3.21.4", "Bria 6.5.1", "PortSIP UA 16.4",
-]
-# Плейсхолдер под тег-модификатор внутри текстового сообщения. Байт 0x01 в
-# SIP-запросе появиться не может, поэтому по нему безопасно резать.
-_SIP_MARK = "\x01"
+def ext_psk_modes():
+    return u16(0x002D) + u16(2) + b"\x01\x01"
 
-def gen_sip():
-    host = rc(SIP_POOL)
-    user = rc(["alice","bob","100","200","sip","user","client"]) + str(ri(10,9999))
-    lip = rand_private_ip()
-    lport = rc([5060, 5062, 5080, 5160, ri(10000, 65000)])
-    # branch, tag и Call-ID — токены, уникальные для каждой транзакции. Если
-    # запечь их в <b 0x..>, клиент будет слать один и тот же Call-ID перед
-    # каждым рукопожатием: для наблюдателя это отпечаток устройства, заметный
-    # лучше, чем сам факт VPN. Уходят тегами <rc N> — буквы допустимы в token
-    # по RFC 3261 §25.1.
-    branch_len, tag_len, callid_len = 14, 8, 16
-    branch = "z9hG4bK" + _SIP_MARK
-    tag = _SIP_MARK
-    callid = "%s@%s" % (_SIP_MARK, host)
-    cseq = ri(1, 50)
-    transport = rc(["udp","udp","udp","udp","tcp"])
-    ua = rc(SIP_UA_POOL)
-    # Обязательный минимум RFC 3261 §8.1.1 для REGISTER: request-line, Via с
-    # branch, Max-Forwards, From с tag, To, Call-ID, CSeq, Content-Length.
-    # Contact и Expires тоже оставляем — без них REGISTER бессмысленный и
-    # выглядит поддельным. Allow/Supported/длинный User-Agent — необязательные
-    # заголовки: в компактном режиме их не шлём, экономя ~170 байт.
-    lines = [
-        "REGISTER sip:%s SIP/2.0" % host,
-        "Via: SIP/2.0/%s %s:%d;branch=%s;rport" % (transport.upper(), lip, lport, branch),
-        "Max-Forwards: 70",
-        "From: <sip:%s@%s>;tag=%s" % (user, host, tag),
-        "To: <sip:%s@%s>" % (user, host),
-        "Call-ID: %s" % callid,
-        "CSeq: %d REGISTER" % cseq,
-        "Contact: <sip:%s@%s:%d;transport=%s>" % (user, lip, lport, transport),
-    ]
-    if COMPACT:
-        lines += [
-            "User-Agent: %s" % ua.split("/")[0],
-            "Expires: %d" % rc([300,600,1800,3600]),
-        ]
-    else:
-        lines += [
-            "User-Agent: %s" % ua,
-            "Allow: INVITE, ACK, CANCEL, BYE, REFER, OPTIONS, NOTIFY, SUBSCRIBE, PRACK, MESSAGE, INFO, UPDATE",
-            "Supported: replaces, outbound, gruu, path",
-            "Expires: %d" % rc([300,600,1800,3600]),
-        ]
-    # Тело из случайных букв: клиент заполняет его заново на каждую отправку,
-    # поэтому одинаковых REGISTER подряд не бывает. Длина объявлена в
-    # Content-Length честно, иначе сообщение перестанет быть валидным.
-    body_len = ri(16, 48)
-    lines += ["Content-Length: %d" % body_len, "", ""]
+def key_share_value(group):
+    if group == 0x0017:
+        return b"\x04" + rb(64)
+    if group == 0x0018:
+        return b"\x04" + rb(96)
+    return rb(32)
 
-    # Режем текст по плейсхолдерам и вставляем модификаторы на их места.
-    # Порядок совпадает с порядком появления: branch, tag, Call-ID.
-    text = "\r\n".join(lines)
-    specs = [("rc", branch_len), ("rc", tag_len), ("rc", callid_len)]
-    chunks = text.split(_SIP_MARK)
-    if len(chunks) != len(specs) + 1:
-        # плейсхолдер потерялся — отдаём сообщение целиком, без модификаторов
-        return [text.replace(_SIP_MARK, "").encode(), ("rc", body_len)]
+def ext_key_share(grease_value, groups):
+    entries = b""
+    if grease_value is not None:
+        entries += u16(grease_value) + u16(1) + b"\x00"
+    for group in (groups or [0x001D]):
+        kb = key_share_value(group)
+        entries += u16(group) + u16(len(kb)) + kb
+    return u16(0x0033) + u16(len(entries) + 2) + u16(len(entries)) + entries
+
+def ext_extended_master_secret():
+    return u16(0x0017) + u16(0)
+
+def ext_renegotiation_info():
+    return u16(0xFF01) + u16(1) + b"\x00"
+
+def ext_session_ticket():
+    return u16(0x0023) + u16(0)
+
+def ext_status_request():
+    return ext(0x0005, b"\x01" + u16(0) + u16(0))
+
+def ext_sct():
+    return u16(0x0012) + u16(0)
+
+def ext_compress_certificate(algorithms):
+    encoded = b""
+    for algorithm in (algorithms or [0x0002]):
+        encoded += u16(algorithm)
+    return ext(0x001B, bytes([len(encoded)]) + encoded)
+
+def ext_application_settings(protocols):
+    entries = b""
+    for protocol in protocols:
+        pb = enc_text(protocol)
+        entries += bytes([len(pb)]) + pb
+    return u16(0x4469) + u16(len(entries) + 2) + u16(len(entries)) + entries
+
+def ext_encrypted_client_hello(config):
+    # buildEncryptedClientHelloExtension: inner ClientHello несёт один байт
+    # типа, outer — полный набор (kdf/aead/config_id/enc/payload).
+    if config and config.get("clientHelloType") == 0x01:
+        return u16(0xFE0D) + u16(1) + b"\x01"
+    enc_key = config.get("enc") or b"" if config else b""
+    payload = config.get("payload") or b"" if config else b""
+    data = (bytes([config.get("clientHelloType", 0x00) if config else 0x00]) +
+            u16(config.get("kdfId", 0x0001) if config else 0x0001) +
+            u16(config.get("aeadId", 0x0001) if config else 0x0001) +
+            bytes([config.get("configId", 0x00) if config else 0x00]) +
+            u16(len(enc_key)) + enc_key +
+            u16(len(payload)) + payload)
+    return ext(0xFE0D, data)
+
+def ext_quic_transport_parameters(source_connection_id, fingerprint):
+    order = fingerprint.get("quicTransportParameterOrder") or [
+        0x01, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0E, 0x0F]
+    values = {
+        0x01: quic_varint(_fp_num(fingerprint, "maxIdleTimeout", 30000)),
+        0x03: quic_varint(_fp_num(fingerprint, "maxUdpPayloadSize", 1472)),
+        0x04: quic_varint(_fp_num(fingerprint, "initialMaxData", 15728640)),
+        0x05: quic_varint(_fp_num(fingerprint, "initialMaxStreamDataBidiLocal", 6291456)),
+        0x06: quic_varint(_fp_num(fingerprint, "initialMaxStreamDataBidiRemote", 6291456)),
+        0x07: quic_varint(_fp_num(fingerprint, "initialMaxStreamDataUni", 6291456)),
+        0x08: quic_varint(_fp_num(fingerprint, "initialMaxStreamsBidi", 100)),
+        0x09: quic_varint(_fp_num(fingerprint, "initialMaxStreamsUni", 100)),
+        0x0A: quic_varint(_fp_num(fingerprint, "ackDelayExponent", 3)),
+        0x0B: quic_varint(_fp_num(fingerprint, "maxAckDelay", 25)),
+        0x0E: quic_varint(_fp_num(fingerprint, "activeConnectionIdLimit", 8)),
+        0x0F: source_connection_id,
+    }
+    parameters = b""
+    for parameter_id in order:
+        value = b"" if parameter_id == 0x0C else values[parameter_id]
+        parameters += quic_varint(parameter_id) + quic_varint(len(value)) + value
+    return ext(0x0039, parameters)
+
+def ext_padding(padding_length):
+    if padding_length <= 0:
+        return b""
+    return u16(0x0015) + u16(padding_length) + zeros(padding_length)
+
+def ext_grease(grease_value):
+    return u16(grease_value) + u16(0)
+
+def ext_use_srtp():
+    profiles = u16(2) + u16(0x0001) + b"\x00"
+    return ext(0x000E, profiles)
+
+def calculate_tls_padding_length(parts, target_size):
+    # calculateTlsPaddingLength: формула оригинала, константа 4+2+32+1+32+2+32+2+2
+    if not target_size:
+        return 0
+    current = sum(len(p) for p in parts)
+    return max(0, target_size - (4 + 2 + 32 + 1 + 32 + 2 + 32 + 2 + 2) - current - 4)
+
+def resolve_alpn_protocols(protocol, is_quic):
+    if is_quic:
+        return [protocol]
+    if protocol == "h2":
+        return ["h2", "http/1.1"]
+    return [protocol]
+
+def build_tls_extensions(host, opts):
+    fingerprint = opts["fingerprint"]
+    is_quic = opts.get("isQuic", False)
+    grease_value = opts.get("greaseValue")
     parts = []
-    for i, chunk in enumerate(chunks):
-        parts.append(chunk.encode())
-        if i < len(specs):
-            parts.append(specs[i])
-    parts.append(("rc", body_len))
-    return parts
+
+    for name in fingerprint["extensionOrder"]:
+        if name == "grease" and grease_value is not None:
+            parts.append(ext_grease(grease_value))
+        elif name == "sni":
+            parts.append(ext_server_name(host))
+        elif name == "extended_master_secret":
+            parts.append(ext_extended_master_secret())
+        elif name == "renegotiation_info":
+            parts.append(ext_renegotiation_info())
+        elif name == "supported_groups":
+            parts.append(ext_supported_groups(grease_value, fingerprint["supportedGroups"]))
+        elif name == "ec_point_formats":
+            parts.append(ext_ec_point_formats())
+        elif name == "session_ticket":
+            parts.append(ext_session_ticket())
+        elif name == "alpn" and opts.get("alpnProtocol"):
+            parts.append(ext_alpn(resolve_alpn_protocols(opts["alpnProtocol"], is_quic)))
+        elif name == "status_request":
+            parts.append(ext_status_request())
+        elif name == "signature_algorithms":
+            parts.append(ext_signature_algorithms(fingerprint["signatureAlgorithms"]))
+        elif name == "sct":
+            parts.append(ext_sct())
+        elif name == "supported_versions" and opts.get("withTls13"):
+            parts.append(ext_supported_versions(grease_value, fingerprint["supportedVersions"]))
+        elif name == "key_share":
+            parts.append(ext_key_share(grease_value, fingerprint["keyShares"]))
+        elif name == "psk_modes":
+            parts.append(ext_psk_modes())
+        elif name == "quic_transport_parameters" and opts.get("withQuicTransportParameters"):
+            parts.append(ext_quic_transport_parameters(
+                opts.get("quicSourceConnectionId") or b"", fingerprint))
+        elif name == "compress_certificate" and opts.get("withTls13") and \
+                fingerprint["compressCertificateAlgorithms"]:
+            parts.append(ext_compress_certificate(fingerprint["compressCertificateAlgorithms"]))
+        elif name == "application_settings" and not is_quic and \
+                opts.get("alpnProtocol") == "h2" and fingerprint["includeApplicationSettings"]:
+            parts.append(ext_application_settings(["h2"]))
+        elif name == "encrypted_client_hello" and fingerprint.get("encryptedClientHello"):
+            parts.append(ext_encrypted_client_hello(fingerprint["encryptedClientHello"]))
+        elif name == "secondary_grease" and opts.get("secondaryGreaseValue") is not None:
+            parts.append(ext_grease(opts["secondaryGreaseValue"]))
+        elif name == "padding":
+            padding_length = calculate_tls_padding_length(parts, fingerprint["paddingTarget"])
+            if padding_length > 0:
+                parts.append(ext_padding(padding_length))
+
+    return b"".join(parts)
+
+def build_client_hello_body(host, opts):
+    """
+    Возвращает handshake-сообщение ClientHello целиком: 0x01 + длина + тело.
+    Порт buildClientHelloBody.
+    """
+    is_quic = bool(opts.get("withQuicTransportParameters"))
+    fingerprint = opts.get("fingerprintOverride") or \
+        resolve_tls_fingerprint(is_quic, opts.get("tlsFingerprintProfile"))
+    grease_value = opts["greaseValue"] if "greaseValue" in opts else (
+        select_grease_value() if fingerprint["useGrease"] else None)
+    secondary_grease = opts["secondaryGreaseValue"] if "secondaryGreaseValue" in opts else (
+        select_grease_value(grease_value) if fingerprint["useSecondaryGrease"] else None)
+    session_id = opts["sessionIdBytes"] if opts.get("sessionIdBytes") is not None else rb(32)
+    client_random = opts.get("clientRandom") or rb(32)
+
+    extensions = build_tls_extensions(host, {
+        "withTls13": bool(opts.get("withTls13")),
+        "alpnProtocol": opts.get("alpnProtocol"),
+        "greaseValue": grease_value,
+        "secondaryGreaseValue": secondary_grease,
+        "isQuic": is_quic,
+        "withQuicTransportParameters": bool(opts.get("withQuicTransportParameters")),
+        "quicSourceConnectionId": opts.get("quicSourceConnectionId") or b"",
+        "fingerprint": fingerprint,
+    })
+
+    cipher_suites = b""
+    if grease_value is not None:
+        cipher_suites += u16(grease_value)
+    for suite in fingerprint["cipherSuites"]:
+        cipher_suites += u16(suite)
+
+    body = (u16(opts["legacyVersion"]) + client_random +
+            bytes([len(session_id)]) + session_id +
+            u16(len(cipher_suites)) + cipher_suites +
+            b"\x01\x00" + u16(len(extensions)) + extensions)
+    return b"\x01" + u24(len(body)) + body
 
 # ================================================================
-# DNS Query w/ EDNS0 (unchanged from legacy engine)
+# ECHConfig (generators.js: parseEchConfig* / serializeEchConfig)
 # ================================================================
-def gen_dns(domain=None):
-    host = domain or DOMAIN
-    flags = b"\x01\x00"
-    counts = b"\x00\x01\x00\x00\x00\x00\x00\x01"
-    qn = b""
-    for lbl in host.split("."):
-        lbl_b = lbl.encode()[:63]
-        qn += bytes([len(lbl_b)]) + lbl_b
-    qn += b"\x00"
-    qtype = u16(_weighted_choice([1, 28, 16], [60, 30, 10]))
-    qclass = b"\x00\x01"
-    udp_size = rc([1232, 4096])
-    do_bit = rc([0x0000, 0x8000])
-    opt_rr = b"\x00" + b"\x00\x29" + u16(udp_size) + b"\x00\x00" + u16(do_bit) + b"\x00\x00"
-    return flags + counts + qn + qtype + qclass + opt_rr
+def serialize_ech_config(definition):
+    public_key = definition["publicKey"]
+    public_name_bytes = enc_text(definition["publicName"])
+    cipher_suites = b""
+    for suite in definition["cipherSuites"]:
+        cipher_suites += u16(suite["kdfId"]) + u16(suite["aeadId"])
+    contents = (bytes([definition["configId"] & 0xFF]) +
+                u16(definition["kemId"]) +
+                u16(len(public_key)) + public_key +
+                u16(len(cipher_suites)) + cipher_suites +
+                bytes([min(255, definition.get("maximumNameLength") or len(public_name_bytes))]) +
+                bytes([len(public_name_bytes)]) + public_name_bytes +
+                u16(0))
+    return u16(0xFE0D) + u16(len(contents)) + contents
 
-# == Dispatch (identical contract: 1 line per packet, up to 5) ==
-if PROFILE == "sip":
-    def _sip_line():
-        return to_cps_parts(gen_sip())
-    print(_sip_line())
-    if not ONLY_I1:
-        for _ in range(4):
-            print(_sip_line())
+def build_ech_config_descriptor(definition):
+    suites = definition.get("cipherSuites") or [{"kdfId": 0x0001, "aeadId": 0x0001}]
+    selected = select_supported_cipher_suite(suites) or {"kdfId": 0x0001, "aeadId": 0x0001}
+    return {
+        "configId": definition["configId"],
+        "kemId": definition["kemId"],
+        "kdfId": selected["kdfId"],
+        "aeadId": selected["aeadId"],
+        "publicKey": definition["publicKey"],
+        "maximumNameLength": definition["maximumNameLength"],
+        "publicName": definition["publicName"],
+        "rawBytes": serialize_ech_config({
+            "configId": definition["configId"],
+            "kemId": definition["kemId"],
+            "publicKey": definition["publicKey"],
+            "maximumNameLength": definition["maximumNameLength"],
+            "publicName": definition["publicName"],
+            "cipherSuites": suites,
+        }),
+    }
 
-elif PROFILE == "dns":
-    print("<r 2><b 0x%s>" % gen_dns(DOMAIN).hex())
-    if not ONLY_I1:
-        pool = DOMAIN_POOL.copy()
-        secure_shuffle(pool)
-        for i in range(4):
-            print("<r 2><b 0x%s>" % gen_dns(pool[i % len(pool)]).hex())
+def select_supported_cipher_suite(cipher_suites):
+    for suite in cipher_suites or []:
+        if suite.get("kdfId") == 0x0001 and suite.get("aeadId") in (0x0001, 0x0002):
+            return suite
+    return None
 
-elif PROFILE == "tls":
-    print(tls_chain(DOMAIN))
-    if not ONLY_I1:
-        pool = DOMAIN_POOL.copy()
-        secure_shuffle(pool)
-        for i in range(4):
-            print(tls_chain(pool[i % len(pool)]))
+def parse_ech_config_list(data):
+    configs = []
+    if len(data) < 2:
+        return configs
+    total_length = read_u16(data, 0)
+    end = min(len(data), 2 + total_length)
+    offset = 2
+    while offset + 4 <= end:
+        config_start = offset
+        version = read_u16(data, offset)
+        content_length = read_u16(data, offset + 2)
+        content_start = offset + 4
+        content_end = content_start + content_length
+        if content_end > end:
+            break
+        if version == 0xFE0D:
+            config = parse_ech_config(data, config_start, content_start, content_end)
+            if config:
+                configs.append(config)
+        offset = content_end
+    return configs
 
-else:  # quic
-    def _quic_initial_line(pkt):
-        # Всё после заголовка и первых байт шифротекста — для наблюдателя
-        # неразличимый шум (AEAD), поэтому хвост отдаём тегом <r>: пакет
-        # остаётся ровно 1200 байт и валидным по RFC 9000 §14.1, но каждый раз
-        # другим, а строка в конфиге короче примерно вчетверо.
-        tail = ri(700, 1000)
-        return to_cps_parts([pkt[:len(pkt) - tail], ("r", tail)])
+def parse_ech_config(data, config_start, content_start, content_end):
+    offset = content_start
+    if offset + 5 > content_end:
+        return None
+    config_id = data[offset]
+    offset += 1
+    kem_id = read_u16(data, offset)
+    offset += 2
+    public_key_length = read_u16(data, offset)
+    offset += 2
+    if offset + public_key_length > content_end:
+        return None
+    public_key = data[offset:offset + public_key_length]
+    offset += public_key_length
+    if offset + 2 > content_end:
+        return None
+    cipher_suites_length = read_u16(data, offset)
+    offset += 2
+    suite_end = offset + cipher_suites_length
+    if suite_end > content_end:
+        return None
+    cipher_suites = []
+    while offset + 4 <= suite_end:
+        cipher_suites.append({"kdfId": read_u16(data, offset),
+                              "aeadId": read_u16(data, offset + 2)})
+        offset += 4
+    if offset + 2 > content_end:
+        return None
+    maximum_name_length = data[offset]
+    offset += 1
+    public_name_length = data[offset]
+    offset += 1
+    if offset + public_name_length > content_end:
+        return None
+    public_name = data[offset:offset + public_name_length].decode("utf-8", "replace")
+    selected = select_supported_cipher_suite(cipher_suites)
+    if not selected:
+        return None
+    return {
+        "configId": config_id,
+        "kemId": kem_id,
+        "kdfId": selected["kdfId"],
+        "aeadId": selected["aeadId"],
+        "publicKey": public_key,
+        "maximumNameLength": maximum_name_length,
+        "publicName": public_name,
+        "rawBytes": data[config_start:content_end],
+    }
 
-    def _quic_short_line():
-        # У короткого заголовка структурный только первый байт (fixed bit,
-        # spin, key phase, длина номера пакета) — остальное шум.
-        pkt = gen_quic_short()
-        return to_cps_parts([pkt[:1], ("r", len(pkt) - 1)])
+def select_supported_ech_config(configs):
+    for config in configs or []:
+        if config["kemId"] == 0x0020 and config["kdfId"] == 0x0001 and \
+                config["aeadId"] in (0x0001, 0x0002):
+            return config
+    return None
 
-    i1_pkt, dcid, ver = gen_quic_initial(DOMAIN)
-    print(_quic_initial_line(i1_pkt))
-    if not ONLY_I1:
-        # RFC 9000 §14.1: КЛИЕНТСКАЯ датаграмма с Initial-пакетом обязана быть
-        # не меньше 1200 байт. Короткий второй Initial — не «экономия», а
-        # заметная аномалия: раньше здесь уходили 300-600 байт. В компактном
-        # режиме вместо него идёт 1-RTT пакет с коротким заголовком: он
-        # валиден при любой длине и вчетверо короче.
-        if COMPACT:
-            print(_quic_short_line())
+def create_synthetic_ech_config(host):
+    """
+    Синтетический ECHConfig: ключ генерируем сами. Для наблюдателя структура
+    расширения неотличима от настоящего ECH — расшифровать его всё равно может
+    только владелец приватного ключа, и им никто не пользуется.
+    """
+    private_key = X25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    return build_ech_config_descriptor({
+        "configId": rb(1)[0],
+        "kemId": 0x0020,
+        "publicKey": public_key,
+        "maximumNameLength": min(255, len(host)),
+        "publicName": host,
+        "cipherSuites": [{"kdfId": 0x0001, "aeadId": 0x0001}],
+    })
+
+def fetch_published_ech_config(host, timeout=2.0):
+    """
+    Настоящий ECHConfig из HTTPS RR через DoH (как fetchPublishedEchConfig).
+    Включается флагом --ech-doh или AWG_CPS_ECH_DOH=1: запрос уходит наружу,
+    поэтому по умолчанию выключен, а при любой ошибке/таймауте возвращается
+    None и берётся синтетический конфиг.
+    """
+    import base64, json, re, urllib.parse, urllib.request
+    url = "https://dns.google/resolve?name=%s&type=HTTPS" % urllib.parse.quote(host)
+    request = urllib.request.Request(url, headers={"accept": "application/dns-json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+    except Exception as exc:
+        _warn_once("DoH-запрос ECHConfig не удался (%s) — берём синтетический ECH"
+                   % type(exc).__name__)
+        return None
+    for answer in payload.get("Answer") or []:
+        match = re.search(r"\bech=\"?([^\"\s]+)\"?", str(answer.get("data") or ""), re.I)
+        if not match:
+            continue
+        try:
+            raw = base64.b64decode(match.group(1) + "==")
+        except Exception:
+            continue
+        config = select_supported_ech_config(parse_ech_config_list(raw))
+        if config:
+            return config
+    return None
+
+def resolve_ech_config(host, use_doh):
+    if use_doh:
+        config = fetch_published_ech_config(host)
+        if config:
+            return config
+    return create_synthetic_ech_config(host)
+
+# ================================================================
+# QUIC Initial (generators.js: generateQuicPayload* + crypto.js)
+# ================================================================
+def build_quic_client_hello(host, options, scid):
+    return build_client_hello_body(host, {
+        "legacyVersion": 0x0303,
+        "withTls13": True,
+        "alpnProtocol": "h3",
+        "withQuicTransportParameters": True,
+        "quicSourceConnectionId": scid,
+        "tlsFingerprintProfile": options.get("tlsFingerprintProfile"),
+    })
+
+def build_ech_quic_client_hello(host, options, scid):
+    """
+    ClientHello с настоящим ECH: внутренний ClientHello (реальный SNI)
+    шифруется HPKE и кладётся во внешний, где SNI — public_name конфига.
+    Порт buildDynamicEchQuicClientHello.
+    """
+    ech_config = options["echConfig"]
+    base_fingerprint = resolve_tls_fingerprint(True, options.get("tlsFingerprintProfile"))
+
+    inner_fingerprint = dict(base_fingerprint)
+    inner_fingerprint["extensionOrder"] = list(base_fingerprint["extensionOrder"])
+    if "encrypted_client_hello" not in inner_fingerprint["extensionOrder"]:
+        inner_fingerprint["extensionOrder"].append("encrypted_client_hello")
+    inner_fingerprint["encryptedClientHello"] = {"clientHelloType": 0x01}
+
+    encoded_inner = build_client_hello_body(host, {
+        "legacyVersion": 0x0303,
+        "withTls13": True,
+        "alpnProtocol": "h3",
+        "withQuicTransportParameters": True,
+        "quicSourceConnectionId": scid,
+        "fingerprintOverride": inner_fingerprint,
+        "sessionIdBytes": b"",
+    })[4:]
+
+    host_length = len(enc_text(host))
+    max_name_length = ech_config["maximumNameLength"] or host_length
+    padding_length = max(0, max_name_length - host_length)
+    padded_length = len(encoded_inner) + padding_length
+    padding_length += (32 - (padded_length % 32)) % 32
+    padded_inner = encoded_inner + zeros(padding_length)
+
+    context = hpke_setup_base_sender(
+        ech_config["publicKey"],
+        b"tls ech" + b"\x00" + ech_config["rawBytes"],
+        ech_config["kemId"], ech_config["kdfId"], ech_config["aeadId"])
+
+    outer_fingerprint = dict(base_fingerprint)
+    outer_fingerprint["extensionOrder"] = list(base_fingerprint["extensionOrder"])
+    if "encrypted_client_hello" not in outer_fingerprint["extensionOrder"]:
+        outer_fingerprint["extensionOrder"].append("encrypted_client_hello")
+    outer_fingerprint["encryptedClientHello"] = {
+        "clientHelloType": 0x00,
+        "kdfId": ech_config["kdfId"],
+        "aeadId": ech_config["aeadId"],
+        "configId": ech_config["configId"],
+        "enc": context["enc"],
+        "payload": zeros(len(padded_inner) + context["tag_length"]),
+    }
+
+    outer = build_client_hello_body(ech_config["publicName"] or host, {
+        "legacyVersion": 0x0303,
+        "withTls13": True,
+        "alpnProtocol": "h3",
+        "withQuicTransportParameters": True,
+        "quicSourceConnectionId": scid,
+        "fingerprintOverride": outer_fingerprint,
+    })
+
+    ech_payload = hpke_seal(context, outer[4:], padded_inner)
+    return replace_ech_payload(outer, ech_payload)
+
+def find_ech_payload_offset(client_hello):
+    offset = 4 + 2 + 32
+    session_id_length = client_hello[offset]
+    offset += 1 + session_id_length
+    cipher_suites_length = read_u16(client_hello, offset)
+    offset += 2 + cipher_suites_length
+    compression_methods_length = client_hello[offset]
+    offset += 1 + compression_methods_length
+    extensions_length = read_u16(client_hello, offset)
+    offset += 2
+    extensions_end = offset + extensions_length
+    while offset + 4 <= extensions_end:
+        extension_type = read_u16(client_hello, offset)
+        extension_length = read_u16(client_hello, offset + 2)
+        data_offset = offset + 4
+        if extension_type == 0xFE0D:
+            enc_length = read_u16(client_hello, data_offset + 1 + 2 + 2 + 1)
+            payload_length_offset = data_offset + 1 + 2 + 2 + 1 + 2 + enc_length
+            payload_length = read_u16(client_hello, payload_length_offset)
+            return payload_length_offset + 2, payload_length
+        offset = data_offset + extension_length
+    raise ValueError("ECH extension was not found in ClientHello")
+
+def replace_ech_payload(client_hello, ech_payload):
+    offset, length = find_ech_payload_offset(client_hello)
+    if length != len(ech_payload):
+        raise ValueError("ECH payload length mismatch")
+    data = bytearray(client_hello)
+    data[offset:offset + length] = ech_payload
+    return bytes(data)
+
+def quic_crypto_frame(data, offset=0):
+    return b"\x06" + quic_varint(offset) + quic_varint(len(data)) + data
+
+def quic_initial_first_byte(packet_number_length):
+    return QUIC_INITIAL_HEADER_BASE | ((packet_number_length - 1) & 0x03)
+
+def resolve_quic_target_packet_size(options):
+    if options.get("quicPadToMtu") and options.get("quicMtu"):
+        return max(1200, int(options["quicMtu"]))
+    if options.get("quicTargetPacketSize"):
+        return max(1200, int(options["quicTargetPacketSize"]))
+    return 1200
+
+def calculate_quic_initial_padding(payload_length, dcid_length, scid_length,
+                                   pn_length, target_packet_size, auth_tag_length):
+    # RFC 9000 §14.1: датаграмма клиента с Initial обязана быть >= 1200 байт.
+    # Длина поля length зависит от паддинга, поэтому считаем итеративно —
+    # ровно как calculateQuicInitialPaddingLength в оригинале.
+    target = max(1200, int(target_packet_size or 1200))
+    header_prefix = 1 + 4 + 1 + dcid_length + 1 + scid_length + 1
+    protected_length = pn_length + payload_length + max(0, int(auth_tag_length or 0))
+    length_field_size = len(quic_varint(protected_length))
+    previous = -1
+    padding = 0
+    while length_field_size != previous:
+        previous = length_field_size
+        padding = max(0, target - (header_prefix + length_field_size + protected_length))
+        length_field_size = len(quic_varint(protected_length + padding))
+    return max(0, target - (header_prefix + length_field_size + protected_length))
+
+def pad_quic_initial_payload(payload, dcid, scid, packet_number, options, auth_tag_length):
+    padding = calculate_quic_initial_padding(
+        len(payload), len(dcid), len(scid), len(packet_number),
+        resolve_quic_target_packet_size(options), auth_tag_length)
+    return payload + zeros(padding) if padding > 0 else payload
+
+def build_plain_quic_initial(dcid, scid, packet_number, payload):
+    packet_length = len(packet_number) + len(payload)
+    return (bytes([quic_initial_first_byte(len(packet_number))]) +
+            u32(QUIC_WIRE_VERSION) +
+            bytes([len(dcid)]) + dcid +
+            bytes([len(scid)]) + scid +
+            quic_varint(0) + quic_varint(packet_length) +
+            packet_number + payload)
+
+def build_protected_quic_initial(dcid, scid, packet_number, payload):
+    # RFC 9001: ключи Initial выводятся из DCID, затем AEAD и header protection.
+    initial_secret = hkdf_extract(QUIC_V1_INITIAL_SALT, dcid)
+    client_secret = hkdf_expand_label(initial_secret, "client in", b"", 32)
+    key = hkdf_expand_label(client_secret, "quic key", b"", 16)
+    iv = hkdf_expand_label(client_secret, "quic iv", b"", 12)
+    hp = hkdf_expand_label(client_secret, "quic hp", b"", 16)
+
+    first_byte = quic_initial_first_byte(len(packet_number))
+    packet_length = len(packet_number) + len(payload) + 16
+    header = (bytes([first_byte]) + u32(QUIC_WIRE_VERSION) +
+              bytes([len(dcid)]) + dcid +
+              bytes([len(scid)]) + scid +
+              quic_varint(0) + quic_varint(packet_length) + packet_number)
+
+    nonce = bytearray(iv)
+    for i, byte in enumerate(packet_number):
+        nonce[len(nonce) - len(packet_number) + i] ^= byte
+    encrypted = aes_gcm_encrypt(key, bytes(nonce), payload, header)
+
+    sample_offset = 4 - len(packet_number)
+    if sample_offset < 0 or len(encrypted) < sample_offset + 16:
+        return header + encrypted
+    mask = aes_ecb_encrypt_block(hp, encrypted[sample_offset:sample_offset + 16])
+    protected = bytearray(header)
+    protected[0] = first_byte ^ (mask[0] & 0x0F)
+    for i in range(len(packet_number)):
+        protected[len(protected) - len(packet_number) + i] = packet_number[i] ^ mask[i + 1]
+    return bytes(protected) + encrypted
+
+def generate_quic_payload(options):
+    """
+    QUIC Initial с ClientHello в CRYPTO-фрейме. С доступной криптографией
+    пакет шифруется по RFC 9001 — тогда его содержимое для DPI неотличимо
+    от шифротекста Chrome; без неё уходит нешифрованный Initial (fallback
+    generateQuicPayload из оригинала).
+    """
+    dcid = rb(int(options.get("quicDcidLength", 8)))
+    scid = rb(int(options.get("quicScidLength", 8)))
+    packet_number = options.get("quicPacketNumber") or rb(int(options.get("quicPacketNumberLength", 4)))
+
+    if options.get("echConfig") and crypto_available():
+        try:
+            client_hello = build_ech_quic_client_hello(options["host"], options, scid)
+        except Exception as exc:
+            _warn_once("сбой ECH (%s) — ClientHello уйдёт без него" % type(exc).__name__)
+            client_hello = build_quic_client_hello(options["host"], options, scid)
+    else:
+        client_hello = build_quic_client_hello(options["host"], options, scid)
+
+    crypto_frame = quic_crypto_frame(client_hello, 0)
+
+    if not crypto_available():
+        payload = pad_quic_initial_payload(crypto_frame, dcid, scid, packet_number, options, 0)
+        return build_plain_quic_initial(dcid, scid, packet_number, payload)
+
+    try:
+        payload = pad_quic_initial_payload(crypto_frame, dcid, scid, packet_number, options, 16)
+        return build_protected_quic_initial(dcid, scid, packet_number, payload)
+    except Exception as exc:
+        _warn_once("сбой шифрования QUIC (%s: %s) — Initial уйдёт без защиты"
+                   % (type(exc).__name__, exc))
+        payload = pad_quic_initial_payload(crypto_frame, dcid, scid, packet_number, options, 0)
+        return build_plain_quic_initial(dcid, scid, packet_number, payload)
+
+def generate_curl_quic_payload(options):
+    # withCapturedCurlQuicProfile: curl шлёт пустой SCID, целевой размер 1250,
+    # номер пакета 0x00 и ClientHello с ECH.
+    merged = dict(options)
+    merged.setdefault("tlsFingerprintProfile", CURL_QUIC_PROFILE_ID)
+    merged["quicScidLength"] = merged.get("quicScidLength", 0)
+    merged["quicTargetPacketSize"] = merged.get("quicTargetPacketSize", 1250)
+    merged["quicPacketNumber"] = merged.get("quicPacketNumber", b"\x00")
+    if crypto_available() and not merged.get("echConfig"):
+        try:
+            merged["echConfig"] = resolve_ech_config(merged["host"], merged.get("echDoh", False))
+        except Exception as exc:
+            _warn_once("не удалось подготовить ECHConfig (%s) — ClientHello без ECH"
+                       % type(exc).__name__)
+    return generate_quic_payload(merged)
+
+# ================================================================
+# DNS / SSDP / NTP / RTP / RTCP (generators.js)
+# ================================================================
+def encode_dns_name(name):
+    trimmed = (name or DEFAULT_HOST).rstrip(".")
+    out = b""
+    for label in trimmed.split("."):
+        label_bytes = enc_text(label)
+        if not label_bytes or len(label_bytes) > 63:
+            raise ValueError("each DNS label must be between 1 and 63 bytes")
+        out += bytes([len(label_bytes)]) + label_bytes
+    return out + b"\x00"
+
+def build_dns_opt_record(udp_payload_size=1232):
+    return b"\x00" + u16(0x0029) + u16(udp_payload_size) + u32(0) + u16(0)
+
+def build_dns_question(query_id, flags, name_bytes, type_value, class_value,
+                       additional_record=b""):
+    additional_count = 1 if additional_record else 0
+    return (u16(query_id) + u16(flags) + u16(1) + u16(0) + u16(0) +
+            u16(additional_count) + name_bytes + u16(type_value) +
+            u16(class_value) + additional_record)
+
+def generate_dns_payload(options):
+    return build_dns_question(ri(65535), 0x0100, encode_dns_name(options["host"]),
+                              rc(DNS_QUERY_TYPES), 0x0001, build_dns_opt_record(1232))
+
+def generate_ssdp_payload(options):
+    message = "\r\n".join([
+        "M-SEARCH * HTTP/1.1",
+        "HOST: 239.255.255.250:1900",
+        "MAN: \"ssdp:discover\"",
+        "ST: " + rc(SSDP_SEARCH_TARGETS),
+        "MX: %d" % (1 + ri(5)),
+        "USER-AGENT: " + rc(SSDP_USER_AGENTS),
+        "ACCEPT-LANGUAGE: en-US,en;q=0.9",
+        "",
+        "",
+    ])
+    return enc_text(message)
+
+def generate_ntp_payload(options):
+    now = time.time()
+    payload = bytearray(48)
+    payload[0] = 0x23          # LI=0, VN=4, Mode=3 (client)
+    payload[1] = 0x00
+    payload[2] = 0x06
+    payload[3] = 0xEC
+    payload[4:8] = u32(0x00000100)
+    payload[8:12] = u32(0x00000100)
+    payload[12:16] = enc_text("INIT")
+    payload[16:24] = ntp_timestamp(now - 1)
+    payload[40:48] = ntp_timestamp(now)
+    return bytes(payload)
+
+def generate_rtp_payload(options=None):
+    payload_type = rc([0x00, 0x08, 0x60])
+    body = rb(96) if payload_type == 0x60 else rb(160)
+    return (bytes([0x80, payload_type]) + u16(ri(65535)) +
+            u32(ru32()) + u32(ru32()) + body)
+
+def generate_rtcp_payload(options=None):
+    ssrc = ru32()
+    sender_report = (bytes([0x80, 0xC8]) + u16(0x0006) + u32(ssrc) +
+                     ntp_timestamp() + u32(ru32()) + u32(1 + ri(64)) +
+                     u32(160 + ri(4096)))
+    cname = enc_text("webrtc@" + DEFAULT_HOST)
+    sdes_value = (u32(ssrc) + bytes([0x01, len(cname)]) + cname + b"\x00" +
+                  zeros((4 - ((4 + 2 + len(cname) + 1) % 4)) % 4))
+    sdes = bytes([0x81, 0xCA]) + u16(((4 + len(sdes_value)) // 4) - 1) + sdes_value
+    return sender_report + sdes
+
+# ================================================================
+# SIP (generators.js: generateSipPayload)
+# ================================================================
+def random_sip_user_part():
+    prefix = rc(["100", "101", "200", "300", "400", "500",
+                 "alice", "bob", "support", "sales", "noc", "ops"])
+    return prefix + str(100 + ri(900))
+
+def format_sip_address(display_name, user, host):
+    return "\"%s\" <sip:%s@%s>" % (display_name, user, host)
+
+def generate_random_sip_domain():
+    base = rc(SIP_DOMAIN_BASES)
+    suffix = rc(SIP_DOMAIN_SUFFIXES)
+    if ri(3) == 0:
+        return base + "." + suffix
+    return "%s-%d.%s.%s" % (rc(SIP_DOMAIN_PREFIXES), 10 + ri(90), base, suffix)
+
+def resolve_sip_host(options):
+    # resolveSipHost: без флага sipCustomMessage домен всегда CONFIG.defaultHost
+    if not options.get("sipCustomMessage"):
+        return DEFAULT_HOST
+    if options.get("hasCustomHost"):
+        return options["host"]
+    return generate_random_sip_domain()
+
+def build_sip_invite_body(origin_user, host):
+    media_ip = random_private_ipv4()
+    audio_port = 12000 + ri(20000)
+    session_id = 1000000000 + ri(900000000)
+    codec_profile = rc(SIP_AUDIO_CODEC_PROFILES)
+    fingerprint = ":".join(to_hex(rb(32))[i:i + 2] for i in range(0, 64, 2)).upper()
+    lines = [
+        "v=0",
+        "o=%s %d %d IN IP4 %s" % (origin_user, session_id, session_id + 1, media_ip),
+        "s=Call",
+        "c=IN IP4 " + media_ip,
+        "t=0 0",
+        "m=audio %d RTP/AVP %s" % (audio_port, codec_profile["formatList"]),
+        "a=rtcp:%d IN IP4 %s" % (audio_port + 1, media_ip),
+        "a=sendrecv",
+        "a=ptime:%d" % rc([20, 30, 40]),
+        "a=maxptime:%d" % rc([60, 80, 120]),
+        "a=rtcp-mux",
+        "a=ice-ufrag:" + to_hex(rb(4)),
+        "a=ice-pwd:" + to_hex(rb(12)),
+        "a=fingerprint:sha-256 " + fingerprint,
+        "a=setup:actpass",
+        "a=msid-semantic: WMS " + origin_user,
+        "a=rtcp-fb:* transport-cc",
+    ]
+    lines += ["a=rtpmap:" + p for p in codec_profile["payloads"]]
+    lines += ["a=ssrc:%d cname:%s@%s" % (ru32(), origin_user, host)]
+    return "\r\n".join(lines)
+
+def generate_sip_payload(options):
+    action = str(options.get("sipAction") or "OPTIONS").strip().upper()
+    if action == "RANDOM":
+        action = rc(["OPTIONS", "REGISTER", "INVITE", "TRYING"])
+    if action not in ("REGISTER", "INVITE", "TRYING"):
+        action = "OPTIONS"
+
+    host = resolve_sip_host(options)
+    local_ip = random_private_ipv4()
+    local_port = rc(SIP_LOCAL_PORTS)
+    from_user = random_sip_user_part()
+    to_user = from_user if action == "REGISTER" else random_sip_user_part()
+    from_display = rc(SIP_DISPLAY_NAMES)
+    to_display = from_display if action == "REGISTER" else rc(SIP_DISPLAY_NAMES)
+    branch = "z9hG4bK" + to_hex(rb(9))
+    tag = to_hex(rb(6))
+    call_id = to_hex(rb(12)) + "@" + host
+    cseq = 1 + ri(50)
+    user_agent = rc(SIP_USER_AGENTS)
+    allow_header = rc(SIP_ALLOW_HEADERS)
+    supported_header = rc(SIP_SUPPORTED_HEADERS)
+    to_uri = format_sip_address(to_display, to_user, host)
+    from_uri = format_sip_address(from_display, from_user, host)
+    request_uri = "sip:" + host if action == "REGISTER" else "sip:%s@%s" % (to_user, host)
+    via = "Via: SIP/2.0/UDP %s:%d;branch=%s;rport" % (local_ip, local_port, branch)
+    contact = "Contact: <sip:%s@%s:%d;transport=udp>" % (from_user, local_ip, local_port)
+
+    if action == "TRYING":
+        lines = [
+            "SIP/2.0 100 CONNECTING", via,
+            "To: " + to_uri,
+            "From: %s;tag=%s" % (from_uri, tag),
+            "Call-ID: " + call_id,
+            "CSeq: %d INVITE" % cseq,
+            "Server: " + rc(SIP_SERVER_NAMES),
+            "Content-Length: 0", "", "",
+        ]
+    elif action == "REGISTER":
+        lines = [
+            "REGISTER %s SIP/2.0" % request_uri, via,
+            "Max-Forwards: 70",
+            "From: %s;tag=%s" % (from_uri, tag),
+            "To: " + to_uri,
+            "Call-ID: " + call_id,
+            "CSeq: %d REGISTER" % cseq,
+            contact,
+            "User-Agent: " + user_agent,
+            "Allow: " + allow_header,
+            "Supported: " + supported_header,
+            "Allow-Events: " + rc(SIP_ALLOW_EVENTS_HEADERS),
+            "Expires: %d" % rc([300, 600, 900, 1200, 1800, 3600]),
+            "Content-Length: 0", "", "",
+        ]
+    elif action == "INVITE":
+        body = build_sip_invite_body(from_user, host)
+        lines = [
+            "INVITE %s SIP/2.0" % request_uri, via,
+            "Max-Forwards: 70",
+            "From: %s;tag=%s" % (from_uri, tag),
+            "To: " + to_uri,
+            "Call-ID: " + call_id,
+            "CSeq: %d INVITE" % cseq,
+            contact,
+            "User-Agent: " + user_agent,
+            "Allow: " + allow_header,
+            "Supported: " + supported_header,
+            "Content-Type: application/sdp",
+            "Content-Length: %d" % len(enc_text(body)),
+            "", body,
+        ]
+    else:
+        lines = [
+            "OPTIONS %s SIP/2.0" % request_uri, via,
+            "Max-Forwards: 70",
+            "From: %s;tag=%s" % (from_uri, tag),
+            "To: " + to_uri,
+            "Call-ID: " + call_id,
+            "CSeq: %d OPTIONS" % cseq,
+            contact,
+            "User-Agent: " + user_agent,
+            "Allow: " + allow_header,
+            "Supported: " + supported_header,
+            "Accept: application/sdp",
+            "Accept-Language: " + rc(SIP_ACCEPT_LANGUAGES),
+            "Content-Length: 0", "", "",
+        ]
+    return enc_text("\r\n".join(lines))
+
+# ================================================================
+# DTLS (generators.js: generateDtlsPayload)
+# ================================================================
+def build_dtls_client_hello_body(host):
+    session_id = rb(32)
+    extensions = (ext_server_name(host) +
+                  ext_supported_groups(None, [0x001D, 0x0017, 0x0018]) +
+                  ext_ec_point_formats() +
+                  ext_signature_algorithms() +
+                  ext_use_srtp() +
+                  ext_extended_master_secret())
+    cipher_suites = b"".join(u16(c) for c in
+                             [0xC02B, 0xC02F, 0xCCA9, 0xC02C, 0x009C, 0x009D])
+    return (b"\xFE\xFD" + rb(32) + bytes([len(session_id)]) + session_id +
+            b"\x00" + u16(len(cipher_suites)) + cipher_suites + b"\x01\x00" +
+            u16(len(extensions)) + extensions)
+
+def generate_dtls_payload(options):
+    body = build_dtls_client_hello_body(options["host"])
+    handshake = (b"\x01" + u24(len(body)) + u16(0) + u24(0) + u24(len(body)) + body)
+    return (b"\x16\xFE\xFD" + u16(0) + zeros(6) + u16(len(handshake)) + handshake)
+
+# ================================================================
+# STUN / TURN и WebRTC (generators.js: generateUnifiedStunTurnPayload)
+# ================================================================
+def build_stun_attribute(attr_type, value):
+    padding = (4 - (len(value) % 4)) % 4
+    return u16(attr_type) + u16(len(value)) + value + zeros(padding)
+
+def build_stun_message_with_fingerprint(message_type, attrs):
+    """
+    STUN-сообщение с атрибутом FINGERPRINT (RFC 5389 §15.5).
+
+    Отличие от payloadGen: там CRC32 считается по сообщению ВМЕСТЕ с четырьмя
+    байтами заголовка самого FINGERPRINT, а RFC требует считать до атрибута,
+    не включая его. С расчётом оригинала любой разбирающий STUN наблюдатель
+    видит несходящуюся контрольную сумму — то есть ровно ту аномалию, ради
+    сокрытия которой мимикрия и делается, поэтому здесь взят вариант RFC.
+    Длина сообщения при этом, как и требуется, учитывает FINGERPRINT.
+    """
+    transaction_id = rb(12)
+    attr_bytes = b"".join(attrs)
+    total_length = len(attr_bytes) + 8      # + FINGERPRINT (4 байта заголовка + 4 значения)
+    prefix = u16(message_type) + u16(total_length) + u32(0x2112A442) + transaction_id
+    crc_value = (crc32_stun(prefix + attr_bytes) ^ 0x5354554E) & 0xFFFFFFFF
+    return prefix + attr_bytes + build_stun_attribute(0x8028, u32(crc_value))
+
+def resolve_stun_turn_profile(provider):
+    provider = str(provider or "").strip().lower()
+    if provider == "random":
+        provider = rc(["google", "cloudflare", "meta", "twilio", "twilio_stun"])
+    if provider == "twilio_stun":
+        return {"id": "twilio", "serverPool": TWILIO_STUN_SERVERS, "realm": TWILIO_REALM,
+                "softwareName": "Twilio WebRTC ICE agent", "preferredMode": "binding",
+                "autoAllocateProbability": 0.0, "supportsAllocate": False,
+                "lifetimeRange": [300, 600]}
+    if provider in ("twilio", "twilio_turn"):
+        return {"id": "twilio", "serverPool": TWILIO_TURN_SERVERS, "realm": TWILIO_REALM,
+                "softwareName": "Twilio WebRTC ICE agent", "preferredMode": "allocate",
+                "autoAllocateProbability": 0.67, "supportsAllocate": True,
+                "lifetimeRange": [300, 600]}
+    if provider == "cloudflare":
+        return {"id": "cloudflare", "serverPool": CLOUDFLARE_WEBRTC_SERVERS,
+                "realm": CLOUDFLARE_REALM, "softwareName": "Cloudflare WebRTC client",
+                "preferredMode": None, "autoAllocateProbability": 0.67,
+                "supportsAllocate": True, "lifetimeRange": [600, 1200]}
+    if provider == "meta":
+        return {"id": "meta", "serverPool": META_WEBRTC_SERVERS, "realm": META_REALM,
+                "softwareName": None, "preferredMode": None,
+                "autoAllocateProbability": 0.75, "supportsAllocate": True,
+                "lifetimeRange": [180, 600]}
+    return {"id": "google", "serverPool": GOOGLE_STUN_SERVERS, "realm": "google.com",
+            "softwareName": "Google STUN client", "preferredMode": None,
+            "autoAllocateProbability": 0.0, "supportsAllocate": False,
+            "lifetimeRange": [300, 600]}
+
+def resolve_stun_turn_mode(options, profile):
+    requested = str(options.get("iceMode") or "auto")
+    if requested == "binding":
+        return "binding"
+    if requested == "allocate":
+        return "allocate" if profile["supportsAllocate"] else "binding"
+    if profile["preferredMode"] == "binding":
+        return "binding"
+    if profile["preferredMode"] == "allocate":
+        return "allocate" if profile["supportsAllocate"] else "binding"
+    if not profile["supportsAllocate"]:
+        return "binding"
+    return "allocate" if (ri(1000) / 1000.0) < profile["autoAllocateProbability"] else "binding"
+
+def stun_software_name(profile):
+    if profile["id"] == "meta":
+        return rc(["WhatsApp/2", "Instagram/2", "Messenger WebRTC"])
+    return profile["softwareName"]
+
+def build_stun_binding_username(profile, server_host):
+    if profile["id"] == "meta":
+        return enc_text("WA-%d:%s" % (1000000000 + ri(9000000000), server_host))
+    if profile["id"] == "twilio":
+        return enc_text("%s:%s" % (rc(TWILIO_TURN_USERNAME_PREFIXES), server_host))
+    return enc_text("%s:%s" % (to_hex(rb(4)), server_host))
+
+def build_stun_allocate_username(profile, server_host):
+    if profile["id"] == "meta":
+        return enc_text("WA-%d@%s" % (1000000000 + ri(9000000000), server_host))
+    suffix = str(ri(9000) + 1000)
+    if profile["id"] == "twilio":
+        return enc_text("%s%s@%s" % (rc(TWILIO_TURN_USERNAME_PREFIXES), suffix, server_host))
+    return enc_text("%s%s@%s" % (to_hex(rb(8)), suffix, server_host))
+
+def generate_stun_payload(options):
+    """
+    STUN Binding или TURN Allocate под выбранного провайдера ICE.
+    Реальный WebRTC-клиент шлёт ровно такие пакеты в начале звонка.
+    """
+    profile = resolve_stun_turn_profile(options.get("iceProvider") or "google")
+    mode = resolve_stun_turn_mode(options, profile)
+    server_host = options.get("iceServerHost") or rc(profile["serverPool"])
+    attrs = []
+
+    if mode == "allocate":
+        lifetime = profile["lifetimeRange"][0] + \
+            ri(profile["lifetimeRange"][1] - profile["lifetimeRange"][0])
+        attrs.append(build_stun_attribute(0x0014, enc_text(profile["realm"])))
+        attrs.append(build_stun_attribute(0x000D, u32(lifetime)))
+        attrs.append(build_stun_attribute(0x0019, u32(0x00000011) + zeros(4)))
+        attrs.append(build_stun_attribute(
+            0x8027, bytes([0x00, 0x0001 if ri(2) == 0 else 0x0002, 0x00, 0x00])))
+        username = build_stun_allocate_username(profile, server_host)
+    else:
+        username = build_stun_binding_username(profile, server_host)
+
+    attrs.append(build_stun_attribute(0x8022, enc_text(stun_software_name(profile))))
+    attrs.append(build_stun_attribute(0x0024, u32(ru32() | 0x40000000)))
+    attrs.append(build_stun_attribute(0x8029 if ri(2) == 0 else 0x802A,
+                                      u32(ru32()) + u32(ru32())))
+    attrs.append(build_stun_attribute(0x0006, username))
+
+    return build_stun_message_with_fingerprint(0x000A if mode == "allocate" else 0x0001, attrs)
+
+def generate_webrtc_payload(options):
+    """
+    Связка первых пакетов WebRTC-сессии: STUN Binding, DTLS ClientHello,
+    RTP и RTCP. Порт generateWebrtcCombinedPayload.
+    """
+    stun_options = dict(options)
+    stun_options["iceMode"] = "binding"
+    stun_payload = generate_stun_payload(stun_options)
+    dtls_host = options.get("iceServerHost") or options.get("host") or "stun.l.google.com"
+    return (stun_payload + generate_dtls_payload({"host": dtls_host}) +
+            generate_rtp_payload() + generate_rtcp_payload())
+
+# ================================================================
+# Диспетчер профилей и вывод (app.js: appendChunkLines/chunkPayload)
+# ================================================================
+PROTOCOL_GENERATORS = {
+    "dns": generate_dns_payload,
+    "quic": generate_quic_payload,
+    "curl_quic": generate_curl_quic_payload,
+    "stun": generate_stun_payload,
+    "webrtc": generate_webrtc_payload,
+    "sip": generate_sip_payload,
+    "ntp": generate_ntp_payload,
+    "rtp": generate_rtp_payload,
+    "ssdp": generate_ssdp_payload,
+    "dtls": generate_dtls_payload,
+}
+
+# Устаревшие имена профилей awg2 до перехода на payloadGen. TLS-запись поверх
+# UDP не существует как протокол, поэтому профиль tls заменён на quic — это
+# настоящий UDP-протокол с тем же Chrome-подобным ClientHello внутри.
+PROFILE_ALIASES = {"tls": "quic"}
+
+def chunk_payload(payload, mtu):
+    if not payload:
+        return [payload]
+    return [payload[i:i + mtu] for i in range(0, len(payload), mtu)]
+
+def build_options(profile, domain, domain_is_explicit, args):
+    options = {"host": domain or DEFAULT_HOST}
+    if profile in ("quic", "curl_quic"):
+        options["quicMtu"] = args["mtu"]
+        options["quicPadToMtu"] = False
+        options["echDoh"] = args["ech_doh"]
+    elif profile == "sip":
+        # sipCustomMessage=True заставляет использовать наш домен, иначе
+        # оригинал подставил бы CONFIG.defaultHost во все пять пакетов.
+        options["sipCustomMessage"] = True
+        options["hasCustomHost"] = True
+        options["sipAction"] = args["sip_action"]
+    elif profile in ("stun", "webrtc"):
+        options["iceProvider"] = args["ice_provider"]
+        options["iceMode"] = args["ice_mode"]
+        # Домен подставляем в ICE только если его ввёл пользователь: при
+        # автогенерации правдоподобнее пул серверов самого провайдера.
+        options["iceServerHost"] = domain if domain_is_explicit else ""
+    return options
+
+def main(argv):
+    args = {
+        "mtu": DEFAULT_MTU,
+        # Бюджет длины всей цепочки в символах конфига (0 = без лимита).
+        "budget": 0,
+        "ech_doh": os.environ.get("AWG_CPS_ECH_DOH", "") not in ("", "0"),
+        "sip_action": "OPTIONS",
+        "ice_provider": "random",
+        "ice_mode": "auto",
+    }
+    only_i1 = False
+    positional = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--only-i1":
+            only_i1 = True
+        elif arg == "--ech-doh":
+            args["ech_doh"] = True
+        elif arg == "--full":
+            # Флаг компактного режима старого генератора: размеры пакетов теперь
+            # задаёт payloadGen, поэтому флаг принимается и ничего не меняет.
+            pass
+        elif arg == "--mtu" and index + 1 < len(argv):
+            index += 1
+            try:
+                args["mtu"] = max(1200, min(1500, int(argv[index])))
+            except ValueError:
+                _warn_once("значение --mtu не число, беру %d" % DEFAULT_MTU)
+        elif arg == "--budget" and index + 1 < len(argv):
+            index += 1
+            try:
+                args["budget"] = max(0, int(argv[index]))
+            except ValueError:
+                _warn_once("значение --budget не число, лимит длины снят")
+        elif arg == "--sip-action" and index + 1 < len(argv):
+            index += 1
+            args["sip_action"] = argv[index]
+        elif arg == "--ice-provider" and index + 1 < len(argv):
+            index += 1
+            args["ice_provider"] = argv[index]
+        elif arg == "--ice-mode" and index + 1 < len(argv):
+            index += 1
+            args["ice_mode"] = argv[index]
+        elif arg.startswith("--"):
+            _warn_once("неизвестный флаг %s пропущен" % arg)
         else:
-            print(_quic_initial_line(gen_quic_second_initial(dcid, ver)))
-        for _ in range(3):
-            print(_quic_short_line())
+            positional.append(arg)
+        index += 1
+
+    profile = positional[0] if positional else "quic"
+    domain = positional[1].strip() if len(positional) > 1 else ""
+    profile = PROFILE_ALIASES.get(profile, profile)
+    if profile not in PROTOCOL_GENERATORS:
+        _warn_once("неизвестный профиль %s, беру quic" % profile)
+        profile = "quic"
+
+    domain_is_explicit = bool(domain)
+    if not domain:
+        domain = rc(RU_DOMAIN_POOL)
+
+    generator = PROTOCOL_GENERATORS[profile]
+    options = build_options(profile, domain, domain_is_explicit, args)
+
+    # Бюджет применяется ЦЕЛЫМИ пакетами. Обрезать пакет на середине нельзя:
+    # получится не снимок протокола, а обрубок, по которому DPI отличает нас
+    # быстрее, чем по отсутствию мимикрии вовсе. Поэтому сколько пакетов
+    # поместится — зависит от профиля: DNS укладывает все пять в ~370 символов,
+    # один QUIC Initial занимает ~2400. Первый пакет выдаётся всегда, иначе
+    # слишком маленький бюджет молча оставил бы конфиг без мимикрии.
+    budget = args["budget"]
+    lines = []
+    used = 0
+    for _ in range(MAX_OUTPUT_LINES):
+        if len(lines) >= MAX_OUTPUT_LINES:
+            break
+        try:
+            payload = generator(options)
+        except Exception as exc:
+            _warn_once("сбой генерации %s (%s: %s)" % (profile, type(exc).__name__, exc))
+            break
+        room = MAX_OUTPUT_LINES - len(lines)
+        piece = ["<b 0x%s>" % to_hex(chunk)
+                 for chunk in chunk_payload(payload, args["mtu"])[:room]]
+        cost = sum(len(item) for item in piece)
+        if budget and lines and used + cost > budget:
+            break
+        lines.extend(piece)
+        used += cost
+        if only_i1:
+            break
+
+    if not lines:
+        return 1
+    for line in (lines[:1] if only_i1 else lines):
+        print(line)
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
 '
-# CPS_GENERATOR_END v1
+# CPS_GENERATOR_END v2
 
 
-# Генерация I1-I5 через Python
-# $1 = profile (quic|sip|dns), $2 = domain (опционально), $3 = --only-i1 (опционально)
+# Генерация I1-I5 через Python.
+# $1 = профиль мимикрии, $2 = домен (пустой — генератор берёт свой RU-пул),
+# $3 = --only-i1 (необязательно). Вывод: одна строка на пакет, до пяти.
+# AWG_CPS_MTU задаёт размер, по которому пакет режется на несколько I (1200-1500).
+# AWG_CPS_ECH_DOH=1 разрешает генератору сходить за настоящим ECHConfig по DoH.
+# CPS_BUDGET (символов, 0 = без лимита) ограничивает длину всей цепочки —
+# генератор режет её целыми пакетами, см. choose_cps_budget.
 gen_cps_i1() {
   local profile="${1:-quic}"
   local domain="${2:-}"
   local only_i1="${3:-}"
-  # AWG_CPS_FULL=1 — прежние «толстые» пакеты (см. [v4] выше)
-  local full=""
-  [[ -n "${AWG_CPS_FULL:-}" ]] && full="--full"
-  python3 -c "$_CPS_GENERATOR" "$profile" "$domain" ${only_i1:+"$only_i1"} ${full:+"$full"}
+  local mtu_args=()
+  [[ -n "${AWG_CPS_MTU:-}" ]] && mtu_args=(--mtu "$AWG_CPS_MTU")
+  local budget_args=()
+  local budget="${CPS_BUDGET:-0}"
+  if [[ "$budget" =~ ^[0-9]+$ ]] && (( budget > 0 )); then
+    budget_args=(--budget "$budget")
+  fi
+  python3 -c "$_CPS_GENERATOR" "$profile" "$domain" ${only_i1:+"$only_i1"} \
+    ${mtu_args[@]+"${mtu_args[@]}"} ${budget_args[@]+"${budget_args[@]}"}
 }
 
 
 # Алгоритм:
-# 1. Профиль 1-4: выбираем домен из пула через scan_pool → select_random_domain
-#    Fallback при пустом пуле: домен НЕ подменяется на другой профиль — в
-#    генератор уходит пустая строка, и он берёт случайный домен из своего
-#    встроенного DOMAIN_POOL. Профиль мимикрии (tls/dtls/sip/quic) при этом
-#    сохраняется: смена профиля из-за недоступности пула поменяла бы сигнатуру
-#    на протокол, который пользователь не выбирал.
-# 2. Профиль 5: ручной ввод домена + выбор CPS-профиля (tls/dtls/sip/dns)
-# 3. OBF_LEVEL=1 отключает мимикрию (I1="", MIMICRY_PROFILE="none")
+# 1. Пользователь выбирает профиль мимикрии (choose_mimicry_profile), затем один
+#    домен на всю цепочку I1-I5 (choose_cps_domain): свой или из RU-пула
+#    CPS_RU_DOMAINS с проверкой доступности через scan_pool.
+# 2. Fallback при пустом пуле: домен НЕ подменяется на другой профиль — в
+#    генератор уходит пустая строка, и он берёт домен из своего встроенного
+#    RU_DOMAIN_POOL. Профиль мимикрии при этом сохраняется: смена профиля из-за
+#    недоступности пула поменяла бы сигнатуру на протокол, который пользователь
+#    не выбирал.
+# 3. Профилям ntp/rtp/ssdp домен не нужен (пакет его не содержит), а stun/webrtc
+#    без явного ввода берут адреса из пула своего ICE-провайдера.
+# 4. OBF_LEVEL=1 отключает мимикрию (I1="", MIMICRY_PROFILE="none")
 #
 # Все профили генерируют I1-I5 через CPS-генератор (_CPS_GENERATOR).
 # Глобальные переменные на выходе: I1, I2, I3, I4, I5, MIMICRY_PROFILE
-# ── Профили AWG (Lite / Standard / Pro) ──────────────────
+# ── Профили AWG ──────────────────────────────────────────
+# Выбор из двух: «AmneziaVPN» (значение lite) и «Мощный» (значение pro).
+# Имена значений не меняются — они уже записаны в awg0.conf у созданных
+# серверов и читаются ботом. Значение standard больше не предлагается, но
+# по-прежнему распознаётся у серверов, созданных раньше.
 # AWG_PROFILE определяет ВСЁ:
 #   - параметры Jc/Jmin/Jmax/S1-S4/H1-H4 (gen_awg_params)
 #   - уровень обфускации (OBF_LEVEL)
 #   - профиль мимикрии (MIMICRY_PROFILE)
 # Маркер пишется первой строкой awg0.conf: "# AWG_PROFILE=<value>"
-# ── Целевой клиент ────────────────────────────────────────
-# От клиента зависит не «сколько параметров он потянет», а что он вообще
-# читает. Здесь только проверенное:
+# ── Совместимость клиентов с цепочкой I1-I5 ───────────────
+# Раньше здесь спрашивали «куда поедет конфиг». Вопрос убран: диапазоны
+# Jc/S/H — параметры УСТРОЙСТВА, они одинаковы у сервера и всех клиентов и
+# клиентом не сужаются, то есть выбор влиял ровно на одно — на цепочку I1-I5.
+# А у профиля по умолчанию (AmneziaVPN) цепочки нет вовсе, так что вопрос
+# задавался в каждом сценарии и почти всегда ни на что не влиял.
+#
+# То, что он сообщал, никуда не делось — это предупреждения в меню уровня
+# обфускации, где цепочка и выбирается:
 #  • WireSock (форк BoringTun под Windows) не читает I1-I5 совсем. По
 #    документации вендора поля «silently ignored»: туннель поднимется, мимикрии
 #    в трафике не будет, ошибки тоже не будет. Худший вид поломки — тихий.
 #  • Keenetic OS 4.x: чем именно разбирается цепочка, по исходникам установить
-#    не удалось, поэтому цепочку держим короткой (I1, профиль DNS).
+#    не удалось, поэтому длинная цепочка на нём ненадёжна.
 #  • AmneziaWG для Windows до v2.0.2 не принимал H выше 2^31-1. Мы и так
 #    генерируем внутри этой границы, отдельного действия не нужно.
 #  • Теги b/r/rc/rd читают оба известных движка (amneziawg-go device/obf.go и
 #    модуль ядра src/junk.c), поэтому цепочка переносима между всеми
 #    клиентами, которые её вообще разбирают.
-# Диапазоны Jc/S/H — параметры УСТРОЙСТВА: они одинаковы у сервера и всех
-# клиентов, поэтому клиентом их не сузить. Выбор влияет только на I1-I5.
-TARGET_CLIENT="amnezia"
-
-_target_client_label() {
-  case "${1:-${TARGET_CLIENT:-amnezia}}" in
-    kmod)     echo "Linux / OpenWrt (модуль ядра)" ;;
-    keenetic) echo "Keenetic (нативный AmneziaWG)" ;;
-    wiresock) echo "WireSock (Windows)" ;;
-    mixed)    echo "разные клиенты" ;;
-    *)        echo "Amnezia VPN / AmneziaWG" ;;
-  esac
-}
-
-# Ложь, если выбранный клиент цепочку I1-I5 не читает.
-_target_client_reads_cps() {
-  [[ "${TARGET_CLIENT:-amnezia}" != "wiresock" ]]
-}
-
-# Печатает предупреждение и возвращает 0, если CPS для этого клиента бесполезен.
-# Вызывающий в этом случае обязан оставить конфиг без I1-I5. Текст печатается
-# один раз на выбор клиента: он длинный, а проверка стоит в нескольких местах.
-_warn_cps_unsupported() {
-  _target_client_reads_cps && return 1
-  [[ -n "${_CPS_UNSUPPORTED_WARNED:-}" ]] && return 0
-  _CPS_UNSUPPORTED_WARNED=1
-  echo ""
-  warn "WireSock не читает I1-I5 — по документации вендора поля молча игнорируются"
-  warn "Туннель поднимется, мимикрии в трафике не будет, и об этом никто не сообщит"
-  info "Поэтому конфиг делается без CPS. Обфускация H/S/Jc у WireSock работает полностью"
-  return 0
-}
-
-# Спрашивает, куда поедет конфиг. Влияет только на цепочку I1-I5.
-choose_target_client() {
-  TARGET_CLIENT="amnezia"
-  _CPS_UNSUPPORTED_WARNED=""
-  echo ""
-  hdr "▣  Куда поедет конфиг"
-  echo -e "  ${G}1${N}  ${W}Amnezia VPN / AmneziaWG${N} ${D}— Android, iOS, Windows, macOS, Linux${N} ${C}(по умолчанию)${N}"
-  echo -e "  ${G}2${N}  ${W}Linux / OpenWrt${N} ${D}— модуль ядра amneziawg${N}"
-  echo -e "  ${G}3${N}  ${W}Keenetic${N} ${D}— нативный AmneziaWG в KeeneticOS 4.x${N}"
-  echo -e "  ${R}4${N}  ${W}WireSock${N} ${D}— Windows; мимикрию I1-I5 не поддерживает${N}"
-  echo -e "  ${G}5${N}  Не знаю / разные клиенты"
-  echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  local _tc
-  read_choice _tc "$(echo -e "${C}  Выбор [1-5] (Enter = 1): ${N}")" 1 5 1
-  case "$_tc" in
-    2) TARGET_CLIENT="kmod" ;;
-    3) TARGET_CLIENT="keenetic" ;;
-    4) TARGET_CLIENT="wiresock" ;;
-    5) TARGET_CLIENT="mixed" ;;
-    *) TARGET_CLIENT="amnezia" ;;
-  esac
-  ok "Клиент: $(_target_client_label)"
-
-  case "$TARGET_CLIENT" in
-    keenetic)
-      info "Длинная цепочка на Keenetic ненадёжна — предложу I1 и профиль DNS"
-      ;;
-    wiresock)
-      _warn_cps_unsupported || true
-      ;;
-    mixed)
-      info "Цепочка будет из тегов, которые читают оба движка — она переносима"
-      ;;
-  esac
-  log_info "TARGET_CLIENT=$TARGET_CLIENT"
-  return 0
-}
 
 choose_awg_profile() {
   AWG_PROFILE=""
-  choose_target_client
   echo ""
   hdr "⚙  Профиль AmneziaWG"
-  echo -e "  ${G}3${N}  ${W}Pro${N}      — максимальная защита, I1-I5 на выбор ${C}(рекомендуется)${N}"
-  echo -e "  ${D}1   Lite     — параметры как у оригинальной Amnezia, DNS мимикрия${N}"
-  echo -e "  ${D}2   Standard — усечённые диапазоны, TLS мимикрия${N}"
+  echo -e "  ${G}1${N}  ${W}AmneziaVPN${N} ${D}— параметры один в один с официальным клиентом${N} ${C}(рекомендуется)${N}"
+  echo -e "     ${D}Jc/Jmin/Jmax и S1-S4 как в конфигах Amnezia, MTU 1280,${N}"
+  echo -e "     ${D}цепочка I1-I5 по умолчанию не добавляется — конфиг короткий.${N}"
+  echo -e "     ${D}Ровно такой набор даёт полную скорость у официальной установки.${N}"
+  echo ""
+  echo -e "  ${G}2${N}  ${W}Мощный${N} ${D}— широкие диапазоны Jc/S плюс цепочка I1-I5${N}"
+  echo -e "     ${D}Сильнее против анализа трафика. Конфиг длинный, и на части${N}"
+  echo -e "     ${D}маршрутов такой профиль заметно теряет в скорости —${N}"
+  echo -e "     ${D}если после него скорость просела в разы, вернись на профиль 1.${N}"
+  echo -e "  ${D}0   Назад${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   local _choice
-  read_choice _choice "$(echo -e "${C}  Выбор [1-3] (Enter = 3 Pro): ${N}")" 1 3 3
+  read_choice _choice "$(echo -e "${C}  Выбор [0-2] (Enter = 1): ${N}")" 0 2 1
 
   case "$_choice" in
+    0) return 1 ;;
     1)
+      # Значение lite сохранено как есть: оно уже записано в awg0.conf у всех
+      # созданных серверов и читается ботом. Меняется наполнение, не имя.
       AWG_PROFILE="lite"
-      if _warn_cps_unsupported; then
+      # MTU 1280 — то же, что ставит официальный клиент. При 1320 внешний пакет
+      # AWG 3.x (паддинг содержимого + S4 + хвост) подходит вплотную к 1500,
+      # и на маршруте с меньшим MTU крупные пакеты начинают резаться.
+      if [[ "${MTU:-}" =~ ^[0-9]+$ ]] && (( MTU > 1280 )); then
+        info "Профиль «AmneziaVPN»: MTU ${MTU} → 1280 (как у официального клиента)"
+        MTU=1280
+      fi
+      # У официальной Amnezia строк I вообще нет. Один компактный I1 (DNS,
+      # ~90 символов) добавляем только по явному согласию: любая строка I —
+      # это лишний пакет перед рукопожатием, то есть лишний повод для DPI.
+      echo ""
+      echo -e "  ${D}Добавить один компактный пакет мимикрии I1 (DNS-запрос, ~90 симв)?${N}"
+      local _add_i1
+      read_choice _add_i1 "$(echo -e "${C}  1 — нет, AmneziaVPN (Enter), 2 — да: ${N}")" 1 2 1
+      if [[ "$_add_i1" == "1" ]]; then
         OBF_LEVEL=1; MIMICRY_PROFILE="none"
         I1=""; I2=""; I3=""; I4=""; I5=""
-        info "Профиль: Lite без CPS (клиент его не читает)"
+        ok "Профиль: AmneziaVPN (без I1-I5)"
         return 0
       fi
-      OBF_LEVEL=2                # клиентам кладём I1
+      OBF_LEVEL=2                # клиентам кладём один I1
       MIMICRY_PROFILE="dns"
-      # Домен не передаём — Python выбирает случайный из DOMAIN_POOL
-      info "Профиль: Lite (I1 = DNS / случайный домен)"
+      CPS_BUDGET=0               # один пакет DNS и так короткий
+      choose_cps_domain "dns"
+      local sel_domain="${CPS_DOMAIN:-}"
       local cps_out
-      cps_out=$(gen_cps_i1 "dns" "" "--only-i1") || cps_out=""
+      cps_out=$(gen_cps_i1 "dns" "$sel_domain" "--only-i1") || cps_out=""
       I1=$(echo "$cps_out" | sed -n '1p')
       I2=""; I3=""; I4=""; I5=""
       if [[ -z "$I1" ]]; then
-        warn "Не удалось сгенерировать I1 для Lite — клиенты пойдут без CPS"
+        warn "Не удалось сгенерировать I1 — клиенты пойдут без CPS"
+        MIMICRY_PROFILE="none"; OBF_LEVEL=1
       else
-        ok "I1 готов (${#I1} сим)"
+        ok "Профиль: AmneziaVPN + I1 (${#I1} симв${sel_domain:+, $sel_domain})"
       fi
       ;;
     2)
-      AWG_PROFILE="standard"
-      if _warn_cps_unsupported; then
-        OBF_LEVEL=1; MIMICRY_PROFILE="none"
-        I1=""; I2=""; I3=""; I4=""; I5=""
-        info "Профиль: Standard без CPS (клиент его не читает)"
-        return 0
-      fi
-      OBF_LEVEL=2                # клиентам кладём I1
-      MIMICRY_PROFILE="tls"
-      info "Профиль: Standard (I1 = TLS ClientHello)"
-      local sel_domain
-      sel_domain=$(select_random_domain "tls")
-      [[ -z "$sel_domain" ]] && sel_domain=""
-      local cps_out
-      cps_out=$(gen_cps_i1 "tls" "$sel_domain") || cps_out=""
-      I1=$(echo "$cps_out" | sed -n '1p')
-      I2=""; I3=""; I4=""; I5=""
-      if [[ -z "$I1" ]]; then
-        warn "Не удалось сгенерировать I1 для Standard — клиенты пойдут без CPS"
-      else
-        ok "I1 готов (${#I1} сим${sel_domain:+, $sel_domain})"
-      fi
-      ;;
-    3)
       AWG_PROFILE="pro"
-      info "Профиль: Pro — выбор уровня I1-I5 и мимикрии"
+      info "Профиль: Мощный — выбор уровня I1-I5 и мимикрии"
       choose_obf_level
       choose_mimicry_profile || return 1
       ;;
@@ -1299,18 +2425,7 @@ choose_obf_level() {
   #   3 = +I1-I5 — полный CPS chain (максимум DPI bypass)
   OBF_LEVEL=""
 
-  # У WireSock цепочки не будет вовсе, у Keenetic длинная ненадёжна — меняем
-  # предложение по умолчанию, но выбор оставляем за человеком.
   local _lvl_default=3
-  if _warn_cps_unsupported; then
-    OBF_LEVEL=1; MIMICRY_PROFILE="none"
-    I1=""; I2=""; I3=""; I4=""; I5=""
-    ok "Уровень обфускации: Базовый (H/S/Jc), без I1-I5"
-    return 0
-  fi
-  if [[ "${TARGET_CLIENT:-amnezia}" == "keenetic" ]]; then
-    _lvl_default=2
-  fi
 
   echo ""
   hdr "⛊  Уровень обфускации"
@@ -1320,10 +2435,13 @@ choose_obf_level() {
   echo -e "     ${D}I1 = снимок реального TLS/QUIC/DTLS протокола${N}"
   echo -e "  ${D}1   Базовый — H ranges + S1-S4 + Jc junk, без I1-I5${N}"
   echo -e "     ${D}Максимальная совместимость со старыми клиентами.${N}"
-  if [[ "${TARGET_CLIENT:-amnezia}" == "keenetic" ]]; then
-    echo -e "  ${Y}  Keenetic: чем он разбирает цепочку — по исходникам неизвестно.${N}"
-    echo -e "  ${Y}  Надёжнее уровень 2 (один I1), поэтому он и предложен.${N}"
-  fi
+  echo ""
+  echo -e "  ${Y}  Цепочку читают не все клиенты:${N}"
+  echo -e "  ${D}  • WireSock (Windows) не читает I1-I5 совсем — поля молча${N}"
+  echo -e "  ${D}    игнорируются, туннель поднимется без мимикрии и без ошибки.${N}"
+  echo -e "  ${D}    Ему подходит только уровень 1 (H/S/Jc работают полностью).${N}"
+  echo -e "  ${D}  • Keenetic: чем он разбирает цепочку — по исходникам неизвестно,${N}"
+  echo -e "  ${D}    длинная ненадёжна. Надёжнее уровень 2 (один I1).${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   read_choice OBF_LEVEL "$(echo -e "${C}  Выбор [1-3] (Enter = ${_lvl_default}): ${N}")" 1 3 "$_lvl_default"
   local label
@@ -1335,6 +2453,211 @@ choose_obf_level() {
   echo -e "${G}  √ Уровень обфускации: ${W}${label}${N}"
   return 0
 }
+# Профили мимикрии, которым нужен домен: он уезжает в SNI (QUIC), в QNAME
+# (DNS) или в Request-URI (SIP). Остальным домен не нужен — NTP, RTP и SSDP
+# его не содержат вовсе, а STUN/WebRTC без явного ввода берут пул серверов
+# своего ICE-провайдера, что правдоподобнее случайного сайта.
+_cps_profile_needs_domain() {
+  case "${1:-}" in
+    quic|curl_quic|dns|sip) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Один домен на всю цепочку I1-I5: спрашивается один раз и уходит во все пять
+# пакетов. Разные домены в соседних пакетах — это не «больше энтропии», а
+# лишний повод для DPI: настоящий клиент за одно рукопожатие ходит на один
+# хост. Результат кладётся в CPS_DOMAIN.
+choose_cps_domain() {
+  local profile="${1:-quic}"
+  CPS_DOMAIN=""
+
+  if ! _cps_profile_needs_domain "$profile"; then
+    case "$profile" in
+      stun|webrtc)
+        echo ""
+        info "Профилю $profile домен не нужен: адреса берутся из пула ICE-провайдера"
+        echo -e "  ${D}Можно задать свой — он попадёт в USERNAME STUN и в SNI DTLS.${N}"
+        local _use_custom
+        read_choice _use_custom "$(echo -e "${C}  Задать свой домен? 1 — нет (Enter), 2 — да: ${N}")" 1 2 1
+        [[ "$_use_custom" == "1" ]] && return 0
+        ;;
+      *)
+        info "Профилю $profile домен не нужен — пакет его не содержит"
+        return 0
+        ;;
+    esac
+  fi
+
+  # Требование к домену зависит от профиля: QUIC-снимок с SNI хоста, который
+  # HTTP/3 не отдаёт вовсе, недостоверен сам по себе — DPI видит QUIC Initial
+  # к тому, кто по QUIC не отвечает. Для DNS-запроса годится любое имя.
+  local _dom_hint=""
+  case "$profile" in
+    quic|curl_quic) _dom_hint=" ${W}и который отдаёт HTTP/3${N}" ;;
+    sip)            _dom_hint=" ${W}(домен SIP-провайдера)${N}" ;;
+  esac
+
+  echo ""
+  hdr "◈  Домен для мимикрии (один на все I1-I5)"
+  echo -e "  ${G}1${N}  ${W}Ввести свой${N} ${D}— сайт, к которому у вас и так идёт трафик${N} ${C}(рекомендуется)${N}"
+  echo -e "  ${G}2${N}  ${W}Автоматически${N} ${D}— возьму из встроенного пула с проверкой доступности${N}"
+  echo ""
+  echo -e "  ${Y}Свой домен почти всегда лучше встроенного: пул одинаков у всех,${N}"
+  echo -e "  ${Y}кто ставит эту тулзу, поэтому по нему DPI учится быстрее всего.${N}"
+  echo -e "  ${Y}Годится любой ЖИВОЙ сайт, куда вы реально ходите с этого${N}"
+  echo -e "  ${Y}устройства${N}${_dom_hint}${Y}. Мёртвый или заблокированный домен${N}"
+  echo -e "  ${Y}делает мимикрию недостоверной — соединение может не подняться.${N}"
+  echo ""
+  echo -e "  ${D}Важно: автопроверка идёт С ЭТОГО СЕРВЕРА, а мимикрию разбирает DPI${N}"
+  echo -e "  ${D}у вашего провайдера. Живой отсюда домен может быть мёртвым или${N}"
+  echo -e "  ${D}блокируемым там. Проверить со стороны клиента можно, например,${N}"
+  echo -e "  ${D}github.com/Runnin4ik/dpi-detector — и вписать сюда домен, который${N}"
+  echo -e "  ${D}он показал рабочим.${N}"
+  echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  local _dom_choice
+  read_choice _dom_choice "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" 1 2 1
+
+  if [[ "$_dom_choice" == "1" ]]; then
+    local _input
+    while true; do
+      _flush_stdin
+      read -rp "$(echo -e "${C}  Домен (Enter — вернуться к автовыбору): ${N}")" _input || _input=""
+      _input="${_input## }"; _input="${_input%% }"
+      [[ -z "$_input" ]] && break
+      # Валидация: только то, что вообще может быть именем хоста. Домен уезжает
+      # аргументом в python3 и внутрь пакета, длина метки ограничена RFC 1035.
+      if [[ "$_input" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]] \
+         && [[ ${#_input} -le 253 ]]; then
+        CPS_DOMAIN="${_input,,}"
+        ok "Домен: $CPS_DOMAIN"
+        return 0
+      fi
+      warn "Не похоже на домен: метки из букв, цифр и дефисов, минимум одна точка"
+    done
+  fi
+
+  # Пул выбираем под профиль: quic/curl_quic — только проверенные на HTTP/3
+  # (QUIC_DOMAINS), sip — домены SIP-провайдеров, остальным подходит общий пул.
+  local _pool=() _probe="tls"
+  case "$profile" in
+    quic|curl_quic) _pool=("${QUIC_DOMAINS[@]}"); _probe="quic" ;;
+    sip)            _pool=("${SIP_DOMAINS[@]}");  _probe="sip"  ;;
+    *)              _pool=("${CPS_RU_DOMAINS[@]}") ;;
+  esac
+
+  echo -e "${C}  → Проверяю доступность доменов из встроенного пула...${N}"
+  scan_pool "$_probe" "${_pool[@]}"
+  local available=("${SCAN_POOL_RESULT[@]+"${SCAN_POOL_RESULT[@]}"}")
+  if [[ ${#available[@]} -gt 0 ]]; then
+    CPS_DOMAIN="${available[$((RANDOM % ${#available[@]}))]}"
+    ok "Домен: $CPS_DOMAIN ${D}(доступно ${#available[@]} из ${#_pool[@]})${N}"
+    info "Если подключение не встанет или скорость просядет — пересоздай конфиг со СВОИМ доменом"
+  else
+    # Пул целиком недоступен (нет ICMP/TCP наружу) — домен не подменяем на
+    # чужой профиль, а отдаём генератору пустую строку: он возьмёт домен из
+    # своего встроенного RU-пула.
+    CPS_DOMAIN=""
+    warn "Ни один домен из пула не ответил — генератор возьмёт домен сам"
+  fi
+  return 0
+}
+
+# Длина цепочки I1-I5 в символах конфига.
+#
+# Пять полных пакетов QUIC — это ~12 000 символов: конфиг перестаёт помещаться
+# в QR, его неудобно передавать, а часть клиентов такой [Interface] читает уже
+# с трудом. Бюджет режет цепочку ЦЕЛЫМИ пакетами: обрезанный пакет — не снимок
+# протокола, а обрубок, по которому DPI отличает нас быстрее, чем по отсутствию
+# мимикрии вовсе. Поэтому сколько пакетов поместится, зависит от профиля:
+# DNS укладывает все пять в ~440 символов, один QUIC Initial занимает ~2400
+# и выдаётся целиком даже при меньшем бюджете (без первого пакета мимикрии
+# не будет вовсе).
+# Результат: глобальная CPS_BUDGET (символов, 0 = без лимита).
+CPS_BUDGET=0
+
+# Ориентировочная длина ОДНОГО пакета мимикрии в символах конфига.
+# Числа — замеры генератора v2; точная длина зависит от домена и случайных
+# полей, поэтому они годятся только для предупреждения в меню, а итог всегда
+# печатается по факту после генерации.
+_cps_pkt_len() {
+  case "${1:-}" in
+    quic)      echo 2400 ;;
+    curl_quic) echo 2500 ;;
+    sip)       echo 1200 ;;
+    webrtc)    echo 950  ;;
+    ssdp)      echo 450  ;;
+    dtls)      echo 380  ;;
+    rtp)       echo 300  ;;
+    stun)      echo 280  ;;
+    ntp)       echo 100  ;;
+    dns)       echo 90   ;;
+    *)         echo 500  ;;
+  esac
+}
+
+# Сколько пакетов профиля влезет в бюджет. Первый выдаётся всегда: без него
+# мимикрии не было бы вовсе, поэтому минимум — 1, даже если пакет длиннее
+# всего бюджета.
+_cps_fit_count() {
+  local budget="$1" pkt="$2" n
+  (( pkt <= 0 )) && { echo 5; return; }
+  n=$(( budget / pkt ))
+  (( n < 1 )) && n=1
+  (( n > 5 )) && n=5
+  echo "$n"
+}
+
+# $1 = профиль мимикрии: он уже выбран, поэтому меню может сказать заранее,
+# сколько пакетов реально поместится, а не общими словами про «QUIC урежется».
+choose_cps_budget() {
+  local profile="${1:-quic}"
+  local pkt fit1500 fit3000
+  pkt=$(_cps_pkt_len "$profile")
+  fit1500=$(_cps_fit_count 1500 "$pkt")
+  fit3000=$(_cps_fit_count 3000 "$pkt")
+
+  CPS_BUDGET=1500
+  echo ""
+  hdr "▭  Длина цепочки I1-I5"
+  echo -e "  ${D}Профиль ${W}${profile}${N}${D}: один пакет ~${pkt} символов.${N}"
+  echo -e "  ${D}Бюджет режет цепочку ЦЕЛЫМИ пакетами — обрезанный пакет это не${N}"
+  echo -e "  ${D}снимок протокола, а обрубок. Поэтому в бюджет попадает столько:${N}"
+  echo ""
+  # Уровень «полный CPS» человек уже выбрал на предыдущем экране. Если у
+  # этого профиля пять пакетов в компактный бюджет не влезают, предлагать
+  # компактный по умолчанию значит тихо отменить его выбор — поэтому
+  # рекомендация и Enter уезжают на «без лимита».
+  local _def=1 _rec1="" _rec3=""
+  if (( fit1500 < 5 )); then _def=3; _rec3=" ${C}(рекомендуется)${N}"
+  else                       _rec1=" ${C}(рекомендуется)${N}"; fi
+
+  echo -e "  ${G}1${N}  ${W}Компактная${N}  ${D}— до ~1500 симв, влезает в QR${N}  → ${W}${fit1500} из 5${N}${_rec1}"
+  echo -e "  ${G}2${N}  ${W}Средняя${N}     ${D}— до ~3000 симв${N}              → ${W}${fit3000} из 5${N}"
+  echo -e "  ${G}3${N}  ${W}Без лимита${N}  ${D}— все пять целиком (~$((pkt * 5)) симв)${N} → ${W}5 из 5${N}${_rec3}"
+  echo -e "  ${D}0   Назад${N}"
+  if (( fit1500 < 5 )); then
+    echo ""
+    echo -e "  ${Y}  Все пять в компактный бюджет укладывают только DNS, NTP и RTP.${N}"
+    echo -e "  ${Y}  Нужна и короткая цепочка, и пять пакетов — вернитесь и смените профиль.${N}"
+  fi
+  echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  local _b
+  read_choice _b "$(echo -e "${C}  Выбор [0-3] (Enter = ${_def}): ${N}")" 0 3 "$_def"
+  case "$_b" in
+    0) return 1 ;;
+    1) CPS_BUDGET=1500 ;;
+    2) CPS_BUDGET=3000 ;;
+    3) CPS_BUDGET=0 ;;
+  esac
+  if (( CPS_BUDGET > 0 )); then
+    ok "Бюджет цепочки: ${CPS_BUDGET} символов"
+  else
+    ok "Бюджет цепочки: без лимита"
+  fi
+  return 0
+}
+
 choose_mimicry_profile() {
   I1=""
   I2=""
@@ -1351,45 +2674,54 @@ choose_mimicry_profile() {
 
   echo ""
   hdr "~  Профили мимикрии I1-I5"
-  echo -e "  ${G}1${N}  ${W}QUIC${N}  — Initial 1200 Б по RFC 9000 + короткие заголовки"
-  echo -e "     ${D}Единственный из четырёх, где содержимое — шифротекст: смотреть${N}"
-  echo -e "     ${D}DPI не на что. По UDP это настоящий протокол.${N}"
-  echo -e "  ${G}2${N}  ${W}DNS${N}   — DNS Query с EDNS0 + случайный TXID"
-  echo -e "     ${D}Тоже настоящий UDP-протокол и самый компактный: 40 байт.${N}"
-  echo -e "  ${Y}3${N}  ${W}TLS${N}   — ClientHello (Chrome-подобный)"
-  echo -e "     ${D}⚠ TLS-записи поверх UDP не существует: настоящий UDP-TLS — это${N}"
-  echo -e "     ${D}DTLS, а у него другой формат. Плюс SNI уходит открытым текстом${N}"
-  echo -e "     ${D}и не совпадает с IP сервера. Сообщение из поля: конфиг с этим${N}"
-  echo -e "     ${D}профилем не работал в РФ, но работал в ЕС.${N}"
-  echo -e "  ${Y}4${N}  SIP   — REGISTER-запрос (VoIP)"
+  echo -e "  ${G}1${N}  ${W}QUIC${N}      — Initial 1200 Б, ClientHello Chrome внутри"
+  echo -e "     ${D}Содержимое зашифровано по RFC 9001: смотреть DPI не на что.${N}"
+  echo -e "  ${G}2${N}  ${W}cURL QUIC${N} — Initial 1250 Б, отпечаток curl --http3 + ECH"
+  echo -e "     ${D}Настоящий SNI спрятан внутрь ECH, наружу видно только public_name.${N}"
+  echo -e "  ${G}3${N}  ${W}DNS${N}       — запрос с EDNS0, 35-45 Б"
+  echo -e "     ${D}Самый компактный пакет: короткие I1-I5 и плотный QR.${N}"
+  echo -e "  ${G}4${N}  ${W}STUN${N}      — Binding или TURN Allocate к реальному ICE-провайдеру"
+  echo -e "     ${D}Google, Cloudflare, Meta, Twilio. Открытый текст, но обычный для UDP.${N}"
+  echo -e "  ${G}5${N}  ${W}WebRTC${N}    — связка STUN + DTLS ClientHello + RTP + RTCP"
+  echo -e "     ${D}Начало видеозвонка целиком. Пакет крупный: ~1 КБ.${N}"
+  echo -e "  ${Y}6${N}  ${W}SIP${N}       — OPTIONS/REGISTER/INVITE (VoIP)"
   echo -e "     ${D}Настоящий UDP-протокол, но целиком открытый текст.${N}"
+  echo -e "  ${Y}7${N}  ${W}NTP${N}       — client mode 3, ровно 48 Б"
+  echo -e "     ${D}Самый короткий пакет из всех, но и самый бедный на детали.${N}"
+  echo -e "  ${Y}8${N}  ${W}RTP${N}       — медиапоток (аудио/видео payload)"
+  echo -e "     ${D}Без предшествующего сигналинга выглядит вырванным из контекста.${N}"
+  echo -e "  ${Y}9${N}  ${W}SSDP${N}      — M-SEARCH (обнаружение UPnP)"
+  echo -e "     ${D}Локальный протокол: наружу, к VPN-серверу, ходит редко.${N}"
+  echo -e "  ${D}0   Назад${N}"
   echo ""
   local _mim_default=1
-  if [[ "${TARGET_CLIENT:-amnezia}" == "keenetic" ]]; then
-    # Keenetic чувствителен к длинному I1, а DNS — самый короткий пакет
-    _mim_default=2
-    echo -e "  ${Y}  Keenetic чувствителен к I1: DNS — самый короткий пакет${N}"
-    echo -e "  ${Y}  из четырёх, поэтому он и предложен.${N}"
-    echo ""
-  fi
-  read_choice PROFILE_CHOICE "$(echo -e "${C}  Выбор [1-4] (Enter = ${_mim_default}): ${N}")" 1 4 "$_mim_default"
+  echo -e "  ${D}  На Keenetic надёжнее DNS (3): он чувствителен к длине I1.${N}"
+  echo ""
+  read_choice PROFILE_CHOICE "$(echo -e "${C}  Выбор [0-9] (Enter = ${_mim_default}): ${N}")" 0 9 "$_mim_default"
 
   case $PROFILE_CHOICE in
+    0) return 1 ;;
     1) MIMICRY_PROFILE="quic" ;;
-    2) MIMICRY_PROFILE="dns"  ;;
-    3) MIMICRY_PROFILE="tls"  ;;
-    4) MIMICRY_PROFILE="sip"  ;;
+    2) MIMICRY_PROFILE="curl_quic" ;;
+    3) MIMICRY_PROFILE="dns"  ;;
+    4) MIMICRY_PROFILE="stun" ;;
+    5) MIMICRY_PROFILE="webrtc" ;;
+    6) MIMICRY_PROFILE="sip"  ;;
+    7) MIMICRY_PROFILE="ntp"  ;;
+    8) MIMICRY_PROFILE="rtp"  ;;
+    9) MIMICRY_PROFILE="ssdp" ;;
   esac
 
-  # Выбираем домен из пула под профиль
-  local sel_domain=""
-  case "$MIMICRY_PROFILE" in
-    tls)  sel_domain=$(select_random_domain "tls")  ;;
-    quic) sel_domain=$(select_random_domain "quic") ;;
-    sip)  sel_domain=$(select_random_domain "sip")  ;;
-    dns)  sel_domain=$(select_random_domain "tls")  ;;
-  esac
-  [[ -z "$sel_domain" ]] && sel_domain=""
+  # Длину цепочки спрашиваем только там, где пакетов больше одного
+  if [[ "${OBF_LEVEL:-1}" == "3" ]]; then
+    choose_cps_budget "$MIMICRY_PROFILE" || return 1
+  else
+    CPS_BUDGET=0
+  fi
+
+  # Домен спрашивается один раз и уходит во все пять пакетов
+  choose_cps_domain "$MIMICRY_PROFILE"
+  local sel_domain="${CPS_DOMAIN:-}"
 
   # ── Генерация через Python ──
   echo -e "${C}  → Генерируем $MIMICRY_PROFILE${sel_domain:+ ($sel_domain)}...${N}"
@@ -1410,6 +2742,44 @@ choose_mimicry_profile() {
       [[ -n "$I4" ]] && nonempty=$((nonempty+1))
       [[ -n "$I5" ]] && nonempty=$((nonempty+1))
       echo -e "${G}  √ ${nonempty}/5 пакетов ${D}(символов строки)${G}: I1=${#I1} I2=${#I2} I3=${#I3} I4=${#I4} I5=${#I5}${N}"
+      local _cps_len=$(( ${#I1} + ${#I2} + ${#I3} + ${#I4} + ${#I5} ))
+
+      # Цепочка короче пяти пакетов при заданном бюджете — это не сбой, а его
+      # работа: пакет режется только целиком. Молчать об этом нельзя, иначе
+      # человек, выбравший «полный CPS», получает один I1 и не понимает почему.
+      if (( nonempty < 5 )) && [[ "${CPS_BUDGET:-0}" =~ ^[0-9]+$ ]] && (( CPS_BUDGET > 0 )); then
+        echo ""
+        warn "Выбран полный CPS, но в цепочке ${nonempty} из 5 пакетов"
+        info "Один пакет $MIMICRY_PROFILE занимает ~$(( ${#I1} )) символов, а бюджет — ${CPS_BUDGET}."
+        info "Бюджет режет цепочку целыми пакетами, поэтому больше не поместилось."
+        info "Первый пакет выдаётся всегда — иначе мимикрии не было бы вовсе."
+        echo ""
+        local _regen
+        read_choice _regen "$(echo -e "${C}  1 — оставить ${nonempty} (Enter), 2 — перегенерировать без лимита: ${N}")" 1 2 1
+        if [[ "$_regen" == "2" ]]; then
+          CPS_BUDGET=0
+          echo -e "${C}  → Перегенерируем без лимита...${N}"
+          cps_out=$(gen_cps_i1 "$MIMICRY_PROFILE" "$sel_domain") || cps_out=""
+          I1=$(echo "$cps_out" | sed -n '1p')
+          I2=$(echo "$cps_out" | sed -n '2p')
+          I3=$(echo "$cps_out" | sed -n '3p')
+          I4=$(echo "$cps_out" | sed -n '4p')
+          I5=$(echo "$cps_out" | sed -n '5p')
+          nonempty=0
+          local _k
+          for _k in I1 I2 I3 I4 I5; do [[ -n "${!_k}" ]] && nonempty=$((nonempty + 1)); done
+          _cps_len=$(( ${#I1} + ${#I2} + ${#I3} + ${#I4} + ${#I5} ))
+          echo -e "${G}  √ ${nonempty}/5 пакетов, ${_cps_len} символов${N}"
+        fi
+      fi
+
+      # Пакеты уходят в конфиг чистым hex, поэтому цепочка из крупных пакетов
+      # (QUIC, WebRTC) занимает килобайты. Порог 2800 байт — тот же, по которому
+      # show_config отказывается рисовать QR: предупреждаем сразу, а не потом.
+      if (( _cps_len > 2500 )); then
+        warn "Цепочка занимает ${_cps_len} символов — конфиг в QR не поместится, выдавать придётся файлом"
+        info "Все пять пакетов в компактный бюджет укладывают DNS (~440), NTP (~510), RTP (~1370)"
+      fi
     else
       I2=""; I3=""; I4=""; I5=""
       echo -e "${G}  √ I1 готов (${#I1} сим)${N}"
@@ -1467,6 +2837,23 @@ def detect(p):
     # DTLS
     if p[0] == 0x16 and p[1:3] in (b"\xfe\xfd", b"\xfe\xff"):
         return ("dtls", f"DTLS handshake ({len(p)}B)")
+    # SSDP M-SEARCH (профиль ssdp)
+    if p.startswith(b"M-SEARCH"):
+        return ("ssdp", f"SSDP M-SEARCH ({len(p)}B)")
+    # STUN / TURN (профили stun и webrtc) — magic cookie RFC 5389
+    if len(p) >= 20 and p[4:8] == b"\x21\x12\xa4\x42":
+        mt = struct.unpack(">H", p[0:2])[0]
+        if mt in (0x0001, 0x000A):
+            kind = "TURN Allocate" if mt == 0x000A else "STUN Binding"
+            # У профиля webrtc за STUN-сообщением в той же датаграмме идёт
+            # DTLS ClientHello: отличаем связку от одиночного STUN по длине.
+            mlen = struct.unpack(">H", p[2:4])[0]
+            if 20 + mlen < len(p) and p[20+mlen] == 0x16:
+                return ("webrtc", f"WebRTC: {kind} + DTLS ({len(p)}B)")
+            return ("stun", f"{kind} ({len(p)}B)")
+    # NTP client (профиль ntp) — 48 байт, mode 3, reference id INIT
+    if len(p) == 48 and p[0] == 0x23 and p[12:16] == b"INIT":
+        return ("ntp", f"NTP client mode 3 ({len(p)}B)")
     # DNS
     if len(p) >= 12:
         flags = p[2]; qr = (flags >> 7) & 1; opcode = (flags >> 3) & 0xf
@@ -1487,6 +2874,11 @@ def detect(p):
     # ~25% случайных AWG data-пакетов попадают сюда из-за H-обфускации.
     if 0x40 <= fb <= 0x7f and len(p) > 20:
         return ("quic-short?", f"QUIC Short Header? ({len(p)}B)")
+    # RTP (профиль rtp). Правило нарочно узкое: версия 2 без CSRC, payload type
+    # из профиля генератора и его же длины. Более широкое ловило бы обычные
+    # AWG data-пакеты — первый байт 0x80 у них встречается регулярно.
+    if len(p) in (172, 108) and p[0] == 0x80 and (p[1] & 0x7F) in (0, 8, 96):
+        return ("rtp", f"RTP pt={p[1] & 0x7F} ({len(p)}B)")
     return (None, None)
 
 # ── Main ──
@@ -2954,9 +4346,9 @@ show_header() {
   if [[ -f "$SERVER_CONF" ]]; then
     profile_raw=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
     case "$profile_raw" in
-      lite)     profile_label="Lite" ;;
-      standard) profile_label="Standard" ;;
-      pro)      profile_label="Pro" ;;
+      lite)     profile_label="AmneziaVPN" ;;
+      standard) profile_label="Standard (устаревший)" ;;
+      pro)      profile_label="Мощный" ;;
       "")       profile_label="—" ;;
       *)        profile_label="$profile_raw" ;;
     esac
@@ -3116,19 +4508,21 @@ show_submenu_3() {
     echo ""
     hdr "Диагностика"
     echo ""
-    echo -e "  ${G}1)${N} Проверить домены из пулов (TCP+ping)"
+    echo -e "  ${G}1)${N} Проверить домены из пулов (TCP+ping) ${D}— с этого сервера${N}"
     if $HAS_SERVER_CONF; then
       echo -e "  ${G}2)${N} Тест DPI мимикрии (захват CPS пакета)"
     else
       echo -e "  ${D}2) Тест DPI мимикрии (нужен пункт Сервер → 2)${N}"
     fi
+    echo -e "  ${G}3)${N} DPI со стороны клиента ${D}— команда для вашего устройства${N}"
     echo ""
     echo -e "  ${W}0)${N} ← Назад"
     echo ""
-    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")" 0 2 "0"
+    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-3]: ${N}")" 0 3 "0"
     case "${SUB_CHOICE:-}" in
       1) do_check_domains || true ;;
       2) do_sniff_test || true ;;
+      3) do_client_dpi_hint || true ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -3517,42 +4911,54 @@ choose_dns() {
 # действуют на весь интерфейс сразу. Отдельному клиенту свою версию выдать
 # нельзя: включив 3.0, сервер перестаёт принимать клиентов на 2.0. Поэтому
 # спрашиваем один раз при создании и пишем маркер в awg0.conf.
-# Результат: глобальная AWG_PROTO = "2.0" | "3.0" | "3.1"
+# Результат: глобальная AWG_PROTO = "2.0" | "3.1"
+#
+# 3.0 из выбора убрана: это тот же набор, что и 3.1, только без RandomTrailers
+# и DisableCookies, а требования к версии tools/модуля у них почти совпадают.
+# Держать промежуточный вариант значило плодить конфигурации, которые никто
+# осознанно не выбирает. Уже созданные серверы на 3.0 продолжают работать:
+# конфиги читаются как раньше, а перегенерация параметров предложит перейти
+# на 3.1 или вернуться на 2.0.
 choose_awg_proto() {
   AWG_PROTO="2.0"
   echo ""
   hdr "▤  Версия протокола AmneziaWG"
   echo ""
-  echo -e "  ${G}1)${N} ${W}AWG 2.0${N} ${D}(по умолчанию, максимальная совместимость)${N}"
+  echo -e "  ${G}1)${N} ${W}AWG 2.0${N} ${D}(максимальная совместимость)${N}"
   echo -e "     ${D}Обфускация Jc/Jmin/Jmax, S1-S4, H1-H4 плюс мимикрия I1-I5.${N}"
   echo -e "     ${D}Работает со всеми клиентами AmneziaWG.${N}"
+  echo -e "     ${Y}Заголовок здесь открытый, поэтому H1-H4 обязаны быть${N}"
+  echo -e "     ${Y}диапазонами — иначе 1/2/3/4 выдают WireGuard прямым текстом.${N}"
+  echo -e "     ${Y}А диапазоны H заметно снижают скорость: замер на одном${N}"
+  echo -e "     ${Y}сервере дал 10 Мбит/с против 100+ при тех же остальных${N}"
+  echo -e "     ${Y}параметрах. Дешёвого способа получить и обфускацию${N}"
+  echo -e "     ${Y}заголовка, и полную скорость на 2.0 нет — это плата за версию.${N}"
   echo ""
-  echo -e "  ${G}2)${N} ${W}AWG 3.0${N} ${C}(сильнее против анализа трафика)${N}"
-  echo -e "     ${D}Дополнительно: защита заголовков ключом, случайный паддинг${N}"
-  echo -e "     ${D}содержимого и рандомизация таймингов рукопожатий —${N}"
-  echo -e "     ${D}то есть скрывает не только размеры, но и временные паттерны.${N}"
-  echo ""
-  echo -e "  ${G}3)${N} ${W}AWG 3.1${N} ${C}(новейшая, самая узкая совместимость)${N}"
-  echo -e "     ${D}Всё из 3.0 плюс RandomTrailers — случайный «хвост» у пакетов${N}"
-  echo -e "     ${D}рукопожатия, из-за чего их длина перестаёт быть постоянной,${N}"
-  echo -e "     ${D}и DisableCookies — сервер не отвечает cookie-пакетами.${N}"
+  echo -e "  ${G}2)${N} ${W}AWG 3.1${N} ${C}(сильнее против анализа трафика И быстрее)${N}"
+  echo -e "     ${D}Защита заголовков ключом, случайный паддинг содержимого,${N}"
+  echo -e "     ${D}рандомизация таймингов рукопожатий, RandomTrailers (длина${N}"
+  echo -e "     ${D}пакетов рукопожатия перестаёт быть постоянной) и${N}"
+  echo -e "     ${D}DisableCookies — сервер не отвечает cookie-пакетами.${N}"
+  echo -e "     ${D}Заголовок шифруется целиком, поэтому диапазоны H не нужны:${N}"
+  echo -e "     ${D}ставятся штатные 1/2/3/4, и цены за них нет.${N}"
   echo -e "     ${D}Нужны amneziawg-tools и модуль v3.1.20260812 или новее${N}"
   echo -e "     ${D}И НА СЕРВЕРЕ, И НА КЛИЕНТЕ: старый клиент такой конфиг${N}"
   echo -e "     ${D}даже не прочитает.${N}"
   echo ""
   echo -e "  ${Y}  Требует клиента с поддержкой выбранной версии. Версия задаётся${N}"
-  echo -e "  ${Y}  на ВЕСЬ сервер: клиенты на 2.0 к серверу 3.x не подключатся.${N}"
+  echo -e "  ${Y}  на ВЕСЬ сервер: клиенты на 2.0 к серверу 3.1 не подключатся.${N}"
+  echo -e "  ${D}  Промежуточная 3.0 из выбора убрана — 3.1 это она же плюс${N}"
+  echo -e "  ${D}  RandomTrailers/DisableCookies; уже созданные серверы на 3.0${N}"
+  echo -e "  ${D}  работают дальше без изменений.${N}"
   echo ""
   local _proto_choice
-  read_choice _proto_choice "$(echo -e "${C}  Выбор [1-3] (Enter = 1): ${N}")" 1 3 "1"
+  read_choice _proto_choice "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" 1 2 "1"
   case "$_proto_choice" in
-    2|3)
+    2)
       # Проверяем до генерации конфигов: с несовместимыми tools/модулем
-      # сервер 3.x просто не поднимется, а конфиги уже будут перезаписаны.
-      local _want="3.0"
-      [[ "$_proto_choice" == "3" ]] && _want="3.1"
-      if awg_compat_gate "$_want"; then
-        AWG_PROTO="$_want"; ok "Выбран AmneziaWG $_want"
+      # сервер 3.1 просто не поднимется, а конфиги уже будут перезаписаны.
+      if awg_compat_gate "3.1"; then
+        AWG_PROTO="3.1"; ok "Выбран AmneziaWG 3.1"
       else
         AWG_PROTO="2.0"; info "Остаёмся на AmneziaWG 2.0"
       fi
@@ -3682,10 +5088,13 @@ AWG_PARAM_KEYS_RE="(Jc|Jmin|Jmax|S[1-4]|H[1-4]|HeaderProtectionKey|ContentPaddin
 _awg_rand_s() {
   case "${AWG_PROFILE:-pro}" in
     lite)
-      # Образец оригинальной Amnezia: S1=102, S2=22, S3=21, S4=7 (±5)
+      # Образец конфига официального клиента Amnezia на 3.1:
+      # S1=86, S2=48, S3=16, S4=12. Держимся вокруг них.
+      # S4 от 12, а не от 4: при HeaderProtectionKey ядро требует S >= 12
+      # (AWG_HP_MIN_S), иначе setconf падает на «Invalid argument».
       case "$1" in
-        S1) rand_range 97 107 ;; S2) rand_range 17 27 ;;
-        S3) rand_range 16 26 ;;  S4) rand_range 4 10 ;;
+        S1) rand_range 80 92 ;; S2) rand_range 42 54 ;;
+        S3) rand_range 14 20 ;; S4) rand_range 12 18 ;;
       esac ;;
     standard)
       case "$1" in
@@ -3786,30 +5195,96 @@ _awg_apply_hp_min_s() {
   return 0
 }
 
+# Запас до 1500 байт на каждый ТРАНСПОРТНЫЙ пакет.
+#
+# Полезная нагрузка MTU байт превращается на проводе в:
+#   +16  заголовок транспортного пакета WireGuard (тип, индекс, счётчик)
+#   +16  тег Poly1305
+#   +S4  junk перед транспортным пакетом (S1/S2/S3 — рукопожатие, S4 — данные)
+#   +CPA верхняя граница добавки к паддингу содержимого (AWG 3.x)
+#   +28  IPv4 (20) + UDP (8)
+# RandomTrailers добавляет сверху случайный хвост, размер которого из конфига
+# не виден, — на него и на возможный туннель по пути держим отдельный запас.
+#
+# Если сумма подходит к 1500, крупные пакеты начинают резаться или теряться, а
+# PMTU discovery по UDP работает не везде. Наружу это выглядит не как обрыв, а
+# как загадочная просадка скорости в разы при живом туннеле.
+AWG_MTU_OVERHEAD_FIXED=60      # 16 + 16 + 28
+# Запас под RandomTrailers и возможный туннель по пути. 24, а не больше:
+# конфиг с MTU 1320, S4=19 и паддингом до 57 (внешний пакет до 1456 Б)
+# измеренно работает на полной скорости, и предупреждать на нём — шум.
+AWG_MTU_SAFETY=24
+AWG_MTU_PATH=1500              # типовой Ethernet до сервера
+
+# Возвращает 1 и печатает предупреждение, если запаса нет.
+# Использует S4 и AWG3_CPA_MAX из текущей генерации.
+_awg_check_mtu_headroom() {
+  local mtu="${MTU:-}"
+  [[ "$mtu" =~ ^[0-9]+$ ]] || return 0
+  [[ "${S4:-}" =~ ^[0-9]+$ ]] || return 0
+  local cpa_max="${AWG3_CPA_MAX:-0}"
+  [[ "$cpa_max" =~ ^[0-9]+$ ]] || cpa_max=0
+
+  local outer=$(( mtu + AWG_MTU_OVERHEAD_FIXED + S4 + cpa_max ))
+  local limit=$(( AWG_MTU_PATH - AWG_MTU_SAFETY ))
+  log_info "gen_awg_params: внешний пакет до ${outer} Б при MTU=${mtu} (S4=${S4}, CPA<=${cpa_max})"
+  (( outer <= limit )) && return 0
+
+  local safe_mtu=$(( limit - AWG_MTU_OVERHEAD_FIXED - S4 - cpa_max ))
+  # Округляем ВНИЗ до десятка: «1300» читается как осознанное значение,
+  # а «1303» — как случайное. Вниз, потому что вверх съело бы запас.
+  safe_mtu=$(( safe_mtu / 10 * 10 ))
+  (( safe_mtu > 1420 )) && safe_mtu=1420
+  (( safe_mtu < 1280 )) && safe_mtu=1280
+
+  echo ""
+  warn "MTU ${mtu} не оставляет запаса: внешний пакет доходит до ${outer} Б при пути в ${AWG_MTU_PATH}"
+  info "Считаем так: ${mtu} + 32 (WG) + ${S4} (S4) + ${cpa_max} (паддинг) + 28 (IP/UDP)"
+  info "Плюс случайный хвост RandomTrailers, которого в конфиге не видно"
+  info "Крупные пакеты начнут резаться, а PMTU discovery по UDP работает не везде —"
+  info "выглядит это не как обрыв, а как просадка скорости в разы при живом туннеле"
+  echo ""
+  local _fix
+  read_choice _fix "$(echo -e "${C}  1 — снизить MTU до ${safe_mtu} (Enter), 2 — оставить ${mtu}: ${N}")" 1 2 1
+  if [[ "$_fix" == "1" ]]; then
+    MTU="$safe_mtu"
+    ok "MTU: ${safe_mtu}"
+    log_info "gen_awg_params: MTU ${mtu} → ${safe_mtu} (не было запаса до ${AWG_MTU_PATH})"
+  else
+    warn "Оставлен MTU ${mtu} — если скорость просядет, снизь его первым делом"
+  fi
+  return 0
+}
+
 gen_awg_params() {
   AWG_PARAMS_LINES=""
+  AWG3_CPA_MAX=0
 
   # ══════════════════════════════════════════════════════════
   # Параметры AmneziaWG по ОФИЦИАЛЬНОМУ МАНУАЛУ
   # https://docs.amnezia.org/documentation/amnezia-wg/
   # ══════════════════════════════════════════════════════════
-  # Ветвление по AWG_PROFILE: lite / standard / pro
-  # Pro = текущая логика без изменений (полные диапазоны).
+  # Ветвление по AWG_PROFILE:
+  #   lite     — «AmneziaVPN»: значения вокруг официального конфига
+  # H1-H4 от профиля НЕ зависят — только от версии протокола, см. ниже.
+  #   standard — устаревший, оставлен для серверов, созданных раньше
+  #   pro      — «Мощный»: полные диапазоны
 
   local Jc Jmin Jmax S1 S2 S3 S4
 
   case "${AWG_PROFILE:-pro}" in
     lite)
-      # ── Lite: параметры как у оригинальной Amnezia, ±5 рандом ──
-      # Образец оригинала: Jc=4, Jmin=10, Jmax=50, S1=102, S2=22, S3=21, S4=7
+      # ── «AmneziaVPN»: значения вокруг официального конфига ──
+      # Образец конфига официального клиента (AWG 3.1):
+      #   Jc=4, Jmin=10, Jmax=50, S1=86, S2=48, S3=16, S4=12, H1..H4 = 1/2/3/4
       Jc=$(rand_range 3 5)              # 4 ±1
-      Jmin=$(rand_range 5 15)           # 10 ±5
+      Jmin=$(rand_range 8 14)           # 10 ±4
       Jmax=$(rand_range 45 55)          # 50 ±5
       S1=$(_awg_rand_s S1); S2=$(_awg_rand_s S2)
       S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
     standard)
-      # ── Standard: промежуточные значения ──
+      # ── Standard (устаревший): промежуточные значения ──
       Jc=$(rand_range 5 8)
       Jmin=$(rand_range 30 80)
       Jmax=$(rand_range 100 250)
@@ -3817,7 +5292,7 @@ gen_awg_params() {
       S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
     pro|*)
-      # ── Pro: текущие полные диапазоны (без изменений) ──
+      # ── «Мощный»: полные диапазоны ──
       Jc=$(rand_range 4 16)
       Jmin=$(rand_range 50 256)
       Jmax=$(rand_range 300 1000)
@@ -3880,11 +5355,31 @@ gen_awg_params() {
     echo "${lo}-${hi}"
   }
 
+  # ── H1-H4 зависят от версии, а не от профиля ──
+  #
+  # На 3.x задан HeaderProtectionKey, то есть заголовок шифруется целиком.
+  # Подменять под шифром тип пакета бессмысленно: наблюдателю всё равно видна
+  # только шифрограмма, а значение типа он прочитать не может ни при каких H.
+  # То есть на 3.x диапазоны H — это чистая цена без выигрыша в маскировке.
+  # Ровно поэтому и сам клиент Amnezia на 3.1 оставляет штатные 1/2/3/4.
+  #
+  # Раньше 1/2/3/4 ставились только профилю «AmneziaVPN», а «Мощный» на той же
+  # версии получал диапазоны — то есть платил за обфускацию, которой под
+  # шифрованием заголовка не существует.
+  #
+  # На 2.0 заголовок открытый: там 1/2/3/4 — прямой признак WireGuard,
+  # поэтому диапазоны остаются обязательно.
   local H1 H2 H3 H4
-  H1=$(_gen_quadrant_pair 5 "$SQ1_MAX")
-  H2=$(_gen_quadrant_pair "$SQ2_MIN" "$SQ2_MAX")
-  H3=$(_gen_quadrant_pair "$SQ3_MIN" "$SQ3_MAX")
-  H4=$(_gen_quadrant_pair "$SQ4_MIN" "$SQ4_MAX")
+  local _h_fixed=0
+  case "${AWG_PROTO:-2.0}" in 3.0|3.1) _h_fixed=1 ;; esac
+  if (( _h_fixed )); then
+    H1=1; H2=2; H3=3; H4=4
+  else
+    H1=$(_gen_quadrant_pair 5 "$SQ1_MAX")
+    H2=$(_gen_quadrant_pair "$SQ2_MIN" "$SQ2_MAX")
+    H3=$(_gen_quadrant_pair "$SQ3_MIN" "$SQ3_MAX")
+    H4=$(_gen_quadrant_pair "$SQ4_MIN" "$SQ4_MAX")
+  fi
 
   AWG_PARAMS_LINES="Jc = $Jc\nJmin = $Jmin\nJmax = $Jmax\nS1 = $S1\nS2 = $S2\nS3 = $S3\nS4 = $S4\nH1 = $H1\nH2 = $H2\nH3 = $H3\nH4 = $H4"
 
@@ -3898,6 +5393,10 @@ gen_awg_params() {
     [[ -n "$_p3" ]] || { err "Параметры AWG ${AWG_PROTO} пусты"; return 1; }
     AWG_PARAMS_LINES+="\n${_p3}"
   fi
+
+  # Запас до 1500 проверяем последним: к этому моменту известны и S4, и верхняя
+  # граница паддинга, и выбранный MTU.
+  _awg_check_mtu_headroom
 }
 
 # Параметры AmneziaWG 3.0.
@@ -3927,7 +5426,12 @@ gen_awg3_params() {
   fi
 
   # Добавка к паддингу содержимого: 0 = выключено, поэтому берём от 8
-  cpa="$(rand_range 8 24)-$(rand_range 48 96)"
+  local cpa_lo cpa_hi
+  cpa_lo=$(rand_range 8 24)
+  cpa_hi=$(rand_range 48 96)
+  cpa="${cpa_lo}-${cpa_hi}"
+  # Верхняя граница нужна снаружи: на неё смотрит расчёт запаса до 1500 байт
+  AWG3_CPA_MAX="$cpa_hi"
 
   # Рекей: вокруг 120 с. Верх держим ниже нижней границы RejectAfterTime.
   rat_lo=$(rand_range 110 125)
@@ -4118,6 +5622,25 @@ EOF
   return 0
 }
 
+# Шаги сборки вынесены в функции: run_step запускает команду, и подоболочка
+# «( cd ... && make )» ему аргументом не передаётся. Логика та же, что была
+# внутри скобок, включая версию из dkms.conf.
+_build_awg_module() {
+  local src="$1/src"
+  cd "$src" || return 1
+  make dkms-install || return 1
+  local mod_ver
+  mod_ver=$(grep -oP 'version\s*"\K[^"]+' dkms.conf 2>/dev/null || echo "1.0.0")
+  dkms add -m amneziawg -v "$mod_ver" 2>/dev/null || true
+  dkms build -m amneziawg -v "$mod_ver" || return 1
+  dkms install -m amneziawg -v "$mod_ver" || return 1
+}
+
+_build_awg_tools() {
+  cd "$1/src" || return 1
+  make && make install
+}
+
 do_install() {
   while true; do
   # Detect OS
@@ -4214,14 +5737,23 @@ EOF
     ok "DNS работает"
   fi
 
-  hdr "+  Обновление системы"
+  hdr "+  Система и зависимости"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -q || { err "Не удалось обновить репозитории"; prompt_retry || return 1; continue; }
-  apt-get upgrade -y -q \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold"
+  # Полный вывод шагов уходит в $INSTALL_LOG, на экране — строка на шаг.
+  # Лог обнуляем на каждый запуск: хвост при провале должен быть от этой
+  # попытки, а не от позавчерашней.
+  : > "$INSTALL_LOG" 2>/dev/null || true
+  chmod 600 "$INSTALL_LOG" 2>/dev/null || true
+  info "Полный вывод: $INSTALL_LOG"
 
-  hdr "+  Установка зависимостей"
+  run_step "Обновление списка пакетов" apt-get update -q || {
+    err "Не удалось обновить репозитории"; prompt_retry || return 1; continue; }
+  run_step "Обновление системы (apt upgrade)" \
+    apt-get upgrade -y -q \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confold" || \
+    warn "apt upgrade отработал с ошибкой — продолжаю, детали в $INSTALL_LOG"
+
   # iputils-ping — ping не входит в минимальные облачные образы Ubuntu 26.04 /
   # Debian 13, а на нём держатся scan_pool, _probe_host и WARP health-check.
   local base_deps=(python3 net-tools curl ufw iptables qrencode bc ca-certificates gnupg iputils-ping)
@@ -4230,7 +5762,8 @@ EOF
   # do_install вызывается как «do_install || true», то есть errexit внутри не
   # работает. Без явной проверки провал apt проходил молча, а ломалось потом —
   # на сборке DKMS или на отсутствии git, и уже без внятной причины.
-  if ! apt-get install -y -q "${base_deps[@]}"; then
+  if ! run_step "Установка зависимостей (${#base_deps[@]} пакетов)" \
+        apt-get install -y -q "${base_deps[@]}"; then
     err "Не удалось установить зависимости"
     info "Проверь вывод выше — обычно это битое зеркало или нет места на диске"
     info "Повтори вручную: apt-get update && apt-get install -y ${base_deps[*]}"
@@ -4249,10 +5782,9 @@ EOF
     headers_ok=1
   else
     # Пытаемся установить headers под running kernel
-    info "Устанавливаем linux-headers-${running_kernel}..."
-    if apt-get install -y -q "linux-headers-${running_kernel}" 2>&1 | tail -3; then
+    if run_step "linux-headers-${running_kernel}" \
+         apt-get install -y -q "linux-headers-${running_kernel}"; then
       if [[ -d "/lib/modules/${running_kernel}/build" ]]; then
-        ok "Headers установлены"
         headers_ok=1
       fi
     fi
@@ -4260,8 +5792,9 @@ EOF
 
   # Если headers всё ещё нет — пробуем мета-пакеты
   if [[ $headers_ok -eq 0 ]]; then
-    apt-get install -y -q linux-headers-amd64 2>/dev/null || \
-    apt-get install -y -q linux-headers-generic 2>/dev/null || true
+    run_step "Мета-пакет kernel headers" bash -c \
+      'apt-get install -y -q linux-headers-amd64 2>/dev/null ||
+       apt-get install -y -q linux-headers-generic 2>/dev/null || true' || true
 
     if [[ -d "/lib/modules/${running_kernel}/build" ]]; then
       headers_ok=1
@@ -4309,20 +5842,13 @@ EOF
   hdr "+  AmneziaWG kernel module (git + DKMS)"
   local tmp_mod=/tmp/amneziawg-linux-kernel-module
   rm -rf "$tmp_mod"
-  git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git "$tmp_mod" || {
+  run_step "Клонирование kernel module" \
+    git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git "$tmp_mod" || {
     err "Не удалось клонировать kernel module"
     info "Проверь интернет: ping github.com"
     prompt_retry || return 1; continue
   }
-  (
-    cd "$tmp_mod/src" || exit 1
-    make dkms-install || exit 1
-    local mod_ver
-    mod_ver=$(grep -oP 'version\s*"\K[^"]+' dkms.conf 2>/dev/null || echo "1.0.0")
-    dkms add -m amneziawg -v "$mod_ver" 2>/dev/null || true
-    dkms build -m amneziawg -v "$mod_ver" || exit 1
-    dkms install -m amneziawg -v "$mod_ver" || exit 1
-  ) || {
+  run_step "Сборка и установка модуля (DKMS)" _build_awg_module "$tmp_mod" || {
     err "Сборка kernel module провалилась"
     echo ""
     info "Возможные причины:"
@@ -4361,20 +5887,14 @@ EOF
   if (( ${#_kernels[@]} > 0 )); then
     newest_k=$(printf '%s\n' "${_kernels[@]}" | sort -V | tail -1)
   fi
-  if dkms autoinstall >/dev/null 2>&1; then
-    ok "Модуль собран под все установленные ядра"
-  else
+  run_step "Сборка под все установленные ядра" dkms autoinstall || \
     warn "dkms autoinstall отработал с ошибкой — проверь: dkms status"
-  fi
 
   # autoinstall молча пропускает ядро без заголовков, поэтому «всё собрано»
   # проверяем по факту, а не по коду возврата
   if [[ -n "$newest_k" ]] && ! dkms status 2>/dev/null | grep -q "$newest_k"; then
-    if dkms autoinstall -k "$newest_k" >/dev/null 2>&1; then
-      ok "Модуль дособран под $newest_k"
-    else
+    run_step "Досборка под $newest_k" dkms autoinstall -k "$newest_k" || \
       warn "Модуль под $newest_k собрать не удалось (нет linux-headers-$newest_k?)"
-    fi
   fi
 
   # Если загружено не самое новое ядро — предупреждаем прямо, а не постфактум
@@ -4393,13 +5913,12 @@ EOF
   hdr "+  amneziawg-tools (git + make)"
   local tmp_tools=/tmp/amneziawg-tools
   rm -rf "$tmp_tools"
-  git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-tools.git "$tmp_tools" || {
+  run_step "Клонирование amneziawg-tools" \
+    git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-tools.git "$tmp_tools" || {
     err "Не удалось клонировать tools"; prompt_retry || return 1; continue
   }
-  (
-    cd "$tmp_tools/src" || exit 1
-    make && make install
-  ) || { err "Сборка tools провалилась"; prompt_retry || return 1; continue; }
+  run_step "Сборка amneziawg-tools" _build_awg_tools "$tmp_tools" || {
+    err "Сборка tools провалилась"; prompt_retry || return 1; continue; }
   rm -rf "$tmp_tools"
 
   if command -v awg &>/dev/null; then
@@ -4754,6 +6273,12 @@ do_gen() {
     # знает, что выдавать, и раньше давал один I1 на сервере с полным CPS.
     echo "# AWG_OBF_LEVEL=${OBF_LEVEL:-1}"
     echo "# AWG_MIMICRY=${MIMICRY_PROFILE:-none}"
+    # Домен мимикрии. Пишется только если он был выбран: бот генерирует I1-I5
+    # сам и без этой метки брал бы случайный домен из встроенного пула — то
+    # есть клиенты одного сервера маскировались бы под разные хосты, хотя
+    # админ выбрал конкретный.
+    [[ -n "${CPS_DOMAIN:-}" && "${MIMICRY_PROFILE:-none}" != "none" ]] && \
+      echo "# AWG_MIMICRY_DOMAIN=${CPS_DOMAIN}"
     # Домен для Endpoint: строку пишем только если он задан, иначе клиентам
     # уходит IP (см. endpoint_host)
     [[ -n "${ENDPOINT_DOMAIN:-}" ]] && echo "# AWG_ENDPOINT=${ENDPOINT_DOMAIN}"
@@ -4771,6 +6296,7 @@ do_gen() {
     echo ""
     echo "[Peer]"
     echo "# $FIRST_CLIENT_NAME"
+    echo "# mimicry=$(_mimicry_tag "${I1:-}")"
     echo "PublicKey = $cli_pub"
     echo "PresharedKey = $psk"
     echo "AllowedIPs = $CLIENT_ADDR"
@@ -4913,8 +6439,10 @@ _mgmt_scan_clients() {
     elif [[ $in_peer -eq 1 ]]; then
       if [[ "$line" =~ ^#[[:space:]](.+) ]]; then
         local _cmt="${BASH_REMATCH[1]}"
-        # Пропускаем служебные метки expires= и orig_ips=
-        if [[ "$_cmt" != expires=* && "$_cmt" != orig_ips=* ]]; then
+        # Имя клиента — первый комментарий без "=" (валидатор имён знак "="
+        # не пропускает). Так пропускаются все служебные метки разом:
+        # expires=, orig_ips=, mimicry=, note= от бота.
+        if [[ -z "$cur_name" && "$_cmt" != *=* ]]; then
           cur_name="$_cmt"
         fi
       elif [[ "$line" =~ ^PublicKey[[:space:]]=[[:space:]](.+) ]]; then
@@ -5444,44 +6972,41 @@ do_add_client() {
 
   local i1_line="" i2_line="" i3_line="" i4_line="" i5_line=""
 
-  # Цепочка I1-I5 — клиентская: у каждого устройства она своя, поэтому
-  # спрашиваем на каждого клиента, а не один раз на сервер.
-  choose_target_client
-
-  # Читаем профиль сервера — определяет поведение для клиентского I1
+  # Читаем профиль сервера — определяет поведение для клиентского I1.
+  # Цепочка I1-I5 клиентская: у каждого устройства она своя.
   local _srv_profile
   _srv_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
   _srv_profile="${_srv_profile:-pro}"
 
-  # Клиент, который цепочку не читает, делает профиль сервера неважным:
-  # генерировать I1-I5 не для кого.
-  if ! _target_client_reads_cps; then
-    _warn_cps_unsupported || true
-    _srv_profile="nocps"
-  fi
-
   case "$_srv_profile" in
-    nocps)
-      I1=""; I2=""; I3=""; I4=""; I5=""
-      i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
-      ;;
     lite)
-      # Lite-сервер: клиенту всегда I1=DNS (icloud.com), без I2-I5
-      info "Профиль сервера: Lite — клиент получит I1=DNS (icloud.com)"
-      local cps_out
-      cps_out=$(gen_cps_i1 "dns" "icloud.com" "--only-i1") || cps_out=""
-      I1=$(echo "$cps_out" | sed -n '1p')
-      I2=""; I3=""; I4=""; I5=""
-      [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+      # Профиль «AmneziaVPN». Строк I у самой Amnezia нет, и с версии, где
+      # профиль это учитывает, сервер пишет "# AWG_MIMICRY=none" — тогда клиент
+      # тоже идёт без цепочки, иначе конфиги сервера и клиента разошлись бы по
+      # смыслу. Старый lite-сервер метки не имеет: для него поведение прежнее.
+      if [[ "$(_server_mimicry)" == "none" ]]; then
+        info "Профиль сервера: AmneziaVPN, без мимикрии — клиент тоже без I1"
+        I1=""; I2=""; I3=""; I4=""; I5=""
+        i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
+      else
+        info "Профиль сервера: AmneziaVPN — клиент получит один I1=DNS"
+        CPS_BUDGET=0
+        choose_cps_domain "dns"
+        local cps_out
+        cps_out=$(gen_cps_i1 "dns" "${CPS_DOMAIN:-}" "--only-i1") || cps_out=""
+        I1=$(echo "$cps_out" | sed -n '1p')
+        I2=""; I3=""; I4=""; I5=""
+        [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+      fi
       ;;
     standard)
-      # Standard-сервер: клиенту I1=TLS ClientHello, без I2-I5
-      info "Профиль сервера: Standard — клиент получит I1=TLS"
+      # Standard-сервер: клиенту I1=QUIC Initial, без I2-I5
+      info "Профиль сервера: Standard — клиент получит I1=QUIC"
       local sel_domain
-      sel_domain=$(select_random_domain "tls")
+      sel_domain=$(select_random_domain "quic")
       [[ -z "$sel_domain" ]] && sel_domain=""
       local cps_out
-      cps_out=$(gen_cps_i1 "tls" "$sel_domain") || cps_out=""
+      cps_out=$(gen_cps_i1 "quic" "$sel_domain") || cps_out=""
       I1=$(echo "$cps_out" | sed -n '1p')
       I2=""; I3=""; I4=""; I5=""
       [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
@@ -5496,7 +7021,9 @@ do_add_client() {
       case $I1_SELECT in
         1)
           choose_obf_level
-          choose_mimicry_profile
+          if ! choose_mimicry_profile; then
+            info "Профиль мимикрии не выбран — конфиг уйдёт без I1-I5"
+          fi
           [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
           [[ -n "$I2" ]] && i2_line="I2 = $I2" || i2_line=""
           [[ -n "$I3" ]] && i3_line="I3 = $I3" || i3_line=""
@@ -5531,6 +7058,7 @@ do_add_client() {
     echo ""
     echo "[Peer]"
     echo "# $client_name"
+    echo "# mimicry=$(_mimicry_tag "$i1_line")"
     echo "PublicKey = $cli_pub"
     echo "PresharedKey = $psk"
     echo "AllowedIPs = $client_addr"
@@ -5777,31 +7305,29 @@ do_bulk_add_clients() {
   # ── I1 (один раз для всех) ──
   local i1_line="" i2_line="" i3_line="" i4_line="" i5_line=""
 
-  choose_target_client
-  if ! _target_client_reads_cps; then
-    _warn_cps_unsupported || true
-    _srv_profile="nocps"
-  fi
-
   case "$_srv_profile" in
-    nocps)
-      I1=""; I2=""; I3=""; I4=""; I5=""
-      i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
-      ;;
     lite)
-      info "Профиль сервера Lite — клиенты получат I1=DNS (icloud.com)"
-      local cps_out
-      cps_out=$(gen_cps_i1 "dns" "icloud.com" "--only-i1") || cps_out=""
-      I1=$(echo "$cps_out" | sed -n '1p')
-      I2=""; I3=""; I4=""; I5=""
-      [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+      if [[ "$(_server_mimicry)" == "none" ]]; then
+        info "Профиль сервера: AmneziaVPN, без мимикрии — клиенты тоже без I1"
+        I1=""; I2=""; I3=""; I4=""; I5=""
+        i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
+      else
+        info "Профиль сервера: AmneziaVPN — клиенты получат один I1=DNS"
+        CPS_BUDGET=0
+        choose_cps_domain "dns"
+        local cps_out
+        cps_out=$(gen_cps_i1 "dns" "${CPS_DOMAIN:-}" "--only-i1") || cps_out=""
+        I1=$(echo "$cps_out" | sed -n '1p')
+        I2=""; I3=""; I4=""; I5=""
+        [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+      fi
       ;;
     standard)
-      info "Профиль сервера Standard — клиенты получат I1=TLS"
+      info "Профиль сервера Standard — клиенты получат I1=QUIC"
       local sel_domain cps_out
-      sel_domain=$(select_random_domain "tls")
+      sel_domain=$(select_random_domain "quic")
       [[ -z "$sel_domain" ]] && sel_domain=""
-      cps_out=$(gen_cps_i1 "tls" "$sel_domain") || cps_out=""
+      cps_out=$(gen_cps_i1 "quic" "$sel_domain") || cps_out=""
       I1=$(echo "$cps_out" | sed -n '1p')
       I2=""; I3=""; I4=""; I5=""
       [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
@@ -5815,7 +7341,9 @@ do_bulk_add_clients() {
       case $I1_SELECT in
         1)
           choose_obf_level
-          choose_mimicry_profile
+          if ! choose_mimicry_profile; then
+            info "Профиль мимикрии не выбран — конфиг уйдёт без I1-I5"
+          fi
           [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
           [[ -n "$I2" ]] && i2_line="I2 = $I2" || i2_line=""
           [[ -n "$I3" ]] && i3_line="I3 = $I3" || i3_line=""
@@ -5916,11 +7444,16 @@ do_bulk_add_clients() {
     cli_pub=$(echo "$cli_priv" | awg pubkey)
     psk=$(awg genpsk)
 
-    # Дописываем [Peer] в SERVER_CONF (6 строк: пустая, [Peer], #name, PublicKey, PresharedKey, AllowedIPs)
+    # Дописываем [Peer] в SERVER_CONF. Размер блока запоминаем числом строк
+    # до записи: откат ниже отрезает ровно дописанное, не завися от того,
+    # сколько строк в блоке сейчас (метки вроде mimicry= его меняют).
+    local _peer_mark
+    _peer_mark=$(wc -l < "$SERVER_CONF")
     {
       echo ""
       echo "[Peer]"
       echo "# $name"
+      echo "# mimicry=$(_mimicry_tag "$i1_line")"
       echo "PublicKey = $cli_pub"
       echo "PresharedKey = $psk"
       echo "AllowedIPs = $client_addr"
@@ -5933,11 +7466,10 @@ do_bulk_add_clients() {
     if ! awg set awg0 peer "$cli_pub" preshared-key "$psk_tmp" allowed-ips "$client_addr" 2>/dev/null; then
       rm -f "$psk_tmp"
       warn "[${idx}/${count}] ${name}: awg set не удался, откат записи"
-      # Откат: удаляем последние 6 строк из SERVER_CONF
-      local total_lines
-      total_lines=$(wc -l < "$SERVER_CONF")
-      if (( total_lines > 6 )); then
-        head -n $((total_lines - 6)) "$SERVER_CONF" > "${SERVER_CONF}.tmp" && mv "${SERVER_CONF}.tmp" "$SERVER_CONF"
+      # Откат: возвращаем файл к размеру, снятому перед дописыванием блока
+      if [[ "$_peer_mark" =~ ^[0-9]+$ ]] && (( _peer_mark > 0 )); then
+        head -n "$_peer_mark" "$SERVER_CONF" > "${SERVER_CONF}.tmp" \
+          && mv "${SERVER_CONF}.tmp" "$SERVER_CONF"
       fi
       skipped=$((skipped+1))
       idx=$((idx+1))
@@ -6116,8 +7648,9 @@ do_list_clients() {
       expire_ts="${BASH_REMATCH[1]}"
     elif [[ "$line" =~ ^#[[:space:]](.+) ]]; then
       _cmt="${BASH_REMATCH[1]}"
-      # Пропускаем служебные метки expires= и orig_ips=
-      if [[ "$_cmt" != expires=* && "$_cmt" != orig_ips=* ]]; then
+      # Имя клиента — первый комментарий без "=" (см. комментарий выше):
+      # так метки expires=/orig_ips=/mimicry=/note= не подменяют имя.
+      if [[ -z "$name" && "$_cmt" != *=* ]]; then
         name="$_cmt"
       fi
     elif [[ "$line" =~ ^PublicKey[[:space:]]=[[:space:]](.+) ]]; then
@@ -6252,8 +7785,102 @@ _print_client_info() {
 # устройства, не задевая сервер и остальных клиентов. Это нужная операция, а не
 # удобство: один и тот же конфиг проходит у одного провайдера и не проходит у
 # другого, и перебрать профиль должно быть дешевле, чем пересоздавать клиента.
-_detect_mimicry() {           # $1 = строка I1
-  local line="$1"
+# Прочитать служебную метку "# <key>=<value>" из peer-блока клиента.
+# Stdout: значение или пустая строка. Один вызов awk на весь конфиг —
+# функция дёргается в цикле по списку клиентов, поэтому python здесь избыточен.
+_peer_meta_get() {            # $1 = имя клиента, $2 = ключ метки
+  local name="$1" key="$2"
+  [[ -n "$name" && -n "$key" && -f "$SERVER_CONF" ]] || return 0
+  awk -v target="$name" -v key="$key" '
+    /^\[Peer\]/ { cur = ""; next }
+    /^#[[:space:]]/ {
+      c = $0
+      sub(/^#[[:space:]]+/, "", c); sub(/[[:space:]]+$/, "", c)
+      # Имя клиента "=" не содержит (валидатор имён его не пропускает),
+      # поэтому первая строка без "=" в блоке — это имя, остальные — метки.
+      if (c !~ /=/) { cur = c; next }
+      if (cur == target && index(c, key "=") == 1) {
+        print substr(c, length(key) + 2); exit
+      }
+    }
+  ' "$SERVER_CONF" 2>/dev/null
+}
+
+# Записать/обновить служебную метку в peer-блоке. Пустое значение — удалить.
+# Пишем атомарно, как _expire_set_client: конфиг сервера рвать нельзя.
+_peer_meta_set() {            # $1 = имя клиента, $2 = ключ, $3 = значение
+  local name="$1" key="$2" val="${3:-}"
+  [[ -n "$name" && -n "$key" && -f "$SERVER_CONF" ]] || return 1
+  python3 - "$SERVER_CONF" "$name" "$key" "$val" << 'PYEOF'
+import sys, re, os, pathlib, tempfile
+conf, target, key, val = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+try:
+    text = pathlib.Path(conf).read_text()
+except Exception as e:
+    print(f"read failed: {e}", file=sys.stderr); sys.exit(1)
+
+parts = re.split(r'(?=\[Peer\])', text)
+header, peers = parts[0], parts[1:]
+
+found = False
+out_peers = []
+for block in peers:
+    nm = re.search(r'^#\s+(\S+)\s*$', block, re.M)
+    if nm and nm.group(1) == target:
+        found = True
+        block = re.sub(rf'^#\s*{re.escape(key)}=.*$\n?', '', block, flags=re.M)
+        if val:
+            block = re.sub(
+                r'(^#\s+' + re.escape(target) + r'\s*$)',
+                lambda m: m.group(1) + f'\n# {key}={val}',
+                block, count=1, flags=re.M
+            )
+    out_peers.append(block)
+
+if not found:
+    print("client not found", file=sys.stderr); sys.exit(2)
+
+new_text = header + ''.join(out_peers)
+d = os.path.dirname(conf)
+fd, tmp = tempfile.mkstemp(dir=d, prefix='.awg0.', suffix='.tmp')
+try:
+    with os.fdopen(fd, 'w') as f: f.write(new_text)
+    os.chmod(tmp, 0o600)
+    os.rename(tmp, conf)
+except Exception as e:
+    try: os.unlink(tmp)
+    except Exception: pass
+    print(f"write failed: {e}", file=sys.stderr); sys.exit(3)
+PYEOF
+}
+
+# Значение метки mimicry для нового клиента. Профиль знает только тот код,
+# который сгенерировал I1 — по байтам он не восстанавливается: сигнатуры
+# профилей пересекаются (sip и quic оба начинаются с 0x4..), а stun/webrtc/
+# ntp/rtp/ssdp неотличимы вовсе. Нет I1 — нет и профиля.
+_mimicry_tag() {              # $1 = непустая строка => клиент получил I1
+  if [[ -n "${1:-}" ]]; then
+    echo "${MIMICRY_PROFILE:-none}"
+  else
+    echo "none"
+  fi
+}
+
+# Профиль мимикрии выданного клиента для показа в меню.
+# Достоверный источник — метка "# mimicry=" в peer-блоке (пишется при
+# создании и при смене профиля). Для конфигов, выданных до появления метки,
+# остаётся эвристика по сигнатуре I1: она различает не все девять профилей,
+# поэтому идёт только запасным путём.
+_detect_mimicry() {           # $1 = путь к конфигу клиента
+  local conf="$1" name tag line
+  name=$(basename "$conf" _awg2.conf)
+  tag=$(_peer_meta_get "$name" "mimicry")
+  if [[ -n "$tag" ]]; then
+    if [[ "$tag" == "none" ]]; then echo "нет"; else echo "$tag"; fi
+    return 0
+  fi
+
+  line=$(grep -m1 '^I1 = ' "$conf" 2>/dev/null | cut -d' ' -f3-)
   case "$line" in
     *"<b 0x16"*)        echo "tls" ;;
     *"<b 0x52454749"*)  echo "sip" ;;      # "REGI" в hex
@@ -6283,7 +7910,7 @@ do_change_client_mimicry() {
   for f in "${unique[@]}"; do
     i=$((i+1))
     local _cur
-    _cur=$(_detect_mimicry "$(grep -m1 '^I1 = ' "$f" 2>/dev/null | cut -d' ' -f3-)")
+    _cur=$(_detect_mimicry "$f")
     printf "  %d) %-28s ${D}сейчас: %s${N}\n" "$i" "$(basename "$f")" "$_cur"
   done
   echo ""
@@ -6299,18 +7926,13 @@ do_change_client_mimicry() {
   _srv_profile="${_srv_profile:-pro}"
 
   I1=""; I2=""; I3=""; I4=""; I5=""
-  choose_target_client
-  if ! _target_client_reads_cps; then
-    _warn_cps_unsupported || true
+  if [[ "$_srv_profile" == "pro" ]]; then
+    choose_obf_level
   else
-    if [[ "$_srv_profile" == "pro" ]]; then
-      choose_obf_level
-    else
-      OBF_LEVEL=2
-      info "Профиль сервера ${_srv_profile}: у клиента только I1"
-    fi
-    choose_mimicry_profile || return 1
+    OBF_LEVEL=2
+    info "Профиль сервера ${_srv_profile}: у клиента только I1"
   fi
+  choose_mimicry_profile || return 1
 
   # Собираем новые строки. Пустые не пишем: строка «I2 = » ломает разбор.
   local new_lines="" k v
@@ -6341,6 +7963,14 @@ do_change_client_mimicry() {
   fi
   cat "$tmp" > "$chosen" && rm -f "$tmp"
   chmod 600 "$chosen" 2>/dev/null || true
+
+  # Метка в peer-блоке — единственный источник профиля для меню и для бота,
+  # поэтому её обновляем в той же операции, что и сами I1-I5.
+  local _cli_name
+  _cli_name=$(basename "$chosen" _awg2.conf)
+  if ! _peer_meta_set "$_cli_name" "mimicry" "$(_mimicry_tag "${I1:-}")"; then
+    warn "Профиль записан в конфиг, но метку в конфиге сервера обновить не удалось"
+  fi
 
   local _n
   _n=$(grep -cE '^I[1-5] = ' "$chosen" 2>/dev/null || echo 0)
@@ -6557,20 +8187,23 @@ do_rotate_awg_params() {
   # Раз конфиги всё равно переписываются — предлагаем сменить и версию
   echo -e "  ${W}Версия протокола после перегенерации:${N}"
   echo -e "  ${G}1)${N} AWG 2.0 ${D}(шире совместимость клиентов)${N}"
-  echo -e "  ${G}2)${N} AWG 3.0 ${D}(защита заголовков, паддинг, таймеры)${N}"
-  echo -e "  ${G}3)${N} AWG 3.1 ${D}(плюс RandomTrailers/DisableCookies, нужен свежий клиент)${N}"
-  echo -e "  ${D}Enter — оставить текущую (AWG ${cur_proto})${N}"
+  echo -e "  ${G}2)${N} AWG 3.1 ${D}(защита заголовков, паддинг, таймеры,${N}"
+  echo -e "     ${D}RandomTrailers/DisableCookies — нужен свежий клиент)${N}"
   echo ""
   local _pc _def
   case "$cur_proto" in
-    3.1) _def="3" ;;
-    3.0) _def="2" ;;
+    3.0)
+      # 3.0 больше не предлагается как вариант: остаться на ней можно только
+      # ничего не перегенерируя. Предлагаем ближайшую поддерживаемую — 3.1.
+      _def="2"
+      warn "Текущая версия 3.0 из выбора убрана — перегенерация переведёт сервер на 2.0 или 3.1"
+      ;;
+    3.1) _def="2" ;;
     *)   _def="1" ;;
   esac
-  read_choice _pc "$(echo -e "${C}  Выбор [1-3] (Enter = ${_def}): ${N}")" 1 3 "$_def"
+  read_choice _pc "$(echo -e "${C}  Выбор [1-2] (Enter = ${_def}): ${N}")" 1 2 "$_def"
   case "$_pc" in
-    3) new_proto="3.1" ;;
-    2) new_proto="3.0" ;;
+    2) new_proto="3.1" ;;
     *) new_proto="2.0" ;;
   esac
 
@@ -7927,7 +9560,11 @@ _warp_get_client_net() {
 _warp_list_awg_clients() {
   [[ ! -f "$SERVER_CONF" ]] && return 0
   awk '
-    /^# /{ if ($2 !~ /^expires=/ && $2 !~ /^orig_ips=/) name=$2 }
+    # Сброс на границе блока обязателен: в шапке конфига тоже есть
+    # комментарии без "=" ("# AmneziaWG Toolza ...", "# Region: ..."),
+    # и без сброса первый peer унаследовал бы имя из них.
+    /^\[Peer\]/{ name="" }
+    /^# /{ if (name == "" && $2 !~ /=/) name=$2 }
     /^AllowedIPs/{
       if (name) {
         gsub(/\/32.*/, "", $3)
@@ -10229,6 +11866,51 @@ do_uninstall() {
   exit 0
 }
 
+# Подсказка по клиентской диагностике DPI.
+#
+# Здесь СПЕЦИАЛЬНО ничего не запускается. Всё, что умеет проверить awg2, он
+# проверяет с сервера, а мимикрию и блокировки разбирает DPI у провайдера
+# клиента: домен, живой отсюда, там может быть заблокирован или подменён.
+# Проверять это надо с той стороны, поэтому функция только печатает команду
+# для копирования — никаких зависимостей, ничего не ставится и не качается.
+#
+# dpi-detector (MIT, github.com/Runnin4ik/dpi-detector) проверяет TLS 1.2/1.3
+# и HTTP, перехват UDP/53 и подмену IP, блокировку DoH, SNI-блокировку и
+# обрыв соединения к CDN/хостингам после 14-34 КБ. UDP кроме DNS, QUIC и
+# WireGuard он не трогает — сам туннель AmneziaWG им не диагностируется.
+do_client_dpi_hint() {
+  echo ""
+  hdr "◈  DPI со стороны клиента"
+  echo ""
+  echo -e "  ${Y}Запускать НЕ ЗДЕСЬ, а на устройстве, с которого вы ходите в VPN.${N}"
+  echo -e "  ${D}Сервер обычно стоит за границей: отсюда видно совсем не то, что${N}"
+  echo -e "  ${D}видит DPI у вашего провайдера. Ниже — команда для того устройства.${N}"
+  echo ""
+  echo -e "  ${W}Docker (проще всего):${N}"
+  echo -e "  ${G}docker run --rm -it --pull=always ghcr.io/runnin4ik/dpi-detector:latest${N}"
+  echo ""
+  echo -e "  ${W}Python 3.8+ без Docker:${N}"
+  echo -e "  ${G}git clone https://github.com/Runnin4ik/dpi-detector.git${N}"
+  echo -e "  ${G}cd dpi-detector && python -m pip install -r requirements.txt${N}"
+  echo -e "  ${G}python dpi_detector.py${N}"
+  echo ""
+  echo -e "  ${D}Windows и macOS — готовые сборки в разделе Releases репозитория.${N}"
+  echo ""
+  echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo -e "  ${W}Что делать с результатом:${N}"
+  echo -e "  ${C}•${N} Домен, который он показал рабочим, впишите при создании сервера"
+  echo -e "    или клиента: меню домена мимикрии → ${W}1) Ввести свой${N}."
+  echo -e "  ${C}•${N} Подмена DNS или перехват UDP/53 — включите шифрованный DNS:"
+  echo -e "    ${W}Туннели и DNS${N} → DNSCrypt."
+  echo -e "  ${C}•${N} Обрыв или просадка ПОСЛЕ первых десятков килобайт — это"
+  echo -e "    ограничение потока, а не оверхед параметров: пробуйте профиль"
+  echo -e "    ${W}«AmneziaVPN»${N} и цепочку I1-I5 покороче."
+  echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo ""
+  echo -e "  ${D}Проект сторонний, лицензия MIT. awg2 его не ставит и не запускает.${N}"
+  return 0
+}
+
 # Параллельный пинг всех доменов из 4 пулов.
 # Результаты сохраняются в кэш /tmp/awg_domain_cache.txt.
 do_check_domains() {
@@ -10675,6 +12357,7 @@ I3=""
 I4=""
 I5=""
 MIMICRY_PROFILE=""
+CPS_DOMAIN=""
 MTU=""
 AWG_PARAMS_LINES=""
 

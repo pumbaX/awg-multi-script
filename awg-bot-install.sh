@@ -129,7 +129,7 @@ if [[ ! -f "$CONF" ]] || ! grep -q '^BOT_TOKEN=' "$CONF" 2>/dev/null; then
   echo ""
   echo -e "${W}  Нужен Telegram-бот. Создай его у @BotFather и вставь токен.${N}"
   read -rp "$(echo -e "${C}  Токен бота: ${N}")" BOT_TOKEN
-  read -rp "$(echo -e "${C}  Твой Telegram ID (узнать у @userinfobot): ${N}")" ADMIN_ID
+  read -rp "$(echo -e "${C}  Твой Telegram ID (@userinfobot; несколько — через запятую): ${N}")" ADMIN_ID
   touch "$CONF"; chmod 600 "$CONF"
   sed -i '/^BOT_TOKEN=/d;/^ADMIN_ID=/d' "$CONF"
   { echo "BOT_TOKEN=${BOT_TOKEN}"; echo "ADMIN_ID=${ADMIN_ID}"; } >> "$CONF"
@@ -143,7 +143,10 @@ fi
 # и накатит его поверх локальной сборки — то есть откатит правки, которых в
 # репозитории ещё нет. Ставили локально → обновляемся оттуда же.
 touch "$CONF"; chmod 600 "$CONF"
-sed -i '/^LOCAL_SRC=/d;/^REPO_URL=/d' "$CONF"
+# UPDATE_CHANNEL снимаем вместе с REPO_URL: установка задаёт источник заново, и
+# оставшаяся метка канала противоречила бы новому адресу (awg-bot channel_read
+# считает её главнее REPO_URL). Канал заново выведется из записанного адреса.
+sed -i '/^LOCAL_SRC=/d;/^REPO_URL=/d;/^UPDATE_CHANNEL=/d' "$CONF"
 if [[ -n "$LOCAL_SRC" ]]; then
   echo "LOCAL_SRC=${SRC}" >> "$CONF"
   ok "Обновления будут браться из ${SRC}"
