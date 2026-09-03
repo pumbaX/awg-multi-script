@@ -49,6 +49,26 @@ sudo awg2
 
 ---
 
+## Туннели: Xray, tun2socks, AWG-exit
+
+Пункт **5) Туннели и DNS** — Warp, DNS, каскад портов, плюс:
+
+- **Xray** — TUN/gvisor, outbounds `vless://` / `vmess://` / `hysteria2://`, балансировка, кто из клиентов идёт в туннель
+- **tun2socks** — весь трафик AWG-клиентов в SOCKS5 (`awg-tun2socks.service`)
+- **AWG exit-ноды** — каскад через другие AWG-серверы
+
+Одновременно может быть активен только один из Warp / Xray / tun2socks / exit.
+
+CLI:
+
+```bash
+sudo awg2 --auto                  # неинтерактивная установка
+sudo awg2 --add-client имя        # добавить клиента
+sudo awg2 --interactive           # меню даже на чистом сервере
+```
+
+---
+
 ## 🤖 Telegram бот
 
 Опционально — Telegram бот для управления сервером со смартфона: inline-меню с теми же возможностями, что и в консоли.
