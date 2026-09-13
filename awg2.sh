@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.27"
+VERSION="v0.8.25"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -80,6 +80,20 @@ else
   REAL_HOME="/root"
 fi
 BACKUP_DIR="${REAL_HOME}/awg_backup"
+
+# Неинтерактивный запуск (--auto/--add-client): ни один шаг не имеет права
+# ждать ввода — скрипт зовут из ansible/cloud-init, там некому отвечать.
+AUTO_MODE=0
+
+XRAY_DIR="/etc/xray"
+XRAY_CONF="$XRAY_DIR/config.json"
+XRAY_STATE="$XRAY_DIR/state"
+XRAY_PEERS="$XRAY_DIR/peers.list"
+
+# ── AWG Exit-ноды (каскад) ──────────────────────────────────
+AWG_EXITS_DIR="/etc/amnezia/amneziawg"
+AWG_EXITS_PEERS="$AWG_EXITS_DIR/exits_peers.list"
+AWG_EXITS_STATE="$AWG_EXITS_DIR/exits_state"
 
 # ── Expire-механика (срок действия клиентов) ───────────────
 EXPIRE_CHECK_BIN="/usr/local/bin/awg2-expire-check"
@@ -510,6 +524,35 @@ QUIC_DOMAINS=("${QUIC_DOMAINS_WORLD[@]}")
 # shellcheck disable=SC2034  # используется в будущих расширениях и логах
 SERVER_REGION="world"
 
+# Переключение активных пулов доменов под регион. Один источник правды для
+# choose_region (выбор при установке), check_deps (восстановление из шапки
+# конфига) и _detect_server_region (неинтерактивные сценарии --auto/--add-client).
+_apply_region_pools() {
+  local region="${1:-world}"
+  if [[ "$region" == "ru" ]]; then
+    TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_RU[@]}")
+    DTLS_DOMAINS=("${DTLS_DOMAINS_RU[@]}")
+    SIP_DOMAINS=("${SIP_DOMAINS_RU[@]}")
+    QUIC_DOMAINS=("${QUIC_DOMAINS_RU[@]}")
+  else
+    TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_WORLD[@]}")
+    DTLS_DOMAINS=("${DTLS_DOMAINS_WORLD[@]}")
+    SIP_DOMAINS=("${SIP_DOMAINS_WORLD[@]}")
+    QUIC_DOMAINS=("${QUIC_DOMAINS_WORLD[@]}")
+  fi
+}
+
+# Регион из шапки конфига сервера (# Region: ...). Нет конфига или нет строки —
+# world. Нужен там, где choose_region не спрашивали: --auto, --add-client.
+_detect_server_region() {
+  local region=""
+  if [[ -f "$SERVER_CONF" ]]; then
+    region=$(grep -oP '^#\s*Region:\s*\K\w+' "$SERVER_CONF" 2>/dev/null | head -1 || true)
+  fi
+  SERVER_REGION="${region:-world}"
+  _apply_region_pools "$SERVER_REGION"
+}
+
 choose_region() {
   echo ""
   echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
@@ -523,18 +566,12 @@ choose_region() {
   case $REGION_CHOICE in
     2)
       SERVER_REGION="ru"
-      TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_RU[@]}")
-      DTLS_DOMAINS=("${DTLS_DOMAINS_RU[@]}")
-      SIP_DOMAINS=("${SIP_DOMAINS_RU[@]}")
-      QUIC_DOMAINS=("${QUIC_DOMAINS_RU[@]}")
+      _apply_region_pools ru
       echo -e "${G}  √ Регион: Россия${N}"
       ;;
     1)
       SERVER_REGION="world"
-      TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_WORLD[@]}")
-      DTLS_DOMAINS=("${DTLS_DOMAINS_WORLD[@]}")
-      SIP_DOMAINS=("${SIP_DOMAINS_WORLD[@]}")
-      QUIC_DOMAINS=("${QUIC_DOMAINS_WORLD[@]}")
+      _apply_region_pools world
       echo -e "${G}  √ Регион: Европа / Мир${N}"
       ;;
   esac
@@ -757,6 +794,75 @@ def to_hex(b):
 def read_u16(b, off):
     return (b[off] << 8) | b[off + 1]
 
+# == Динамические поля пакета мимикрии (теги <r>/<rc>/<rd>) ==
+#
+# Строка I, собранная только из <b 0x...>, — это замороженный снимок: модуль
+# кладёт его в буфер один раз при setconf и шлёт БАЙТ В БАЙТ при каждой попытке
+# рукопожатия (send.c: jp_spec_applymods + wg_socket_send_buffer_to_peer, раз в
+# ~120 с). Повторяющийся один и тот же UDP-пакет — ровно тот статистический
+# признак, против которого делалась 3.1.
+#
+# Теги <r N> / <rc N> / <rd N> модуль пересчитывает на КАЖДОЙ отправке
+# (junk.c: random_byte_modifier / random_char_modifier / random_digit_modifier,
+# вызываются из jp_spec_applymods перед каждым send), то есть поле становится
+# заново случайным. Порядок тегов в строке сохраняется: jp_parse_tags кладёт их
+# через list_add (в обратном порядке), а сборка идёт list_for_each_entry_reverse
+# — на выходе порядок написания.
+#
+# Помечать можно ДАЛЕКО не всё. Поле годится, только если оно случайно в самом
+# протоколе и от него ничего не считается:
+#   • нельзя всё, что покрыто контрольной суммой или AEAD (STUN FINGERPRINT
+#     CRC32, QUIC Initial — ключи выводятся из DCID, заголовок входит в AAD);
+#   • нельзя поле, встречающееся в пакете дважды (SIP Call-ID в двух заголовках,
+#     RTCP SSRC): теги независимы, и две копии разъедутся. Это ловится
+#     автоматически — помечается только уникальное вхождение;
+#   • в текстовых протоколах нельзя <r> (двоичный мусор внутри текста) — только
+#     <rc>/<rd>.
+# Длина поля тегом сохраняется, поэтому длины и Content-Length остаются верными.
+#
+# Ограничение движка: длина <r/rc/rd> не больше 1000 байт.
+DYN_TAG_MAX = 1000
+
+_DYN = []
+
+def dyn_reset():
+    del _DYN[:]
+
+def dyn(value, tag="r"):
+    """Помечает поле как заново случайное при каждой отправке. Возвращает его же."""
+    token = value if isinstance(value, bytes) else enc_text(value)
+    if 2 <= len(token) <= DYN_TAG_MAX:
+        _DYN.append((token, tag))
+    return value
+
+def dyn_all_unique(payload):
+    """Все ли помеченные поля встречаются в пакете ровно один раз."""
+    return all(payload.count(token) == 1 for token, _ in _DYN)
+
+
+def build_tagged_line(payload):
+    """Строка I: статические куски <b 0x..> вперемешку с тегами помеченных полей."""
+    holes = []
+    for token, tag in _DYN:
+        # Неуникальное вхождение пропускаем: разные вхождения одного поля
+        # обязаны совпадать, а два тега дали бы разные значения.
+        if payload.count(token) != 1:
+            continue
+        holes.append((payload.find(token), len(token), tag))
+    holes.sort()
+    out = []
+    pos = 0
+    for start, length, tag in holes:
+        if start < pos:                 # перекрытие с уже вставленным тегом
+            continue
+        if start > pos:
+            out.append("<b 0x%s>" % to_hex(payload[pos:start]))
+        out.append("<%s %d>" % (tag, length))
+        pos = start + length
+    if pos < len(payload):
+        out.append("<b 0x%s>" % to_hex(payload[pos:]))
+    return "".join(out)
+
 def quic_varint(value):
     # encodeQuicVarInt (RFC 9000 §16)
     if value < 0:
@@ -836,10 +942,6 @@ TWILIO_TURN_SERVERS = [
     "ie01-1.turn.twilio.com", "ie01-2.turn.twilio.com", "jp01-1.turn.twilio.com",
     "jp01-2.turn.twilio.com", "au01-1.turn.twilio.com", "br01-1.turn.twilio.com",
     "in01-1.turn.twilio.com",
-]
-TWILIO_TURN_USERNAME_PREFIXES = [
-    "a1b2c3d4e5f6g7h8i9j0", "1a2b3c4d5e6f7g8h9i0j",
-    "abcdef1234567890abcd", "1234567890abcdef1234",
 ]
 TWILIO_REALM = "twilio.com"
 GOOGLE_STUN_SERVERS = [
@@ -926,7 +1028,12 @@ try:
     from cryptography.hazmat.primitives.asymmetric.x25519 import (
         X25519PrivateKey, X25519PublicKey)
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-except Exception:
+# BaseException, а не Exception: при поломанной сборке python3-cryptography
+# (нет _cffi_backend, рассинхрон с pyo3 после частичного обновления) импорт
+# падает с PanicException, а она наследуется напрямую от BaseException и мимо
+# "except Exception" проходит насквозь. Тогда умирал ВЕСЬ генератор, и клиенты
+# оставались без I1-I5 вообще — вместо честной деградации «QUIC без шифрования».
+except BaseException:
     _CRYPTO_OK = False
 
 def crypto_available():
@@ -1786,9 +1893,46 @@ def build_dns_question(query_id, flags, name_bytes, type_value, class_value,
             u16(additional_count) + name_bytes + u16(type_value) +
             u16(class_value) + additional_record)
 
+def next_dns_query_type(options):
+    """Тип запроса для очередного пакета цепочки — без повторов подряд.
+
+    Раньше тип разыгрывался независимо на каждый из пяти пакетов, и они
+    схлопывались: четыре одинаковых запроса из пяти — обычный расклад. Живой
+    stub-резолвер по одному имени спрашивает РАЗНОЕ (A, AAAA, у браузеров ещё
+    HTTPS), а повторяет только при потере ответа. Раздаём типы по кругу,
+    перемешивая порядок на каждом проходе: типов три, пакетов пять, поэтому
+    два повтора остаются — но они выглядят как обычный ретрай, тем более что
+    идентификатор запроса у каждого пакета теперь свой.
+    """
+    queue = options.get("_dnsQueue")
+    if not queue:
+        queue = list(DNS_QUERY_TYPES)
+        # Перемешивание Фишера-Йетса на нашем источнике случайности
+        for i in range(len(queue) - 1, 0, -1):
+            j = ri(i + 1)
+            queue[i], queue[j] = queue[j], queue[i]
+        # Стык проходов: типов три, пакетов пять, поэтому круг начинается
+        # заново — и может начаться тем же типом, которым кончился прошлый.
+        # Два одинаковых запроса ПОДРЯД — это уже не ретрай (тот приходит
+        # через таймаут, а не встык), поэтому такой стык разводим.
+        last = options.get("_dnsLast")
+        if last is not None and len(queue) > 1 and queue[0] == last:
+            queue[0], queue[-1] = queue[-1], queue[0]
+        options["_dnsQueue"] = queue
+    qtype = queue.pop(0)
+    options["_dnsLast"] = qtype
+    return qtype
+
 def generate_dns_payload(options):
-    return build_dns_question(ri(65535), 0x0100, encode_dns_name(options["host"]),
-                              rc(DNS_QUERY_TYPES), 0x0001, build_dns_opt_record(1232))
+    # Идентификатор запроса резолвер выбирает случайно на каждый запрос — это
+    # штатная защита от подделки ответа (RFC 5452), поэтому тег здесь не только
+    # безопасен, но и правдоподобнее фиксированного значения.
+    query_id = ri(65535)
+    payload = build_dns_question(query_id, 0x0100, encode_dns_name(options["host"]),
+                                 next_dns_query_type(options), 0x0001,
+                                 build_dns_opt_record(1232))
+    dyn(u16(query_id))
+    return payload
 
 def generate_ssdp_payload(options):
     message = "\r\n".join([
@@ -1814,15 +1958,34 @@ def generate_ntp_payload(options):
     payload[4:8] = u32(0x00000100)
     payload[8:12] = u32(0x00000100)
     payload[12:16] = enc_text("INIT")
-    payload[16:24] = ntp_timestamp(now - 1)
-    payload[40:48] = ntp_timestamp(now)
+    # Reference Timestamp — момент последней синхронизации клиента, у живого
+    # клиента это минуты назад, а не ровно секунда. Секундный сдвиг был ещё и
+    # вреден технически: дробные части обеих меток совпадали байт в байт, и
+    # уникальности для тега не оставалось.
+    # Сдвиг обязан быть дробным: ntp_timestamp считает дробь от миллисекунд, и
+    # при целом числе секунд обе метки получили бы одинаковые младшие 4 байта.
+    reference = ntp_timestamp(now - rr(30, 900) - ri(1000) / 1000.0)
+    transmit = ntp_timestamp(now)
+    payload[16:24] = reference
+    payload[40:48] = transmit
+    # Секунды не трогаем: случайные 4 байта дали бы дату вне текущей эпохи NTP,
+    # то есть подделку виднее, чем повтор. Дробная часть (младшие 4 байта
+    # метки) в реальных клиентах равномерно случайна — её и помечаем.
+    dyn(reference[4:])
+    dyn(transmit[4:])
     return bytes(payload)
 
 def generate_rtp_payload(options=None):
     payload_type = rc([0x00, 0x08, 0x60])
     body = rb(96) if payload_type == 0x60 else rb(160)
-    return (bytes([0x80, payload_type]) + u16(ri(65535)) +
-            u32(ru32()) + u32(ru32()) + body)
+    sequence = u16(ri(65535))
+    timestamp = u32(ru32())
+    ssrc = u32(ru32())
+    # Внутри RTP ничего не считается от этих полей: заголовок без контрольной
+    # суммы, тело — сжатый звук, для наблюдателя неотличимый от случайного.
+    # Поэтому весь пакет, кроме двух байт версии/типа, может быть динамическим.
+    dyn(sequence); dyn(timestamp); dyn(ssrc); dyn(body)
+    return bytes([0x80, payload_type]) + sequence + timestamp + ssrc + body
 
 def generate_rtcp_payload(options=None):
     ssrc = ru32()
@@ -1879,8 +2042,10 @@ def build_sip_invite_body(origin_user, host):
         "a=ptime:%d" % rc([20, 30, 40]),
         "a=maxptime:%d" % rc([60, 80, 120]),
         "a=rtcp-mux",
-        "a=ice-ufrag:" + to_hex(rb(4)),
-        "a=ice-pwd:" + to_hex(rb(12)),
+        # ICE-креденшелы генерируются заново на каждую сессию (RFC 5245 §15.4)
+        # и состоят из ice-char = ALPHA / DIGIT / + / — буквы от <rc> подходят.
+        "a=ice-ufrag:" + dyn(to_hex(rb(4)), "rc"),
+        "a=ice-pwd:" + dyn(to_hex(rb(12)), "rc"),
         "a=fingerprint:sha-256 " + fingerprint,
         "a=setup:actpass",
         "a=msid-semantic: WMS " + origin_user,
@@ -1904,9 +2069,14 @@ def generate_sip_payload(options):
     to_user = from_user if action == "REGISTER" else random_sip_user_part()
     from_display = rc(SIP_DISPLAY_NAMES)
     to_display = from_display if action == "REGISTER" else rc(SIP_DISPLAY_NAMES)
-    branch = "z9hG4bK" + to_hex(rb(9))
-    tag = to_hex(rb(6))
-    call_id = to_hex(rb(12)) + "@" + host
+    # Идентификаторы транзакции SIP: branch, tag и Call-ID уникальны для каждого
+    # запроса по самой спецификации (RFC 3261 §8.1.1.7, §19.3) — повтор одного и
+    # того же Call-ID выглядел бы куда подозрительнее случайных букв. Тег <rc>,
+    # а не <r>: протокол текстовый, двоичный мусор внутри заголовка недопустим.
+    # Префикс z9hG4bK остаётся статикой — это обязательный магический маркер.
+    branch = "z9hG4bK" + dyn(to_hex(rb(9)), "rc")
+    tag = dyn(to_hex(rb(6)), "rc")
+    call_id = dyn(to_hex(rb(12)), "rc") + "@" + host
     cseq = 1 + ri(50)
     user_agent = rc(SIP_USER_AGENTS)
     allow_header = rc(SIP_ALLOW_HEADERS)
@@ -1991,7 +2161,13 @@ def build_dtls_client_hello_body(host):
                   ext_extended_master_secret())
     cipher_suites = b"".join(u16(c) for c in
                              [0xC02B, 0xC02F, 0xCCA9, 0xC02C, 0x009C, 0x009D])
-    return (b"\xFE\xFD" + rb(32) + bytes([len(session_id)]) + session_id +
+    # ClientHello в DTLS ничем не подписан и не зашифрован (MAC появляется
+    # только после смены шифра), а client_random и session_id по спецификации
+    # случайны — оба поля можно отдать тегам. ECH здесь нет, так что связывания
+    # с внешним ClientHello, которое сломалось бы, тоже нет.
+    client_random = rb(32)
+    dyn(client_random); dyn(session_id)
+    return (b"\xFE\xFD" + client_random + bytes([len(session_id)]) + session_id +
             b"\x00" + u16(len(cipher_suites)) + cipher_suites + b"\x01\x00" +
             u16(len(extensions)) + extensions)
 
@@ -2025,10 +2201,14 @@ def build_stun_message_with_fingerprint(message_type, attrs):
     crc_value = (crc32_stun(prefix + attr_bytes) ^ 0x5354554E) & 0xFFFFFFFF
     return prefix + attr_bytes + build_stun_attribute(0x8028, u32(crc_value))
 
+# Провайдеры ICE, из которых выбирает режим random. Список нужен и здесь, и в
+# build_options: разыгрывать провайдера обязаны ОДИН раз на всю цепочку I1-I5.
+STUN_PROVIDERS = ["google", "cloudflare", "meta", "twilio", "twilio_stun"]
+
 def resolve_stun_turn_profile(provider):
     provider = str(provider or "").strip().lower()
     if provider == "random":
-        provider = rc(["google", "cloudflare", "meta", "twilio", "twilio_stun"])
+        provider = rc(STUN_PROVIDERS)
     if provider == "twilio_stun":
         return {"id": "twilio", "serverPool": TWILIO_STUN_SERVERS, "realm": TWILIO_REALM,
                 "softwareName": "Twilio WebRTC ICE agent", "preferredMode": "binding",
@@ -2068,16 +2248,37 @@ def resolve_stun_turn_mode(options, profile):
         return "binding"
     return "allocate" if (ri(1000) / 1000.0) < profile["autoAllocateProbability"] else "binding"
 
-def stun_software_name(profile):
-    if profile["id"] == "meta":
-        return rc(["WhatsApp/2", "Instagram/2", "Messenger WebRTC"])
-    return profile["softwareName"]
+# Приложения Meta, которыми может представиться профиль meta. Выбор — один на
+# цепочку: WhatsApp не превращается в Instagram от пакета к пакету.
+META_SOFTWARE_NAMES = ["WhatsApp/2", "Instagram/2", "Messenger WebRTC"]
+
+def stun_software_name(profile, options=None):
+    if profile["id"] != "meta":
+        return profile["softwareName"]
+    if options is None:
+        return rc(META_SOFTWARE_NAMES)
+    name = options.get("_metaSoftware")
+    if not name:
+        name = rc(META_SOFTWARE_NAMES)
+        options["_metaSoftware"] = name
+    return name
+
+def twilio_username_token():
+    """Временный креденшел Twilio: 20 hex-символов.
+
+    Здесь стоял пул из четырёх строк-заглушек — "a1b2c3d4e5f6g7h8i9j0",
+    "abcdef1234567890abcd" и ещё две того же вида. Это не статистика и не
+    эвристика: четыре литерала, по которым любой DPI однозначно опознаёт всех,
+    кто пользуется этим профилем, — сигнатура жёстче, чем у самого WireGuard.
+    Форму (длину и алфавит) сохраняем, содержимое делаем случайным.
+    """
+    return to_hex(rb(10))
 
 def build_stun_binding_username(profile, server_host):
     if profile["id"] == "meta":
         return enc_text("WA-%d:%s" % (1000000000 + ri(9000000000), server_host))
     if profile["id"] == "twilio":
-        return enc_text("%s:%s" % (rc(TWILIO_TURN_USERNAME_PREFIXES), server_host))
+        return enc_text("%s:%s" % (twilio_username_token(), server_host))
     return enc_text("%s:%s" % (to_hex(rb(4)), server_host))
 
 def build_stun_allocate_username(profile, server_host):
@@ -2085,7 +2286,7 @@ def build_stun_allocate_username(profile, server_host):
         return enc_text("WA-%d@%s" % (1000000000 + ri(9000000000), server_host))
     suffix = str(ri(9000) + 1000)
     if profile["id"] == "twilio":
-        return enc_text("%s%s@%s" % (rc(TWILIO_TURN_USERNAME_PREFIXES), suffix, server_host))
+        return enc_text("%s%s@%s" % (twilio_username_token(), suffix, server_host))
     return enc_text("%s%s@%s" % (to_hex(rb(8)), suffix, server_host))
 
 def generate_stun_payload(options):
@@ -2096,6 +2297,18 @@ def generate_stun_payload(options):
     profile = resolve_stun_turn_profile(options.get("iceProvider") or "google")
     mode = resolve_stun_turn_mode(options, profile)
     server_host = options.get("iceServerHost") or rc(profile["serverPool"])
+
+    # Свой домен пользователя и провайдерская маркировка вместе не живут.
+    # Было: REALM = cloudflare.com, SOFTWARE = «Cloudflare WebRTC client», а
+    # USERNAME = <случайное>@<домен пользователя> — разбирающий STUN видит
+    # клиента, который представляется Cloudflare, а ходит к чужому хосту.
+    # Домен в пакете пользователю и нужен (в STUN больше негде показать имя),
+    # поэтому не выкидываем его, а снимаем противоречие: realm становится тем
+    # же доменом, а вендорские имена уходят — SOFTWARE в STUN необязателен
+    # (RFC 5389 §15.10), и клиенты его регулярно не шлют.
+    if options.get("iceServerHost"):
+        profile = dict(profile, id="generic", realm=server_host, softwareName=None)
+
     attrs = []
 
     if mode == "allocate":
@@ -2104,13 +2317,21 @@ def generate_stun_payload(options):
         attrs.append(build_stun_attribute(0x0014, enc_text(profile["realm"])))
         attrs.append(build_stun_attribute(0x000D, u32(lifetime)))
         attrs.append(build_stun_attribute(0x0019, u32(0x00000011) + zeros(4)))
+        # REQUESTED-ADDRESS-FAMILY (0x0017, RFC 6156 §4.1.1): байт семейства,
+        # затем три зарезервированных нуля. Было 0x8027 со значением
+        # 00 01 00 00 — и тип, и порядок байт мимо: 0x8027 это CACHE-TIMEOUT
+        # (RFC 5780), атрибут ОТВЕТА при обнаружении поведения NAT, клиент его
+        # в Allocate не шлёт, а семейство 0x00 не существует. Разбирающий STUN
+        # видел ровно ту аномалию, ради сокрытия которой мимикрия и делается.
         attrs.append(build_stun_attribute(
-            0x8027, bytes([0x00, 0x0001 if ri(2) == 0 else 0x0002, 0x00, 0x00])))
+            0x0017, bytes([0x01 if ri(2) == 0 else 0x02, 0x00, 0x00, 0x00])))
         username = build_stun_allocate_username(profile, server_host)
     else:
         username = build_stun_binding_username(profile, server_host)
 
-    attrs.append(build_stun_attribute(0x8022, enc_text(stun_software_name(profile))))
+    software = stun_software_name(profile, options)
+    if software:
+        attrs.append(build_stun_attribute(0x8022, enc_text(software)))
     attrs.append(build_stun_attribute(0x0024, u32(ru32() | 0x40000000)))
     attrs.append(build_stun_attribute(0x8029 if ri(2) == 0 else 0x802A,
                                       u32(ru32()) + u32(ru32())))
@@ -2133,6 +2354,18 @@ def generate_webrtc_payload(options):
 # ================================================================
 # Диспетчер профилей и вывод (app.js: appendChunkLines/chunkPayload)
 # ================================================================
+# Динамические поля (теги <r>/<rc>/<rd>) есть не у всех профилей — и это не
+# недоделка, а свойство самих протоколов:
+#   dns, ntp, rtp, sip, dtls — помечены (см. dyn() в соответствующих функциях);
+#   webrtc — помечены только его DTLS/RTP-части, STUN внутри неприкосновенен;
+#   stun   — весь пакет накрыт FINGERPRINT (CRC32 по всему сообщению), любое
+#            динамическое поле сделало бы контрольную сумму несходящейся;
+#   quic, curl_quic — ключи Initial выводятся из DCID, а заголовок целиком
+#            входит в AAD (RFC 9001 §5.2): подменив байт, мы получаем пакет,
+#            который не расшифрует никто, включая DPI, который как раз и лезет
+#            в Initial за SNI. Повторный идентичный Initial выглядит обычной
+#            ретрансмиссией, битый — аномалией. Поэтому статика;
+#   ssdp   — M-SEARCH реального устройства и в жизни повторяется дословно.
 PROTOCOL_GENERATORS = {
     "dns": generate_dns_payload,
     "quic": generate_quic_payload,
@@ -2169,8 +2402,23 @@ def build_options(profile, domain, domain_is_explicit, args):
         options["hasCustomHost"] = True
         options["sipAction"] = args["sip_action"]
     elif profile in ("stun", "webrtc"):
-        options["iceProvider"] = args["ice_provider"]
+        # random разыгрываем ЗДЕСЬ, один раз на цепочку, а не внутри
+        # resolve_stun_turn_profile на каждый пакет. Атрибут SOFTWARE описывает
+        # клиентскую реализацию, а не сервер: пять пакетов подряд, где клиент
+        # называется то «Google STUN client», то «Twilio WebRTC ICE agent»,
+        # то «Cloudflare WebRTC client», — это один браузер, объявивший себя
+        # тремя разными. Такого не бывает, и заметно это без всякой статистики.
+        provider = str(args["ice_provider"] or "").strip().lower()
+        if provider == "random":
+            provider = rc(STUN_PROVIDERS)
+        options["iceProvider"] = provider
         options["iceMode"] = args["ice_mode"]
+        # Имя приложения Meta фиксируем здесь же, а не лениво при первом
+        # пакете: профиль webrtc собирает STUN на КОПИИ options
+        # (dict(options)), и запомненное внутри копии значение до следующего
+        # пакета не доживает — цепочка снова представлялась бы тремя разными
+        # приложениями сразу.
+        options["_metaSoftware"] = rc(META_SOFTWARE_NAMES)
         # Домен подставляем в ICE только если его ввёл пользователь: при
         # автогенерации правдоподобнее пул серверов самого провайдера.
         options["iceServerHost"] = domain if domain_is_explicit else ""
@@ -2185,6 +2433,10 @@ def main(argv):
         "sip_action": "OPTIONS",
         "ice_provider": "random",
         "ice_mode": "auto",
+        # --static возвращает поведение до динамических тегов: строка целиком из
+        # <b 0x..>. Нужен для сравнения в тестах и как аварийный откат, если
+        # клиент окажется без поддержки <r>/<rc>.
+        "static": False,
     }
     only_i1 = False
     positional = []
@@ -2193,6 +2445,8 @@ def main(argv):
         arg = argv[index]
         if arg == "--only-i1":
             only_i1 = True
+        elif arg == "--static":
+            args["static"] = True
         elif arg == "--ech-doh":
             args["ech_doh"] = True
         elif arg == "--full":
@@ -2252,14 +2506,36 @@ def main(argv):
     for _ in range(MAX_OUTPUT_LINES):
         if len(lines) >= MAX_OUTPUT_LINES:
             break
-        try:
-            payload = generator(options)
-        except Exception as exc:
-            _warn_once("сбой генерации %s (%s: %s)" % (profile, type(exc).__name__, exc))
+        # Помеченное поле выбрасывается из строки, если случайно встретилось в
+        # пакете дважды: два тега разъехались бы, а копии обязаны совпадать.
+        # Для коротких полей это не теория — Transaction ID в DNS занимает 2
+        # байта, и примерно раз на 1600 пакетов они попадаются в теле ещё раз.
+        # Тогда у пакета не остаётся ни одного динамического поля, и строка I
+        # уходит в эфир БАЙТ В БАЙТ при каждом рукопожатии — ровно та статичная
+        # сигнатура, против которой всё и делается. Пакет случайный, поэтому
+        # достаточно сгенерировать заново.
+        payload = None
+        for _attempt in range(8):
+            try:
+                dyn_reset()
+                payload = generator(options)
+            except Exception as exc:
+                _warn_once("сбой генерации %s (%s: %s)" % (profile, type(exc).__name__, exc))
+                payload = None
+                break
+            if not _DYN or dyn_all_unique(payload):
+                break
+        if payload is None:
             break
         room = MAX_OUTPUT_LINES - len(lines)
-        piece = ["<b 0x%s>" % to_hex(chunk)
-                 for chunk in chunk_payload(payload, args["mtu"])[:room]]
+        chunks = chunk_payload(payload, args["mtu"])
+        if args["static"] or len(chunks) > 1:
+            # Разрезанный на несколько строк пакет помечать нечем: смещения
+            # полей уезжают в соседний кусок. Такое бывает только у QUIC при
+            # маленьком --mtu, а там динамических полей всё равно нет.
+            piece = ["<b 0x%s>" % to_hex(chunk) for chunk in chunks[:room]]
+        else:
+            piece = [build_tagged_line(payload)]
         cost = sum(len(item) for item in piece)
         if budget and lines and used + cost > budget:
             break
@@ -2293,11 +2569,20 @@ gen_cps_i1() {
   local only_i1="${3:-}"
   local mtu_args=()
   [[ -n "${AWG_CPS_MTU:-}" ]] && mtu_args=(--mtu "$AWG_CPS_MTU")
+  # Потолок применяем здесь, а не только в меню: CPS_BUDGET приходит и из
+  # конфига сервера (маркер AWG_CPS_BUDGET, который читает бот), и из
+  # профильных пресетов, где встречается 0 = «без лимита». Ноль за этой
+  # чертой означал бы цепочку в 12000 символов для quic — втрое выше
+  # порога, за которым awg set падает, а awg show перестаёт читать
+  # интерфейс (см. CPS_HARD_LIMIT).
   local budget_args=()
   local budget="${CPS_BUDGET:-0}"
-  if [[ "$budget" =~ ^[0-9]+$ ]] && (( budget > 0 )); then
-    budget_args=(--budget "$budget")
+  local cap="${CPS_HARD_LIMIT:-3500}"
+  [[ "$budget" =~ ^[0-9]+$ ]] || budget=0
+  if (( budget <= 0 || budget > cap )); then
+    budget=$cap
   fi
+  budget_args=(--budget "$budget")
   python3 -c "$_CPS_GENERATOR" "$profile" "$domain" ${only_i1:+"$only_i1"} \
     ${mtu_args[@]+"${mtu_args[@]}"} ${budget_args[@]+"${budget_args[@]}"}
 }
@@ -2576,6 +2861,20 @@ choose_cps_domain() {
 # Результат: глобальная CPS_BUDGET (символов, 0 = без лимита).
 CPS_BUDGET=0
 
+# Потолок суммарной длины I1-I5. Не наша прихоть, а предел amneziawg-tools:
+# атрибуты уровня устройства пишутся в netlink-буфер 4096 Б (на x86-64 это
+# min(pagesize, 8192)) функциями mnl_attr_put* БЕЗ проверки границ — в
+# отличие от атрибутов пиров, где используются варианты _check. Замеры из
+# amneziawg-tools issue #69:
+#   до 3598 симв — применяется и читается;
+#   3600-3866    — применяется, но `awg show` виснет и отдаёт EMSGSIZE;
+#   от 3868      — `awg set` падает с кодом 134, устройство настроено, но
+#                  прочитать его больше нельзя.
+# Второй и третий случай для нас смертельны: на `awg show` держатся выдача
+# публичного ключа при создании клиента, список пиров и вся статистика.
+# 3500 — с запасом до первого порога.
+CPS_HARD_LIMIT=3500
+
 # Ориентировочная длина ОДНОГО пакета мимикрии в символах конфига.
 # Числа — замеры генератора v2; точная длина зависит от домена и случайных
 # полей, поэтому они годятся только для предупреждения в меню, а итог всегда
@@ -2612,10 +2911,11 @@ _cps_fit_count() {
 # сколько пакетов реально поместится, а не общими словами про «QUIC урежется».
 choose_cps_budget() {
   local profile="${1:-quic}"
-  local pkt fit1500 fit3000
+  local pkt fit1500 fit3000 fitmax
   pkt=$(_cps_pkt_len "$profile")
   fit1500=$(_cps_fit_count 1500 "$pkt")
   fit3000=$(_cps_fit_count 3000 "$pkt")
+  fitmax=$(_cps_fit_count "$CPS_HARD_LIMIT" "$pkt")
 
   CPS_BUDGET=1500
   echo ""
@@ -2634,8 +2934,13 @@ choose_cps_budget() {
 
   echo -e "  ${G}1${N}  ${W}Компактная${N}  ${D}— до ~1500 симв, влезает в QR${N}  → ${W}${fit1500} из 5${N}${_rec1}"
   echo -e "  ${G}2${N}  ${W}Средняя${N}     ${D}— до ~3000 симв${N}              → ${W}${fit3000} из 5${N}"
-  echo -e "  ${G}3${N}  ${W}Без лимита${N}  ${D}— все пять целиком (~$((pkt * 5)) симв)${N} → ${W}5 из 5${N}${_rec3}"
+  echo -e "  ${G}3${N}  ${W}Максимум${N}    ${D}— ${CPS_HARD_LIMIT} симв, предел awg-tools${N}     → ${W}${fitmax} из 5${N}${_rec3}"
   echo -e "  ${D}0   Назад${N}"
+  echo ""
+  echo -e "  ${D}Выше ${CPS_HARD_LIMIT} нельзя не из осторожности: в amneziawg-tools атрибуты${N}"
+  echo -e "  ${D}I1-I5 пишутся в буфер 4 КБ без проверки границ (issue #69). За${N}"
+  echo -e "  ${D}порогом awg show перестаёт читать интерфейс, а на нём держатся${N}"
+  echo -e "  ${D}выдача ключа новому клиенту, список пиров и статистика.${N}"
   if (( fit1500 < 5 )); then
     echo ""
     echo -e "  ${Y}  Все пять в компактный бюджет укладывают только DNS, NTP и RTP.${N}"
@@ -2648,13 +2953,9 @@ choose_cps_budget() {
     0) return 1 ;;
     1) CPS_BUDGET=1500 ;;
     2) CPS_BUDGET=3000 ;;
-    3) CPS_BUDGET=0 ;;
+    3) CPS_BUDGET=$CPS_HARD_LIMIT ;;
   esac
-  if (( CPS_BUDGET > 0 )); then
-    ok "Бюджет цепочки: ${CPS_BUDGET} символов"
-  else
-    ok "Бюджет цепочки: без лимита"
-  fi
+  ok "Бюджет цепочки: ${CPS_BUDGET} символов"
   return 0
 }
 
@@ -2694,7 +2995,42 @@ choose_mimicry_profile() {
   echo -e "     ${D}Локальный протокол: наружу, к VPN-серверу, ходит редко.${N}"
   echo -e "  ${D}0   Назад${N}"
   echo ""
+  # Цепочка уходит в эфир МГНОВЕННЫМ всплеском: замер на живом сервере дал
+  # дельты 0-1 мкс между всеми пятью пакетами (tcpdump -ttt). Поэтому профиль
+  # выбирается не по «красоте протокола», а по тому, бывает ли у него такой
+  # всплеск в природе:
+  #   • DNS  — stub-резолвер и правда шлёт пачку запросов (A, AAAA, HTTPS)
+  #            с одного сокета залпом. Пять пакетов подряд — норма.
+  #   • RTP  — медиапоток это и есть быстрая череда пакетов с одного порта.
+  #   • STUN — ICE-сбор кандидатов шлёт несколько Binding подряд.
+  #   • QUIC — настоящий клиент на одно соединение шлёт ОДИН Initial. Пять
+  #            штук в одну точку за микросекунды — это пять одновременных
+  #            соединений, чего браузер не делает. Для одиночного I1 (уровень
+  #            2) QUIC, наоборот, самый достоверный вариант.
   local _mim_default=1
+  if [[ "${OBF_LEVEL:-3}" == "3" ]]; then
+    _mim_default=3
+    echo -e "  ${D}  Цепочка из пяти пакетов уходит залпом за микросекунды.${N}"
+    echo -e "  ${D}  Так бывает у DNS (3), RTP (8) и STUN (4). У QUIC — нет:${N}"
+    echo -e "  ${D}  браузер шлёт один Initial, а не пять сразу в одну точку.${N}"
+    echo -e "  ${D}  Нужен именно QUIC — берите уровень 2 (один I1).${N}"
+  else
+    echo -e "  ${D}  Один пакет: QUIC (1) достовернее всего — реальный клиент${N}"
+    echo -e "  ${D}  шлёт ровно один Initial на соединение.${N}"
+  fi
+
+  # Второй критерий после «бывает ли такой всплеск» — порт. Сервер слушает
+  # случайный высокий порт (30001-65535), и половина протоколов на нём
+  # выглядит не на своём месте: DNS живёт на 53, NTP на 123, SSDP на 1900 —
+  # запрос такого вида на 65129 сам по себе аномалия, сколько бы пакетов в
+  # цепочке ни было. STUN, WebRTC, DTLS и RTP, наоборот, в жизни ходят по
+  # эфемерным портам: ICE и медиапотоки именно так и работают.
+  echo ""
+  echo -e "  ${D}  И про порт: сервер слушает случайный высокий порт. На нём${N}"
+  echo -e "  ${D}  естественны STUN (4), WebRTC (5), RTP (8) — ICE и медиа и в${N}"
+  echo -e "  ${D}  жизни ходят по эфемерным портам. DNS (3), NTP (7), SSDP (9)${N}"
+  echo -e "  ${D}  привязаны к 53/123/1900: такой пакет на высоком порту сам по${N}"
+  echo -e "  ${D}  себе странность, сколько бы пакетов в цепочке ни было.${N}"
   echo -e "  ${D}  На Keenetic надёжнее DNS (3): он чувствителен к длине I1.${N}"
   echo ""
   read_choice PROFILE_CHOICE "$(echo -e "${C}  Выбор [0-9] (Enter = ${_mim_default}): ${N}")" 0 9 "$_mim_default"
@@ -2966,6 +3302,12 @@ do_sniff_test() {
     return 0
   fi
 
+  # Модуль, дописывающий хвост к I1-I5, испортит ровно то, что показывает
+  # этот тест: длины пакетов поедут, а за концом протокола будут лишние байты.
+  # Сказать об этом надо до захвата, а не оставлять гадать над результатом.
+  awg_warn_trailer_fix "$SERVER_CONF" || true
+  awg_warn_cps_oversize "$SERVER_CONF" || true
+
   local listen_port
   listen_port=$(awk -F= '/^ListenPort/{gsub(/ /,"",$2); print $2}' "$SERVER_CONF")
   [[ -z "$listen_port" ]] && { warn "ListenPort не найден"; return 0; }
@@ -3086,6 +3428,30 @@ do_sniff_test() {
   log_info "DPI тест: клиент=$client_ip verdict=$verdict"
 }
 
+# apt-get install с одной повторной попыткой после обновления индексов.
+# Типичный отказ на давно не обновлявшемся сервере — 404 на .deb: в архиве
+# уже лежит более новая версия пакета, а локальный индекс помнит старую.
+# Гонять "apt-get update" перед каждой установкой дорого, поэтому обновляемся
+# только после первой неудачи. Вывод apt остаётся в APT_LAST_OUTPUT — чтобы
+# вызывающий показал настоящую причину, а не «не удалось установить».
+APT_LAST_OUTPUT=""
+_apt_install() {
+  local rc=0
+  APT_LAST_OUTPUT=$(apt-get install -y -q "$@" 2>&1) || rc=$?
+  (( rc == 0 )) && return 0
+
+  info "Индексы пакетов устарели — обновляю и пробую ещё раз..."
+  apt-get update -q >/dev/null 2>&1 || true
+  rc=0
+  APT_LAST_OUTPUT=$(apt-get install -y -q "$@" 2>&1) || rc=$?
+  return $rc
+}
+
+# Печатает строки ошибок из последнего вызова _apt_install.
+_apt_last_errors() {
+  printf '%s\n' "$APT_LAST_OUTPUT" | grep -E '^E:' | head -3 | sed 's/^/      /' || true
+}
+
 check_deps() {
   HAS_AWG=false
   HAS_SERVER_CONF=false
@@ -3107,18 +3473,7 @@ check_deps() {
     saved_region=$(grep -oP '^#\s*Region:\s*\K\w+' "$SERVER_CONF" 2>/dev/null | head -1 || true)
     if [[ -n "$saved_region" ]]; then
       SERVER_REGION="$saved_region"
-      # Пересобираем активные пулы под регион
-      if [[ "$saved_region" == "ru" ]]; then
-        TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_RU[@]}")
-        DTLS_DOMAINS=("${DTLS_DOMAINS_RU[@]}")
-        SIP_DOMAINS=("${SIP_DOMAINS_RU[@]}")
-        QUIC_DOMAINS=("${QUIC_DOMAINS_RU[@]}")
-      else
-        TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_WORLD[@]}")
-        DTLS_DOMAINS=("${DTLS_DOMAINS_WORLD[@]}")
-        SIP_DOMAINS=("${SIP_DOMAINS_WORLD[@]}")
-        QUIC_DOMAINS=("${QUIC_DOMAINS_WORLD[@]}")
-      fi
+      _apply_region_pools "$saved_region"
     fi
   fi
 
@@ -3131,27 +3486,80 @@ check_deps() {
   fi
 }
 
+# Интерфейсы, которые скрипт поднимает сам. Их адрес не должен попасть в
+# Endpoint клиентского конфига: после включения Warp/Xray/tun2socks/каскада
+# дефолтный маршрут уезжает в туннель, и «внешний IP» стал бы адресом туннеля.
+PUBIP_TUNNEL_IFACES=" awg0 warp0 xray0 tun0 wgcf "
+
+# Диапазоны, непригодные как Endpoint: 10/8, 172.16/12, 192.168/16, 127/8,
+# 169.254/16 (link-local) и 100.64/10 (CGNAT — частый случай у дешёвых VPS).
+_ip_is_private() {
+  local ip="${1:-}"
+  [[ "$ip" =~ ^10\. ]] && return 0
+  [[ "$ip" =~ ^192\.168\. ]] && return 0
+  [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] && return 0
+  [[ "$ip" =~ ^127\. ]] && return 0
+  [[ "$ip" =~ ^169\.254\. ]] && return 0
+  [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]] && return 0
+  return 1
+}
+
+# Первый интерфейс дефолтного маршрута, не считая наших туннелей.
+# Пустой вывод + код 1 — маршрута нет (или он весь через туннель).
+_uplink_iface() {
+  local dev
+  while read -r dev; do
+    [[ -n "$dev" ]] || continue
+    case "$PUBIP_TUNNEL_IFACES" in *" $dev "*) continue ;; esac
+    printf '%s\n' "$dev"
+    return 0
+  done < <(ip -4 route show default 2>/dev/null \
+            | awk '{for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' || true)
+  return 1
+}
+
 get_public_ip() {
-  local ip=""
-  # Использую explicit check вместо chain с set -e
-  ip=$(timeout 5 curl -s --connect-timeout 3 -4 ifconfig.me 2>/dev/null || true)
-  if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "$ip"; return 0
+  local ip="" main_if="" if_ip=""
+
+  # ── 1. Адрес самого аплинка ──
+  # Если он уже публичный — это и есть Endpoint, в сеть ходить незачем.
+  main_if=$(_uplink_iface || true)
+  if [[ -n "$main_if" ]]; then
+    if_ip=$(ip -4 addr show dev "$main_if" scope global 2>/dev/null \
+            | awk '$1=="inet"{split($2,a,"/"); print a[1]; exit}' || true)
+  fi
+  if [[ -n "$if_ip" ]] && _cascade_valid_ip "$if_ip" && ! _ip_is_private "$if_ip"; then
+    echo "$if_ip"; return 0
   fi
 
-  ip=$(timeout 5 curl -s --connect-timeout 3 -4 api.ipify.org 2>/dev/null || true)
-  if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "$ip"; return 0
-  fi
+  # ── 2. Аплинк за NAT — спрашиваем внешний сервис ──
+  # curl прибиваем к аплинку (--interface): иначе при поднятом туннеле ответ
+  # придёт с адреса туннеля, и клиенты получат нерабочий Endpoint.
+  local -a curl_opts=(-s --connect-timeout 3 -4)
+  [[ -n "$main_if" ]] && curl_opts+=(--interface "$main_if")
 
-  ip=$(timeout 5 curl -s --connect-timeout 3 -4 ipinfo.io/ip 2>/dev/null || true)
-  if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "$ip"; return 0
-  fi
+  local svc
+  for svc in ifconfig.me api.ipify.org ipinfo.io/ip; do
+    ip=$(timeout 5 curl "${curl_opts[@]}" "$svc" 2>/dev/null || true)
+    if _cascade_valid_ip "$ip" && ! _ip_is_private "$ip"; then
+      echo "$ip"; return 0
+    fi
+    # --interface не работает на части хостингов (policy routing, отсутствие
+    # source-адреса) — второй заход тем же сервисом, но без привязки.
+    if [[ ${#curl_opts[@]} -gt 3 ]]; then
+      ip=$(timeout 5 curl -s --connect-timeout 3 -4 "$svc" 2>/dev/null || true)
+      if _cascade_valid_ip "$ip" && ! _ip_is_private "$ip"; then
+        echo "$ip"; return 0
+      fi
+    fi
+  done
 
-  # Fallback — локальный IP через ip route
-  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
-  if [[ -n "$ip" ]]; then
+  # ── 3. Fallback — локальный src-адрес маршрута ──
+  # Может быть приватным: сервер за NAT без выхода в интернет. Лучше, чем
+  # пустая строка: пользователь увидит адрес и поправит Endpoint руками.
+  ip=$(ip -4 route get 1.1.1.1 2>/dev/null \
+       | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
+  if [[ -n "$ip" ]] && _cascade_valid_ip "$ip"; then
     echo "$ip"; return 0
   fi
 
@@ -3398,20 +3806,185 @@ awg_reboot_reason() {
   return 1
 }
 
-# Возвращает 0 (true), если файл .ko модуля amneziawg на диске новее момента
-# его последней загрузки в ядро — то есть в памяти сидит устаревшая версия.
-# Возвращает 1 (false), если сравнить не удалось или модуль актуален.
-awg_module_stale() {
-  [[ -d /sys/module/amneziawg ]] || return 1
+# Собран ли модуль из исходников, где RandomTrailers уже не портит мимикрию.
+#
+# До тега v3.1.20260906 модуль дописывал случайный хвост RandomTrailers к
+# пакетам I1-I5 и к junk-пакетам. Для нас это существенно: I1-I5 — это и есть
+# цепочка мимикрии, и лишние байты в хвосте ломают ровно то, ради чего она
+# делается (QUIC Initial перестаёт быть 1200 Б, а за концом валидной структуры
+# протокола идёт мусор — для DPI это аномалия). В исправленной версии трейлеры
+# остались только на настоящих пакетах рукопожатия WireGuard.
+#
+# По версии это не определить: WIREGUARD_VERSION в src/version.h у тегов
+# 20260812, 20260828 и 20260906 одинаковый ("3.1.20260812"), так что
+# `modinfo amneziawg` покажет одно и то же на сломанном и на исправленном.
+# Поэтому смотрим исходники, которые DKMS оставляет на диске: параметр
+# `bool trailer` в объявлении wg_socket_send_buffer_to_peer появился ровно
+# вместе с этим фиксом.
+#
+# Коды: 0 — фикс есть, 1 — фикса точно нет, 2 — проверить не удалось.
+awg_module_trailer_fix() {
+  local f checked=0
+  for f in /usr/src/amneziawg-*/socket.h; do
+    [[ -f "$f" ]] || continue
+    # Файл без этого объявления — не тот, что нам нужен: не делаем по нему
+    # вывода ни в одну сторону.
+    grep -q 'wg_socket_send_buffer_to_peer' "$f" 2>/dev/null || continue
+    checked=1
+    if grep -qE 'bool[[:space:]]+trailer' "$f" 2>/dev/null; then
+      return 0
+    fi
+  done
+  (( checked == 1 )) && return 1
+  return 2
+}
 
-  local ko_path load_time mod_time
+# Предупреждение для сервера на 3.1 с цепочкой мимикрии. Молчит, когда фикс
+# есть, когда проверить не удалось и когда RandomTrailers не включён: пугать
+# там, где мы не уверены, хуже, чем промолчать.
+# Суммарная длина значений I1-I5 в конфиге, в символах.
+_cps_chain_len() {
+  local conf="${1:-$SERVER_CONF}"
+  [[ -f "$conf" ]] || { echo 0; return 0; }
+  awk -F'=' '/^[[:space:]]*I[1-5][[:space:]]*=/ {
+      v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); gsub(/[[:space:]]+$/, "", v)
+      n += length(v)
+    } END { print n + 0 }' "$conf" 2>/dev/null || echo 0
+}
+
+# Конфиг, который amneziawg-tools не сможет прочитать обратно. Пороги — из
+# замеров в amneziawg-tools issue #69, см. CPS_HARD_LIMIT. Это не про
+# качество мимикрии, а про работоспособность: за верхним порогом `awg set`
+# падает, а `awg show` перестаёт отдавать данные, на которых у нас держатся
+# выдача ключа новому клиенту, список пиров и статистика.
+awg_warn_cps_oversize() {
+  local conf="${1:-$SERVER_CONF}"
+  [[ -f "$conf" ]] || return 0
+  local n; n=$(_cps_chain_len "$conf")
+  [[ "$n" =~ ^[0-9]+$ ]] || return 0
+  (( n <= 3598 )) && return 0
+
+  echo ""
+  if (( n >= 3868 )); then
+    err "Цепочка I1-I5 занимает ${n} символов — это выше предела awg-tools"
+    info "На таком конфиге ${W}awg set${N} падает, а ${W}awg show${N} не читает интерфейс"
+  else
+    warn "Цепочка I1-I5 занимает ${n} символов — на грани предела awg-tools"
+    info "${W}awg show${N} на таком конфиге может виснуть и отдавать EMSGSIZE"
+  fi
+  info "Причина не у нас: атрибуты I1-I5 пишутся в буфер 4 КБ без проверки"
+  info "границ (amneziawg-tools issue #69). Безопасный предел — ${CPS_HARD_LIMIT:-3500}"
+  info "Проверить сейчас: ${W}awg show awg0 public-key${N} — если молчит, задето"
+  info "Пересоздать цепочку короче: ${W}Сервер (1) → п.5${N} (сменить профиль/бюджет)"
+  echo ""
+  return 1
+}
+
+awg_warn_trailer_fix() {
+  local conf="${1:-$SERVER_CONF}"
+  [[ -f "$conf" ]] || return 0
+  grep -qiE '^[[:space:]]*RandomTrailers[[:space:]]*=[[:space:]]*on' "$conf" 2>/dev/null || return 0
+  grep -qE '^[[:space:]]*I1[[:space:]]*=' "$conf" 2>/dev/null || return 0
+  local st; awg_module_trailer_fix; st=$?
+  (( st == 0 || st == 2 )) && return 0
+
+  echo ""
+  warn "Модуль ядра дописывает случайный хвост к пакетам мимикрии I1-I5"
+  info "Это ослабляет мимикрию: пакет перестаёт совпадать с настоящим"
+  info "протоколом по длине, а за его концом идут лишние байты"
+  info "Исправлено в модуле от 06.09.2026 (тег v3.1.20260906)"
+  info "Обновить: ${W}Сервер (1) → п.1${N}, затем ${W}перезагрузка${N}"
+  echo ""
+  return 1
+}
+
+# Возвращает 0 (true), если в память ядра загружена не та сборка модуля,
+# что лежит на диске, — то есть dkms install прошёл, а ядро продолжает
+# работать со старым модулем. Возвращает 1 (false), если сборка та же или
+# сравнить не удалось.
+#
+# Раньше это делалось по времени: mtime файла .ko против mtime
+# /sys/module/amneziawg. Так нельзя — sysfs не хранит время создания узла,
+# `stat -c %Y /sys/module/<что угодно>` возвращает ТЕКУЩЕЕ время. Значит
+# mod_time > load_time не выполнялось никогда, проверка молчала всегда, и
+# после пересборки скрипт сообщал «перезагрузка не требуется», хотя в ядре
+# оставался прежний модуль.
+#
+# Сравниваем srcversion — хеш исходников, вшитый в модуль при сборке. У
+# загруженного он в /sys/module/amneziawg/srcversion, у файла его отдаёт
+# modinfo. Разошлись — в памяти другая сборка.
+AWG_SYSFS_MODULE="${AWG_SYSFS_MODULE:-/sys/module/amneziawg}"
+
+awg_module_stale() {
+  [[ -d "$AWG_SYSFS_MODULE" ]] || return 1
+
+  local ko_path live disk ko_time boot_time uptime src_checked=0
   ko_path=$(modinfo -n amneziawg 2>/dev/null) || return 1
   [[ -n "$ko_path" && -f "$ko_path" ]] || return 1
 
-  load_time=$(stat -c %Y /sys/module/amneziawg 2>/dev/null) || return 1
-  mod_time=$(stat -c %Y "$ko_path" 2>/dev/null) || return 1
+  if [[ -r "$AWG_SYSFS_MODULE/srcversion" ]]; then
+    live=$(cat "$AWG_SYSFS_MODULE/srcversion" 2>/dev/null || true)
+    disk=$(modinfo -F srcversion "$ko_path" 2>/dev/null || true)
+    if [[ -n "$live" && -n "$disk" ]]; then
+      src_checked=1
+      [[ "$live" != "$disk" ]] && return 0
+    fi
+  fi
 
-  (( mod_time > load_time ))
+  # Исходники в DKMS новее собранного модуля — значит их положили (git pull,
+  # make dkms-install, ручная правка), а пересобрать забыли. srcversion этого
+  # не ловит: он сравнивает загруженный модуль с дисковым .ko, а оба остаются
+  # прежними, пока dkms build не отработал. Ровно так и вышло на живом
+  # сервере: socket.h от 07.09, .ko от 05.09, srcversion совпадают, фикса в
+  # ядре нет.
+  local src newest_src=0 t
+  for src in /usr/src/amneziawg-*/*.c /usr/src/amneziawg-*/*.h; do
+    [[ -f "$src" ]] || continue
+    t=$(stat -c %Y "$src" 2>/dev/null) || continue
+    (( t > newest_src )) && newest_src=$t
+  done
+  if (( newest_src > 0 )); then
+    ko_time=$(stat -c %Y "$ko_path" 2>/dev/null) || ko_time=0
+    if (( ko_time > 0 && newest_src > ko_time )); then
+      return 0
+    fi
+  fi
+
+  # srcversion сравнить удалось и он совпал, исходники не новее модуля —
+  # больше проверять нечего. Дальше идёт грубая прикидка по времени, и
+  # пускать её сюда нельзя: она даёт ложное «устарел» на свежей установке,
+  # где модуль собран и загружен уже после старта системы.
+  (( src_checked == 1 )) && return 1
+
+  # Запасной путь, если srcversion недоступен: файл .ko собран уже после
+  # загрузки системы. Модуль при этом почти всегда загружен при старте, то
+  # есть в памяти сборка более ранняя. Ошибка возможна в одну сторону —
+  # предложим лишнюю перезагрузку, а не пропустим нужную.
+  ko_time=$(stat -c %Y "$ko_path" 2>/dev/null) || return 1
+  uptime=$(cut -d. -f1 /proc/uptime 2>/dev/null) || return 1
+  [[ "$uptime" =~ ^[0-9]+$ ]] || return 1
+  boot_time=$(( $(date +%s) - uptime ))
+  (( ko_time > boot_time ))
+}
+
+# Делает net.ipv4.ip_forward=1 постоянным и печатает файл, куда записано.
+# В Ubuntu 26.04 /etc/sysctl.conf больше нет — всё переехало в /etc/sysctl.d/,
+# и прежний `grep ... /etc/sysctl.conf` ругался на отсутствующий файл, а потом
+# создавал его редиректом. Пишем drop-in, а старый файл уважаем, если строка
+# уже там (иначе получили бы два источника одной настройки).
+_ip_forward_persist() {
+  local dropin="/etc/sysctl.d/99-awg2.conf"
+  local re='^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*1'
+  if grep -qsE "$re" /etc/sysctl.conf; then
+    echo "/etc/sysctl.conf"
+    return 0
+  fi
+  mkdir -p /etc/sysctl.d 2>/dev/null || true
+  if ! grep -qsE "$re" "$dropin"; then
+    echo "net.ipv4.ip_forward=1" > "$dropin" 2>/dev/null || return 1
+    chmod 644 "$dropin" 2>/dev/null || true
+  fi
+  echo "$dropin"
 }
 
 # Кто держит UDP-порт $1. Пустой вывод — держатель неизвестен (нет ss или
@@ -3462,7 +4035,7 @@ awg_diagnose_up_failure() {
     if [[ -n "$bad" ]] && [[ "$bad" =~ ^${AWG3_KEYS_RE}$ ]]; then
       if [[ "$bad" =~ ^${AWG31_KEYS_RE}$ ]]; then
         info "Это параметр AWG 3.1 — установленный awg собран без его поддержки"
-        info "Нужны amneziawg-tools/модуль v3.1.20260812 или новее"
+        info "Нужны amneziawg-tools/модуль v3.1.20260906 или новее"
       else
         info "Это параметр AWG 3.0 — установленный awg собран без его поддержки"
       fi
@@ -3695,7 +4268,7 @@ awg_compat_gate() {
       ;;
   esac
 
-  [[ "$proto" == "3.1" ]] && hint="Нужны amneziawg-tools и модуль v3.1.20260812 или новее"
+  [[ "$proto" == "3.1" ]] && hint="Нужны amneziawg-tools и модуль v3.1.20260906 или новее"
 
   echo ""
   err "Установленный awg не знает параметров AWG ${proto}"
@@ -3878,9 +4451,13 @@ do_repair() {
     warn "IP forwarding выключён"
     issues=$((issues+1))
     sysctl -w net.ipv4.ip_forward=1 -q
-    grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf || \
-      echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-    ok "IP forwarding включён"
+    local _fwd_file
+    _fwd_file=$(_ip_forward_persist) || _fwd_file=""
+    if [[ -n "$_fwd_file" ]]; then
+      ok "IP forwarding включён (постоянно в $_fwd_file)"
+    else
+      ok "IP forwarding включён (постоянную настройку записать не удалось)"
+    fi
     fixed=$((fixed+1))
   fi
 
@@ -4396,7 +4973,7 @@ show_menu() {
   echo -e "  ${C}2)${N}  Клиенты         ${D}— управление${N}"
   echo -e "  ${C}3)${N}  Диагностика     ${D}— тест, домены${N}"
   echo -e "  ${C}4)${N}  Бекапы          ${D}— создать, восстановить${N}"
-  echo -e "  ${C}5)${N}  Туннели и DNS   ${D}— Warp, DNS, каскад${N}"
+  echo -e "  ${C}5)${N}  Туннели и DNS   ${D}— Warp, DNS, каскад, Xray, tun2socks${N}"
   echo -e "  ${C}6)${N}  Telegram-бот    ${D}— управление ботом${N}"
   echo -e "  ${R}7)${N}  Удаление и сброс ${D}—  вроде понятно${N}"
   if [[ "$UPDATE_CHANNEL" == "beta" ]]; then
@@ -4561,6 +5138,76 @@ show_submenu_4() {
 }
 
 # ── Подменю 5: Туннели и DNS ───────────────────────────
+# Аварийный сброс: вернуть всех клиентов на прямой маршрут.
+# Нужен, когда туннель включился, интернет у клиентов пропал, а штатное
+# «выключить» по какой-то причине не помогло. Ничего не удаляет из настроек —
+# только снимает маршрутизацию и гасит службы туннелей.
+_tunnels_panic_reset() {
+  hdr "⛑  Аварийный сброс маршрутизации"
+  echo ""
+  warn "Все туннели (Warp / Xray / tun2socks / каскад) будут выключены,"
+  warn "клиенты вернутся на прямой маршрут через сервер."
+  echo ""
+  local go="n"
+  read_yesno go "$(echo -e "${G}  Продолжить? [Y/n]: ${N}")" "y"
+  [[ "$go" == "y" ]] || { info "Отменено"; return 0; }
+
+  info "Останавливаю службы туннелей..."
+  local unit
+  for unit in awg-xray-tun.service awg-xray.service awg-tun2socks.service \
+              awg-exits-routing.service; do
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+    systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+  done
+
+  # Таблицы: 100 tun2socks, 200 Warp, 201 Xray, 202 каскад.
+  info "Снимаю правила маршрутизации..."
+  local table guard
+  for table in 100 200 201 202; do
+    guard=0
+    while (( guard < 128 )) && ip rule del lookup "$table" 2>/dev/null; do
+      guard=$((guard + 1))
+    done
+    ip route flush table "$table" 2>/dev/null || true
+  done
+
+  local client_net iface dev
+  client_net=$(_warp_get_client_net 2>/dev/null || echo "")
+  iface=$(_uplink_iface || true)
+  [[ -n "$iface" ]] || iface="eth0"
+
+  if [[ -n "$client_net" ]]; then
+    info "Убираю NAT через туннельные интерфейсы..."
+    for dev in xray0 tun0 warp0; do
+      iptables -t nat -D POSTROUTING -s "$client_net" -o "$dev" -j MASQUERADE 2>/dev/null || true
+      iptables -D FORWARD -i awg0 -o "$dev" -j ACCEPT 2>/dev/null || true
+      iptables -D FORWARD -i "$dev" -o awg0 -j ACCEPT 2>/dev/null || true
+    done
+    # Возвращаем прямой NAT — то же правило, что ставит PostUp конфига сервера
+    iptables -t nat -C POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE >/dev/null 2>&1 || \
+      iptables -t nat -A POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE || \
+      warn "Не удалось вернуть MASQUERADE на $iface — проверь iptables -t nat -S"
+    iptables -C FORWARD -i awg0 -j ACCEPT >/dev/null 2>&1 || \
+      iptables -A FORWARD -i awg0 -j ACCEPT || true
+    iptables -C FORWARD -o awg0 -j ACCEPT >/dev/null 2>&1 || \
+      iptables -A FORWARD -o awg0 -j ACCEPT || true
+  else
+    warn "Подсеть клиентов не определяется — NAT не трогаю"
+  fi
+
+  for dev in xray0 tun0; do
+    ip link show "$dev" &>/dev/null && { info "Удаляю $dev..."; ip link delete "$dev" 2>/dev/null || true; }
+  done
+
+  rm -f "$XRAY_STATE" "$AWG_EXITS_STATE" 2>/dev/null || true
+  sysctl -qw net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+
+  echo ""
+  ok "Маршрутизация сброшена — клиенты идут напрямую через сервер"
+  info "Если интернет не вернулся, перезапусти интерфейс:"
+  info "  awg-quick down $SERVER_CONF && awg-quick up $SERVER_CONF"
+}
+
 show_submenu_5() {
   while true; do
     check_deps
@@ -4599,14 +5246,47 @@ show_submenu_5() {
     else
       echo -e "  ${C}3)${N} Каскад  ${D}○ не настроен${N}"
     fi
+
+    # Xray статус
+    if ip link show xray0 &>/dev/null; then
+      echo -e "  ${C}4)${N} Xray туннель  ${G}● включен${N}"
+    elif [[ -f "$XRAY_CONF" ]]; then
+      echo -e "  ${C}4)${N} Xray туннель  ${D}○ настроен, выключен${N}"
+    else
+      echo -e "  ${C}4)${N} Xray туннель  ${D}○ не настроен${N}"
+    fi
+
+    # tun2socks статус
+    if systemctl is-active --quiet awg-tun2socks.service 2>/dev/null; then
+      echo -e "  ${C}5)${N} tun2socks прокси  ${G}● включен${N}"
+    elif [[ -f "/etc/systemd/system/awg-tun2socks.service" ]]; then
+      echo -e "  ${C}5)${N} tun2socks прокси  ${D}○ выключен${N}"
+    else
+      echo -e "  ${C}5)${N} tun2socks прокси  ${D}○ не настроен${N}"
+    fi
+
+    # AWG Exit-ноды статус
+    if systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+      echo -e "  ${C}6)${N} AWG Exit-ноды  ${G}● включен${N}"
+    elif [[ -d "$AWG_EXITS_DIR" ]] && ls "$AWG_EXITS_DIR"/awg-exit-*.conf &>/dev/null; then
+      echo -e "  ${C}6)${N} AWG Exit-ноды  ${D}○ настроен, выключен${N}"
+    else
+      echo -e "  ${C}6)${N} AWG Exit-ноды  ${D}○ не настроен${N}"
+    fi
+    echo ""
+    echo -e "  ${R}7)${N} Аварийный сброс ${D}— вернуть клиентов напрямую${N}"
     echo ""
     echo -e "  ${W}0)${N} ← Назад"
     echo ""
-    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-3]: ${N}")" 0 3 "0"
+    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-7]: ${N}")" 0 7 "0"
     case "${SUB_CHOICE:-}" in
       1) do_warp_menu || true ;;
       2) do_dns_menu || true ;;
       3) do_cascade_menu || true ;;
+      4) do_xray_menu || true ;;
+      5) do_tun2socks_menu || true ;;
+      6) do_awg_exits_menu || true ;;
+      7) _tunnels_panic_reset || true; read -rp "Enter..." ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -4614,6 +5294,261 @@ show_submenu_5() {
     # после выхода из них мы уже здесь — не нужен read
   done
 }
+
+
+# ── Telegram-бот: версия и прокси ──────────────────────
+BOT_CONF_PATH="/etc/awg-bot.conf"
+# Те же схемы, что понимает awgbot/net.py. Разъедутся — бот встанет на старте
+# с внятным отказом, но до этого лучше не доводить: проверяем здесь.
+BOT_PROXY_SCHEMES="http https socks4 socks5 socks5h"
+
+# Версия установленного бота, а не той копии, что лежит рядом с awg2: в меню
+# важно, что реально крутится на сервере.
+_bot_version() {
+  local f
+  for f in /opt/awg-bot/awgbot/__init__.py \
+           /usr/local/lib/awg-bot/awgbot/__init__.py; do
+    [[ -f "$f" ]] || continue
+    sed -n 's/^__version__[[:space:]]*=[[:space:]]*["'"'"']\([^"'"'"']\{1,\}\)["'"'"'].*/\1/p' \
+      "$f" | head -1
+    return 0
+  done
+  return 1
+}
+
+_bot_proxy_get() {
+  [[ -f "$BOT_CONF_PATH" ]] || return 1
+  # Порядок важен: сперва хвостовые пробелы, потом кавычки. Наоборот
+  # значение вида  BOT_PROXY = "socks5://h:1080"   (с пробелами после
+  # кавычки) теряло бы только открывающую кавычку.
+  sed -n 's/^[[:space:]]*BOT_PROXY[[:space:]]*=[[:space:]]*//p' "$BOT_CONF_PATH" 2>/dev/null \
+    | tail -1 | sed -e 's/[[:space:]]*$//' -e 's/^["'"'"']//' -e 's/["'"'"']$//' -e 's/[[:space:]]*$//'
+}
+
+# В логах и на экране пароль от прокси показывать нельзя: у него тот же вес,
+# что у токена бота, а меню часто снимают на скриншот.
+_bot_proxy_mask() {
+  local url="$1"
+  if [[ "$url" == *"@"* ]]; then
+    printf '%s://***@%s' "${url%%://*}" "${url##*@}"
+  else
+    printf '%s' "$url"
+  fi
+}
+
+_bot_proxy_valid() {
+  local url="$1" scheme
+  [[ "$url" == *"://"* ]] || return 1
+  scheme="${url%%://*}"
+  [[ -n "${url#*://}" ]] || return 1
+  local s
+  for s in $BOT_PROXY_SCHEMES; do
+    [[ "$scheme" == "$s" ]] && return 0
+  done
+  return 1
+}
+
+# Живая проверка: доходит ли через прокси до Telegram API. Любой ответ HTTP
+# означает, что прокси работает (api.telegram.org на / отдаёт 404, и это
+# нормально); 000 — соединения не было. Код curl подставляем отдельным
+# присваиванием: при неудаче curl сам печатает 000, и `|| echo 000` дописал
+# бы второй — получилось бы 000000, что мимо любой проверки.
+_bot_proxy_probe() {
+  local url="$1" code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+           --proxy "$url" https://api.telegram.org/ 2>/dev/null) || code="000"
+  [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]
+}
+
+# Правка одной строки в конфиге бота. Файл хранит токен, поэтому пишем через
+# временный файл рядом (атомарная замена) и возвращаем права 600.
+_bot_proxy_write() {
+  local url="$1" tmp
+  if [[ ! -f "$BOT_CONF_PATH" ]]; then
+    err "Нет ${W}${BOT_CONF_PATH}${N} — сначала установи бота (пункт 1)"
+    return 1
+  fi
+  tmp=$(mktemp "${BOT_CONF_PATH}.XXXXXX") || { err "Не удалось создать временный файл"; return 1; }
+  grep -vE '^[[:space:]]*BOT_PROXY[[:space:]]*=' "$BOT_CONF_PATH" > "$tmp" || true
+  if [[ -n "$url" ]]; then
+    printf 'BOT_PROXY=%s\n' "$url" >> "$tmp"
+  fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  chown --reference="$BOT_CONF_PATH" "$tmp" 2>/dev/null || true
+  if ! mv -f "$tmp" "$BOT_CONF_PATH"; then
+    rm -f "$tmp" 2>/dev/null || true
+    err "Не удалось записать ${BOT_CONF_PATH}"
+    return 1
+  fi
+  return 0
+}
+
+# Локальные SOCKS-прокси, которые уже подняты на этом сервере, — их можно
+# отдать боту, не поднимая ничего отдельно. Практически это SOCKS-вход Xray
+# из пункта 5. Строки вида "socks5://127.0.0.1:10808|Xray (пункт 5)".
+#
+# Порт проверяем пробой наружу, а не просто «слушает ли кто-то»: Xray умеет
+# принимать соединения и никуда их не отправлять, если выходной сервер мёртв.
+# Отдать боту такой прокси — променять одну немоту на другую.
+_bot_proxy_candidates() {
+  local port addr
+  for port in 10808; do
+    _xray_port_owner "$port" | grep -q . || continue
+    addr="127.0.0.1:${port}"
+    if _socks_probe "$addr" >/dev/null 2>&1; then
+      printf 'socks5://%s|SOCKS-вход Xray, туннель проверен\n' "$addr"
+    else
+      printf 'socks5://%s|SOCKS-вход Xray, но наружу через него не проходит\n' "$addr"
+    fi
+  done
+}
+
+# Xray в пункте 5 запускается transient-юнитом (systemd-run) и перезагрузку не
+# переживает. Значит, прокси на 127.0.0.1 после ребута исчезнет. Бот это
+# переживёт — с версии 2.2.4 он видит мёртвый прокси и идёт напрямую, — но
+# сказать об этом надо здесь, а не оставлять на выяснение по логам.
+_bot_proxy_local_warn() {
+  local url="$1"
+  case "$url" in
+    *127.0.0.1*|*localhost*|*::1*) ;;
+    *) return 0 ;;
+  esac
+  echo ""
+  warn "Это прокси с самого сервера — он живёт, пока поднят туннель"
+  info "Туннель из пункта 5 после перезагрузки не поднимается сам:"
+  info "  включите его заново, затем ${W}systemctl restart awg-bot${N}"
+  info "Пока туннеля нет, бот пойдёт напрямую (запасные адреса Telegram)"
+}
+
+do_bot_proxy() {
+  if [[ $EUID -ne 0 ]]; then
+    err "Правка ${W}${BOT_CONF_PATH}${N} требует root. Запусти: ${W}sudo awg2${N}"
+    return 1
+  fi
+
+  local cur; cur=$(_bot_proxy_get || true)
+  echo ""
+  hdr "Прокси до Telegram API"
+  echo ""
+  if [[ -n "$cur" ]]; then
+    echo -e "  Сейчас: ${W}$(_bot_proxy_mask "$cur")${N}"
+  else
+    echo -e "  Сейчас: ${D}не задан — бот ходит напрямую${N}"
+  fi
+  echo ""
+  echo -e "  ${D}Нужен, если провайдер режет Telegram не по IP: запасные адреса${N}"
+  echo -e "  ${D}в таком случае не спасают. Подойдёт любой SOCKS5 или HTTP-прокси,${N}"
+  echo -e "  ${D}в том числе SOCKS-вход Xray с этого же сервера (пункт 5 → 4).${N}"
+  echo ""
+  echo -e "  ${C}1)${N} Задать / изменить прокси"
+  if [[ -n "$cur" ]]; then
+    echo -e "  ${C}2)${N} Проверить текущий"
+    echo -e "  ${R}3)${N} Убрать прокси ${D}(ходить напрямую)${N}"
+  fi
+  echo -e "  ${W}0)${N} ← Назад"
+  echo ""
+
+  local _pc _pc_max=1
+  [[ -n "$cur" ]] && _pc_max=3
+  read_choice _pc "$(echo -e "${C}  Выбор [0-${_pc_max}]: ${N}")" 0 "$_pc_max" "0"
+
+  case "${_pc:-}" in
+    1)
+      local url="" cand_lines=() line i=0
+      # Готовые прокси с этого же сервера — чтобы не вбивать адрес руками и
+      # не гадать, какой порт слушает Xray.
+      while IFS= read -r line; do
+        [[ -n "$line" ]] && cand_lines+=("$line")
+      done < <(_bot_proxy_candidates)
+
+      echo ""
+      if ((${#cand_lines[@]} > 0)); then
+        echo -e "  ${G}Найдены прокси на этом сервере:${N}"
+        for i in "${!cand_lines[@]}"; do
+          echo -e "    ${C}$((i+1)))${N} ${W}${cand_lines[$i]%%|*}${N} ${D}— ${cand_lines[$i]#*|}${N}"
+        done
+        echo -e "    ${C}$(( ${#cand_lines[@]} + 1 )))${N} Ввести другой адрес"
+        echo ""
+        local _sel
+        read -rp "$(echo -e "${C}  Выбор [1-$(( ${#cand_lines[@]} + 1 ))], пусто — отмена: ${N}")" _sel || return 0
+        _sel="${_sel//[[:space:]]/}"
+        [[ -z "$_sel" ]] && { info "Отменено"; return 0; }
+        if [[ "$_sel" =~ ^[0-9]+$ ]] && (( _sel >= 1 && _sel <= ${#cand_lines[@]} )); then
+          url="${cand_lines[$((_sel-1))]%%|*}"
+          info "Выбран ${W}${url}${N}"
+        elif [[ "$_sel" != "$(( ${#cand_lines[@]} + 1 ))" ]]; then
+          err "Неверный выбор"
+          return 1
+        fi
+      fi
+
+      if [[ -z "$url" ]]; then
+        echo ""
+        echo -e "  ${D}Формат: схема://[логин:пароль@]хост:порт${N}"
+        echo -e "  ${D}Например: socks5://127.0.0.1:10808 или http://1.2.3.4:8080${N}"
+        echo ""
+        read -rp "$(echo -e "${C}  Адрес прокси (пусто — отмена): ${N}")" url || return 0
+        url="${url//[[:space:]]/}"
+        [[ -z "$url" ]] && { info "Отменено"; return 0; }
+      fi
+      if ! _bot_proxy_valid "$url"; then
+        err "Не похоже на адрес прокси: нужна схема из ${W}${BOT_PROXY_SCHEMES// /, }${N}"
+        info "Например: ${W}socks5://127.0.0.1:10808${N}"
+        return 1
+      fi
+      echo ""
+      info "Проверяю связь с Telegram через прокси..."
+      if _bot_proxy_probe "$url"; then
+        ok "Через прокси Telegram отвечает"
+      else
+        warn "Через прокси до Telegram достучаться не удалось"
+        local _yn
+        read_yesno _yn "$(echo -e "${Y}  Всё равно сохранить? [y/N]: ${N}")" "n"
+        [[ "$_yn" =~ ^[Yy]$ ]] || { info "Отменено — прокси не изменён"; return 0; }
+      fi
+      # socks-схемы aiogram обслуживает через aiohttp_socks. Он в зависимостях
+      # бота, но на давно установленном боте venv может быть старым.
+      if [[ "$url" == socks* ]] && [[ -x /opt/awg-bot/venv/bin/python ]]; then
+        if ! /opt/awg-bot/venv/bin/python -c 'import aiohttp_socks' 2>/dev/null; then
+          info "Доставляю aiohttp-socks в venv бота..."
+          /opt/awg-bot/venv/bin/pip install -q aiohttp-socks 2>/dev/null || \
+            warn "Не удалось поставить aiohttp-socks — обнови бота (пункт 1)"
+        fi
+      fi
+      _bot_proxy_write "$url" || return 1
+      ok "Прокси сохранён: ${W}$(_bot_proxy_mask "$url")${N}"
+      _bot_proxy_local_warn "$url"
+      if systemctl is-active --quiet awg-bot 2>/dev/null; then
+        systemctl restart awg-bot 2>/dev/null && ok "Бот перезапущен" || \
+          warn "Не удалось перезапустить бота"
+      fi
+      ;;
+    2)
+      [[ -z "$cur" ]] && { warn "Прокси не задан"; return 0; }
+      echo ""
+      info "Проверяю ${W}$(_bot_proxy_mask "$cur")${N}..."
+      if _bot_proxy_probe "$cur"; then
+        ok "Через прокси Telegram отвечает"
+      else
+        err "Через прокси до Telegram достучаться не удалось"
+        info "Проверь, что прокси поднят: ${W}ss -lntp | grep ${cur##*:}${N}"
+      fi
+      ;;
+    3)
+      [[ -z "$cur" ]] && { warn "Прокси не задан"; return 0; }
+      _bot_proxy_write "" || return 1
+      ok "Прокси убран — бот пойдёт напрямую"
+      if systemctl is-active --quiet awg-bot 2>/dev/null; then
+        systemctl restart awg-bot 2>/dev/null && ok "Бот перезапущен" || \
+          warn "Не удалось перезапустить бота"
+      fi
+      ;;
+    0|"") return 0 ;;
+    *) warn "Неверный выбор" ;;
+  esac
+  return 0
+}
+
 
 # ── Подменю 6: Telegram-бот ────────────────────────────
 show_submenu_6() {
@@ -4642,6 +5577,19 @@ show_submenu_6() {
       else
         echo -e "  Статус: ${Y}○ установлен, остановлен${N}"
       fi
+      # Версия — из установленного пакета: по ней видно, доехало ли обновление
+      local _bver; _bver=$(_bot_version || true)
+      if [[ -n "$_bver" ]]; then
+        echo -e "  Версия: ${W}${_bver}${N}"
+      else
+        echo -e "  Версия: ${D}не определена${N}"
+      fi
+      local _bprx; _bprx=$(_bot_proxy_get || true)
+      if [[ -n "$_bprx" ]]; then
+        echo -e "  Прокси: ${W}$(_bot_proxy_mask "$_bprx")${N}"
+      else
+        echo -e "  Прокси: ${D}нет — напрямую${N}"
+      fi
     else
       echo -e "  Статус: ${D}○ не установлен${N}"
     fi
@@ -4653,7 +5601,8 @@ show_submenu_6() {
       echo -e "  ${G}3)${N} Остановить"
       echo -e "  ${G}4)${N} Перезапустить"
       echo -e "  ${C}5)${N} Логи (последние 40 строк)"
-      echo -e "  ${R}6)${N} Полностью удалить бота ${D}(сервис, код, venv, токен)${N}"
+      echo -e "  ${C}6)${N} Прокси до Telegram ${D}(если провайдер блокирует)${N}"
+      echo -e "  ${R}7)${N} Полностью удалить бота ${D}(сервис, код, venv, токен)${N}"
     else
       echo -e "  ${C}1)${N} Установить бота"
     fi
@@ -4662,7 +5611,7 @@ show_submenu_6() {
 
     # Набор пунктов зависит от того, установлен ли бот
     local _bc _bc_max=1
-    $installed && _bc_max=6
+    $installed && _bc_max=7
     read_choice _bc "$(echo -e "${C}  Выбор [0-${_bc_max}]: ${N}")" 0 "$_bc_max" "0"
 
     case "${_bc:-}" in
@@ -4745,6 +5694,13 @@ show_submenu_6() {
         fi
         ;;
       6)
+        if $installed; then
+          do_bot_proxy || true
+        else
+          warn "Бот не установлен"
+        fi
+        ;;
+      7)
         if $installed; then
           do_bot_uninstall || true
         else
@@ -4941,12 +5897,19 @@ choose_awg_proto() {
   echo -e "     ${D}DisableCookies — сервер не отвечает cookie-пакетами.${N}"
   echo -e "     ${D}Заголовок шифруется целиком, поэтому диапазоны H не нужны:${N}"
   echo -e "     ${D}ставятся штатные 1/2/3/4, и цены за них нет.${N}"
-  echo -e "     ${D}Нужны amneziawg-tools и модуль v3.1.20260812 или новее${N}"
+  echo -e "     ${D}Нужны amneziawg-tools и модуль v3.1.20260906 или новее:${N}"
+  echo -e "     ${D}до 06.09.2026 модуль дописывал случайный хвост к пакетам${N}"
+  echo -e "     ${D}мимикрии I1-I5 и этим её ослаблял.${N}"
   echo -e "     ${D}И НА СЕРВЕРЕ, И НА КЛИЕНТЕ: старый клиент такой конфиг${N}"
   echo -e "     ${D}даже не прочитает.${N}"
   echo ""
   echo -e "  ${Y}  Требует клиента с поддержкой выбранной версии. Версия задаётся${N}"
   echo -e "  ${Y}  на ВЕСЬ сервер: клиенты на 2.0 к серверу 3.1 не подключатся.${N}"
+  echo -e "  ${Y}  Для 3.1 нужен AmneziaVPN 5.0.1.5 или новее: версии постарше не${N}"
+  echo -e "  ${Y}  знают RandomTrailers и DisableCookies и отказываются импортировать${N}"
+  echo -e "  ${Y}  конфиг с незнакомым ключом ЦЕЛИКОМ — не «пропустят строку», а${N}"
+  echo -e "  ${Y}  отвергнут весь файл. Есть клиенты, которых обновить нельзя, —${N}"
+  echo -e "  ${Y}  оставьте им отдельный сервер на 2.0.${N}"
   echo -e "  ${D}  Промежуточная 3.0 из выбора убрана — 3.1 это она же плюс${N}"
   echo -e "  ${D}  RandomTrailers/DisableCookies; уже созданные серверы на 3.0${N}"
   echo -e "  ${D}  работают дальше без изменений.${N}"
@@ -5022,7 +5985,12 @@ _replace_awg_params() {
 # раз в 25 секунд — идеально стабильную временную сигнатуру. Рандомизировать
 # рекеи и оставить keepalive константой значит наполовину обесценить 3.0.
 # Диапазон держим вокруг привычных 25 с, чтобы не ломать проход через NAT:
-# слишком редкий keepalive рвёт сессию у домашних роутеров.
+# слишком редкий keepalive рвёт сессию у домашних роутеров. Границы — ровно
+# 22-30, официально рекомендованные Amnezia. Прежние 18-34 выходили за них с
+# обеих сторон, и верхняя была не просто «шире»: 34 с превышают типичный
+# UDP-таймаут NAT в 30 с, то есть роутер успевает забыть сессию между двумя
+# keepalive. Ради джиттера это плохой размен — рандомизация здесь и так
+# работает, ядро выбирает значение из диапазона на каждой отправке.
 awg_keepalive_value() {
   local proto="${AWG_PROTO:-}"
   # Клиента могли добавлять уже после создания сервера — тогда AWG_PROTO в
@@ -5032,7 +6000,7 @@ awg_keepalive_value() {
     proto=$(grep -m1 '^# AWG_PROTO=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
   fi
   if [[ "${proto:-2.0}" == "3.0" || "${proto:-2.0}" == "3.1" ]]; then
-    echo "$(rand_range 18 24)-$(rand_range 26 34)"
+    echo "$(rand_range 22 25)-$(rand_range 27 30)"
   else
     echo "25"
   fi
@@ -5042,7 +6010,8 @@ awg_keepalive_value() {
 # совпадать у сервера и всех клиентов, и по ним же диагностика понимает, что
 # конфиг требует компонентов новее.
 #   3.0 — HeaderProtectionKey, ContentPaddingAddition и таймеры;
-#   3.1 — RandomTrailers и DisableCookies (amneziawg-tools v3.1.20260812).
+#   3.1 — RandomTrailers и DisableCookies (amneziawg-tools v3.1.20260812;
+#         модуль — v3.1.20260906 или новее, см. awg_module_trailer_fix).
 AWG3_KEYS_RE="(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|RandomTrailers|DisableCookies)"
 # Ключи, которые отличают именно 3.1: по ним выбирается версия пробы.
 AWG31_KEYS_RE="(RandomTrailers|DisableCookies)"
@@ -5053,6 +6022,18 @@ AWG31_KEYS_RE="(RandomTrailers|DisableCookies)"
 # меньше HEADER_PROTECTION_NONCE_SIZE — в этот паддинг прячется nonce защиты
 # заголовков (header_protection.h: NONCE_SIZE = 12). Наружу это выглядит как
 # «Unable to modify interface: Invalid argument» при подъёме awg0.
+# Минимум для S1-S4 при включённой защите заголовков. Не рекомендация из
+# статьи, а требование ядра: в netlink.c модуля каждый из S1-S4 сверяется с
+# HEADER_PROTECTION_NONCE_SIZE, и при меньшем значении setconf возвращает
+# -EINVAL. Причина видна в send.c: паддинг заполняется случайными байтами
+# (get_random_bytes), и ПЕРВЫЕ 12 из них уходят nonce'ом в chacha20, которым
+# шифруется заголовок, — короче 12 nonce взять неоткуда.
+#
+# Требование к каждому значению по отдельности; равенство S1=S2=S3=S4 нигде в
+# модуле не проверяется, в рекомендациях Amnezia не значится (README модуля:
+# S1 и S2 — случайные из 15..150, плюс S1+56 != S2) и ничего не даёт.
+# Действует только когда задан HeaderProtectionKey, то есть на 3.x; на 2.0
+# низкие S остаются как были.
 AWG_HP_MIN_S=12
 
 # Размеры сообщений WireGuard до паддинга (messages.h модуля). S1-S3
@@ -5061,9 +6042,21 @@ AWG_HP_MIN_S=12
 #   148 + S1 == 92 + S2  →  S2 = S1 + 56   (initiation против response)
 #   148 + S1 == 64 + S3  →  S3 = S1 + 84   (initiation против cookie)
 #    92 + S2 == 64 + S3  →  S3 = S2 + 28   (response против cookie)
-# Совпавшая длина возвращает наблюдателю ровно то, что паддинг прятал, — тип
-# пакета. Раньше проверялось только первое совпадение, а третье достижимо в
-# профиле Pro примерно в одной генерации из 350.
+#
+# Первое из этих совпадений — прямое требование Amnezia, а не наша догадка.
+# README модуля ядра, раздел Configuration:
+#   S1 — S1 <= 1132; S1 + 56 != S2; recommended range is from 15 to 150 inclusive
+#   S2 — S2 <= 1188;                recommended range is from 15 to 150 inclusive
+# Два других совпадения (с cookie) там не названы, но природа у них та же, и
+# стоят они ноль, поэтому разводим все три.
+#
+# Там же видно, чего в рекомендациях Amnezia НЕТ: равенства S1=S2=S3=S4.
+# Наоборот — S1 и S2 предлагается брать случайными из 15..150, то есть
+# заведомо разными, а S1+56 != S2 при равных значениям выполнялось бы само
+# собой и смысла не имело.
+#
+# Ограничение S >= 12 (AWG_HP_MIN_S) с этим не связано и живёт отдельно: оно
+# из netlink.c модуля и действует только при заданном HeaderProtectionKey.
 AWG_S_DELTA_INIT_RESP=56
 AWG_S_DELTA_INIT_COOKIE=84
 AWG_S_DELTA_RESP_COOKIE=28
@@ -5272,30 +6265,47 @@ gen_awg_params() {
 
   local Jc Jmin Jmax S1 S2 S3 S4
 
+  # Jmin/Jmax — размер каждого junk-пакета. README модуля Amnezia:
+  #   Jmin — recommended value is 8
+  #   Jmax — recommended value is 80
+  # Раньше «Мощный» брал Jmin 50-256 и Jmax 300-1000. Это не просто «шире
+  # рекомендации»: junk уходит ПЕРЕД каждым рукопожатием в количестве Jc, то
+  # есть при Jc=12 и Jmax=1000 сервер выплёвывал до 12 КБ мусора на попытку.
+  # Само по себе это и сигнатура (UDP-пакеты странного размера пачкой), и
+  # лишняя задержка рукопожатия.
+  #
+  # Прибивать к 8 и 80 гвоздями нельзя — одинаковые значения у всех серверов
+  # станут сигнатурой сами. Держим разброс вокруг рекомендованных, профили
+  # различаются шириной, а не порядком величины.
   case "${AWG_PROFILE:-pro}" in
     lite)
       # ── «AmneziaVPN»: значения вокруг официального конфига ──
       # Образец конфига официального клиента (AWG 3.1):
       #   Jc=4, Jmin=10, Jmax=50, S1=86, S2=48, S3=16, S4=12, H1..H4 = 1/2/3/4
       Jc=$(rand_range 3 5)              # 4 ±1
-      Jmin=$(rand_range 8 14)           # 10 ±4
-      Jmax=$(rand_range 45 55)          # 50 ±5
+      Jmin=$(rand_range 8 12)           # рекомендация Amnezia: 8
+      Jmax=$(rand_range 70 90)          # рекомендация Amnezia: 80
       S1=$(_awg_rand_s S1); S2=$(_awg_rand_s S2)
       S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
     standard)
       # ── Standard (устаревший): промежуточные значения ──
       Jc=$(rand_range 5 8)
-      Jmin=$(rand_range 30 80)
-      Jmax=$(rand_range 100 250)
+      Jmin=$(rand_range 8 16)
+      Jmax=$(rand_range 70 100)
       S1=$(_awg_rand_s S1); S2=$(_awg_rand_s S2)
       S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
     pro|*)
       # ── «Мощный»: полные диапазоны ──
-      Jc=$(rand_range 4 16)
-      Jmin=$(rand_range 50 256)
-      Jmax=$(rand_range 300 1000)
+      # Верх Jc — 12, а не 16: 4-12 это единственный диапазон, который Amnezia
+      # опубликовала как рекомендованный (наравне с PersistentKeepalive 22-30);
+      # всё остальное в конфиге — наш собственный джиттер вокруг дефолтов.
+      # Каждый junk-пакет уходит перед initiation, так что верх ещё и стоит
+      # времени на рукопожатии.
+      Jc=$(rand_range 4 12)
+      Jmin=$(rand_range 8 24)
+      Jmax=$(rand_range 80 120)
       S1=$(_awg_rand_s S1); S2=$(_awg_rand_s S2)
       S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
@@ -5415,7 +6425,7 @@ gen_awg_params() {
 # Инвариант, который нельзя нарушать: RejectAfterTime > RekeyAfterTime, иначе
 # сессия будет отвергнута раньше, чем сторона успеет её переустановить.
 gen_awg3_params() {
-  local hp_key cpa rat_lo rat_hi rjt_lo rjt_hi ka_lo ka_hi rkt mha
+  local hp_key cpa rat_lo rat_hi rjt_lo rjt_hi ka_lo ka_hi rkt rkt_lo rkt_hi mha
 
   # Ключ защиты заголовков — обязан совпадать на обоих концах
   hp_key=$(awg genkey 2>/dev/null || true)
@@ -5448,9 +6458,21 @@ gen_awg3_params() {
   ka_lo=$(rand_range 9 14)
   ka_hi=$(rand_range 20 30)
 
-  # Таймаут повтора рукопожатия оставляем фиксированным: разброс тут даёт
-  # мало маскировки, зато заметно влияет на скорость восстановления связи.
-  rkt=5
+  # Таймаут повтора рукопожатия. Раньше держали фиксированные 5 с — те самые,
+  # что зашиты в WireGuard (REKEY_TIMEOUT в messages.h). При потере пакета это
+  # даёт серию повторов ровно через 5 с, то есть стабильную временную подпись
+  # ровно там, где 3.1 как раз и рандомизирует поведение: остальные таймеры мы
+  # раздаём диапазонами, а этот оставался константой.
+  #
+  # Нижнюю границу не опускаем ниже 5: от неё же считается момент, с которого
+  # рукопожатие разрешено повторить (peer.h, wg_peer_reset_last_sent_handshake
+  # берёт u16_range_lo), и меньшее значение означает более агрессивный повтор.
+  # Верх держим не выше 9: MaxHandshakeAttempts у нас 16-20, и при худшем
+  # розыгрыше (20 x 9) отказ от рукопожатия наступает через ~3 минуты —
+  # приемлемо, дальше уже заметно на глаз при восстановлении связи.
+  rkt_lo=$(rand_range 5 6)
+  rkt_hi=$(( rkt_lo + $(rand_range 2 3) ))
+  rkt="${rkt_lo}-${rkt_hi}"
   mha=$(rand_range 16 20)
 
   # ── Добавка AWG 3.1 ──
@@ -5465,6 +6487,13 @@ gen_awg3_params() {
   # нагрузкой. Эффект односторонний, но это отключает штатную защиту
   # WireGuard от флуда рукопожатиями: платим ей за то, что в трафике не
   # появляется отдельный тип пакета.
+  #
+  # Что флаг локальный, видно в receive.c: он входит ровно в одно выражение,
+  # under_load = !wg->disable_cookies && ..., то есть решает только за себя,
+  # отвечать ли cookie. Приём чужих пакетов от него не зависит. У
+  # RandomTrailers наоборот: там же, в receive.c, приёмник выбирает между
+  # skb->len >= expected_len и skb->len == expected_len — сторона без флага
+  # молча отбросит пакет с хвостом, поэтому он обязан совпадать.
   local extra=""
   if [[ "${AWG_PROTO:-}" == "3.1" ]]; then
     extra=$'\nRandomTrailers = on\nDisableCookies = on'
@@ -5657,36 +6686,39 @@ do_install() {
     err "Не удалось определить ОС (/etc/os-release отсутствует)"; return 1
   fi
 
-  hdr "▬  Обнаружена ОС"
-  echo -e "  ${W}ID${N}       : $OS_ID"
-  echo -e "  ${W}Version${N}  : $OS_VER"
-  echo -e "  ${W}Codename${N} : ${OS_CODENAME:-n/a}"
-  echo ""
+  # ── Предпроверки: ОС, остатки PPA, DNS ──
+  # Три быстрые проверки. Раньше у каждой была своя рамка hdr — пол-экрана
+  # ради одной строки результата. Теперь один блок построчно, а подробности
+  # печатаются только когда что-то не так.
+  echo -e "  ${W}▬  Проверки перед установкой${N}"
+
+  local _os_label="${OS_ID^} $OS_VER"
+  [[ -n "$OS_CODENAME" ]] && _os_label+=" ($OS_CODENAME)"
 
   case "$OS_ID" in
     ubuntu)
       case "$OS_VER" in
         24.04|24.10|25.04|25.10|26.04)
-          ok "Ubuntu $OS_VER — будем собирать amneziawg через git+DKMS"
+          ok "ОС   $_os_label — сборка amneziawg через git+DKMS"
           ;;
         *)
-          warn "Ubuntu $OS_VER не в списке проверенных, но пробуем git+DKMS"
+          warn "ОС   $_os_label не в списке проверенных, но пробуем git+DKMS"
           ;;
       esac
       ;;
     debian)
       case "$OS_VER" in
         12|13)
-          ok "Debian $OS_VER — будем собирать amneziawg через git+DKMS"
+          ok "ОС   $_os_label — сборка amneziawg через git+DKMS"
           ;;
         *)
-          err "Debian $OS_VER не поддерживается. Нужен 12 или 13"
+          err "ОС   $_os_label не поддерживается. Нужен Debian 12 или 13"
           return 1
           ;;
       esac
       ;;
     *)
-      err "ОС $OS_ID не поддерживается. Только Ubuntu 24+ или Debian 12/13"
+      err "ОС   $_os_label не поддерживается. Только Ubuntu 24+ или Debian 12/13"
       return 1
       ;;
   esac
@@ -5694,17 +6726,15 @@ do_install() {
   # ───────────── Очистка остатков PPA от прошлых попыток установки
   # Чтобы apt-get update не плевался ошибками типа "Temporary failure resolving"
   # при наличии висящих PPA от прошлой версии скрипта
-  hdr "✂  Очистка старых PPA"
   if _purge_legacy_ppa; then
-    ok "Старые PPA удалены"
+    ok "PPA  остатки прошлых установок удалены"
   else
-    ok "Чисто — PPA остатков нет"
+    ok "PPA  остатков нет"
   fi
 
   # ───────────── Проверка DNS
-  hdr "⌘  Проверка DNS"
   if ! getent hosts github.com &>/dev/null; then
-    warn "DNS не работает — github.com не резолвится"
+    warn "DNS  github.com не резолвится"
     info "Применяю Cloudflare + Google DNS как fallback..."
     if [[ -L /etc/resolv.conf ]]; then
       # systemd-resolved — добавляем DNS через resolvectl
@@ -5723,9 +6753,9 @@ EOF
     rm -f /tmp/resolv.conf.fix
 
     if getent hosts github.com &>/dev/null; then
-      ok "DNS работает (Cloudflare + Google)"
+      ok "DNS  работает через Cloudflare + Google"
     else
-      err "DNS всё ещё не работает. Проверь сетевую настройку сервера"
+      err "DNS  всё ещё не работает. Проверь сетевую настройку сервера"
       info "Команды для диагностики:"
       info "  ping 1.1.1.1            (проверка интернета)"
       info "  cat /etc/resolv.conf    (текущие DNS)"
@@ -5734,8 +6764,9 @@ EOF
       continue
     fi
   else
-    ok "DNS работает"
+    ok "DNS  github.com резолвится"
   fi
+  echo ""
 
   hdr "+  Система и зависимости"
   export DEBIAN_FRONTEND=noninteractive
@@ -5938,8 +6969,13 @@ EOF
 
   hdr "»  IP Forwarding"
   sysctl -w net.ipv4.ip_forward=1 -q
-  grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf || \
-    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+  local _fwd_file
+  if _fwd_file=$(_ip_forward_persist) && [[ -n "$_fwd_file" ]]; then
+    ok "net.ipv4.ip_forward=1 (включён, постоянно в $_fwd_file)"
+  else
+    warn "IP forwarding включён, но постоянную настройку записать не удалось"
+    info "После перезагрузки проверь: sysctl net.ipv4.ip_forward"
+  fi
 
   hdr "»  NAT + FORWARD"
   local ext_if
@@ -5960,6 +6996,7 @@ EOF
   hdr "›  Папка конфигов"
   mkdir -p /etc/amnezia/amneziawg
   chmod 700 /etc/amnezia/amneziawg
+  ok "/etc/amnezia/amneziawg готова (права 700)"
 
   hdr "◼  Firewall (UFW)"
   if command -v ufw &>/dev/null; then
@@ -6008,11 +7045,20 @@ EOF
     echo -e "  ${Y}не совпадающий с тем, что сейчас на диске.${N}"
     echo ""
     info "После перезагрузки: awg2 → Сервер (1) → п.2 — Создать сервер"
+    info "Модуль под поднявшееся ядро п.2 подхватит сам. Если он скажет, что"
+    info "модуль не собран — сначала п.1, затем сразу п.2 без второй перезагрузки"
     echo ""
     local _do_rb
-    read_yesno _do_rb "$(echo -e "${G}  Перезагрузить сейчас? [Y/n]: ${N}")" "y"
+    if [[ "${AUTO_MODE:-0}" == "1" ]]; then
+      # В --auto спросить некого: продолжаем без ребута, дальше awg-quick up
+      # либо поднимется, либо честно упадёт с ошибкой.
+      _do_rb="n"
+      warn "Автоустановка: перезагрузка отложена"
+    else
+      read_yesno _do_rb "$(echo -e "${G}  Перезагрузить сейчас? [Y/n]: ${N}")" "y"
+    fi
     if [[ "$_do_rb" == "y" ]]; then
-      ok "Перезагружаюсь. Заходи через минуту и запускай: awg2"
+      ok "Перезагружаюсь. Заходи через минуту: awg2 → Сервер (1) → п.2"
       log_info "do_install: reboot по согласию пользователя ($_rb_reason)"
       sleep 2
       reboot
@@ -6031,6 +7077,396 @@ EOF
   break
   done
 }
+
+do_autoinstall() {
+  log_info "do_autoinstall: старт"
+  AUTO_MODE=1
+
+  # 1. Запуск установки пакетов/модуля, если не установлено
+  if ! $HAS_AWG; then
+    info "AmneziaWG не установлен. Запускаем автоматическую установку пакетов..."
+    do_install
+  fi
+
+  # Сбрасываем кэш и перепроверяем зависимости
+  _DEPS_CACHED=""
+  check_deps
+
+  if ! $HAS_AWG; then
+    err "Ошибка: AmneziaWG не был установлен корректно."
+    exit 1
+  fi
+
+  # 2. Проверка, не сконфигурирован ли уже сервер
+  if ip link show awg0 &>/dev/null && [[ ! -f "$SERVER_CONF" ]]; then
+    err "Интерфейс awg0 уже поднят, но $SERVER_CONF нет — разберись вручную."
+    exit 1
+  fi
+  if [[ -f "$SERVER_CONF" ]]; then
+    warn "Сервер AmneziaWG уже настроен ($SERVER_CONF)."
+    info "Вывод существующего клиентского конфига..."
+    if [[ -f "/root/client1_awg2.conf" ]]; then
+      _share_config "/root/client1_awg2.conf"
+      echo ""
+      echo -e "${G}======================================================${N}"
+      echo -e "${W}          СКОПИРУЙТЕ ЭТОТ КОНФИГ ДЛЯ ПОДКЛЮЧЕНИЯ      ${N}"
+      echo -e "${G}======================================================${N}"
+      cat /root/client1_awg2.conf
+      echo -e "${G}======================================================${N}"
+      echo ""
+    else
+      err "Файл /root/client1_awg2.conf не найден."
+    fi
+    exit 0
+  fi
+
+  # 3. Настройка параметров по умолчанию (лучшая обфускация)
+  _detect_server_region
+
+  CLIENT_DNS="1.1.1.1, 1.0.0.1"
+  MTU=1320
+  AWG_PROFILE="pro"
+  OBF_LEVEL=3
+  MIMICRY_PROFILE="tls"
+
+  local sel_domain=""
+  sel_domain=$(select_random_domain "tls")
+  [[ -z "$sel_domain" ]] && sel_domain=""
+
+  info "Генерация CPS пакетов для домена: ${sel_domain:-google.com}..."
+  local cps_out
+  cps_out=$(gen_cps_i1 "tls" "$sel_domain") || cps_out=""
+
+  if [[ -n "$cps_out" ]]; then
+    I1=$(echo "$cps_out" | sed -n '1p')
+    I2=$(echo "$cps_out" | sed -n '2p')
+    I3=$(echo "$cps_out" | sed -n '3p')
+    I4=$(echo "$cps_out" | sed -n '4p')
+    I5=$(echo "$cps_out" | sed -n '5p')
+    local nonempty=0 _i
+    for _i in "$I1" "$I2" "$I3" "$I4" "$I5"; do
+      [[ -n "$_i" ]] && nonempty=$((nonempty+1))
+    done
+    ok "Сгенерировано $nonempty/5 пакетов CPS мимикрии."
+  else
+    warn "Не удалось сгенерировать CPS, продолжение без I1-I5"
+    I1=""; I2=""; I3=""; I4=""; I5=""
+  fi
+
+  # Случайная подсеть
+  local rnd_octet2 rnd_octet3
+  rnd_octet2=$(rand_range 10 55)
+  rnd_octet3=$(rand_range 1 254)
+  CLIENT_ADDR="10.${rnd_octet2}.${rnd_octet3}.2/32"
+  SERVER_ADDR="10.${rnd_octet2}.${rnd_octet3}.1/24"
+  CLIENT_NET="10.${rnd_octet2}.${rnd_octet3}.0/24"
+  ok "Выбрана подсеть: $CLIENT_NET"
+
+  # Случайный порт 30001-65535. Занятый порт awg-quick не поднимет, поэтому
+  # проверяем ss/netstat: за 20 попыток свободный находится всегда.
+  local _try
+  PORT=""
+  for _try in $(seq 1 20); do
+    local _p
+    _p=$(rand_range 30001 65535)
+    if command -v ss &>/dev/null; then
+      ss -lunH "sport = :$_p" 2>/dev/null | grep -q . && continue
+    elif command -v netstat &>/dev/null; then
+      netstat -lun 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$_p\$" && continue
+    fi
+    PORT="$_p"; break
+  done
+  [[ -n "$PORT" ]] || { err "Не удалось подобрать свободный UDP-порт"; exit 1; }
+  ok "Выбран порт: $PORT"
+
+  # Ключи
+  local srv_priv srv_pub cli_priv cli_pub psk srv_ip iface
+  srv_priv=$(awg genkey 2>/dev/null) || { err "awg genkey failed"; exit 1; }
+  srv_pub=$(echo "$srv_priv" | awg pubkey 2>/dev/null) || { err "awg pubkey failed"; exit 1; }
+  cli_priv=$(awg genkey 2>/dev/null) || { err "awg genkey failed (client)"; exit 1; }
+  cli_pub=$(echo "$cli_priv" | awg pubkey 2>/dev/null) || { err "awg pubkey failed (client)"; exit 1; }
+  psk=$(awg genpsk 2>/dev/null) || { err "awg genpsk failed"; exit 1; }
+
+  # Внешний IP
+  srv_ip=$(get_public_ip 2>/dev/null || echo "")
+  if [[ -z "$srv_ip" ]]; then
+    err "Не удалось определить внешний IP."
+    exit 1
+  fi
+  ok "Внешний IP сервера: $srv_ip"
+
+  # Интерфейс аплинка. Не «первый default»: если в момент установки уже поднят
+  # какой-то туннель, MASQUERADE уехал бы на него, и клиенты остались бы без NAT.
+  iface=$(_uplink_iface || true)
+  [[ -z "$iface" ]] && iface="eth0"
+  ok "Интерфейс: $iface"
+
+  # Генерация параметров AWG (Pro профиль)
+  AWG_PARAMS_LINES=""
+  gen_awg_params || { err "Не удалось получить параметры AWG"; exit 1; }
+  [[ -z "$AWG_PARAMS_LINES" ]] && { err "Пустые параметры AWG"; exit 1; }
+
+  # IP Forwarding
+  sysctl -w net.ipv4.ip_forward=1 -q || echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+
+  mkdir -p /etc/amnezia/amneziawg
+
+  # Запись конфига сервера
+  {
+    echo "# AWG_PROFILE=pro"
+    echo "# AmneziaWG Toolza — AWG 2.0 server config (AUTOINSTALL)"
+    echo "# Region: ${SERVER_REGION:-world}"
+    echo "[Interface]"
+    echo "PrivateKey = $srv_priv"
+    echo "Address = $SERVER_ADDR"
+    echo "ListenPort = $PORT"
+    echo "MTU = $MTU"
+    echo -e "$AWG_PARAMS_LINES"
+    echo ""
+    echo "PostUp   = ip link set dev awg0 mtu $MTU; echo 1 > /proc/sys/net/ipv4/ip_forward; iptables -t nat -C POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE; iptables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -j ACCEPT; iptables -C FORWARD -o awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o awg0 -j ACCEPT"
+    echo "PostDown = iptables -t nat -D POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE 2>/dev/null || true; iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null || true"
+    echo ""
+    echo "[Peer]"
+    echo "# client1"
+    echo "PublicKey = $cli_pub"
+    echo "PresharedKey = $psk"
+    echo "AllowedIPs = $CLIENT_ADDR"
+  } > "$SERVER_CONF"
+  chmod 600 "$SERVER_CONF"
+
+  # Запись конфига клиента
+  {
+    echo "[Interface]"
+    echo "PrivateKey = $cli_priv"
+    echo "Address = $CLIENT_ADDR"
+    echo "DNS = $CLIENT_DNS"
+    echo "MTU = $MTU"
+    echo -e "$AWG_PARAMS_LINES"
+    if [[ -n "$I1" ]]; then
+      echo "I1 = $I1"
+      [[ -n "$I2" ]] && echo "I2 = $I2" || true
+      [[ -n "$I3" ]] && echo "I3 = $I3" || true
+      [[ -n "$I4" ]] && echo "I4 = $I4" || true
+      [[ -n "$I5" ]] && echo "I5 = $I5" || true
+    fi
+    echo ""
+    echo "[Peer]"
+    echo "PublicKey = $srv_pub"
+    echo "PresharedKey = $psk"
+    echo "Endpoint = $srv_ip:$PORT"
+    echo "AllowedIPs = 0.0.0.0/0, ::/0"
+    echo "PersistentKeepalive = 25"
+  } > /root/client1_awg2.conf
+  chmod 600 /root/client1_awg2.conf
+
+  # Запуск интерфейса
+  if awg-quick up "$SERVER_CONF"; then
+    log_info "do_autoinstall: awg-quick up успешно"
+  else
+    log_err "do_autoinstall: awg-quick up провалился"
+    err "Не удалось запустить AmneziaWG (awg-quick up failed)."
+    exit 1
+  fi
+
+  # Firewall UFW
+  if command -v ufw &>/dev/null && ufw status | grep -qi "active"; then
+    ufw allow "${PORT}/udp" comment "AmneziaWG" || true
+    ok "Порт ${PORT}/udp открыт в UFW"
+  fi
+
+  _setup_autostart
+
+  success_box "Автоустановка AmneziaWG завершена!"
+  echo ""
+  echo -e "${W}  Клиентский конфиг сохранён в:${N} /root/client1_awg2.conf"
+  echo ""
+
+  # Выводим QR код и сам конфиг
+  _share_config "/root/client1_awg2.conf"
+
+  # Дополнительно выводим сам текст конфига в консоль для удобного копирования
+  echo ""
+  echo -e "${G}======================================================${N}"
+  echo -e "${W}          СКОПИРУЙТЕ ЭТОТ КОНФИГ ДЛЯ ПОДКЛЮЧЕНИЯ      ${N}"
+  echo -e "${G}======================================================${N}"
+  cat /root/client1_awg2.conf
+  echo -e "${G}======================================================${N}"
+  echo ""
+}
+
+do_add_client_noninteractive() {
+  local client_name="${1:-}"
+  if [[ -z "$client_name" ]]; then
+    err "Имя клиента не указано"
+    exit 1
+  fi
+  if ! [[ "$client_name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    err "Неверное имя клиента (только A-Z, a-z, 0-9, _, -)"
+    exit 1
+  fi
+
+  [[ ! -f "$SERVER_CONF" ]] && { err "Конфиг сервера не найден."; exit 1; }
+  command -v awg &>/dev/null || { err "awg не найден"; exit 1; }
+
+  # Имя уже занято — молча добавить второго пира с тем же комментарием значит
+  # получить конфиг, который потом не удалить по имени.
+  if grep -qE "^#[[:space:]]*${client_name}[[:space:]]*$" "$SERVER_CONF" 2>/dev/null; then
+    err "Клиент '$client_name' уже есть в $SERVER_CONF"
+    exit 1
+  fi
+  if [[ -e "/root/${client_name}_awg2.conf" ]]; then
+    err "Файл /root/${client_name}_awg2.conf уже существует"
+    exit 1
+  fi
+
+  local server_net base_ip client_addr
+  server_net=$(grep "^Address" "$SERVER_CONF" 2>/dev/null | awk -F'=' '{print $2}' | tr -d ' ' | head -1 || true)
+  base_ip=$(echo "$server_net" | cut -d. -f1-3)
+  client_addr=$(find_free_ip "$base_ip") || { err "Подсеть заполнена"; exit 1; }
+
+  local client_file="/root/${client_name}_awg2.conf"
+
+  # DNS по умолчанию Cloudflare
+  CLIENT_DNS="1.1.1.1, 1.0.0.1"
+
+  # MTU по умолчанию из сервера
+  local srv_mtu
+  srv_mtu=$(grep "^MTU = " "$SERVER_CONF" | awk -F'= ' '{print $2}' | head -1 || true)
+  MTU=${srv_mtu:-1320}
+
+  # Читаем профиль сервера
+  local _srv_profile
+  _srv_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
+  _srv_profile="${_srv_profile:-pro}"
+
+  local i1_line="" i2_line="" i3_line="" i4_line="" i5_line=""
+
+  # Для мимикрии
+  _detect_server_region
+
+  if [[ "$_srv_profile" == "lite" ]]; then
+    local cps_out
+    cps_out=$(gen_cps_i1 "dns" "icloud.com" "--only-i1") || cps_out=""
+    I1=$(echo "$cps_out" | sed -n '1p')
+    [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+  elif [[ "$_srv_profile" == "standard" ]]; then
+    local sel_domain
+    sel_domain=$(select_random_domain "tls")
+    [[ -z "$sel_domain" ]] && sel_domain=""
+    local cps_out
+    cps_out=$(gen_cps_i1 "tls" "$sel_domain") || cps_out=""
+    I1=$(echo "$cps_out" | sed -n '1p')
+    [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+  else
+    # Pro profile - генерируем I1-I5 (TLS мимикрия)
+    local sel_domain
+    sel_domain=$(select_random_domain "tls")
+    [[ -z "$sel_domain" ]] && sel_domain=""
+    local cps_out
+    cps_out=$(gen_cps_i1 "tls" "$sel_domain") || cps_out=""
+    if [[ -n "$cps_out" ]]; then
+      I1=$(echo "$cps_out" | sed -n '1p')
+      I2=$(echo "$cps_out" | sed -n '2p')
+      I3=$(echo "$cps_out" | sed -n '3p')
+      I4=$(echo "$cps_out" | sed -n '4p')
+      I5=$(echo "$cps_out" | sed -n '5p')
+      [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+      [[ -n "$I2" ]] && i2_line="I2 = $I2" || i2_line=""
+      [[ -n "$I3" ]] && i3_line="I3 = $I3" || i3_line=""
+      [[ -n "$I4" ]] && i4_line="I4 = $I4" || i4_line=""
+      [[ -n "$I5" ]] && i5_line="I5 = $I5" || i5_line=""
+    fi
+  fi
+
+  local srv_pub srv_ip port
+  srv_pub=$(awg show awg0 public-key 2>/dev/null) || { err "awg0 не поднят"; exit 1; }
+  srv_ip=$(get_public_ip 2>/dev/null || echo "")
+  if [[ -z "$srv_ip" ]]; then
+     # Попробуем взять из Endpoint существующего клиента
+     srv_ip=$(grep -oP 'Endpoint = \K[0-9.]+' /root/*_awg2.conf 2>/dev/null | head -1 || echo "")
+  fi
+  if [[ -z "$srv_ip" ]]; then
+    err "Не удалось определить внешний IP сервера — Endpoint был бы пустым"
+    exit 1
+  fi
+  port=$(grep "^ListenPort = " "$SERVER_CONF" 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' ' | head -1 || true)
+  if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    err "В $SERVER_CONF не найден корректный ListenPort"
+    exit 1
+  fi
+
+  local cli_priv cli_pub psk
+  cli_priv=$(awg genkey)
+  cli_pub=$(echo "$cli_priv" | awg pubkey)
+  psk=$(awg genpsk)
+
+  # Размер до дописывания — точка отката. «Отрезать последние 6 строк» неверно:
+  # число строк в блоке может измениться, а при частичной записи (нет места на
+  # диске) откат срезал бы чужого пира.
+  local conf_size_before
+  conf_size_before=$(wc -c < "$SERVER_CONF")
+
+  # Добавляем peer в конфиг сервера
+  {
+    echo ""
+    echo "[Peer]"
+    echo "# $client_name"
+    echo "PublicKey = $cli_pub"
+    echo "PresharedKey = $psk"
+    echo "AllowedIPs = $client_addr"
+  } >> "$SERVER_CONF"
+
+  # Добавляем peer в runtime
+  local psk_tmp
+  psk_tmp=$(mktemp)
+  chmod 600 "$psk_tmp"
+  echo "$psk" > "$psk_tmp"
+  if ! awg set awg0 peer "$cli_pub" preshared-key "$psk_tmp" allowed-ips "$client_addr" 2>/dev/null; then
+    rm -f "$psk_tmp"
+    err "awg set не удался для клиента '$client_name' — откат"
+    truncate -s "$conf_size_before" "$SERVER_CONF" || \
+      warn "Откат не удался — проверь хвост $SERVER_CONF вручную"
+    chmod 600 "$SERVER_CONF"
+    exit 1
+  fi
+  rm -f "$psk_tmp"
+
+  # Читаем параметры AWG из сервера
+  local awg_params_from_srv
+  # Список ключей берём из AWG_PARAM_KEYS_RE, а не перечисляем руками: иначе
+  # новые параметры (HeaderProtectionKey, Rekey*, ...) не попадут клиенту и он
+  # не сойдётся с сервером по протоколу.
+  awg_params_from_srv=$(sed -n '/^\[Peer\]/q; p' "$SERVER_CONF" | grep -E "^${AWG_PARAM_KEYS_RE} = " | grep -v "^#" || true)
+
+  # Создаем конфиг файл клиента
+  {
+    echo "[Interface]"
+    echo "PrivateKey = $cli_priv"
+    echo "Address = $client_addr"
+    echo "DNS = $CLIENT_DNS"
+    echo "MTU = $MTU"
+    if [[ -n "$awg_params_from_srv" ]]; then echo "$awg_params_from_srv"; fi
+    if [[ -n "$i1_line" ]]; then echo "$i1_line"; fi
+    if [[ -n "$i2_line" ]]; then echo "$i2_line"; fi
+    if [[ -n "$i3_line" ]]; then echo "$i3_line"; fi
+    if [[ -n "$i4_line" ]]; then echo "$i4_line"; fi
+    if [[ -n "$i5_line" ]]; then echo "$i5_line"; fi
+    echo ""
+    echo "[Peer]"
+    echo "PublicKey = $srv_pub"
+    echo "PresharedKey = $psk"
+    echo "Endpoint = $srv_ip:$port"
+    echo "AllowedIPs = 0.0.0.0/0, ::/0"
+    echo "PersistentKeepalive = 25"
+  } > "$client_file"
+  chmod 600 "$client_file"
+
+  _apply_config 2>/dev/null || true
+
+  ok "Клиент $client_name добавлен."
+  echo "Файл конфигурации: $client_file"
+}
+
 
 do_gen() {
   log_info "do_gen: старт"
@@ -6057,6 +7493,30 @@ do_gen() {
   # собранном под другое ядро. Спрашиваем до генерации ключей и конфигов.
   local _rb_reason
   _rb_reason=$(awg_reboot_reason || true)
+
+  # Модуль не загружен — перезагрузка это НЕ лечит. Типовой путь: п.1 принёс
+  # новое ядро, человек перезагрузился, и теперь работает ядро, под которое
+  # модуль в память никто не вставил. Сначала пробуем modprobe (если сборка
+  # под это ядро есть — вопрос закрыт), и только потом отправляем в п.1.
+  if [[ "$_rb_reason" == *"не загружен"* ]]; then
+    echo ""
+    info "Модуль amneziawg не загружен — пробую: modprobe amneziawg"
+    if modprobe amneziawg 2>/dev/null && [[ -d /sys/module/amneziawg ]]; then
+      ok "Модуль загружен под $(uname -r) — перезагрузка не нужна"
+      _rb_reason=$(awg_reboot_reason || true)
+    fi
+  fi
+
+  if [[ "$_rb_reason" == *"не загружен"* ]]; then
+    echo ""
+    err "Модуль amneziawg не собран под работающее ядро $(uname -r)"
+    info "Перезагрузка здесь не поможет — модуль нужно собрать под это ядро:"
+    info "  1) Сервер (1) → п.1 — установка компонентов (пересоберёт модуль)"
+    info "  2) сразу, БЕЗ перезагрузки: Сервер (1) → п.2 — Создать сервер"
+    log_info "do_gen: отказ — модуль не загружен под $(uname -r)"
+    return 1
+  fi
+
   if [[ -n "$_rb_reason" ]]; then
     echo ""
     warn "Сервер не перезагружен после установки: $_rb_reason"
@@ -6272,6 +7732,11 @@ do_gen() {
     # конфиг не пишутся — они клиентские, поэтому без этих маркеров бот не
     # знает, что выдавать, и раньше давал один I1 на сервере с полным CPS.
     echo "# AWG_OBF_LEVEL=${OBF_LEVEL:-1}"
+    # Бюджет цепочки в символах (0 = без лимита). Без этой метки бот не знает
+    # выбор админа и подставляет свой компактный 1500 — на сервере с полной
+    # цепочкой QUIC клиент от бота получал один пакет вместо пяти, то есть
+    # конфиги одного сервера расходились ровно так, как их учили не расходиться.
+    echo "# AWG_CPS_BUDGET=${CPS_BUDGET:-0}"
     echo "# AWG_MIMICRY=${MIMICRY_PROFILE:-none}"
     # Домен мимикрии. Пишется только если он был выбран: бот генерирует I1-I5
     # сам и без этой метки брал бы случайный домен из встроенного пула — то
@@ -6366,6 +7831,10 @@ do_gen() {
 
   _setup_autostart
   _warn_bot_needs_update
+  # Сервер уже создан и работает — но если модуль дописывает хвост к I1-I5,
+  # мимикрия слабее, чем показывает выбранный профиль. Лучше узнать сейчас.
+  awg_warn_trailer_fix "$SERVER_CONF" || true
+  awg_warn_cps_oversize "$SERVER_CONF" || true
 }
 
 
@@ -7624,16 +9093,16 @@ do_list_clients() {
 
   local transfer_cache
   transfer_cache=$(awg show awg0 transfer 2>/dev/null || true)
-  
+
   local handshake_cache
   handshake_cache=$(awg show awg0 latest-handshakes 2>/dev/null || true)
-  
+
   local endpoint_cache
   endpoint_cache=$(awg show awg0 endpoints 2>/dev/null || true)
 
   local i=0
   local name="" pubkey="" ip="" tx_raw=0 rx_raw=0 handshake_time="" endpoint="" expire_ts=""
-  
+
   while IFS= read -r line; do
     if [[ "$line" =~ ^\[Peer\] ]]; then
       if [[ $i -gt 0 ]] && [[ -n "$pubkey" ]]; then
@@ -7671,7 +9140,7 @@ do_list_clients() {
       ip="${BASH_REMATCH[1]}"
     fi
   done < "$SERVER_CONF"
-  
+
   if [[ $i -gt 0 ]] && [[ -n "$pubkey" ]]; then
     tx_raw=${tx_raw:-0}
     rx_raw=${rx_raw:-0}
@@ -7700,10 +9169,10 @@ _print_client_info() {
   local handshake_time="$6"
   local endpoint="$7"
   local expire_ts="$8"
-  
+
   local display_name="${name:-безымянный}"
   display_name="${display_name:0:15}"
-  
+
   local tx_fmt rx_fmt
   if (( tx_raw >= 1073741824 )); then
     tx_fmt=$(echo "scale=2; $tx_raw/1073741824" | bc 2>/dev/null || echo "0")" ГБ"
@@ -7726,7 +9195,7 @@ _print_client_info() {
     [[ "$kb_val" == "0" && "$rx_raw" -gt 0 ]] && kb_val=1 || true
     rx_fmt="${kb_val} КБ"
   fi
-  
+
   local status_icon=""
   local status_text=""
   if [[ -n "$handshake_time" ]] && [[ "$handshake_time" != "0" ]]; then
@@ -7749,12 +9218,12 @@ _print_client_info() {
     status_icon="${R}○${N}"
     status_text="нет подключения"
   fi
-  
+
   local endpoint_short=""
   if [[ -n "$endpoint" ]]; then
     endpoint_short="${endpoint%:*}"
   fi
-  
+
   echo -e "  ${W}┌─ ${C}[${num}]${N} ${W}${display_name}${N}"
   echo -e "  ${W}│${N}  » IP:       ${W}$ip${N}"
   echo -e "  ${W}│${N}  ↑ Трафик:   ↑ ${G}$tx_fmt${N}  ↓ ${C}$rx_fmt${N}"
@@ -7864,6 +9333,15 @@ _mimicry_tag() {              # $1 = непустая строка => клиен
   else
     echo "none"
   fi
+}
+
+# Профиль мимикрии, записанный в шапку конфига сервера ("# AWG_MIMICRY=").
+# Метку пишет do_gen с v0.7.22; на конфигах старше её нет — тогда возвращается
+# пустая строка, и вызывающий код идёт прежним путём. Разбор совпадает с тем,
+# что делает бот (awg_bot/awgbot/core.py), чтобы шапка читалась одинаково.
+_server_mimicry() {
+  [[ -f "$SERVER_CONF" ]] || { echo ""; return 0; }
+  grep -m1 -oP '^#\s*AWG_MIMICRY=\K\S+' "$SERVER_CONF" 2>/dev/null || echo ""
 }
 
 # Профиль мимикрии выданного клиента для показа в меню.
@@ -8273,6 +9751,10 @@ do_rotate_awg_params() {
   ok "Клиентских конфигов обновлено: ${updated}"
   [[ $failed -gt 0 ]] && warn "Не обновлено: ${failed}"
 
+  # Именно down/up, а не syncconf: syncconf применяет дельту по пирам, а
+  # параметры [Interface] (S1-S4, H1-H4, HeaderProtectionKey, RandomTrailers)
+  # так не подхватываются. Сервер остался бы со старыми, клиенты получили бы
+  # новые конфиги — и не подключились бы, причём молча.
   info "Перезапускаю awg0..."
   awg-quick down "$SERVER_CONF" 2>/dev/null || true
   if awg_up_diag "$SERVER_CONF"; then
@@ -9199,7 +10681,7 @@ _warp_ensure_deps() {
     info "Ставим зависимости WARP: ${missing[*]}"
     apt-get update -y >/dev/null 2>&1 || \
       warn "apt-get update завершился с ошибкой — пробуем ставить как есть"
-    if ! apt-get install -y -q "${missing[@]}" >/dev/null 2>&1; then
+    if ! _apt_install "${missing[@]}" >/dev/null 2>&1; then
       err "Не удалось установить: ${missing[*]}"
       info "Поставь вручную и повтори:"
       info "  apt-get update && apt-get install -y ${missing[*]}"
@@ -9937,9 +11419,10 @@ _warp_up() {
   fi
 
   # Получаем CLIENT_NET ДО поднятия интерфейса — без AWG нет смысла делать split-tunnel
-  local client_net iface
+  local client_net iface peer_count=0
   client_net=$(_warp_get_client_net 2>/dev/null || echo "")
-  iface=$(ip route 2>/dev/null | awk '/default/{print $5; exit}' || echo "eth0")
+  iface=$(_uplink_iface || true)
+  [[ -z "$iface" ]] && iface="eth0"
 
   if [[ -z "$client_net" ]]; then
     err "AWG сервер не настроен"
@@ -10962,16 +12445,17 @@ _dns_proxy_install() {
   # ───── 1. Установка пакета ─────
   if ! command -v dnscrypt-proxy &>/dev/null; then
     info "Устанавливаем dnscrypt-proxy + dnsutils..."
-    if ! apt-get install -y -q dnscrypt-proxy dnsutils 2>&1 | grep -E "^(Setting up|E:)" | head -5; then
-      err "Не удалось установить dnscrypt-proxy"
-      info "Попробуй: apt-get update && apt-get install dnscrypt-proxy"
+    if ! _apt_install dnscrypt-proxy dnsutils; then
+      err "Не удалось установить dnscrypt-proxy:"
+      _apt_last_errors
+      info "Попробуй вручную: apt-get update && apt-get install dnscrypt-proxy"
       return 1
     fi
     ok "dnscrypt-proxy установлен"
   else
     info "dnscrypt-proxy уже установлен"
     if ! command -v dig &>/dev/null; then
-      apt-get install -y -q dnsutils 2>&1 | grep -E "^(Setting up|E:)" | head -3 || true
+      _apt_install dnsutils >/dev/null 2>&1 || warn "dnsutils не установился — dig будет недоступен"
     fi
   fi
 
@@ -12131,7 +13615,7 @@ do_clean_clients() {
 
   mv "$temp_conf" "$SERVER_CONF"
   rm -f /root/*_awg2.conf 2>/dev/null || true
-  
+
   info "Перезапускаем awg0..."
   if ! awg_up_diag "$SERVER_CONF"; then
     err "Не удалось перезапустить awg0"
@@ -12401,6 +13885,19 @@ _cascade_valid_ip() {
   done
   return 0
 }
+
+_valid_ip_cidr() {
+  local cidr="$1"
+  local ip mask
+  [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || return 1
+  ip="${cidr%/*}"
+  mask="${cidr#*/}"
+  [[ "$mask" =~ ^[0-9]+$ ]] || return 1
+  (( mask >= 0 && mask <= 32 )) || return 1
+  _cascade_valid_ip "$ip" || return 1
+  return 0
+}
+
 
 _cascade_valid_port() {
   local p="$1"
@@ -14146,7 +15643,3164 @@ _expire_ask_at_creation() {
   echo "$ts"
 }
 
+do_xray_menu() {
+  set +e
+  while true; do
+    clear
+    echo ""
+    hdr "☁  Xray туннель"
+    echo ""
+    _xray_status || true
+    echo ""
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "  1) Установить Xray"
+    echo -e "  2) Добавить Outbound (ссылка)"
+    echo -e "  3) Удалить Outbound"
+    echo -e "  4) Настроить балансировщик"
+    echo -e "  5) Включить туннель"
+    echo -e "  6) Выключить туннель"
+    echo -e "  7) Перезапустить туннель"
+    echo -e "  ${C}8) Управление клиентами в Xray${N}"
+    echo -e "  9) Проверить конфиг (диагностика)"
+    echo -e "  0) Назад в главное меню"
+    echo ""
+    XRAY_CHOICE=0; safe_read XRAY_CHOICE "$(echo -e "${C}  Выбор [0-9]: ${N}")"
 
+    case "${XRAY_CHOICE:-}" in
+      1) _xray_install; read -rp "Enter..." ;;
+      2) _xray_add_outbound; read -rp "Enter..." ;;
+      3) _xray_remove_outbound; read -rp "Enter..." ;;
+      4) _xray_setup_balancer; read -rp "Enter..." ;;
+      5) _xray_up; read -rp "Enter..." ;;
+      6) _xray_down; read -rp "Enter..." ;;
+      7) _xray_down 2>/dev/null; _xray_up; read -rp "Enter..." ;;
+      8) do_xray_peers_menu; set +e ;;
+      9) _xray_diagnose; read -rp "Enter..." ;;
+      0) break ;;
+      *) warn "Неверный выбор" ;;
+    esac
+  done
+  set -e
+}
+
+_xray_status() {
+  if ip link show xray0 &>/dev/null; then
+    echo -e "  Интерфейс  : ${G}● xray0 активен${N}"
+  else
+    echo -e "  Интерфейс  : ${D}○ xray0 выключен${N}"
+  fi
+}
+
+# ── Общая качалка релизных бинарей с GitHub ────────────────
+# Зачем не голый wget: в РФ GitHub часто режут, поэтому нужны зеркала и
+# запасной клиент; а раз файл потом запускается от root — нужна и проверка
+# того, что скачался именно архив/бинарь, а не HTML-заглушка провайдера.
+# $1 = URL релиза, $2 = куда сохранить, $3 = минимальный размер (Б),
+# $4 = сигнатура: zip | elf | any
+_gh_fetch() {
+  local url="$1" dest="$2" min_size="${3:-100000}" kind="${4:-any}"
+  local mirrors=("" "https://ghproxy.net/" "https://gh-proxy.com/" "https://mirror.ghproxy.com/")
+  local mp full sz magic
+  for mp in "${mirrors[@]}"; do
+    full="${mp}${url}"
+    if [[ -z "$mp" ]]; then info "  качаю ${url##*/}..."; else info "  через зеркало ${mp}..."; fi
+    rm -f "$dest"
+    if ! curl -4 -L --fail --silent --show-error --connect-timeout 8 --max-time 180 \
+              --retry 2 --retry-delay 2 "$full" -o "$dest" 2>/dev/null; then
+      wget -4 --tries=2 --timeout=15 -q "$full" -O "$dest" 2>/dev/null || { rm -f "$dest"; continue; }
+    fi
+    sz=$(wc -c < "$dest" 2>/dev/null || echo 0)
+    if [[ ! "$sz" =~ ^[0-9]+$ ]] || (( sz < min_size )); then
+      warn "  получено ${sz} Б — не похоже на релиз, пробую дальше"
+      rm -f "$dest"; continue
+    fi
+    case "$kind" in
+      zip) magic=$(head -c 2 "$dest" 2>/dev/null || true)
+           [[ "$magic" == "PK" ]] || { warn "  это не zip"; rm -f "$dest"; continue ;} ;;
+      elf) head -c 4 "$dest" 2>/dev/null | grep -q $'\x7fELF' \
+             || { warn "  это не ELF-бинарь"; rm -f "$dest"; continue ;} ;;
+    esac
+    return 0
+  done
+  return 1
+}
+
+# Сверка sha256 с заранее известным значением (в отличие от
+# _usque_verify_sha256, который парсит checksums.txt релиза).
+# 0 совпало, 1 не совпало, 2 нечего сверять.
+_verify_sha256_value() {
+  local file="$1" expected="${2:-}" actual
+  [[ -f "$file" ]] || return 2
+  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || return 2
+  actual=$(sha256sum "$file" | cut -d' ' -f1)
+  [[ "${expected,,}" == "$actual" ]] && return 0
+  echo "ожидалось: ${expected,,}" >&2
+  echo "получено:  $actual" >&2
+  return 1
+}
+
+# uname -m → суффикс ассета в релизах XTLS/Xray-core.
+_xray_asset() {
+  case "$(uname -m)" in
+    x86_64|amd64)  echo "Xray-linux-64" ;;
+    aarch64|arm64) echo "Xray-linux-arm64-v8a" ;;
+    armv7l|armv7)  echo "Xray-linux-arm32-v7a" ;;
+    *) echo "" ;;
+  esac
+}
+
+# uname -m → суффикс ассета в релизах xjasonlyu/tun2socks.
+_tun2socks_asset() {
+  case "$(uname -m)" in
+    x86_64|amd64)  echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7)  echo "armv7" ;;
+    *) echo "" ;;
+  esac
+}
+
+_xray_install() {
+  if command -v xray &>/dev/null && xray version &>/dev/null; then
+    warn "Xray уже установлен ($(xray version 2>/dev/null | head -n1))"
+    return 0
+  fi
+
+  local asset
+  asset=$(_xray_asset)
+  [[ -n "$asset" ]] || { err "Архитектура $(uname -m) не поддерживается Xray"; return 1; }
+
+  command -v unzip &>/dev/null || {
+    info "Ставлю unzip (релизы Xray — zip-архивы)"
+    apt-get update >/dev/null 2>&1 || true
+    apt-get install -y -q unzip >/dev/null 2>&1 || { err "unzip не установился"; return 1; }
+  }
+
+  local tmpd
+  tmpd=$(mktemp -d) || { err "mktemp провалился"; return 1; }
+
+  local base="https://github.com/XTLS/Xray-core/releases/latest/download"
+  info "Скачиваем Xray (${asset})..."
+  if ! _gh_fetch "${base}/${asset}.zip" "$tmpd/xray.zip" 1000000 zip; then
+    err "Не удалось скачать Xray ни напрямую, ни через зеркала"
+    info "Проверь вручную: ${base}/${asset}.zip"
+    rm -rf "$tmpd"; return 1
+  fi
+
+  # Проверка суммы: Xray кладёт рядом с ассетом файл .dgst со строкой вида
+  # "SHA2-256= <hash>". Файл необязателен — если его нет, ставим без проверки,
+  # но об этом говорим вслух: бинарь пойдёт работать от root.
+  local expected="" vrc
+  if _gh_fetch "${base}/${asset}.zip.dgst" "$tmpd/dgst" 16 any 2>/dev/null; then
+    expected=$(grep -iE 'sha2?-?256' "$tmpd/dgst" 2>/dev/null \
+               | grep -oE '[0-9a-fA-F]{64}' | head -1 || true)
+  fi
+  if [[ -n "$expected" ]]; then
+    _verify_sha256_value "$tmpd/xray.zip" "$expected"; vrc=$?
+    case $vrc in
+      0) ok "Контрольная сумма Xray совпала" ;;
+      2) warn "Сумма из .dgst не разобралась — ставим без проверки" ;;
+      *) err "Контрольная сумма Xray НЕ совпала — файл повреждён или подменён"
+         rm -rf "$tmpd"; return 1 ;;
+    esac
+  else
+    warn "Файл .dgst недоступен — ставим Xray без проверки суммы"
+  fi
+
+  info "Распаковка Xray..."
+  if ! unzip -qo "$tmpd/xray.zip" xray -d "$tmpd"; then
+    err "Ошибка распаковки Xray"; rm -rf "$tmpd"; return 1
+  fi
+  # geoip/geosite нужны только для маршрутизации по гео — их отсутствие
+  # в архиве не повод валить установку.
+  unzip -qo "$tmpd/xray.zip" geoip.dat geosite.dat -d /usr/local/bin/ 2>/dev/null || \
+    warn "geoip.dat/geosite.dat в архиве нет — гео-правила будут недоступны"
+
+  install -m 0755 "$tmpd/xray" /usr/local/bin/xray || {
+    err "Не удалось установить /usr/local/bin/xray"; rm -rf "$tmpd"; return 1
+  }
+  rm -rf "$tmpd"
+
+  if ! /usr/local/bin/xray version &>/dev/null; then
+    err "Бинарь xray не запускается"; rm -f /usr/local/bin/xray; return 1
+  fi
+  ok "Xray установлен: $(/usr/local/bin/xray version 2>/dev/null | head -n1)"
+
+  mkdir -p "$XRAY_DIR"
+  if [[ -f "$XRAY_CONF" ]]; then
+    info "Конфиг $XRAY_CONF уже есть — оставляем как есть"
+    return 0
+  fi
+  # listen 127.0.0.1 у socks-входа обязателен: без него Xray слушает 0.0.0.0
+  # и на сервере появляется открытый SOCKS5-релей без авторизации.
+  cat > "$XRAY_CONF" << 'JSONEOF'
+{
+  "inbounds": [
+    {
+      "protocol": "tun",
+      "tag": "tun-in",
+      "settings": {
+        "mtu": 1200,
+        "stack": "gvisor",
+        "address": ["172.16.250.1/30"]
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "socks",
+      "tag": "socks-in",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["tun-in"],
+        "outboundTag": "proxy"
+      }
+    ]
+  }
+}
+JSONEOF
+  ok "Xray успешно установлен. Конфиг: $XRAY_CONF"
+}
+
+_xray_add_outbound() {
+  # hysteria2 упомянут, но принимается только сборкой Xray с его поддержкой —
+  # в апстримном XTLS/Xray-core его нет. Проверка ниже скажет об этом прямо.
+  safe_read link "Введите ссылку на Xray outbound (vless:// / vmess:// / hysteria2://): "
+  if [[ -z "$link" ]]; then
+    warn "Ссылка пустая"
+    return 1
+  fi
+  if [[ ! -f "$XRAY_CONF" ]]; then
+    err "Xray не установлен. Сначала выполни установку (пункт 1)."
+    return 1
+  fi
+
+  info "Парсинг ссылки..."
+  # mktemp, а не фиксированный /tmp/parse_xray_link.py: файл пишется и
+  # выполняется от root, а предсказуемое имя в /tmp — это подсунутый симлинк
+  # и запись root-ом куда попало.
+  local parser_script
+  parser_script=$(mktemp /tmp/awg_tmp_parse_XXXXXX.py) || { err "mktemp провалился"; return 1; }
+  chmod 600 "$parser_script"
+  cat > "$parser_script" << 'PYEOF'
+import sys
+import json
+import urllib.parse
+import base64
+
+# Разбор транспорта и TLS — один на все протоколы. Раньше он был скопирован
+# в ветки vless и vmess по отдельности и разъехался: в vless добавили xhttp,
+# в vmess забыли, и ссылка молча теряла path — туннель поднимался пустым.
+TRANSPORT_KNOWN = ("tcp", "raw", "ws", "grpc", "xhttp", "splithttp",
+                   "httpupgrade", "h2", "http")
+
+
+def apply_transport(ss, net, get):
+    """get(имя) -> строка или None. Заполняет <транспорт>Settings."""
+    if net == "ws":
+        cfg = {}
+        if get("path"):
+            cfg["path"] = get("path")
+        if get("host"):
+            cfg["headers"] = {"Host": get("host")}
+        ss["wsSettings"] = cfg
+    elif net == "grpc":
+        cfg = {}
+        svc = get("serviceName") or get("svc") or get("path")
+        if svc:
+            cfg["serviceName"] = svc
+        if get("mode") == "multi":
+            cfg["multiMode"] = True
+        ss["grpcSettings"] = cfg
+    elif net in ("xhttp", "splithttp"):
+        # Без path сервер отдаёт 404 на корень: TLS проходит, туннель
+        # «поднят», трафика нет.
+        cfg = {}
+        for key in ("path", "host", "mode"):
+            if get(key):
+                cfg[key] = get(key)
+        if get("extra"):
+            try:
+                cfg["extra"] = json.loads(get("extra"))
+            except Exception:
+                pass
+        ss["xhttpSettings" if net == "xhttp" else "splithttpSettings"] = cfg
+    elif net == "httpupgrade":
+        cfg = {}
+        for key in ("path", "host"):
+            if get(key):
+                cfg[key] = get(key)
+        ss["httpupgradeSettings"] = cfg
+    elif net in ("h2", "http"):
+        # Транспорт HTTP/2 из Xray выпилен: "has been removed and migrated to
+        # XHTTP stream-one H2 & H3". httpSettings современный бинарь не примет
+        # вообще, поэтому переводим ссылку на официальную замену.
+        cfg = {"mode": "stream-one"}
+        if get("path"):
+            cfg["path"] = get("path")
+        if get("host"):
+            cfg["host"] = get("host").split(",")[0]
+        ss["network"] = "xhttp"
+        ss["xhttpSettings"] = cfg
+        print("MIGRATED_TRANSPORT:h2->xhttp/stream-one", file=sys.stderr)
+    elif net not in ("tcp", "raw", "", None):
+        # Транспорт, который мы собирать не умеем: параметры из ссылки
+        # потеряются, и туннель встанет «рабочим», но пустым.
+        print("UNSUPPORTED_TRANSPORT:" + str(net), file=sys.stderr)
+
+
+def apply_tls(ss, get, fallback_sni=""):
+    sec = ss.get("security") or "none"
+    if sec in ("", "none", "0"):
+        ss["security"] = "none"
+        return
+    ss["security"] = sec
+    # Пустой serverName сервер обрывает на рукопожатии — подставляем host,
+    # а затем адрес самого сервера.
+    tls = {
+        "serverName": get("sni") or get("host") or fallback_sni or "",
+        "fingerprint": get("fp") or "chrome",
+    }
+    if get("pbk"):
+        tls["publicKey"] = get("pbk")
+    if get("sid"):
+        tls["shortId"] = get("sid")
+    if get("spx"):
+        tls["spiderX"] = get("spx")
+    if get("alpn"):
+        tls["alpn"] = get("alpn").split(",")
+    if str(get("allowInsecure") or "").lower() in ("1", "true"):
+        tls["allowInsecure"] = True
+    ss["realitySettings" if sec == "reality" else "tlsSettings"] = tls
+
+
+def parse_link(link):
+    if link.startswith('vless://'):
+        parsed = urllib.parse.urlparse(link)
+        qs = urllib.parse.parse_qs(parsed.query)
+
+        def get(key):
+            vals = qs.get(key)
+            return vals[0] if vals else None
+
+        host = parsed.hostname or ""
+        outbound = {
+            "protocol": "vless",
+            "tag": "proxy_" + host.replace('.', '_'),
+            "settings": {
+                "vnext": [{
+                    "address": host,
+                    "port": parsed.port or 443,
+                    "users": [{
+                        "id": parsed.username,
+                        "encryption": get("encryption") or "none",
+                        "flow": get("flow") or "",
+                    }],
+                }]
+            },
+            "streamSettings": {
+                "network": get("type") or "tcp",
+                "security": get("security") or "none",
+            },
+        }
+        apply_transport(outbound["streamSettings"],
+                        outbound["streamSettings"]["network"], get)
+        apply_tls(outbound["streamSettings"], get, host)
+        print(json.dumps(outbound))
+
+    elif link.startswith('vmess://'):
+        b64 = link[8:]
+        b64 += "=" * ((4 - len(b64) % 4) % 4)
+        data = json.loads(base64.b64decode(b64).decode('utf-8'))
+
+        def get(key):
+            # В vmess-JSON serviceName живёт в path, а SNI — в sni либо host
+            val = data.get(key)
+            return str(val) if val not in (None, "") else None
+
+        host = str(data.get("add") or "")
+        outbound = {
+            "protocol": "vmess",
+            "tag": "proxy_" + host.replace('.', '_'),
+            "settings": {
+                "vnext": [{
+                    "address": host,
+                    "port": int(data.get("port") or 443),
+                    "users": [{
+                        "id": data.get("id"),
+                        "alterId": int(data.get("aid") or 0),
+                        "security": data.get("scy") or "auto",
+                    }],
+                }]
+            },
+            "streamSettings": {
+                "network": data.get("net") or "tcp",
+                "security": data.get("tls") or "none",
+            },
+        }
+        apply_transport(outbound["streamSettings"],
+                        outbound["streamSettings"]["network"], get)
+        apply_tls(outbound["streamSettings"], get, host)
+        print(json.dumps(outbound))
+
+    elif link.startswith('hysteria2://') or link.startswith('hy2://'):
+        parsed = urllib.parse.urlparse(link)
+        qs = urllib.parse.parse_qs(parsed.query)
+        host = parsed.hostname
+        port = parsed.port or 443
+        password = parsed.username or ""
+        tag_name = host.replace('.', '_') if host else 'hysteria'
+
+        settings = {
+            "server": host,
+            "port": port,
+            "password": password,
+        }
+        if "sni" in qs:
+            settings["serverName"] = qs["sni"][0]
+        if "insecure" in qs:
+            settings["insecure"] = qs["insecure"][0] == "1"
+        if "obfs" in qs:
+            obfs_cfg = {"type": qs["obfs"][0]}
+            if "obfs-password" in qs:
+                obfs_cfg["password"] = qs["obfs-password"][0]
+            settings["obfs"] = obfs_cfg
+
+        outbound = {
+            "protocol": "hysteria2",
+            "tag": "proxy_" + tag_name,
+            "settings": settings,
+        }
+        print(json.dumps(outbound))
+
+    else:
+        print("Unsupported", file=sys.stderr)
+        sys.exit(1)
+
+
+try:
+    parse_link(sys.argv[1])
+except Exception as e:
+    print("Error:", e, file=sys.stderr)
+    sys.exit(1)
+PYEOF
+
+  local new_outbound="" parse_err="" parse_log
+  parse_log=$(mktemp /tmp/awg_tmp_xparse_XXXXXX.log) || { err "mktemp провалился"; return 1; }
+  if ! new_outbound=$(python3 "$parser_script" "$link" 2>"$parse_log") || [[ -z "$new_outbound" ]]; then
+    parse_err=$(cat "$parse_log" 2>/dev/null || true)
+    rm -f "$parser_script" "$parse_log"
+    err "Не удалось распарсить ссылку"
+    [[ -n "$parse_err" ]] && printf '%s\n' "$parse_err" | head -3 | sed 's/^/      /'
+    return 1
+  fi
+  if grep -q '^MIGRATED_TRANSPORT:' "$parse_log" 2>/dev/null; then
+    info "Транспорт h2 в Xray убран — ссылка переведена на XHTTP stream-one"
+  fi
+  # Транспорт, для которого парсер не умеет собирать *Settings: путь/хост из
+  # ссылки потеряются, и туннель поднимется рабочим, но пустым.
+  if grep -q '^UNSUPPORTED_TRANSPORT:' "$parse_log" 2>/dev/null; then
+    warn "Транспорт $(sed -n 's/^UNSUPPORTED_TRANSPORT://p' "$parse_log" | head -1) скрипт собирать не умеет"
+    warn "Параметры из ссылки (path/host и прочие) будут потеряны."
+    local _go="n"
+    read_yesno _go "$(echo -e "${G}  Всё равно добавить? [y/N]: ${N}")" "n"
+    if [[ "$_go" != "y" ]]; then
+      rm -f "$parser_script" "$parse_log"
+      info "Отменено — конфиг не тронут"
+      return 1
+    fi
+  fi
+  rm -f "$parser_script" "$parse_log"
+
+  local tag
+  tag=$(echo "$new_outbound" | grep -oP '"tag": "\K[^"]+')
+
+  # Проверяем outbound на самом бинаре ДО записи в config.json. Иначе
+  # неподдерживаемый протокол (в апстримном Xray-core нет hysteria2) попадал
+  # в конфиг, и туннель переставал подниматься вообще — с ошибкой, которая
+  # никак не указывала на только что добавленную ссылку.
+  local probe_conf probe_err=""
+  probe_conf=$(mktemp /tmp/awg_tmp_xprobe_XXXXXX.json) || { err "mktemp провалился"; return 1; }
+  chmod 600 "$probe_conf"
+  OUTBOUND="$new_outbound" python3 - "$probe_conf" << 'PYEOF3'
+import json, os, sys
+json.dump({
+    "log": {"loglevel": "none"},
+    "inbounds": [{"listen": "127.0.0.1", "port": 10808, "protocol": "socks",
+                  "tag": "probe-in", "settings": {"auth": "noauth"}}],
+    "outbounds": [json.loads(os.environ["OUTBOUND"]),
+                  {"protocol": "freedom", "tag": "direct"}],
+}, open(sys.argv[1], "w"))
+PYEOF3
+  if ! probe_err=$(_xray_test_conf "$probe_conf"); then
+    rm -f "$probe_conf"
+    err "Этот Xray не принимает такой outbound:"
+    printf '%s\n' "$probe_err" | sed 's/^/      /'
+    echo ""
+    info "Если это hysteria2 — апстримный XTLS/Xray-core его не поддерживает,"
+    info "нужна сборка с hysteria2 или другой протокол (vless/vmess)."
+    info "Конфиг $XRAY_CONF не тронут."
+    return 1
+  fi
+  rm -f "$probe_conf"
+  ok "Xray принимает outbound '$tag'"
+
+  info "Добавляем outbound '$tag' в $XRAY_CONF..."
+  # Simple python script to append outbound to config.json
+  local inject_script
+  inject_script=$(mktemp /tmp/awg_tmp_inject_XXXXXX.py) || { err "mktemp провалился"; return 1; }
+  chmod 600 "$inject_script"
+  cat > "$inject_script" << 'PYEOF2'
+import json
+import sys
+
+conf_path = sys.argv[1]
+new_out = json.loads(sys.argv[2])
+
+with open(conf_path, 'r') as f:
+    conf = json.load(f)
+
+# Check for duplicate tag
+new_tag = new_out.get('tag', '')
+for out in conf.get('outbounds', []):
+    if out.get('tag') == new_tag:
+        print(f'DUPLICATE:{new_tag}')
+        sys.exit(1)
+
+# Insert before direct/freedom outbounds, or append
+inserted = False
+for i, out in enumerate(conf.get("outbounds", [])):
+    if out.get("protocol") == "freedom":
+        conf["outbounds"].insert(i, new_out)
+        inserted = True
+        break
+if not inserted:
+    conf.setdefault("outbounds", []).append(new_out)
+
+# Update routing to proxy traffic to newly added proxy
+proxy_rule = next((r for r in conf.get('routing', {}).get('rules', []) if r.get('outboundTag') and not r.get('outboundTag') == 'direct' or r.get('balancerTag') == 'balancer'), None)
+if proxy_rule:
+    # Set outboundTag directly to new outbound instead of abstract proxy (unless balancer is active)
+    if 'balancerTag' not in proxy_rule:
+        proxy_rule['outboundTag'] = new_out['tag']
+
+# Пишем через временный файл: обрыв на середине json.dump оставил бы
+# нерабочий config.json, и Xray больше не стартовал бы вообще.
+import os
+tmp_path = conf_path + '.tmp'
+with open(tmp_path, 'w') as f:
+    json.dump(conf, f, indent=2, ensure_ascii=False)
+os.replace(tmp_path, conf_path)
+PYEOF2
+
+  local inject_out inject_rc=0
+  inject_out=$(python3 "$inject_script" "$XRAY_CONF" "$new_outbound" 2>&1) || inject_rc=$?
+  rm -f "$inject_script"
+  if (( inject_rc == 0 )); then
+    ok "Outbound '$tag' добавлен."
+  elif echo "$inject_out" | grep -q 'DUPLICATE'; then
+    err "Outbound '$tag' уже существует! Нельзя добавить дубликат."
+    return 1
+  else
+    err "Ошибка добавления outbound: $inject_out"
+    return 1
+  fi
+}
+
+_xray_remove_outbound() {
+  if [[ ! -f "$XRAY_CONF" ]]; then
+    err "Xray не установлен"
+    return 1
+  fi
+  local tags
+  # Кандидаты в балансировку — только настоящие proxy-outbounds. Отбираем по
+  # протоколу, а не по имени тега: тег задаёт пользователь, и "direct_backup"
+  # раньше выпадал из списка просто из-за префикса.
+  tags=$(python3 -c "
+import json
+conf = json.load(open('$XRAY_CONF'))
+skip = ('freedom', 'blackhole', 'dns')
+print('\n'.join(o['tag'] for o in conf.get('outbounds', [])
+                 if o.get('tag') and o.get('protocol') not in skip))" 2>/dev/null || true)
+
+  if [[ -z "$tags" ]]; then
+    warn "Нет настроенных proxy outbounds."
+    return 0
+  fi
+
+  echo -e "${C}Доступные outbounds:${N}"
+  local i=1
+  local arr=()
+  for t in $tags; do
+    echo -e "  ${C}$i)${N} $t"
+    arr+=("$t")
+    ((i++))
+  done
+  echo -e "  0) Отмена"
+
+  safe_read opt "Выберите номер для удаления: "
+  if [[ "$opt" == "0" || -z "$opt" || ! "$opt" =~ ^[0-9]+$ || "$opt" -gt "${#arr[@]}" ]]; then
+    return 0
+  fi
+
+  local target="${arr[$((opt-1))]}"
+  info "Удаляем '$target'..."
+  python3 -c "import json, sys; conf=json.load(open('$XRAY_CONF')); conf['outbounds'] = [o for o in conf.get('outbounds', []) if o.get('tag') != sys.argv[1]]; json.dump(conf, open('$XRAY_CONF','w'), indent=2)" "$target"
+  ok "Outbound '$target' удалён."
+}
+
+_xray_setup_balancer() {
+  if [[ ! -f "$XRAY_CONF" ]]; then
+    err "Xray не установлен"
+    return 1
+  fi
+
+  local tags
+  tags=$(python3 -c "import json, sys; conf=json.load(open('$XRAY_CONF')); print('\n'.join([o.get('tag', 'unknown') for o in conf.get('outbounds', []) if o.get('tag') and not o.get('tag').startswith('direct')]))")
+
+  if [[ -z "$tags" ]]; then
+    warn "Нет настроенных proxy outbounds. Добавь хотя бы один."
+    return 0
+  fi
+
+  local count
+  count=$(echo "$tags" | wc -l)
+  if [[ "$count" -lt 2 ]]; then
+    warn "Нужно как минимум 2 outbound для балансировки."
+    return 0
+  fi
+
+  info "Настраиваем балансировщик для следующих outbounds:"
+  echo "$tags" | sed 's/^/  - /'
+  echo ""
+
+  echo -e "  ${C}Стратегия балансировки:${N}"
+  echo -e "  ${C}1)${N} random     — случайный выбор при каждом соединении"
+  echo -e "  ${C}2)${N} roundRobin — по очереди (каждое новое соединение — следующий)"
+  echo -e "  ${C}3)${N} leastPing  — по наименьшему пингу (observatory авто)"
+  echo -e "  ${C}4)${N} leastLoad  — по наименьшей загрузке (observatory авто)"
+  echo ""
+
+  local strategy
+  read_choice BAL_STRATEGY "$(echo -e "${C}  Выбор стратегии [1-4] (Enter = random): ${N}")" 1 4 1
+  case $BAL_STRATEGY in
+    1) strategy="random" ;;
+    2) strategy="roundRobin" ;;
+    3) strategy="leastPing" ;;
+    4) strategy="leastLoad" ;;
+  esac
+
+  if python3 -c "
+import json, sys
+conf = json.load(open('$XRAY_CONF'))
+tags = sys.argv[1].strip().split('\n')
+strategy = sys.argv[2]
+conf.setdefault('routing', {})
+conf['routing']['balancers'] = [{'tag': 'balancer', 'selector': tags, 'strategy': {'type': strategy}}]
+rules = conf['routing'].get('rules', [])
+proxy_rule = next((r for r in rules if (r.get('outboundTag') and r.get('outboundTag') != 'direct') or r.get('balancerTag') == 'balancer'), None)
+if proxy_rule:
+    proxy_rule.pop('outboundTag', None)
+    proxy_rule['balancerTag'] = 'balancer'
+else:
+    rules.append({'type': 'field', 'inboundTag': ['tun-in'], 'balancerTag': 'balancer'})
+conf['routing']['rules'] = rules
+
+# leastPing/leastLoad требуют observatory.
+# subjectSelector — ПРЕФИКСНОЕ сопоставление с тегами outbounds (доки Xray).
+# Теги наших outbounds — "proxy_<host>", поэтому ['outbound'] не совпадало ни с
+# одним → observatory не пробил ничего → leastPing/leastLoad исключали ВСЕ
+# outbounds и деградировали до default outbound (балансировки не было).
+# Берём сами теги балансировщика:
+if strategy in ('leastPing', 'leastLoad'):
+    conf['observatory'] = {
+        'subjectSelector': tags,
+        'probeUrl': 'https://www.google.com/generate_204',
+        'probeInterval': '1m'
+    }
+
+# Через временный файл: обрыв на середине записи оставил бы битый config.json.
+import os
+tmp = '$XRAY_CONF' + '.tmp'
+with open(tmp, 'w') as f:
+    json.dump(conf, f, indent=2, ensure_ascii=False)
+os.replace(tmp, '$XRAY_CONF')
+" "$tags" "$strategy"; then
+    ok "Балансировщик ($strategy) настроен. Трафик распределяется между $count outbounds."
+  else
+    err "Ошибка настройки балансировщика."
+    return 1
+  fi
+}
+
+# Умеет ли этот бинарь Xray inbound "tun".
+# Апстримный XTLS/Xray-core его не реализует (TUN есть в отдельных сборках),
+# поэтому не гадаем по версии, а спрашиваем сам бинарь: `xray run -test`
+# валидирует конфиг и падает на неизвестном протоколе. Результат кэшируем —
+# проверка дёргается из меню статуса.
+_XRAY_TUN_SUPPORTED=""
+# Кто слушает 127.0.0.1:<порт> — имя процесса или пусто.
+# Чужой процесс на этом порту не мелочь: наш Xray не сможет забиндиться и
+# умрёт, а проба уйдёт в чужой прокси и покажет ЕГО результат. Именно так
+# залипший вручную запущенный xray со старым конфигом обслуживал клиентов,
+# пока проба рапортовала об успехе.
+_xray_port_owner() {
+  local port="${1:-10808}"
+  command -v ss &>/dev/null || return 0
+  # По строке на сокет, с pid: из-за SO_REUSEPORT на одном порту может сидеть
+  # несколько процессов сразу — и это обычно два экземпляра с ОДНИМ именем
+  # ("xray" и "xray"). По именам их не различить, поэтому берём pid.
+  ss -lntpH "sport = :$port" 2>/dev/null \
+    | sed -n 's/.*users:(("\([^"]*\)",pid=\([0-9]*\).*/\1 (pid \2)/p' \
+    | sort -u || true
+}
+
+# Реально ли ходит трафик через Xray. Проверяем его же SOCKS-вход (он есть в
+# конфиге в обоих режимах), то есть всю цепочку до выходного сервера целиком.
+# Без этой пробы «туннель включён» означало лишь «интерфейс появился»: клиентов
+# уводило в таблицу 201, а там мёртвый outbound — и интернет пропадал у всех.
+# Ходит ли трафик через SOCKS5 по адресу host:port. Настоящий запрос наружу,
+# а не просто TCP-коннект: прокси может принимать соединения и никуда их не
+# отправлять — снаружи это неотличимо, а для клиентов означает чёрную дыру.
+# 0 — прошло, 1 — нет (в stdout код ответа или «нет ответа»).
+_socks_probe() {
+  local addr="${1:-127.0.0.1:10808}" url="http://cp.cloudflare.com/generate_204" code=""
+  command -v curl &>/dev/null || return 0   # нечем проверить — не мешаем
+  local opt
+  for opt in --socks5-hostname --socks5; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+             "$opt" "$addr" "$url" 2>/dev/null || true)
+    [[ "$code" =~ ^(204|200)$ ]] && return 0
+  done
+  echo "${code:-нет ответа}"
+  return 1
+}
+
+_xray_probe_socks() {
+  _socks_probe "127.0.0.1:${1:-10808}"
+}
+
+# Есть ли в конфиге хоть один настоящий proxy-outbound.
+# Тот же критерий, что у guard'а в _xray_up: без него туннель поднимать некуда.
+_xray_has_proxy_outbound() {
+  [[ -f "$XRAY_CONF" ]] || return 1
+  python3 -c "
+import json, sys
+conf = json.load(open('$XRAY_CONF'))
+skip = ('freedom', 'blackhole', 'dns')
+sys.exit(0 if [o for o in conf.get('outbounds', [])
+               if o.get('tag') and o.get('protocol') not in skip] else 1)" 2>/dev/null
+}
+
+# Прогоняет конфиг через сам Xray и отдаёт текст ошибки в stdout.
+# 0 — конфиг принят, 1 — отвергнут (в stdout причина от самого Xray).
+# Раньше вывод уходил в /dev/null, и «Xray отверг конфиг» ничего не объясняло.
+_xray_test_conf() {
+  local conf="${1:-$XRAY_CONF}" out
+  command -v xray &>/dev/null || { echo "бинарь xray не найден"; return 1; }
+  if out=$(xray run -test -c "$conf" 2>&1); then
+    return 0
+  fi
+  # Xray печатает многострочный баннер; интересна строка с failed/infra
+  printf '%s\n' "$out" | grep -iE 'failed|error|invalid|unknown|not found' | head -5
+  [[ -n "$out" ]] || echo "xray вернул ошибку без текста"
+  return 1
+}
+
+_xray_tun_supported() {
+  if [[ -n "$_XRAY_TUN_SUPPORTED" ]]; then
+    [[ "$_XRAY_TUN_SUPPORTED" == "1" ]]
+    return $?
+  fi
+  _XRAY_TUN_SUPPORTED=0
+  command -v xray &>/dev/null || return 1
+
+  local probe
+  probe=$(mktemp) || return 1
+  cat > "$probe" << 'JSONEOF'
+{
+  "log": {"loglevel": "none"},
+  "inbounds": [
+    {
+      "protocol": "tun",
+      "tag": "tun-probe",
+      "settings": {"mtu": 1500, "stack": "gvisor", "address": ["172.16.250.1/30"]}
+    }
+  ],
+  "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+}
+JSONEOF
+  if xray run -test -c "$probe" >/dev/null 2>&1; then
+    _XRAY_TUN_SUPPORTED=1
+  fi
+  rm -f "$probe"
+  [[ "$_XRAY_TUN_SUPPORTED" == "1" ]]
+}
+
+# Какие outbounds этот бинарь Xray не принимает. По тегу в строку на каждый.
+# Проверяем каждый по отдельности: «failed to build router» на весь конфиг не
+# говорит, из-за какого именно outbound он отвалился.
+_xray_bad_outbounds() {
+  [[ -f "$XRAY_CONF" ]] || return 0
+  local tags tag probe
+  tags=$(python3 -c "
+import json
+conf = json.load(open('$XRAY_CONF'))
+skip = ('freedom', 'blackhole', 'dns')
+print('\n'.join(o['tag'] for o in conf.get('outbounds', [])
+                 if o.get('tag') and o.get('protocol') not in skip))" 2>/dev/null || true)
+  [[ -n "$tags" ]] || return 0
+
+  probe=$(mktemp /tmp/awg_tmp_xdiag_XXXXXX.json) || return 0
+  chmod 600 "$probe"
+  while IFS= read -r tag; do
+    [[ -n "$tag" ]] || continue
+    TAG="$tag" python3 - "$XRAY_CONF" "$probe" << 'PYEOF4' || continue
+import json, os, sys
+conf = json.load(open(sys.argv[1]))
+ob = next(o for o in conf["outbounds"] if o.get("tag") == os.environ["TAG"])
+json.dump({
+    "log": {"loglevel": "none"},
+    "inbounds": [{"listen": "127.0.0.1", "port": 10808, "protocol": "socks",
+                  "tag": "probe-in", "settings": {"auth": "noauth"}}],
+    "outbounds": [ob, {"protocol": "freedom", "tag": "direct"}],
+}, open(sys.argv[2], "w"))
+PYEOF4
+    _xray_test_conf "$probe" >/dev/null 2>&1 || echo "$tag"
+  done <<< "$tags"
+  rm -f "$probe"
+}
+
+# Диагностика: что именно не так с текущим конфигом и чем это лечится.
+_xray_diagnose() {
+  if [[ ! -f "$XRAY_CONF" ]]; then
+    err "Конфиг $XRAY_CONF не найден — Xray ещё не установлен (пункт 1)"
+    return 1
+  fi
+  command -v xray &>/dev/null || { err "Бинарь xray не найден (пункт 1)"; return 1; }
+
+  info "Бинарь: $(xray version 2>/dev/null | head -n1)"
+  if _xray_tun_supported; then
+    info "TUN-вход: поддерживается — xray0 поднимет сам Xray"
+  else
+    info "TUN-вход: нет — xray0 поднимет tun2socks поверх SOCKS5 127.0.0.1:10808"
+  fi
+
+  # Xray ставит SO_REUSEPORT: на 10808 могут молча сидеть сразу несколько
+  # процессов, и ядро раскидает соединения между ними. Снаружи это выглядит
+  # как «половина трафика работает» и ничем больше себя не проявляет.
+  local owners owner_count
+  owners=$(_xray_port_owner 10808)
+  owner_count=$(printf '%s' "$owners" | grep -c . || true)
+  if (( owner_count > 1 )); then
+    err "На 127.0.0.1:10808 слушают несколько процессов:"
+    printf '%s\n' "$owners" | sed 's/^/      • /'
+    warn "Соединения делятся между ними — часть трафика уходит не туда."
+    info "Лишний обычно это ручной запуск: pkill -f 'xray run -c'"
+  elif [[ -n "$owners" ]]; then
+    info "SOCKS 127.0.0.1:10808 слушает: $owners"
+  else
+    info "SOCKS 127.0.0.1:10808: никто не слушает (туннель выключен?)"
+  fi
+
+  local test_err=""
+  if test_err=$(_xray_test_conf "$XRAY_CONF"); then
+    ok "Конфиг принят Xray — можно включать туннель (пункт 5)"
+    return 0
+  fi
+
+  err "Конфиг отвергнут:"
+  printf '%s\n' "$test_err" | sed 's/^/      /'
+  echo ""
+
+  local bad
+  bad=$(_xray_bad_outbounds)
+  if [[ -n "$bad" ]]; then
+    warn "Эти outbounds не принимает данная сборка Xray:"
+    printf '%s\n' "$bad" | sed 's/^/      • /'
+    echo ""
+    info "Чаще всего это hysteria2: в апстримном XTLS/Xray-core его нет."
+    local _rm="n"
+    read_yesno _rm "$(echo -e "${G}  Удалить их из конфига? [Y/n]: ${N}")" "y"
+    if [[ "$_rm" == "y" ]]; then
+      BAD_TAGS="$bad" python3 - "$XRAY_CONF" << 'PYEOF5'
+import json, os, sys
+path = sys.argv[1]
+bad = {t for t in os.environ["BAD_TAGS"].split("\n") if t}
+conf = json.load(open(path))
+conf["outbounds"] = [o for o in conf.get("outbounds", []) if o.get("tag") not in bad]
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(conf, f, indent=2, ensure_ascii=False)
+os.replace(tmp, path)
+PYEOF5
+      # Висячие ссылки на удалённые теги чинит подготовка конфига
+      _xray_prepare_conf "$(_xray_tun_supported && echo native || echo tun2socks)" || true
+      if _xray_test_conf "$XRAY_CONF" >/dev/null; then
+        if _xray_has_proxy_outbound; then
+          ok "Конфиг починен — можно включать туннель (пункт 5)"
+        else
+          ok "Конфиг починен, но proxy-outbounds не осталось"
+          info "Добавь рабочую ссылку (пункт 2) — vless:// или vmess://"
+        fi
+        return 0
+      fi
+      warn "Конфиг всё ещё отвергается — смотри вывод выше"
+    fi
+  else
+    info "Отдельные outbounds Xray принимает — дело в маршрутизации."
+    info "Попробуй включить туннель (пункт 5): подготовка конфига чинит"
+    info "висячие ссылки на удалённые outbounds автоматически."
+  fi
+  return 1
+}
+
+# Приводит $XRAY_CONF к выбранному режиму входа.
+# $1 = native (inbound tun) | tun2socks (только socks на 127.0.0.1:10808).
+# Конфиг с tun-входом на бинаре без TUN не стартует вообще, поэтому лишний
+# вход именно удаляем, а не оставляем «на всякий случай».
+_xray_prepare_conf() {
+  local mode="${1:-tun2socks}"
+  [[ -f "$XRAY_CONF" ]] || return 1
+  MODE="$mode" python3 - "$XRAY_CONF" << 'PYEOF'
+import json, os, sys
+
+path = sys.argv[1]
+mode = os.environ.get("MODE", "tun2socks")
+
+with open(path) as f:
+    conf = json.load(f)
+
+inbounds = conf.get("inbounds") or []
+# Наследие ранних версий: вход dokodemo-door с тегом xray0.
+inbounds = [i for i in inbounds
+            if not (i.get("tag") == "xray0" and i.get("protocol") == "dokodemo-door")]
+
+sniff = {"enabled": True, "destOverride": ["http", "tls", "quic"]}
+
+# socks-вход нужен в обоих режимах: в tun2socks через него идёт весь трафик,
+# в native он остаётся как локальный прокси для отладки. listen обязателен —
+# без него Xray слушает 0.0.0.0 и это открытый релей.
+socks = next((i for i in inbounds if i.get("tag") == "socks-in"), None)
+if socks is None:
+    socks = {"protocol": "socks", "tag": "socks-in",
+             "settings": {"auth": "noauth", "udp": True}, "sniffing": sniff}
+    inbounds.append(socks)
+socks["listen"] = "127.0.0.1"
+socks["port"] = socks.get("port") or 10808
+
+tun = next((i for i in inbounds if i.get("protocol") == "tun"), None)
+if mode == "native":
+    if tun is None:
+        tun = {"protocol": "tun", "tag": "tun-in",
+               "settings": {"mtu": 1200, "stack": "gvisor",
+                            "address": ["172.16.250.1/30"]},
+               "sniffing": sniff}
+        inbounds.insert(0, tun)
+    tun["tag"] = tun.get("tag") or "tun-in"
+    want = tun["tag"]
+else:
+    inbounds = [i for i in inbounds if i.get("protocol") != "tun"]
+    want = "socks-in"
+
+conf["inbounds"] = inbounds
+
+routing = conf.setdefault("routing", {})
+routing.setdefault("domainStrategy", "AsIs")
+rules = routing.setdefault("rules", [])
+
+# Правила, привязанные к входу, переводим на актуальный тег. Остальные
+# (гео, домены, per-client) не трогаем — их пишет пользователь и балансировщик.
+known_in = {"xray0", "tun-in", "tun-probe", "socks-in"}
+touched = False
+for r in rules:
+    tags = r.get("inboundTag")
+    if isinstance(tags, list) and any(t in known_in for t in tags):
+        r["inboundTag"] = [want]
+        touched = True
+
+if not touched:
+    rules.append({"type": "field", "inboundTag": [want], "outboundTag": "proxy"})
+
+# Починка висячих outboundTag. Удалили outbound (пункт 3) — правило осталось
+# указывать на несуществующий тег, и Xray отвергает такой конфиг целиком:
+# "failed to build router". Перенаправляем на первый настоящий proxy-outbound,
+# а если его нет — снимаем тег, чтобы конфиг остался валидным (туннель всё
+# равно не поднимется: выше стоит guard "нет proxy outbounds").
+skip_proto = ("freedom", "blackhole", "dns")
+existing_tags = {o.get("tag") for o in conf.get("outbounds", []) if o.get("tag")}
+proxy_tags = [o["tag"] for o in conf.get("outbounds", [])
+              if o.get("tag") and o.get("protocol") not in skip_proto]
+balancer_tags = {b.get("tag") for b in routing.get("balancers", []) or [] if b.get("tag")}
+
+for r in rules:
+    bt = r.get("balancerTag")
+    if bt:
+        if bt in balancer_tags:
+            continue
+        r.pop("balancerTag", None)   # балансировщик удалён — правило осиротело
+    ot = r.get("outboundTag")
+    if ot and ot not in existing_tags:
+        if proxy_tags:
+            r["outboundTag"] = proxy_tags[0]
+        else:
+            r.pop("outboundTag", None)
+
+# Правило вообще без назначения Xray не примет — выкидываем такие
+rules = [r for r in rules if r.get("outboundTag") or r.get("balancerTag")]
+routing["rules"] = rules
+
+# Селектор балансировщика тоже мог протухнуть
+for b in routing.get("balancers", []) or []:
+    sel = [t for t in (b.get("selector") or []) if t in existing_tags]
+    if sel:
+        b["selector"] = sel
+if routing.get("balancers"):
+    routing["balancers"] = [b for b in routing["balancers"] if b.get("selector")]
+    if not routing["balancers"]:
+        del routing["balancers"]
+
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(conf, f, indent=2, ensure_ascii=False)
+os.replace(tmp, path)
+PYEOF
+}
+
+_xray_up() {
+  if [[ ! -f "$XRAY_CONF" ]]; then
+    err "Конфиг Xray не найден. Сначала выполни пункт 1"
+    return 1
+  fi
+
+  if ip link show xray0 &>/dev/null; then
+    info "xray0 уже активен"
+    return 0
+  fi
+
+  # Guard: начальный конфиг (после _xray_install) ссылается на outboundTag
+  # "proxy", которого нет до добавления первого outbound. Без proxy outbounds
+  # Xray стартует с правилом в никуда (дроп/ошибка). Не пускаем.
+  if ! _xray_has_proxy_outbound; then
+    err "Нет настроенных proxy outbounds. Сначала добавьте outbound (пункт 2), затем включайте туннель."
+    return 1
+  fi
+
+  if ip link show warp0 &>/dev/null; then
+    err "Туннель Warp активен! Xray и Warp не могут работать одновременно."
+    warn "Выключи Warp (пункт 5 -> 1 -> 4), затем включай Xray."
+    return 1
+  fi
+
+  if systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+    err "Каскад AWG-exit активен! Xray и каскад не могут работать одновременно."
+    warn "Выключи каскад (пункт 5 -> 6 -> 4), затем включай Xray."
+    return 1
+  fi
+
+  local client_net iface
+  client_net=$(_warp_get_client_net 2>/dev/null || echo "")
+  iface=$(ip route 2>/dev/null | awk '/default/{print $5; exit}' || echo "eth0")
+
+  if [[ -z "$client_net" ]]; then
+    err "AWG сервер не настроен"
+    return 1
+  fi
+
+  # Апстримный XTLS/Xray-core не умеет inbound "tun" — TUN-вход есть только в
+  # отдельных сборках. Определяем это до старта и в зависимости от результата
+  # готовим конфиг под свой режим:
+  #   native    — Xray сам поднимает xray0;
+  #   tun2socks — Xray отдаёт только SOCKS5 на 127.0.0.1:10808, а xray0
+  #               поднимает tun2socks поверх него.
+  # Дальше вся маршрутизация одинаковая: ей важен только интерфейс xray0.
+  local tun_dev="xray0" tun_mode="tun2socks"
+  if _xray_tun_supported; then
+    tun_mode="native"
+  else
+    info "Этот бинарь Xray не поддерживает TUN-вход — идём через tun2socks"
+  fi
+
+  _xray_prepare_conf "$tun_mode" || { err "Не удалось подготовить конфиг Xray"; return 1; }
+
+  # Порт SOCKS должен быть свободен: наш Xray иначе не поднимется, а проба
+  # проверит чужой прокси и пропустит заведомо нерабочий туннель.
+  local port_owner
+  port_owner=$(_xray_port_owner 10808)
+  if [[ -n "$port_owner" ]]; then
+    err "127.0.0.1:10808 уже занят — Xray не запустить:"
+    printf '%s\n' "$port_owner" | sed 's/^/      • /'
+    info "Кто это: ss -lntp | grep 10808"
+    info "Если это забытый ручной запуск: pkill -f 'xray run -c'"
+    return 1
+  fi
+
+  local test_err=""
+  if ! test_err=$(_xray_test_conf "$XRAY_CONF"); then
+    err "Xray отверг конфиг $XRAY_CONF:"
+    printf '%s\n' "$test_err" | sed 's/^/      /'
+    echo ""
+    info "Частые причины:"
+    info "  • outbound на протоколе, которого нет в этой сборке Xray"
+    info "    (hysteria2 в апстримном XTLS/Xray-core не поддерживается)"
+    info "  • правило маршрутизации ссылается на удалённый outbound"
+    local bad_tags
+    bad_tags=$(_xray_bad_outbounds)
+    if [[ -n "$bad_tags" ]]; then
+      warn "Не принимаются этой сборкой Xray:"
+      printf '%s\n' "$bad_tags" | sed 's/^/      • /'
+      info "Убрать их: пункт 9 — «Проверить конфиг (диагностика)»"
+    else
+      info "Список outbounds: пункт 3; диагностика: пункт 9"
+    fi
+    return 1
+  fi
+
+  systemd-run --unit=awg-xray.service /usr/local/bin/xray run -c "$XRAY_CONF" >/dev/null 2>&1
+
+  # Стартовать Xray может не мгновенно, но и падает он сразу — ждём до 5 с,
+  # проверяя не «поднялся ли», а «не умер ли».
+  local i
+  for i in $(seq 1 10); do
+    systemctl is-active --quiet awg-xray.service && break
+    sleep 0.5
+  done
+  if ! systemctl is-active --quiet awg-xray.service; then
+    err "Не удалось запустить Xray. Логи: journalctl -u awg-xray.service"
+    return 1
+  fi
+
+  if [[ "$tun_mode" == "tun2socks" ]]; then
+    if ! _tun2socks_install; then
+      err "tun2socks не установился — Xray-туннель поднять нечем"
+      systemctl stop awg-xray.service 2>/dev/null || true
+      return 1
+    fi
+    # Отдельный юнит, не awg-tun2socks.service: тот принадлежит своему пункту
+    # меню и имеет собственный proxy_url. Смешивать их — значит гасить чужой
+    # туннель при выключении этого.
+    # Флаги только в длинной форме: pflag не понимает "-device", молча
+    # печатает usage и выходит с кодом 0 — юнит «стартовал» бы и тут же умер.
+    systemd-run --unit=awg-xray-tun.service /usr/local/bin/tun2socks \
+      --device "tun://$tun_dev" --proxy socks5://127.0.0.1:10808 --loglevel warn \
+      >/dev/null 2>&1
+  fi
+
+  # Ждём появления TUN-интерфейса (создаётся асинхронно — и Xray, и tun2socks)
+  for i in $(seq 1 20); do
+    ip link show "$tun_dev" &>/dev/null && break
+    sleep 0.5
+  done
+  if ! ip link show "$tun_dev" &>/dev/null; then
+    err "TUN-интерфейс $tun_dev не появился"
+    [[ "$tun_mode" == "tun2socks" ]] && info "Логи: journalctl -u awg-xray-tun.service"
+    systemctl stop awg-xray-tun.service 2>/dev/null || true
+    systemctl stop awg-xray.service 2>/dev/null || true
+    return 1
+  fi
+  ip link set dev "$tun_dev" up 2>/dev/null || true
+  info "TUN-интерфейс: $tun_dev (режим: $tun_mode)"
+
+  # Пробуем цепочку ДО того, как трогаем маршрутизацию клиентов. Если выходной
+  # сервер не отвечает, откатываемся молча и никого никуда не уводим: лучше
+  # «туннель не включился», чем «интернета нет ни у кого».
+  local probe_out=""
+  info "Проверяю, ходит ли трафик через Xray..."
+  if ! probe_out=$(_xray_probe_socks 10808); then
+    err "Через Xray трафик не идёт (ответ: $probe_out) — туннель не включаю"
+    info "Клиенты остались на прямом маршруте, маршрутизация не менялась."
+    info "Проверь outbound: пункт 9 — «Проверить конфиг (диагностика)»"
+    info "Логи: journalctl -u awg-xray.service -n 30 --no-pager"
+    systemctl stop awg-xray-tun.service 2>/dev/null || true
+    systemctl stop awg-xray.service 2>/dev/null || true
+    ip link delete "$tun_dev" 2>/dev/null || true
+    return 1
+  fi
+  ok "Трафик через Xray проходит"
+
+  # Назначаем IP вручную (Xray не всегда делает это сам)
+  ip addr add 172.16.250.1/30 dev "$tun_dev" 2>/dev/null || true
+
+  # rp_filter loose и на туннеле, и на awg0 — как в Warp/usque/каскаде.
+  # Только на $tun_dev недостаточно: пакет клиента приходит на awg0, и обратная
+  # проверка пути для его адреса уходит в таблицу 201 (default dev xray0), то
+  # есть не на awg0 — при строгом rp_filter ядро молча дропает такие пакеты, и
+  # клиент оказывается без интернета при живом туннеле.
+  # .all.rp_filter не трогаем: ядро берёт max(all, iface), и eth0 остаётся
+  # строгим (защита от spoofing).
+  sysctl -w net.ipv4.conf."$tun_dev".rp_filter=2 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.awg0.rp_filter=2 >/dev/null 2>&1 || true
+
+  # Настройка маршрутизации для клиентов
+  if ! iptables -t nat -C POSTROUTING -s "$client_net" -o "$tun_dev" -j MASQUERADE 2>/dev/null; then
+    if ! iptables -t nat -A POSTROUTING -s "$client_net" -o "$tun_dev" -j MASQUERADE; then
+      warn "Не удалось добавить MASQUERADE для $tun_dev (Xray может работать некорректно)"
+    fi
+  fi
+  if ! iptables -C FORWARD -i awg0 -o "$tun_dev" -j ACCEPT 2>/dev/null; then
+    iptables -A FORWARD -i awg0 -o "$tun_dev" -j ACCEPT || warn "Не удалось добавить FORWARD rule (awg0 → $tun_dev)"
+  fi
+  if ! iptables -C FORWARD -i "$tun_dev" -o awg0 -j ACCEPT 2>/dev/null; then
+    iptables -A FORWARD -i "$tun_dev" -o awg0 -j ACCEPT || warn "Не удалось добавить FORWARD rule ($tun_dev → awg0)"
+  fi
+  if ! iptables -C FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+    iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu || true
+  fi
+
+  ip route add default dev "$tun_dev" table 201 2>/dev/null || true
+  # Селективность по клиентам — только через per-IP правила из $XRAY_PEERS
+  # (как в Warp, см. _warp_up). НЕ добавляем blanket from $client_net: иначе
+  # меню «Клиенты в Xray туннеле» (пункт 8) игнорируется и ВСЕ клиенты подсети
+  # идут через Xray даже после «Выключить всех» / перевода клиента в «напрямую».
+  # Чистим возможное blanket-правило от старой версии:
+  ip rule del from "$client_net" table 201 priority 201 2>/dev/null || true
+
+  _xray_sync_peers 2>/dev/null || true
+  if [[ ! -s "$XRAY_PEERS" ]]; then
+    info "Список клиентов в Xray пуст — добавляем всех по умолчанию"
+    mkdir -p "$XRAY_DIR"
+    while IFS='|' read -r name ip; do
+      [[ -z "$ip" ]] && continue
+      echo "$ip" >> "$XRAY_PEERS"
+    done < <(_warp_list_awg_clients)
+  fi
+
+  _xray_apply_peer_rules
+  peer_count=$(wc -l < "$XRAY_PEERS" 2>/dev/null || echo 0)
+
+  {
+    echo "active"
+    echo "client_net=$client_net"
+    echo "iface=$iface"
+    echo "tun_dev=$tun_dev"
+    echo "tun_mode=$tun_mode"
+  } > "$XRAY_STATE"
+
+  ok "Xray активен (TUN: $tun_dev, режим: $tun_mode): $peer_count клиент(ов) через Xray"
+}
+
+_xray_down() {
+  local tun_dev client_net iface
+  # ВАЖНО: очистка маршрутизации идёт БЕЗУСЛОВНО, не под "if -f $XRAY_STATE".
+  # State пишется в _xray_up последним, уже после правил для клиентов: сбой
+  # между этими шагами оставлял клиентов в таблице 201, а «Выключить туннель»
+  # для маршрутов оказывалось пустышкой — интернета нет и вернуть его нечем.
+  if [[ -f "$XRAY_STATE" ]]; then
+    client_net=$(grep "^client_net=" "$XRAY_STATE" 2>/dev/null | cut -d= -f2 || true)
+    iface=$(grep "^iface=" "$XRAY_STATE" 2>/dev/null | cut -d= -f2 || true)
+    tun_dev=$(grep "^tun_dev=" "$XRAY_STATE" 2>/dev/null | cut -d= -f2 || true)
+  fi
+  tun_dev="${tun_dev:-xray0}"
+  [[ -n "${client_net:-}" ]] || client_net=$(_warp_get_client_net 2>/dev/null || echo "")
+
+  # Снимаем ВСЕ правила на таблицу 201, а не только те IP, что сейчас лежат в
+  # peers.list: список мог измениться после того, как правила были добавлены,
+  # и остатки висели бы вечно.
+  local guard=0
+  while (( guard < 128 )) && ip rule del lookup 201 2>/dev/null; do
+    guard=$((guard + 1))
+  done
+  _xray_remove_peer_rules
+  ip rule del from "$client_net" table 201 priority 201 2>/dev/null || true
+  ip route flush table 201 2>/dev/null || true
+
+  if [[ -n "$client_net" ]]; then
+    iptables -t nat -D POSTROUTING -s "$client_net" -o "$tun_dev" -j MASQUERADE 2>/dev/null || true
+    iptables -D FORWARD -i awg0 -o "$tun_dev" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "$tun_dev" -o awg0 -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  fi
+
+  # awg-xray-tun.service существует только в режиме tun2socks; гасим его
+  # первым, иначе он будет держать xray0 и переподключаться к мёртвому SOCKS.
+  if systemctl is-active --quiet awg-xray-tun.service 2>/dev/null; then
+    systemctl stop awg-xray-tun.service >/dev/null 2>&1 || true
+  fi
+  systemctl reset-failed awg-xray-tun.service >/dev/null 2>&1 || true
+
+  if systemctl is-active --quiet awg-xray.service; then
+    systemctl stop awg-xray.service >/dev/null 2>&1 || true
+  fi
+  systemctl reset-failed awg-xray.service >/dev/null 2>&1 || true
+
+  # Xray удаляет свой TUN-интерфейс при остановке, но чистим на всякий случай
+  if [[ -n "${tun_dev:-}" ]] && ip link show "$tun_dev" &>/dev/null; then
+    info "Удаляем $tun_dev..."
+    ip link delete "$tun_dev" 2>/dev/null || true
+  fi
+
+  rm -f "$XRAY_STATE" 2>/dev/null
+  ok "Xray выключен"
+}
+
+_xray_sync_peers() {
+  # Проверяем, есть ли удалённые клиенты, и чистим их из peers.list
+  if [[ -f "$XRAY_PEERS" ]]; then
+    local tmp_peers
+    tmp_peers=$(mktemp)
+    while read -r ip; do
+      [[ -z "$ip" ]] && continue
+      if _warp_list_awg_clients 2>/dev/null | grep -q "|$ip$"; then
+        echo "$ip" >> "$tmp_peers"
+      fi
+    done < "$XRAY_PEERS"
+    mv "$tmp_peers" "$XRAY_PEERS"
+  fi
+}
+
+_xray_peer_enabled() {
+  local ip="$1"
+  [[ -f "$XRAY_PEERS" ]] && grep -q "^${ip}$" "$XRAY_PEERS" 2>/dev/null
+}
+
+_xray_peer_add() {
+  local ip="$1"
+  _xray_peer_enabled "$ip" || echo "$ip" >> "$XRAY_PEERS"
+}
+
+_xray_peer_del() {
+  local ip="$1"
+  [[ -f "$XRAY_PEERS" ]] && grep -vxF "$ip" "$XRAY_PEERS" > "${XRAY_PEERS}.tmp" && mv "${XRAY_PEERS}.tmp" "$XRAY_PEERS"
+}
+
+_xray_apply_peer_rules() {
+  if [[ -s "$XRAY_PEERS" ]] && ip link show xray0 &>/dev/null; then
+    while read -r ip; do
+      [[ -z "$ip" ]] && continue
+      ip rule del from "$ip" lookup 201 priority 201 2>/dev/null || true
+      if ! ip rule add from "$ip" lookup 201 priority 201 2>/dev/null; then
+        warn "Не удалось добавить ip rule (Xray) для $ip"
+      fi
+    done < "$XRAY_PEERS"
+  fi
+}
+
+_xray_remove_peer_rules() {
+  if [[ -f "$XRAY_PEERS" ]]; then
+    while read -r ip; do
+      [[ -z "$ip" ]] && continue
+      ip rule del from "$ip" lookup 201 priority 201 2>/dev/null || true
+    done < "$XRAY_PEERS"
+  fi
+}
+
+do_xray_peers_menu() {
+  set +e
+  while true; do
+    _xray_sync_peers 2>/dev/null || true
+    clear
+    echo ""
+    hdr "⚙ Клиенты в Xray туннеле"
+    echo ""
+
+    local clients=()
+    while IFS='|' read -r name ip; do
+      [[ -z "$name" || -z "$ip" ]] && continue
+      clients+=("$name|$ip")
+    done < <(_warp_list_awg_clients)
+
+    if [[ ${#clients[@]} -eq 0 ]]; then
+      warn "AWG клиентов нет — добавь через пункт 3"
+      read -rp "Enter..."
+      set -e
+      return 0
+    fi
+
+    local i=1
+    for entry in "${clients[@]}"; do
+      local name="${entry%|*}"
+      local ip="${entry##*|}"
+      if _xray_peer_enabled "$ip"; then
+        echo -e "  ${G}[$i]${N} $name  ${D}$ip${N}  ${C}☁ через Xray${N}"
+      else
+        echo -e "  ${D}[$i]${N} $name  ${D}$ip${N}  ${D}○ напрямую${N}"
+      fi
+      ((i++))
+    done
+    echo ""
+    echo -e "  ${C}a) Включить всех${N}  |  ${D}d) Выключить всех${N}"
+    echo -e "  0) Назад"
+    echo ""
+
+    safe_read P_CHOICE "  Введи номер клиента (или a/d/0): "
+    case "${P_CHOICE:-}" in
+      0) break ;;
+      a|A)
+        for entry in "${clients[@]}"; do
+          _xray_peer_add "${entry##*|}"
+        done
+        _xray_apply_peer_rules
+        ok "Все клиенты направлены через Xray"
+        sleep 1
+        ;;
+      d|D)
+        _xray_remove_peer_rules
+        if ! : > "$XRAY_PEERS" 2>/dev/null; then
+          warn "Не удалось очистить $XRAY_PEERS — права? Правила могли остаться активными"
+        fi
+        ok "Все клиенты идут напрямую (AWG -> eth0)"
+        sleep 1
+        ;;
+      *)
+        if [[ "$P_CHOICE" =~ ^[0-9]+$ ]] && (( P_CHOICE >= 1 && P_CHOICE <= ${#clients[@]} )); then
+          local idx=$((P_CHOICE - 1))
+          local entry="${clients[$idx]}"
+          local name="${entry%|*}"
+          local ip="${entry##*|}"
+          if _xray_peer_enabled "$ip"; then
+            _xray_peer_del "$ip"
+            if ip link show xray0 &>/dev/null; then
+              ip rule del from "$ip" lookup 201 priority 201 2>/dev/null || true
+            fi
+            ok "$name → напрямую"
+          else
+            _xray_peer_add "$ip"
+            if ip link show xray0 &>/dev/null; then
+              ip rule del from "$ip" lookup 201 priority 201 2>/dev/null || true
+              if ! ip rule add from "$ip" lookup 201 priority 201 2>/dev/null; then
+                warn "Не удалось добавить ip rule (Xray) для $ip"
+              fi
+            fi
+            ok "$name → через Xray"
+          fi
+          sleep 1
+        else
+          warn "Неверный выбор"
+          sleep 1
+        fi
+        ;;
+    esac
+  done
+  set -e
+}
+
+
+# === TUN2SOCKS ТУННЕЛЬ ===
+TUN2SOCKS_DIR="/etc/tun2socks"
+TUN2SOCKS_CONF="$TUN2SOCKS_DIR/proxy.txt"
+
+_tun2socks_install() {
+  # Флаг именно --version: у tun2socks 2.x разбор на pflag, и одинарный
+  # "-version" печатает usage и выходит с кодом 2 — из-за этого рабочий
+  # бинарь считался сломанным и качался заново на каждый заход.
+  if command -v tun2socks &>/dev/null && tun2socks --version &>/dev/null; then
+    return 0
+  fi
+  info "Устанавливаем tun2socks..."
+
+  local ts_arch
+  ts_arch=$(_tun2socks_asset)
+  [[ -n "$ts_arch" ]] || { err "Архитектура $(uname -m) не поддерживается tun2socks"; return 1; }
+
+  command -v unzip &>/dev/null || {
+    info "Ставлю unzip (релизы tun2socks — zip-архивы)"
+    apt-get update >/dev/null 2>&1 || true
+    apt-get install -y -q unzip >/dev/null 2>&1 || { err "unzip не установился"; return 1; }
+  }
+
+  # Версию берём из API, но не зависим от неё: latest/download отдаёт тот же
+  # ассет и работает, когда api.github.com недоступен.
+  local tag ver
+  tag=$(curl -4 -fsSL --connect-timeout 8 --max-time 15 \
+    "https://api.github.com/repos/xjasonlyu/tun2socks/releases/latest" 2>/dev/null \
+    | grep -oP '"tag_name"\s*:\s*"\K[^"]+' | head -1 || true)
+  ver="${tag:-latest}"
+
+  local tmpd base asset
+  tmpd=$(mktemp -d) || { err "mktemp провалился"; return 1; }
+  asset="tun2socks-linux-${ts_arch}.zip"
+  if [[ "$ver" == "latest" ]]; then
+    base="https://github.com/xjasonlyu/tun2socks/releases/latest/download"
+  else
+    base="https://github.com/xjasonlyu/tun2socks/releases/download/${ver}"
+  fi
+
+  if ! _gh_fetch "${base}/${asset}" "$tmpd/t2s.zip" 500000 zip; then
+    err "Не удалось скачать tun2socks ни напрямую, ни через зеркала"
+    info "Проверь вручную: ${base}/${asset}"
+    rm -rf "$tmpd"; return 1
+  fi
+
+  if ! unzip -qo "$tmpd/t2s.zip" -d "$tmpd/x"; then
+    err "Ошибка распаковки tun2socks"; rm -rf "$tmpd"; return 1
+  fi
+
+  # В архиве бинарь называется по-разному от релиза к релизу
+  # (tun2socks / tun2socks-linux-amd64), поэтому ищем, а не угадываем.
+  local bin
+  bin=$(find "$tmpd/x" -type f -name 'tun2socks*' ! -name '*.zip' 2>/dev/null | head -1 || true)
+  if [[ -z "$bin" || ! -f "$bin" ]]; then
+    err "В архиве tun2socks нет бинарника"; rm -rf "$tmpd"; return 1
+  fi
+  if ! head -c 4 "$bin" | grep -q $'\x7fELF'; then
+    err "Файл в архиве не является ELF-бинарём"; rm -rf "$tmpd"; return 1
+  fi
+
+  install -m 0755 "$bin" /usr/local/bin/tun2socks || {
+    err "Не удалось установить /usr/local/bin/tun2socks"; rm -rf "$tmpd"; return 1
+  }
+  rm -rf "$tmpd"
+
+  local ver_out="" ver_rc=0
+  ver_out=$(/usr/local/bin/tun2socks --version 2>&1) || ver_rc=$?
+  # 126/127 — бинарь физически не исполняется (чужая архитектура, нет loader'а).
+  # Ненулевой код с осмысленным выводом — не повод паниковать: у разных версий
+  # разные флаги, а нам важно лишь то, что файл вообще запускается.
+  if (( ver_rc == 126 || ver_rc == 127 )) || [[ -z "$ver_out" && $ver_rc -ne 0 ]] \
+     || printf '%s' "$ver_out" | grep -qiE 'GLIBC|error while loading shared|exec format'; then
+    err "Бинарь tun2socks не запускается (код $ver_rc):"
+    printf '%s\n' "$ver_out" | head -3 | sed 's/^/      /'
+    rm -f /usr/local/bin/tun2socks
+    return 1
+  fi
+
+  mkdir -p "$TUN2SOCKS_DIR"
+  if (( ver_rc == 0 )); then
+    ok "tun2socks установлен: $(printf '%s' "$ver_out" | head -n1)"
+  else
+    # Бинарь живой, но --version у него не тот: версию не показываем, чтобы
+    # не выдавать текст ошибки за номер версии.
+    ok "tun2socks установлен"
+  fi
+}
+
+_tun2socks_up() {
+  local proxy_url="$1"
+  if [[ ! "$proxy_url" =~ ^[0-9A-Za-z._-]+:[0-9]+$ ]]; then
+    err "Некорректный IP:PORT ($proxy_url)"
+    return 1
+  fi
+  if ip link show warp0 &>/dev/null; then
+    err "Туннель Warp активен! Warp и tun2socks не могут работать одновременно."
+    return 1
+  fi
+  if ip link show xray0 &>/dev/null; then
+    err "Туннель Xray активен! Xray и tun2socks не могут работать одновременно."
+    return 1
+  fi
+  if systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+    err "Каскад AWG-exit активен! tun2socks и каскад не могут работать одновременно."
+    warn "Выключи каскад (пункт 5 -> 6 -> 4), затем включай tun2socks."
+    return 1
+  fi
+
+  _tun2socks_install || return 1
+  local ts_bin
+  ts_bin=$(command -v tun2socks 2>/dev/null || true)
+  [[ -x "$ts_bin" ]] || ts_bin="/usr/local/bin/tun2socks"
+  if [[ ! -x "$ts_bin" ]]; then
+    err "tun2socks не найден"
+    return 1
+  fi
+
+  mkdir -p "$TUN2SOCKS_DIR"
+  echo "$proxy_url" > "$TUN2SOCKS_CONF"
+
+  local awg_subnet
+  awg_subnet=$(ip -4 route show dev awg0 2>/dev/null | grep -v default | awk '{print $1}' | head -1)
+  if [[ -z "$awg_subnet" ]]; then
+    err "Не удалось определить подсеть awg0. Убедитесь, что сервер запущен."
+    return 1
+  fi
+
+  info "Настраиваем tun2socks (прокси: $proxy_url, подсеть AWG: $awg_subnet)..."
+
+  [[ -e /dev/net/tun ]] || modprobe tun 2>/dev/null || true
+  systemctl stop awg-tun2socks.service 2>/dev/null || true
+
+  # Проверяем прокси НАСТОЯЩИМ запросом и до того, как трогаем маршруты.
+  # Раньше здесь был просто TCP-коннект и предупреждение: сервис поднимался
+  # поверх мёртвого прокси, клиенты уходили в таблицу 100 и теряли интернет —
+  # ровно то, от чего защищён путь Xray.
+  local probe_out=""
+  info "Проверяю SOCKS5 $proxy_url..."
+  if ! probe_out=$(_socks_probe "$proxy_url"); then
+    err "Через $proxy_url трафик не идёт (ответ: $probe_out) — туннель не включаю"
+    info "Клиенты остались на прямом маршруте, маршрутизация не менялась."
+    if [[ "$proxy_url" == "127.0.0.1:10808" || "$proxy_url" == "localhost:10808" ]]; then
+      warn "10808 — это SOCKS-вход самого Xray. Он поднимается своим пунктом:"
+      warn "  5 → 4 → 5) Включить туннель, а не через tun2socks."
+    fi
+    return 1
+  fi
+  ok "SOCKS5 $proxy_url отвечает"
+
+  ip rule del from "$awg_subnet" lookup 100 2>/dev/null || true
+  ip route flush table 100 2>/dev/null || true
+  ip link delete tun0 2>/dev/null || true
+
+  # Маршрутизация живёт отдельным скриптом, а не только в этой функции:
+  # юнит включён в автозапуск, и после перезагрузки tun0 поднимется, а
+  # ip rule/route/iptables — нет. Тогда трафик клиентов молча пошёл бы мимо
+  # прокси, напрямую. ExecStartPost/ExecStopPost чинят ровно это.
+  cat > /usr/local/bin/awg2-tun2socks-routing.sh << 'ROUTEEOF'
+#!/bin/bash
+# AWG Toolza — tun2socks routing manager
+# Generated by awg2.sh, do not edit manually.
+set -u
+
+TUN_DEV="tun0"
+TUN_ADDR="10.30.1.1/24"
+TABLE=100
+SERVER_CONF="/etc/amnezia/amneziawg/awg0.conf"
+
+awg_subnet() {
+  local net
+  net=$(ip -4 route show dev awg0 2>/dev/null | grep -v default | awk '{print $1}' | head -1)
+  [[ -n "$net" ]] && { echo "$net"; return 0; }
+  # awg0 ещё не поднят (порядок юнитов при загрузке) — считаем из конфига
+  [[ -f "$SERVER_CONF" ]] || return 1
+  local addr
+  addr=$(awk -F'=' '/^Address/{gsub(/ /,"",$2); print $2; exit}' "$SERVER_CONF")
+  [[ -n "$addr" ]] || return 1
+  addr="${addr%%,*}"
+  python3 -c "import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1], strict=False))" "$addr" 2>/dev/null
+}
+
+start() {
+  local net i
+  net=$(awg_subnet) || { echo "не определить подсеть awg0" >&2; return 1; }
+
+  for i in $(seq 1 20); do
+    ip link show "$TUN_DEV" &>/dev/null && break
+    sleep 0.5
+  done
+  ip link show "$TUN_DEV" &>/dev/null || { echo "$TUN_DEV не появился" >&2; return 1; }
+
+  ip addr add "$TUN_ADDR" dev "$TUN_DEV" 2>/dev/null || true
+  ip link set "$TUN_DEV" up 2>/dev/null || true
+  sysctl -qw net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  # loose rp_filter на обоих концах: обратный путь для адреса клиента ведёт в
+  # таблицу 100 (default dev tun0), а пакет пришёл на awg0 — строгая проверка
+  # такие пакеты дропает.
+  sysctl -qw net.ipv4.conf."$TUN_DEV".rp_filter=2 >/dev/null 2>&1 || true
+  sysctl -qw net.ipv4.conf.awg0.rp_filter=2 >/dev/null 2>&1 || true
+
+  ip route replace default dev "$TUN_DEV" table "$TABLE" || return 1
+  # priority задаём явно: без него ядро выбирает её само, и удалить правило
+  # по тому же выражению потом не всегда получается.
+  ip rule del from "$net" lookup "$TABLE" priority "$TABLE" 2>/dev/null || true
+  ip rule add from "$net" lookup "$TABLE" priority "$TABLE" || return 1
+
+  iptables -t nat -C POSTROUTING -s "$net" -o "$TUN_DEV" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -s "$net" -o "$TUN_DEV" -j MASQUERADE || true
+  iptables -C FORWARD -i awg0 -o "$TUN_DEV" -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i awg0 -o "$TUN_DEV" -j ACCEPT || true
+  iptables -C FORWARD -i "$TUN_DEV" -o awg0 -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "$TUN_DEV" -o awg0 -j ACCEPT || true
+}
+
+stop() {
+  local net
+  net=$(awg_subnet 2>/dev/null || true)
+  if [[ -n "$net" ]]; then
+    ip rule del from "$net" lookup "$TABLE" priority "$TABLE" 2>/dev/null || true
+    ip rule del from "$net" lookup "$TABLE" 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -s "$net" -o "$TUN_DEV" -j MASQUERADE 2>/dev/null || true
+    iptables -D FORWARD -i awg0 -o "$TUN_DEV" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "$TUN_DEV" -o awg0 -j ACCEPT 2>/dev/null || true
+  fi
+  ip route flush table "$TABLE" 2>/dev/null || true
+}
+
+case "${1:-}" in
+  start) start ;;
+  stop)  stop ;;
+  *) echo "usage: $0 start|stop" >&2; exit 1 ;;
+esac
+ROUTEEOF
+  chmod 0755 /usr/local/bin/awg2-tun2socks-routing.sh
+
+  cat > /etc/systemd/system/awg-tun2socks.service << EOF
+[Unit]
+Description=AWG tun2socks proxy
+After=network-online.target awg-quick@awg0.service
+Wants=awg-quick@awg0.service
+
+[Service]
+Type=simple
+ExecStart=$ts_bin --device tun://tun0 --proxy socks5://$proxy_url --loglevel info
+ExecStartPost=/usr/local/bin/awg2-tun2socks-routing.sh start
+ExecStopPost=/usr/local/bin/awg2-tun2socks-routing.sh stop
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  if ! systemctl enable --now awg-tun2socks.service; then
+    err "Ошибка запуска awg-tun2socks.service"
+    journalctl -u awg-tun2socks.service -n 30 --no-pager || true
+    return 1
+  fi
+
+  local i
+  for i in $(seq 1 10); do
+    ip link show tun0 &>/dev/null && break
+    sleep 1
+  done
+  if ! ip link show tun0 &>/dev/null; then
+    err "Интерфейс tun0 не появился"
+    journalctl -u awg-tun2socks.service -n 30 --no-pager || true
+    systemctl disable --now awg-tun2socks.service >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  # ExecStartPost уже прогнал маршрутизацию; повторяем явно, чтобы поймать
+  # ошибку здесь и сразу откатиться, а не оставить наполовину поднятый туннель.
+  if ! /usr/local/bin/awg2-tun2socks-routing.sh start; then
+    err "Не удалось настроить маршрутизацию для $awg_subnet"
+    _tun2socks_down
+    return 1
+  fi
+
+  sleep 1
+  if systemctl is-active --quiet awg-tun2socks.service; then
+    ok "Туннель tun2socks успешно запущен"
+  else
+    err "Ошибка запуска awg-tun2socks.service"
+    journalctl -u awg-tun2socks.service -n 30 --no-pager || true
+    return 1
+  fi
+}
+
+_tun2socks_down() {
+  info "Останавливаем tun2socks..."
+  # Тот же скрипт, что и в ExecStopPost: правила снимает та же логика, что их
+  # ставила, включая случай, когда awg0 уже опущен и подсеть берётся из конфига.
+  if [[ -x /usr/local/bin/awg2-tun2socks-routing.sh ]]; then
+    /usr/local/bin/awg2-tun2socks-routing.sh stop >/dev/null 2>&1 || true
+  else
+    # Установка из старой версии — чистим по месту
+    local awg_subnet
+    awg_subnet=$(ip -4 route show dev awg0 2>/dev/null | grep -v default | awk '{print $1}' | head -1 || true)
+    if [[ -n "$awg_subnet" ]]; then
+      iptables -t nat -D POSTROUTING -s "$awg_subnet" -o tun0 -j MASQUERADE 2>/dev/null || true
+      ip rule del from "$awg_subnet" lookup 100 priority 100 2>/dev/null || true
+      ip rule del from "$awg_subnet" lookup 100 2>/dev/null || true
+    fi
+    iptables -D FORWARD -i awg0 -o tun0 -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i tun0 -o awg0 -j ACCEPT 2>/dev/null || true
+    ip route flush table 100 2>/dev/null || true
+  fi
+
+  systemctl disable --now awg-tun2socks.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/awg-tun2socks.service /usr/local/bin/awg2-tun2socks-routing.sh
+  systemctl daemon-reload
+  systemctl reset-failed awg-tun2socks.service >/dev/null 2>&1 || true
+  ip link delete tun0 2>/dev/null || true
+  ok "Туннель tun2socks остановлен"
+}
+
+
+do_tun2socks_menu() {
+  set +e
+  while true; do
+    clear
+    echo ""
+    hdr "🧦 tun2socks прокси (заворачивание AWG во внутренний прокси)"
+    echo ""
+
+    if systemctl is-active --quiet awg-tun2socks.service 2>/dev/null; then
+      local proxy_ip="неизвестно"
+      [[ -f "$TUN2SOCKS_CONF" ]] && proxy_ip=$(cat "$TUN2SOCKS_CONF")
+      echo -e "  Статус: ${G}● Активен${N}"
+      echo -e "  Прокси: ${Y}$proxy_ip${N}"
+      echo ""
+      echo -e "  ${C}1)${N} Выключить туннель"
+      echo -e "  ${C}2)${N} Просмотр логов"
+      echo ""
+      echo -e "  ${W}0)${N} ← Назад"
+      echo ""
+      safe_read S_CHOICE "  Выбор [0-2]: "
+      case "${S_CHOICE:-}" in
+        1) _tun2socks_down; sleep 2 ;;
+        2) journalctl -u awg-tun2socks.service -n 50 --no-pager; read -rp "Enter..." ;;
+        0) break ;;
+        *) warn "Неверный выбор" ;;
+      esac
+    else
+      local saved_proxy=""
+      [[ -f "$TUN2SOCKS_CONF" ]] && saved_proxy=$(cat "$TUN2SOCKS_CONF")
+      echo -e "  Статус: ${D}○ Выключен${N}"
+      if [[ -n "$saved_proxy" ]]; then
+        echo -e "  Сохраненный прокси: ${D}$saved_proxy${N}"
+      fi
+      echo ""
+      echo -e "  ${C}1)${N} Включить туннель"
+      echo ""
+      echo -e "  ${W}0)${N} ← Назад"
+      echo ""
+      safe_read S_CHOICE "  Выбор [0-1]: "
+      case "${S_CHOICE:-}" in
+        1)
+          # По умолчанию раньше подставлялся 127.0.0.1:10808 — порт SOCKS
+          # самого Xray. Но включить tun2socks на него нельзя: выше стоит
+          # запрет при поднятом xray0, то есть значение годилось лишь когда
+          # Xray выключен и на порту никого нет. Подсказка вела в тупик.
+          local default_proxy="$saved_proxy"
+          if [[ -n "$default_proxy" ]]; then
+            safe_read p "  Введи IP:PORT для SOCKS5 прокси [Enter = $default_proxy]: "
+            [[ -z "$p" ]] && p="$default_proxy"
+          else
+            echo -e "  ${D}Адрес готового SOCKS5-прокси, например 127.0.0.1:1080.${N}"
+            echo -e "  ${D}Для туннеля Xray это не нужно — он поднимается пунктом 5 → 4.${N}"
+            safe_read p "  Введи IP:PORT для SOCKS5 прокси: "
+          fi
+          if [[ -z "$p" ]]; then
+            warn "Адрес не указан"
+            sleep 1
+            continue
+          fi
+          _tun2socks_up "$p"
+          sleep 2
+          ;;
+        0) break ;;
+        *) warn "Неверный выбор" ;;
+      esac
+    fi
+  done
+  set -e
+}
+
+# ==========================================
+# =         AWG EXIT NODES ROUTING         =
+# ==========================================
+
+# Строка списка: "IP" — общий выход каскада, "IP|нода" — персональная нода.
+# Старые файлы состоят из одних IP, поэтому вторая часть необязательна и все
+# функции ниже одинаково понимают оба вида.
+_exits_peer_enabled() {
+  local ip="$1"
+  [[ ! -f "$AWG_EXITS_PEERS" ]] && return 1
+  grep -qE "^${ip//./\\.}(\||\$)" "$AWG_EXITS_PEERS"
+}
+
+# Имя ноды, назначенной клиенту. Пусто — общий выход каскада.
+_exits_peer_node() {
+  local ip="$1" line
+  [[ ! -f "$AWG_EXITS_PEERS" ]] && return 0
+  line=$(grep -E "^${ip//./\\.}(\||\$)" "$AWG_EXITS_PEERS" 2>/dev/null | head -1 || true)
+  [[ "$line" == *"|"* ]] && echo "${line#*|}"
+  return 0
+}
+
+_exits_peer_add() {
+  local ip="$1" node="${2:-}"
+  mkdir -p "$AWG_EXITS_DIR"
+  touch "$AWG_EXITS_PEERS"
+  # Переназначение ноды — это удалить и записать заново, иначе в списке
+  # окажутся две строки на один IP и правил тоже станет два.
+  _exits_peer_remove "$ip"
+  if [[ -n "$node" ]]; then
+    echo "${ip}|${node}" >> "$AWG_EXITS_PEERS"
+  else
+    echo "$ip" >> "$AWG_EXITS_PEERS"
+  fi
+}
+
+_exits_peer_remove() {
+  local ip="$1"
+  [[ ! -f "$AWG_EXITS_PEERS" ]] && return 0
+  grep -vE "^${ip//./\\.}(\||\$)" "$AWG_EXITS_PEERS" > "$AWG_EXITS_PEERS.tmp" 2>/dev/null || true
+  mv "$AWG_EXITS_PEERS.tmp" "$AWG_EXITS_PEERS" 2>/dev/null || true
+}
+
+_exits_sync_peers() {
+  [[ ! -f "$AWG_EXITS_PEERS" ]] && return 0
+  [[ ! -f "$SERVER_CONF" ]] && {
+    : > "$AWG_EXITS_PEERS"
+    return 0
+  }
+
+  local live_ips
+  live_ips=$(_warp_list_awg_clients | awk -F'|' '{print $2}' | sort -u)
+
+  if [[ -z "$live_ips" ]]; then
+    : > "$AWG_EXITS_PEERS"
+    return 0
+  fi
+
+  local tmp="${AWG_EXITS_PEERS}.tmp"
+  : > "$tmp"
+  local line peer_ip
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    peer_ip="${line%%|*}"
+    if echo "$live_ips" | grep -qxF "$peer_ip"; then
+      # Строку сохраняем как есть — вместе с назначенной нодой.
+      echo "$line" >> "$tmp"
+    else
+      if systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+        # Правило могло уйти в персональную таблицу, поэтому снимаем по
+        # приоритету, а не по номеру таблицы: приоритет у всех наш, 202.
+        ip rule del from "$peer_ip" priority 202 2>/dev/null || true
+      fi
+    fi
+  done < "$AWG_EXITS_PEERS"
+  mv "$tmp" "$AWG_EXITS_PEERS"
+}
+
+_exits_install_routing_files() {
+  local script_path="/usr/local/bin/awg2-exits-routing.sh"
+  local service_path="/etc/systemd/system/awg-exits-routing.service"
+
+  cat > "$script_path" << 'EOF'
+#!/bin/bash
+# AWG Toolza — Exit nodes routing manager
+# Generated by awg2.sh, do not edit manually.
+set -u
+
+AWG_EXITS_DIR="/etc/amnezia/amneziawg"
+AWG_EXITS_PEERS="$AWG_EXITS_DIR/exits_peers.list"
+AWG_EXITS_STATE="$AWG_EXITS_DIR/exits_state"
+SERVER_CONF="$AWG_EXITS_DIR/awg0.conf"
+
+# Персональные таблицы: по одной на exit-ноду, чтобы разные клиенты могли
+# выходить через разные ноды. Общая таблица 202 остаётся для тех, кому
+# конкретная нода не назначена.
+#
+# Номер считаем от алфавитного порядка конфигов, а не храним: между stop и
+# start правила и таблицы всё равно пересоздаются целиком, поэтому съехавший
+# после добавления ноды номер ничего не ломает. Диапазон 210-249 выбран так,
+# чтобы не задеть занятые awg2 таблицы 100 (tun2socks), 200 (Warp), 201 (Xray)
+# и 202 (общий выход каскада).
+EXITS_TABLE_BASE=210
+EXITS_TABLE_MAX=249
+
+exit_table_for() {
+  local want="$1" idx=0 conf name
+  for conf in $(ls -1 "$AWG_EXITS_DIR"/awg-exit-*.conf 2>/dev/null | sort); do
+    [[ -f "$conf" ]] || continue
+    name=$(basename "$conf" .conf)
+    name="${name#awg-exit-}"
+    if [[ "$name" == "$want" ]]; then
+      local t=$((EXITS_TABLE_BASE + idx))
+      (( t > EXITS_TABLE_MAX )) && return 1
+      echo "$t"
+      return 0
+    fi
+    idx=$((idx + 1))
+  done
+  return 1
+}
+
+# Все наши таблицы разом — для очистки. Чистить надо и те, что остались от
+# прошлой конфигурации: нода могла быть удалена, а правило от неё — нет.
+exits_clear_rules() {
+  local t
+  while ip rule del lookup 202 2>/dev/null; do :; done
+  ip route flush table 202 2>/dev/null || true
+  for t in $(seq $EXITS_TABLE_BASE $EXITS_TABLE_MAX); do
+    while ip rule del lookup "$t" 2>/dev/null; do :; done
+    ip route flush table "$t" 2>/dev/null || true
+  done
+}
+
+get_client_net() {
+  [[ ! -f "$SERVER_CONF" ]] && return 1
+  local addr
+  addr=$(awk -F'=' '/^Address/{gsub(/ /,"",$2); print $2; exit}' "$SERVER_CONF")
+  [[ -z "$addr" ]] && return 1
+  addr="${addr%%,*}"   # только первый IPv4 (dual-stack safe)
+  # Корректная база сети для ЛЮБОГО префикса (не только /24).
+  # Раньше тупо ставили 4-й октет в .0 — для /23,/22 с сервером в верхней
+  # половине диапазона получалась неверная сеть и часть клиентов выпадала.
+  if command -v python3 &>/dev/null; then
+    local net
+    net=$(python3 -c "import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1], strict=False))" "$addr" 2>/dev/null) \
+      && [[ -n "$net" ]] && { echo "$net"; return 0; }
+  fi
+  # Fallback (корректен только для /24): 4-й октет в .0
+  local ip_part="${addr%/*}"
+  local mask="${addr#*/}"
+  echo "$ip_part" | awk -F. -v m="$mask" '{print $1"."$2"."$3".0/"m}'
+}
+
+start_routing() {
+  [[ ! -f "$AWG_EXITS_STATE" ]] && { echo "exits_state missing" >&2; exit 0; }
+
+  local mode balancer single_exit
+  mode=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || true)
+  mode="${mode:-all}"
+  balancer=$(grep "^balancer=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || true)
+  balancer="${balancer:-single}"
+  single_exit=$(grep "^single_exit=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || true)
+  single_exit="${single_exit:-}"
+
+  local configured_interfaces=()
+  for conf in "$AWG_EXITS_DIR"/awg-exit-*.conf; do
+    [[ ! -f "$conf" ]] && continue
+    configured_interfaces+=("$(basename "$conf" .conf)")
+  done
+
+  # Wait for interfaces to appear in kernel (crucial on boot)
+  if [[ ${#configured_interfaces[@]} -gt 0 ]]; then
+    echo "Waiting for interfaces to appear in kernel..." >&2
+    for i in $(seq 1 10); do
+      local all_up=true
+      for iface in "${configured_interfaces[@]}"; do
+        if ! ip link show "$iface" &>/dev/null; then
+          all_up=false
+          break
+        fi
+      done
+      if $all_up; then
+        break
+      fi
+      sleep 0.5
+    done
+  fi
+
+  local up_interfaces=()
+  for iface in "${configured_interfaces[@]}"; do
+    if ip link show "$iface" &>/dev/null; then
+      up_interfaces+=("$iface")
+    fi
+  done
+
+  if [[ ${#up_interfaces[@]} -eq 0 ]]; then
+    echo "No active awg-exit-* interfaces found. Cannot start routing." >&2
+    exit 1
+  fi
+
+  # Чистим и общую таблицу, и все персональные: конфигурация могла
+  # измениться, а правила от прошлого запуска остаться.
+  exits_clear_rules
+
+  local client_net
+  client_net=$(get_client_net) || { echo "cannot get client net" >&2; exit 1; }
+
+  # Маршрут по умолчанию в таблице 202 — единственное, ради чего всё это.
+  # Его результат ОБЯЗАТЕЛЬНО проверяется: без default в 202 клиенты, чьи
+  # ip rule уже указывают на эту таблицу, остаются без выхода вообще.
+  local single_target=""
+  if [[ -n "$single_exit" ]] && ip link show "awg-exit-$single_exit" &>/dev/null; then
+    single_target="awg-exit-$single_exit"
+  else
+    single_target="${up_interfaces[0]}"
+  fi
+
+  local applied=""
+  if [[ "$balancer" == "ecmp" && ${#up_interfaces[@]} -gt 1 ]]; then
+    local route_args=("ip" "route" "replace" "default" "table" "202")
+    for iface in "${up_interfaces[@]}"; do
+      route_args+=("nexthop" "dev" "$iface" "weight" "1")
+    done
+    if "${route_args[@]}" 2>/dev/null; then
+      # L4-хеш: поток липнет к одной ноде по 5-кортежу, иначе пакеты одного
+      # соединения разъезжались бы по разным выходам и его рвало бы.
+      sysctl -w net.ipv4.fib_multipath_hash_policy=1 >/dev/null 2>&1 || true
+      applied="ECMP: ${up_interfaces[*]}"
+    else
+      # Многопутёвая маршрутизация может быть не собрана в ядре
+      # (CONFIG_IP_ROUTE_MULTIPATH). Молчать нельзя: без отката в таблице
+      # не осталось бы ни одного маршрута.
+      echo "ECMP не принят ядром — откатываюсь на одну ноду" >&2
+      ip route replace default dev "$single_target" table 202 2>/dev/null \
+        && applied="single (откат с ECMP): $single_target"
+    fi
+  else
+    ip route replace default dev "$single_target" table 202 2>/dev/null \
+      && applied="single: $single_target"
+  fi
+
+  if [[ -z "$applied" ]] || ! ip route show table 202 2>/dev/null | grep -q '^default'; then
+    echo "не удалось поставить маршрут по умолчанию в таблицу 202" >&2
+    ip rule del from all lookup 202 2>/dev/null || true
+    exit 1
+  fi
+  echo "Routing through $applied"
+
+  sysctl -w net.ipv4.conf.awg0.rp_filter=2 >/dev/null 2>&1 || true
+  for iface in "${up_interfaces[@]}"; do
+    sysctl -w net.ipv4.conf."$iface".rp_filter=2 >/dev/null 2>&1 || true
+  done
+
+  for iface in "${up_interfaces[@]}"; do
+    iptables -t nat -C POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE 2>/dev/null || \
+      iptables -t nat -A POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE
+    iptables -C FORWARD -i awg0 -o "$iface" -j ACCEPT 2>/dev/null || \
+      iptables -A FORWARD -i awg0 -o "$iface" -j ACCEPT
+    iptables -C FORWARD -i "$iface" -o awg0 -j ACCEPT 2>/dev/null || \
+      iptables -A FORWARD -i "$iface" -o awg0 -j ACCEPT
+  done
+
+  if [[ "$mode" == "all" ]]; then
+    ip rule add from "$client_net" lookup 202 priority 202
+  else
+    if [[ -f "$AWG_EXITS_PEERS" ]]; then
+      # Формат строки: "IP" — общий выход каскада (таблица 202), либо
+      # "IP|нода" — персональная нода. Старые файлы состоят из одних IP,
+      # поэтому вторая часть необязательна.
+      #
+      # Список пишется скриптом, но пережил и ручные правки, и старые версии.
+      # Мусорная строка здесь стоила бы всей маршрутизации: ip rule add падает,
+      # остальные адреса не доезжают.
+      local line peer_ip peer_node peer_table
+      while IFS= read -r line; do
+        line="${line//[[:space:]]/}"
+        [[ -z "$line" ]] && continue
+        peer_ip="${line%%|*}"
+        peer_node=""
+        [[ "$line" == *"|"* ]] && peer_node="${line#*|}"
+        [[ "$peer_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] || {
+          echo "пропускаю некорректную строку в $AWG_EXITS_PEERS: $line" >&2
+          continue
+        }
+
+        peer_table=202
+        if [[ -n "$peer_node" ]]; then
+          # Нода могла быть удалена или лежать: молча увести клиента в
+          # несуществующую таблицу — значит оставить его без интернета.
+          # Откатываемся на общий выход и говорим об этом в лог.
+          if ! ip link show "awg-exit-$peer_node" &>/dev/null; then
+            echo "нода $peer_node для $peer_ip не поднята — общий выход" >&2
+          elif ! peer_table=$(exit_table_for "$peer_node"); then
+            echo "нет номера таблицы для ноды $peer_node — общий выход" >&2
+            peer_table=202
+          else
+            if ! ip route replace default dev "awg-exit-$peer_node" table "$peer_table" 2>/dev/null; then
+              echo "не удалось поставить маршрут для ноды $peer_node — общий выход" >&2
+              peer_table=202
+            fi
+          fi
+        fi
+        ip rule add from "$peer_ip" lookup "$peer_table" priority 202 || true
+      done < "$AWG_EXITS_PEERS"
+    fi
+  fi
+  echo "Routing rules applied successfully."
+}
+
+stop_routing() {
+  local client_net
+  client_net=$(get_client_net) || client_net=""
+
+  exits_clear_rules
+
+  for conf in "$AWG_EXITS_DIR"/awg-exit-*.conf; do
+    [[ ! -f "$conf" ]] && continue
+    local fullname
+    fullname=$(basename "$conf" .conf)
+    if [[ -n "$client_net" ]]; then
+      iptables -t nat -D POSTROUTING -s "$client_net" -o "$fullname" -j MASQUERADE 2>/dev/null || true
+      iptables -D FORWARD -i awg0 -o "$fullname" -j ACCEPT 2>/dev/null || true
+      iptables -D FORWARD -i "$fullname" -o awg0 -j ACCEPT 2>/dev/null || true
+    fi
+  done
+  echo "Routing rules cleared."
+}
+
+case "${1:-}" in
+  start)
+    start_routing
+    ;;
+  stop)
+    stop_routing
+    ;;
+  *)
+    echo "Usage: $0 {start|stop}" >&2
+    exit 1
+    ;;
+esac
+EOF
+
+  chmod +x "$script_path"
+
+  cat > "$service_path" << 'EOF'
+[Unit]
+Description=AWG Toolza Exits Routing
+After=network-online.target awg-quick@awg0.service
+Wants=awg-quick@awg0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/awg2-exits-routing.sh start
+ExecStop=/usr/local/bin/awg2-exits-routing.sh stop
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  chmod 644 "$service_path"
+}
+
+_exits_status() {
+  local active_interfaces=()
+  local files
+  files=$(find "$AWG_EXITS_DIR" -maxdepth 1 -name "awg-exit-*.conf" 2>/dev/null || echo "")
+  if [[ -n "$files" ]]; then
+    for conf in $files; do
+      [[ ! -f "$conf" ]] && continue
+      local fullname
+      fullname=$(basename "$conf" .conf)
+      if ip link show "$fullname" &>/dev/null; then
+        active_interfaces+=("$fullname")
+      fi
+    done
+  fi
+
+  if [[ ${#active_interfaces[@]} -gt 0 ]]; then
+    echo -e "  Активные интерфейсы: ${G}${active_interfaces[*]}${N}"
+  else
+    echo -e "  Активные интерфейсы: ${D}нет${N}"
+  fi
+
+  if [[ -f "$AWG_EXITS_STATE" ]]; then
+    local state_val
+    state_val=$(head -1 "$AWG_EXITS_STATE" 2>/dev/null)
+    if [[ "$state_val" == "active" ]]; then
+      local mode
+      mode=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || true)
+      mode="${mode:-all}"
+      local balancer
+      balancer=$(grep "^balancer=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || true)
+      balancer="${balancer:-single}"
+      # Файл состояния говорит лишь о том, что настраивали. Работает ли оно
+      # сейчас — знает только systemd; раньше статус показывал «Включена»
+      # при мёртвой службе.
+      if ! systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+        echo -e "  Маршрутизация       : ${Y}○ настроена, но служба не запущена${N}"
+        echo -e "  ${D}  включить: пункт 4${N}"
+      elif [[ "$mode" == "all" ]]; then
+        echo -e "  Маршрутизация       : ${G}● Включена (все клиенты)${N}"
+      else
+        local p_count=0
+        [[ -f "$AWG_EXITS_PEERS" ]] && p_count=$(wc -l < "$AWG_EXITS_PEERS" 2>/dev/null || echo 0)
+        echo -e "  Маршрутизация       : ${G}● Включена (выборочно: $p_count кл.)${N}"
+      fi
+      if [[ "$balancer" == "ecmp" ]]; then
+        echo -e "  Режим балансировки  : ${Y}● ECMP балансировка${N}"
+      else
+        local single_exit
+        single_exit=$(grep "^single_exit=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || true)
+        single_exit="${single_exit:-unknown}"
+        echo -e "  Режим балансировки  : ${C}Single Exit ($single_exit)${N}"
+      fi
+
+      # Show real kernel state
+      echo ""
+      echo -e "${W}Текущие правила ядра (ip rule lookup 202):${N}"
+      local rule_out
+      rule_out=$(ip rule show | grep "lookup 202" || echo "")
+      if [[ -n "$rule_out" ]]; then
+        echo "$rule_out" | sed 's/^/  /'
+      else
+        echo -e "  ${D}(нет правил в ядре)${N}"
+      fi
+
+      echo -e "${W}Таблица маршрутизации 202:${N}"
+      local route_out
+      route_out=$(ip route show table 202 || echo "")
+      if [[ -n "$route_out" ]]; then
+        echo "$route_out" | sed 's/^/  /'
+      else
+        echo -e "  ${D}(таблица пуста)${N}"
+      fi
+    else
+      echo -e "  Маршрутизация       : ${D}○ Выключена${N}"
+    fi
+  else
+    echo -e "  Маршрутизация       : ${D}○ Выключена${N}"
+  fi
+
+  if ip link show warp0 &>/dev/null; then
+    warn "Конфликт: Warp туннель активен! Отключите Warp для корректной работы каскада."
+  fi
+  if ip link show xray0 &>/dev/null; then
+    warn "Конфликт: Xray туннель активен! Отключите Xray для корректной работы каскада."
+  fi
+  if systemctl is-active --quiet awg-tun2socks.service 2>/dev/null; then
+    warn "Конфликт: tun2socks прокси активен! Отключите tun2socks для корректной работы каскада."
+  fi
+}
+
+_exits_add() {
+  local name
+  safe_read name "Введите имя exit-ноды (до 6 символов, только латиница/цифры): "
+  if [[ -z "$name" ]]; then
+    warn "Имя пустое"
+    return 1
+  fi
+  if [[ ! "$name" =~ ^[a-zA-Z0-9_]{1,6}$ ]]; then
+    err "Недопустимое имя. Только латинские буквы, цифры и _, длина от 1 до 6 символов."
+    return 1
+  fi
+
+  local conf_path="$AWG_EXITS_DIR/awg-exit-$name.conf"
+  if [[ -f "$conf_path" ]]; then
+    err "Exit-нода с именем '$name' уже существует."
+    return 1
+  fi
+
+  echo ""
+  echo -e "  ${W}Выберите способ добавления конфигурации:${N}"
+  echo -e "  ${C}1)${N} Скопировать и вставить текст конфига (через редактор nano)"
+  echo -e "  ${C}2)${N} Указать путь к локальному файлу .conf"
+  echo ""
+  local method=1
+  safe_read method "Выбор [1-2] (Enter = 1): "
+  method="${method:-1}"
+
+  local temp_conf
+  temp_conf=$(mktemp)
+  if [[ "$method" == "1" ]]; then
+    # nano есть не в каждом минимальном образе — берём что найдётся.
+    local editor="${EDITOR:-}"
+    if [[ -z "$editor" ]] || ! command -v "$editor" &>/dev/null; then
+      for editor in nano vi vim; do command -v "$editor" &>/dev/null && break; editor=""; done
+    fi
+    if [[ -z "$editor" ]]; then
+      err "Не найден текстовый редактор (nano/vi). Используй способ 2 — путь к файлу."
+      rm -f "$temp_conf"
+      return 1
+    fi
+    info "Открываем $editor. Вставьте конфиг, сохраните и выйдите."
+    sleep 1
+    "$editor" "$temp_conf"
+  elif [[ "$method" == "2" ]]; then
+    local path
+    safe_read path "Введите абсолютный путь к файлу .conf: "
+    if [[ ! -f "$path" ]]; then
+      err "Файл не найден по пути: $path"
+      rm -f "$temp_conf"
+      return 1
+    fi
+    cp "$path" "$temp_conf"
+  else
+    warn "Неверный выбор"
+    rm -f "$temp_conf"
+    return 1
+  fi
+
+  if [[ ! -s "$temp_conf" ]]; then
+    err "Конфигурация пуста или не была введена"
+    rm -f "$temp_conf"
+    return 1
+  fi
+
+  if ! grep -qi '^\[Interface\]' "$temp_conf"; then
+    err "Ошибка: В конфигурации отсутствует секция [Interface]"
+    rm -f "$temp_conf"
+    return 1
+  fi
+  if ! grep -qiE '^\s*Endpoint\s*=' "$temp_conf"; then
+    err "Ошибка: в конфигурации нет Endpoint — это не конфиг клиента к exit-ноде"
+    rm -f "$temp_conf"
+    return 1
+  fi
+
+  # Table = off обязателен: без него awg-quick пропишет свой default route в
+  # главную таблицу, и через exit-ноду уедет весь сервер, включая SSH.
+  # Поэтому и вставка, и её результат проверяются — молча пропустить нельзя.
+  if ! python3 - "$temp_conf" << 'PYEOF'
+import sys, re
+path = sys.argv[1]
+content = open(path, 'r').read()
+
+lines = content.split('\n')
+new_lines = []
+in_interface = False
+
+for line in lines:
+    if re.match(r'^\s*\[\s*interface\s*\]', line, re.I):
+        in_interface = True
+        new_lines.append(line)
+        continue
+    if in_interface and re.match(r'^\s*\[', line):
+        in_interface = False
+    if in_interface and re.match(r'^\s*table\s*=', line, re.I):
+        continue
+    # DNS из конфига exit-ноды выбрасываем по той же причине, что и Table:
+    # это транзитный туннель, а не VPN самого сервера. awg-quick на строку DNS
+    # зовёт resolvconf — если его нет, интерфейс просто не поднимается (в логе
+    # "resolvconf -a ..." и сразу "ip link delete"); а если он есть, awg-quick
+    # перепишет /etc/resolv.conf, и DNS всего сервера уедет в exit-ноду.
+    if in_interface and re.match(r'^\s*dns\s*=', line, re.I):
+        continue
+    new_lines.append(line)
+
+for i, line in enumerate(new_lines):
+    if re.match(r'^\s*\[\s*interface\s*\]', line, re.I):
+        new_lines.insert(i + 1, 'Table = off')
+        break
+
+open(path, 'w').write('\n'.join(new_lines))
+PYEOF
+  then
+    err "Не удалось подготовить конфиг exit-ноды"
+    rm -f "$temp_conf"
+    return 1
+  fi
+  if ! grep -qiE '^\s*Table\s*=\s*off' "$temp_conf"; then
+    err "В конфиг не удалось добавить «Table = off» — отказываюсь ставить exit-ноду"
+    rm -f "$temp_conf"
+    return 1
+  fi
+
+  mkdir -p "$AWG_EXITS_DIR"
+  # install, а не cp + chmod: между ними файл с приватным ключом успевает
+  # полежать с правами по umask (644).
+  install -m 600 "$temp_conf" "$conf_path" || {
+    err "Не удалось записать $conf_path"; rm -f "$temp_conf"; return 1
+  }
+  rm -f "$temp_conf"
+
+  info "Запуск туннеля awg-exit-$name..."
+  systemctl daemon-reload
+  systemctl enable "awg-quick@awg-exit-$name" >/dev/null 2>&1
+  systemctl start "awg-quick@awg-exit-$name" >/dev/null 2>&1
+
+  sleep 2
+  if ip link show "awg-exit-$name" &>/dev/null; then
+    ok "Exit-нода '$name' успешно добавлена и запущена!"
+
+    local make_active="n"
+    read_yesno make_active "Сделать её активной exit-нодой прямо сейчас? [Y/n]: " "y"
+    if [[ "$make_active" == "y" ]]; then
+      local mode_val="all"
+      if [[ -f "$AWG_EXITS_STATE" ]]; then
+        mode_val=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || true)
+        mode_val="${mode_val:-all}"
+      fi
+      cat > "$AWG_EXITS_STATE" << EOF
+active
+mode=$mode_val
+balancer=single
+single_exit=$name
+EOF
+      ok "Exit-нода '$name' назначена активной!"
+      _exits_apply_routing
+    else
+      if [[ -f "$AWG_EXITS_STATE" ]]; then
+        local state_val
+        state_val=$(head -1 "$AWG_EXITS_STATE" 2>/dev/null)
+        if [[ "$state_val" == "active" ]]; then
+          _exits_apply_routing
+        fi
+      fi
+    fi
+  else
+    err "Ошибка запуска: интерфейс awg-exit-$name не поднялся."
+    warn "Логи запуска: journalctl -u awg-quick@awg-exit-$name -n 20 --no-pager"
+    journalctl -u "awg-quick@awg-exit-$name" -n 10 --no-pager
+    systemctl disable "awg-quick@awg-exit-$name" >/dev/null 2>&1 || true
+    rm -f "$conf_path"
+  fi
+}
+
+_exits_list() {
+  local files
+  files=$(find "$AWG_EXITS_DIR" -maxdepth 1 -name "awg-exit-*.conf" 2>/dev/null || echo "")
+  if [[ -z "$files" ]]; then
+    warn "Нет настроенных AWG exit-нод."
+    return 0
+  fi
+
+  echo ""
+  echo -e "${W}Список настроенных AWG exit-нод:${N}"
+  echo ""
+
+  for conf in $files; do
+    [[ ! -f "$conf" ]] && continue
+    local fullname
+    fullname=$(basename "$conf" .conf)
+    local name="${fullname#awg-exit-}"
+
+    local svc_active="○ не активен"
+    if systemctl is-active --quiet "awg-quick@awg-exit-$name" 2>/dev/null; then
+      svc_active="${G}● запущен${N}"
+    fi
+
+    local link_active="○ link down"
+    if ip link show "$fullname" &>/dev/null; then
+      link_active="${G}● link UP${N}"
+    fi
+
+    echo -e "— ${W}Нода:${N} ${C}$name${N} ($fullname)"
+    echo -e "  Сервис: $svc_active | Линк: $link_active"
+
+    if ip link show "$fullname" &>/dev/null; then
+      local handshake
+      handshake=$(awg show "$fullname" latest-handshakes 2>/dev/null || echo "")
+      local transfer
+      transfer=$(awg show "$fullname" transfer 2>/dev/null || echo "")
+
+      if [[ -n "$handshake" ]]; then
+        local ts
+        ts=$(echo "$handshake" | awk '{print $2}')
+        if [[ -z "$ts" || "$ts" -eq 0 ]]; then
+          echo -e "  Рукопожатие: ${R}нет связи (0)${N}"
+        else
+          local now
+          now=$(date +%s)
+          local diff=$((now - ts))
+          if [[ $diff -lt 120 ]]; then
+            echo -e "  Рукопожатие: ${G}активно ($diff сек назад)${N}"
+          else
+            echo -e "  Рукопожатие: ${Y}устарело ($diff сек назад)${N}"
+          fi
+        fi
+      fi
+      if [[ -n "$transfer" ]]; then
+        local rx
+        rx=$(echo "$transfer" | awk '{print $2}')
+        local tx
+        tx=$(echo "$transfer" | awk '{print $3}')
+        local rx_h; rx_h=$(numfmt --to=iec-binary --suffix=B "$rx" 2>/dev/null || echo "$rx")
+        local tx_h; tx_h=$(numfmt --to=iec-binary --suffix=B "$tx" 2>/dev/null || echo "$tx")
+        echo -e "  Трафик: Получено $rx_h / Отправлено $tx_h"
+      fi
+
+      info "Тестируем выход в интернет через $fullname..."
+      local test_ip
+      test_ip=$(curl --interface "$fullname" --max-time 5 -s https://api.ipify.org 2>/dev/null || echo "")
+      if [[ -n "$test_ip" ]]; then
+        echo -e "  Внешний IP: ${G}$test_ip${N}"
+      else
+        echo -e "  Внешний IP: ${R}нет доступа в интернет через этот туннель${N}"
+      fi
+    fi
+    echo ""
+  done
+
+  if [[ -f "$AWG_EXITS_STATE" ]] && [[ "$(head -1 "$AWG_EXITS_STATE" 2>/dev/null)" == "active" ]]; then
+    local client_sample; client_sample=$(_warp_list_awg_clients 2>/dev/null | head -1 | cut -d'|' -f2 || echo "")
+    if [[ -n "$client_sample" ]]; then
+      echo -e "${W}Тест маршрута ядра для клиента $client_sample:${N}"
+      local route_test
+      route_test=$(ip route get 1.1.1.1 from "$client_sample" 2>/dev/null || echo "")
+      if [[ -n "$route_test" ]]; then
+        echo -e "  $route_test"
+        if echo "$route_test" | grep -q "table 202"; then
+          echo -e "  Результат: ${G}Трафик успешно перенаправляется в каскад (таблица 202)!${N}"
+        else
+          echo -e "  Результат: ${R}Маршрут идет мимо таблицы 202. Проверьте конфликты!${N}"
+        fi
+      else
+        echo -e "  ${Y}Не удалось выполнить ip route get для $client_sample${N}"
+      fi
+      echo ""
+    fi
+  fi
+}
+
+_exits_delete() {
+  local files
+  files=$(find "$AWG_EXITS_DIR" -maxdepth 1 -name "awg-exit-*.conf" 2>/dev/null || echo "")
+  if [[ -z "$files" ]]; then
+    warn "Нет настроенных AWG exit-нод."
+    return 0
+  fi
+
+  echo -e "${C}Доступные exit-ноды:${N}"
+  local i=1
+  local arr=()
+  for conf in $files; do
+    [[ ! -f "$conf" ]] && continue
+    local fullname
+    fullname=$(basename "$conf" .conf)
+    local name="${fullname#awg-exit-}"
+    echo -e "  ${C}$i)${N} $name"
+    arr+=("$name")
+    ((i++))
+  done
+  echo -e "  0) Отмена"
+
+  local opt
+  safe_read opt "Выберите номер для удаления: "
+  if [[ "$opt" == "0" || -z "$opt" || ! "$opt" =~ ^[0-9]+$ || "$opt" -gt "${#arr[@]}" ]]; then
+    return 0
+  fi
+
+  local name="${arr[$((opt-1))]}"
+  local fullname="awg-exit-$name"
+  local conf_path="$AWG_EXITS_DIR/$fullname.conf"
+
+  info "Останавливаем и удаляем ноду '$name'..."
+  systemctl stop "awg-quick@$fullname" >/dev/null 2>&1 || true
+  systemctl disable "awg-quick@$fullname" >/dev/null 2>&1 || true
+  rm -f "$conf_path"
+
+  ok "Нода '$name' удалена."
+
+  if [[ -f "$AWG_EXITS_STATE" ]]; then
+    local state_val
+    state_val=$(head -1 "$AWG_EXITS_STATE" 2>/dev/null)
+    if [[ "$state_val" == "active" ]]; then
+      local remaining_files
+      remaining_files=$(find "$AWG_EXITS_DIR" -maxdepth 1 -name "awg-exit-*.conf" 2>/dev/null || echo "")
+      if [[ -z "$remaining_files" ]]; then
+        info "Не осталось настроенных exit-нод. Отключаем маршрутизацию..."
+        _exits_down
+      else
+        info "Пересчитываем маршрутизацию для оставшихся нод..."
+        _exits_apply_routing
+      fi
+    fi
+  fi
+}
+
+_exits_setup_balancing() {
+  local files
+  files=$(find "$AWG_EXITS_DIR" -maxdepth 1 -name "awg-exit-*.conf" 2>/dev/null || echo "")
+  if [[ -z "$files" ]]; then
+    warn "Нет настроенных AWG exit-нод. Добавьте хотя бы одну ноду."
+    return 0
+  fi
+
+  # Ноды делим на поднятые и лежащие: ECMP имеет смысл только между живыми
+  # интерфейсами, а раньше в списке были все конфиги подряд, и «балансировка»
+  # предлагалась даже когда работала одна нода.
+  local active_exits=() down_exits=()
+  for conf in $files; do
+    [[ ! -f "$conf" ]] && continue
+    local fullname
+    fullname=$(basename "$conf" .conf)
+    local name="${fullname#awg-exit-}"
+    if ip link show "$fullname" &>/dev/null; then
+      active_exits+=("$name")
+    else
+      down_exits+=("$name")
+    fi
+  done
+
+  if [[ ${#active_exits[@]} -eq 0 ]]; then
+    warn "Ни один интерфейс awg-exit-* не поднят — балансировать нечем"
+    [[ ${#down_exits[@]} -gt 0 ]] && info "Лежат: ${down_exits[*]}"
+    return 0
+  fi
+
+  echo ""
+  echo -e "${W}Настройка балансировки AWG exit-нод:${N}"
+  echo -e "  Подняты: ${G}${active_exits[*]}${N}"
+  [[ ${#down_exits[@]} -gt 0 ]] && echo -e "  Лежат:   ${D}${down_exits[*]}${N}"
+  echo ""
+  echo -e "  ${C}1)${N} Использовать одну конкретную ноду (Single Exit)"
+  if [[ ${#active_exits[@]} -gt 1 ]]; then
+    echo -e "  ${C}2)${N} Использовать все ноды (ECMP балансировка)"
+  else
+    echo -e "  ${D}2) ECMP — нужны минимум две поднятые ноды${N}"
+  fi
+  echo -e "  0) Отмена"
+  echo ""
+
+  local choice=1
+  safe_read choice "Выбор [0-2]: "
+  [[ "$choice" == "0" || -z "$choice" ]] && return 0
+
+  local mode="single"
+  local single_exit=""
+  if [[ "$choice" == "1" ]]; then
+    mode="single"
+    echo ""
+    echo -e "${C}Выберите активную ноду:${N}"
+    local idx=1
+    for name in "${active_exits[@]}"; do
+      echo -e "  ${C}$idx)${N} $name"
+      ((idx++))
+    done
+    local name_idx
+    safe_read name_idx "Номер ноды: "
+    if [[ -z "$name_idx" || ! "$name_idx" =~ ^[0-9]+$ || "$name_idx" -lt 1 || "$name_idx" -ge "$idx" ]]; then
+      warn "Неверный выбор"
+      return 1
+    fi
+    single_exit="${active_exits[$((name_idx - 1))]}"
+  elif [[ "$choice" == "2" && ${#active_exits[@]} -gt 1 ]]; then
+    mode="ecmp"
+  else
+    warn "Неверный выбор"
+    return 1
+  fi
+
+  local mode_val="all"
+  if [[ -f "$AWG_EXITS_STATE" ]]; then
+    mode_val=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || true)
+    mode_val="${mode_val:-all}"
+  fi
+
+  mkdir -p "$AWG_EXITS_DIR"
+  cat > "$AWG_EXITS_STATE" << EOF
+active
+mode=$mode_val
+balancer=$mode
+single_exit=$single_exit
+EOF
+
+  ok "Настройки балансировки сохранены!"
+  if systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+    info "Перезапуск маршрутизации для применения балансировки..."
+    _exits_apply_routing
+  fi
+}
+
+_exits_toggle_routing() {
+  local files
+  files=$(find "$AWG_EXITS_DIR" -maxdepth 1 -name "awg-exit-*.conf" 2>/dev/null || echo "")
+  if [[ -z "$files" ]]; then
+    warn "Нет настроенных AWG exit-нод. Сначала добавьте хотя бы одну (пункт 1)."
+    return 0
+  fi
+
+  if systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+    info "Отключаем маршрутизацию каскада..."
+    _exits_down
+  else
+    if ip link show warp0 &>/dev/null || ip link show xray0 &>/dev/null || systemctl is-active --quiet awg-tun2socks.service 2>/dev/null; then
+      warn "Обнаружен конфликт: другой туннель (Warp, Xray или tun2socks) активен."
+      local confirm
+      read_yesno confirm "Отключить другие туннели перед включением каскада? [y/N]: " "n"
+      if [[ "$confirm" != "y" ]]; then
+        info "Отменено пользователем."
+        return 0
+      fi
+      _warp_down 2>/dev/null || true
+      _xray_down 2>/dev/null || true
+      _tun2socks_down 2>/dev/null || true
+    fi
+
+    echo ""
+    echo -e "${W}Каких клиентов завернуть в каскад?${N}"
+    echo -e "  ${C}1)${N} Всех клиентов подсети (по умолчанию)"
+    echo -e "  ${C}2)${N} Выборочно по списку"
+    echo ""
+    local mode_choice=1
+    safe_read mode_choice "Выбор [1-2] (Enter = 1): "
+    mode_choice="${mode_choice:-1}"
+
+    local mode="all"
+    if [[ "$mode_choice" == "2" ]]; then
+      mode="peers"
+    fi
+
+    _exits_up "$mode"
+  fi
+}
+
+_exits_up() {
+  local mode="$1"
+
+  # Взаимоисключение проверяется во всех четырёх точках входа. Здесь его не
+  # было: каскад включался поверх поднятого Warp/Xray/tun2socks, и два
+  # default-маршрута в таблицах 100/201/202 начинали спорить за клиентов.
+  if ip link show warp0 &>/dev/null; then
+    err "Туннель Warp активен! Warp и каскад не могут работать одновременно."
+    warn "Выключи Warp (пункт 5 -> 1 -> 4), затем включай каскад."
+    return 1
+  fi
+  if ip link show xray0 &>/dev/null; then
+    err "Туннель Xray активен! Xray и каскад не могут работать одновременно."
+    warn "Выключи Xray (пункт 5 -> 4), затем включай каскад."
+    return 1
+  fi
+  if systemctl is-active --quiet awg-tun2socks.service 2>/dev/null; then
+    err "tun2socks активен! tun2socks и каскад не могут работать одновременно."
+    warn "Выключи tun2socks (пункт 5 -> 5), затем включай каскад."
+    return 1
+  fi
+
+  local up_exits=()
+  local files
+  files=$(find "$AWG_EXITS_DIR" -maxdepth 1 -name "awg-exit-*.conf" 2>/dev/null || echo "")
+  if [[ -n "$files" ]]; then
+    for conf in $files; do
+      [[ ! -f "$conf" ]] && continue
+      local fullname
+      fullname=$(basename "$conf" .conf)
+      if ip link show "$fullname" &>/dev/null; then
+        up_exits+=("$fullname")
+      fi
+    done
+  fi
+
+  if [[ ${#up_exits[@]} -eq 0 ]]; then
+    err "Ошибка: Ни один интерфейс awg-exit-* не запущен."
+    warn "Сначала запустите или пересоздайте exit-ноды."
+    return 1
+  fi
+
+  local balancer="single"
+  local single_exit=""
+  if [[ -f "$AWG_EXITS_STATE" ]]; then
+    balancer=$(grep "^balancer=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || true)
+    balancer="${balancer:-single}"
+    single_exit=$(grep "^single_exit=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || true)
+    single_exit="${single_exit:-}"
+  fi
+  if [[ -z "$single_exit" ]]; then
+    local first_fullname="${up_exits[0]}"
+    single_exit="${first_fullname#awg-exit-}"
+  fi
+
+  mkdir -p "$AWG_EXITS_DIR"
+  cat > "$AWG_EXITS_STATE" << EOF
+active
+mode=$mode
+balancer=$balancer
+single_exit=$single_exit
+EOF
+
+  _exits_sync_peers 2>/dev/null || true
+  if [[ "$mode" == "peers" && ! -s "$AWG_EXITS_PEERS" ]]; then
+    info "Список клиентов пуст — добавляем всех по умолчанию"
+    while IFS='|' read -r name ip; do
+      [[ -z "$ip" ]] && continue
+      echo "$ip" >> "$AWG_EXITS_PEERS"
+    done < <(_warp_list_awg_clients)
+  fi
+
+  _exits_install_routing_files
+
+  info "Запускаем службу маршрутизации каскада..."
+  systemctl daemon-reload
+  systemctl enable --now awg-exits-routing.service >/dev/null 2>&1
+
+  sleep 1
+  if systemctl is-active --quiet awg-exits-routing.service; then
+    ok "Маршрутизация каскада успешно активирована!"
+  else
+    err "Ошибка запуска службы awg-exits-routing.service"
+    journalctl -u awg-exits-routing.service -n 20 --no-pager
+  fi
+}
+
+_exits_down() {
+  info "Останавливаем службу маршрутизации каскада..."
+  systemctl disable --now awg-exits-routing.service >/dev/null 2>&1 || true
+  # ExecStop мог не отработать (юнит уже удалён, служба упала) — снимаем
+  # правила сами, иначе клиенты остаются в мёртвой таблице 202.
+  local guard=0
+  while (( guard < 128 )) && ip rule del lookup 202 2>/dev/null; do
+    guard=$((guard + 1))
+  done
+  ip route flush table 202 2>/dev/null || true
+  rm -f /etc/systemd/system/awg-exits-routing.service
+  rm -f /usr/local/bin/awg2-exits-routing.sh
+  rm -f "$AWG_EXITS_STATE"
+  systemctl daemon-reload
+  ok "Маршрутизация каскада отключена."
+}
+
+_exits_apply_routing() {
+  if [[ -f "/usr/local/bin/awg2-exits-routing.sh" ]]; then
+    /usr/local/bin/awg2-exits-routing.sh start >/dev/null 2>&1 || true
+  fi
+}
+
+_ensure_peers_mode() {
+  # В mode=all per-client переключатели в do_exits_peers_menu не действуют:
+  # start_routing добавляет blanket from $client_net lookup 202, который
+  # перекрывает per-IP правила (ip rule del для одного IP — no-op, blanket остаётся).
+  # При первом togglingе переключаемся в mode=peers: переносим всех текущих
+  # клиентов в $AWG_EXITS_PEERS (поведение «все через каскад» сохраняется как
+  # стартовый набор), перезапускаем start_routing — blanket убирается, per-IP
+  # добавляются. Дальше переключатели реально управляют маршрутизацией.
+  [[ -f "$AWG_EXITS_STATE" ]] || return 0
+  local mode
+  mode=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || true)
+  mode="${mode:-all}"
+  [[ "$mode" == "all" ]] || return 0
+  systemctl is-active --quiet awg-exits-routing.service 2>/dev/null || return 0
+
+  local balancer single_exit
+  balancer=$(grep "^balancer=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || true)
+  balancer="${balancer:-single}"
+  single_exit=$(grep "^single_exit=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || true)
+  single_exit="${single_exit:-}"
+
+  mkdir -p "$AWG_EXITS_DIR"
+  : > "$AWG_EXITS_PEERS"
+  while IFS='|' read -r _name ip; do
+    [[ -z "$ip" ]] && continue
+    echo "$ip" >> "$AWG_EXITS_PEERS"
+  done < <(_warp_list_awg_clients)
+
+  cat > "$AWG_EXITS_STATE" << EOF
+active
+mode=peers
+balancer=$balancer
+single_exit=$single_exit
+EOF
+
+  /usr/local/bin/awg2-exits-routing.sh stop >/dev/null 2>&1 || true
+  /usr/local/bin/awg2-exits-routing.sh start >/dev/null 2>&1 || true
+  info "Каскад переведён в режим «Выборочно по списку» — per-client переключатели активированы."
+}
+
+# Назначить клиенту конкретную ноду каскада: клиент A выходит через одну
+# страну, клиент B — через другую. Без назначения все, кто в каскаде, идут
+# общим выходом (одна нода или ECMP между всеми) — как было раньше.
+_exits_assign_node() {
+  local -a clients=("${!1}")
+  local nodes=() conf nm
+
+  for conf in $(ls -1 "$AWG_EXITS_DIR"/awg-exit-*.conf 2>/dev/null | sort); do
+    [[ -f "$conf" ]] || continue
+    nm=$(basename "$conf" .conf)
+    nodes+=("${nm#awg-exit-}")
+  done
+
+  if [[ ${#nodes[@]} -eq 0 ]]; then
+    warn "Нет ни одной exit-ноды — сначала добавьте (пункт 1)"
+    sleep 2
+    return 0
+  fi
+  if [[ ${#nodes[@]} -eq 1 ]]; then
+    info "Нода всего одна (${nodes[0]}) — назначать нечего:"
+    info "все, кто в каскаде, и так идут через неё"
+    sleep 3
+    return 0
+  fi
+
+  echo ""
+  local cnum=""
+  read -rp "$(echo -e "${C}  Номер клиента (пусто — отмена): ${N}")" cnum
+  cnum="${cnum//[[:space:]]/}"
+  [[ -z "$cnum" ]] && return 0
+  if ! [[ "$cnum" =~ ^[0-9]+$ ]] || (( cnum < 1 || cnum > ${#clients[@]} )); then
+    warn "Неверный номер клиента"
+    sleep 1
+    return 0
+  fi
+
+  local entry="${clients[$((cnum - 1))]}"
+  local cname="${entry%|*}" cip="${entry##*|}"
+  local cur; cur=$(_exits_peer_node "$cip")
+
+  echo ""
+  echo -e "  Клиент ${W}${cname}${N} ${D}(${cip})${N}"
+  if [[ -n "$cur" ]]; then
+    echo -e "  Сейчас: нода ${W}${cur}${N}"
+  elif _exits_peer_enabled "$cip"; then
+    echo -e "  Сейчас: ${D}общий выход каскада${N}"
+  else
+    echo -e "  Сейчас: ${D}напрямую, мимо каскада${N}"
+  fi
+  echo ""
+
+  local i
+  for i in "${!nodes[@]}"; do
+    if ip link show "awg-exit-${nodes[$i]}" &>/dev/null; then
+      echo -e "    ${C}$((i+1)))${N} ${W}${nodes[$i]}${N}"
+    else
+      echo -e "    ${C}$((i+1)))${N} ${nodes[$i]} ${Y}(не поднята)${N}"
+    fi
+  done
+  echo -e "    ${C}$(( ${#nodes[@]} + 1 )))${N} Общий выход каскада ${D}(как раньше)${N}"
+  echo -e "    ${C}0)${N} Отмена"
+  echo ""
+
+  local sel=""
+  read -rp "$(echo -e "${C}  Выбор [0-$(( ${#nodes[@]} + 1 ))]: ${N}")" sel
+  sel="${sel//[[:space:]]/}"
+  [[ -z "$sel" || "$sel" == "0" ]] && return 0
+  if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#nodes[@]} + 1 )); then
+    warn "Неверный выбор"
+    sleep 1
+    return 0
+  fi
+
+  if (( sel == ${#nodes[@]} + 1 )); then
+    _exits_peer_add "$cip"
+    ok "$cname → общий выход каскада"
+  else
+    local pick="${nodes[$((sel - 1))]}"
+    _exits_peer_add "$cip" "$pick"
+    ok "$cname → нода ${W}${pick}${N}"
+    ip link show "awg-exit-$pick" &>/dev/null || \
+      warn "Нода $pick сейчас не поднята — пока она лежит, клиент пойдёт общим выходом"
+  fi
+
+  # Правила пересобираем целиком, а не правим одно: назначение меняет таблицу,
+  # а не только наличие правила, и ручная правка здесь легко разъедется с тем,
+  # что делает routing-скрипт.
+  if systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+    _exits_apply_routing
+  fi
+  sleep 2
+}
+
+do_exits_peers_menu() {
+  set +e
+  while true; do
+    _exits_sync_peers 2>/dev/null || true
+
+    clear
+    echo ""
+    hdr "⚙ Клиенты в AWG каскаде"
+    echo ""
+
+    local clients=()
+    while IFS='|' read -r name ip; do
+      [[ -z "$name" || -z "$ip" ]] && continue
+      clients+=("$name|$ip")
+    done < <(_warp_list_awg_clients)
+
+    if [[ ${#clients[@]} -eq 0 ]]; then
+      warn "AWG клиентов нет — добавьте через меню управления клиентами (2)"
+      read -rp "Enter..." _
+      set -e
+      return 0
+    fi
+
+    local i=1
+    for entry in "${clients[@]}"; do
+      local name="${entry%|*}"
+      local ip="${entry##*|}"
+      if _exits_peer_enabled "$ip"; then
+        local node; node=$(_exits_peer_node "$ip")
+        if [[ -n "$node" ]]; then
+          # Нода назначена, но могла лечь — тогда клиент уедет на общий
+          # выход, и в списке это должно быть видно, а не выясняться по логам.
+          if ip link show "awg-exit-$node" &>/dev/null; then
+            echo -e "  ${G}[$i]${N} $name  ${D}$ip${N}  ${C}🌉 нода ${W}$node${N}"
+          else
+            echo -e "  ${G}[$i]${N} $name  ${D}$ip${N}  ${Y}🌉 нода $node (лежит → общий выход)${N}"
+          fi
+        else
+          echo -e "  ${G}[$i]${N} $name  ${D}$ip${N}  ${C}🌉 через каскад${N} ${D}(общий выход)${N}"
+        fi
+      else
+        echo -e "  ${G}[$i]${N} $name  ${D}$ip${N}  → напрямую"
+      fi
+      i=$((i + 1))
+    done
+
+    echo ""
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "  Введи номер клиента для переключения (каскад ↔ напрямую)"
+    echo -e "  ${W}e${N} — назначить клиенту конкретную ноду каскада"
+    echo -e "  a — всех через каскад, n — всех напрямую"
+    echo -e "  0 — назад"
+    echo ""
+    local PEER_CHOICE=""
+    read -rp "$(echo -e "${C}  Выбор: ${N}")" PEER_CHOICE
+
+    # В mode=all per-client переключатели не действуют (blanket from $client_net
+    # lookup 202 перекрывает per-IP) — переключаемся в peers перед действием:
+    if [[ -n "${PEER_CHOICE:-}" && "${PEER_CHOICE:-}" != "0" ]]; then
+      _ensure_peers_mode
+    fi
+
+    case "${PEER_CHOICE:-}" in
+      0|"") set -e; return 0 ;;
+      a|A)
+        for entry in "${clients[@]}"; do
+          local ip="${entry##*|}"
+          _exits_peer_add "$ip"
+        done
+        if systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+          _exits_apply_routing
+        fi
+        ok "Все clients включены в каскад"
+        sleep 1
+        ;;
+      e|E)
+        _exits_assign_node clients[@]
+        ;;
+      n|N)
+        for entry in "${clients[@]}"; do
+          local ip="${entry##*|}"
+          _exits_peer_remove "$ip"
+        done
+        if systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+          /usr/local/bin/awg2-exits-routing.sh stop >/dev/null 2>&1 || true
+          /usr/local/bin/awg2-exits-routing.sh start >/dev/null 2>&1 || true
+        fi
+        ok "Все clients отключены от каскада"
+        sleep 1
+        ;;
+      *)
+        if [[ "$PEER_CHOICE" =~ ^[0-9]+$ ]] && (( PEER_CHOICE >= 1 && PEER_CHOICE < i )); then
+          local entry="${clients[$((PEER_CHOICE - 1))]}"
+          local name="${entry%|*}"
+          local ip="${entry##*|}"
+          if _exits_peer_enabled "$ip"; then
+            _exits_peer_remove "$ip"
+            if systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+              ip rule del from "$ip" lookup 202 priority 202 2>/dev/null || true
+            fi
+            ok "$name → напрямую"
+          else
+            _exits_peer_add "$ip"
+            if systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+              ip rule del from "$ip" lookup 202 priority 202 2>/dev/null || true
+              ip rule add from "$ip" lookup 202 priority 202
+            fi
+            ok "$name → через каскад"
+          fi
+          sleep 1
+        else
+          warn "Неверный выбор"
+          sleep 1
+        fi
+        ;;
+    esac
+  done
+  set -e
+}
+
+do_awg_exits_menu() {
+  set +e
+  while true; do
+    clear
+    echo ""
+    hdr "🌉 AWG Exit-ноды (каскад)"
+    echo ""
+    _exits_status || true
+    echo ""
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "  1) Добавить AWG exit-ноду"
+    echo -e "  2) Список AWG exit-нод и статус"
+    echo -e "  3) Удалить AWG exit-ноду"
+    echo -e "  4) Включить/выключить маршрутизацию"
+    echo -e "  5) Настроить балансировку (ECMP)"
+    echo -e "  6) Управление клиентами в каскаде"
+    echo -e "  0) Назад в главное меню"
+    echo ""
+    local EXITS_CHOICE=0
+    safe_read EXITS_CHOICE "$(echo -e "${C}  Выбор [0-6]: ${N}")"
+
+    case "${EXITS_CHOICE:-}" in
+      1) _exits_add; read -rp "Enter..." ;;
+      2) _exits_list; read -rp "Enter..." ;;
+      3) _exits_delete; read -rp "Enter..." ;;
+      4) _exits_toggle_routing; read -rp "Enter..." ;;
+      5) _exits_setup_balancing; read -rp "Enter..." ;;
+      6) do_exits_peers_menu; set +e ;;
+      0) break ;;
+      *) warn "Неверный выбор" ;;
+    esac
+  done
+  set -e
+}
 
 
 _global_cleanup() {
@@ -14165,6 +18819,57 @@ trap '_global_cleanup; echo ""; warn "Прервано пользователе�
 POST_UPDATE_FROM=""
 case "${1:-}" in
   --post-update) POST_UPDATE_FROM="${2:-}" ;;
+esac
+
+# CLI: --auto / --add-client / --interactive / --help
+# Неизвестный аргумент — это ошибка, а не повод молча открыть меню: опечатка
+# в `awg2 --add-clint vasya` иначе выглядела бы как «скрипт ничего не сделал».
+case "${1:-}" in
+  -h|--help)
+    cat << EOF
+awg2 $VERSION
+
+  awg2                        меню
+  awg2 --interactive          меню даже на чистом сервере
+  awg2 --auto                 неинтерактивная установка сервера и client1
+  awg2 --add-client ИМЯ       добавить клиента без меню
+  awg2 --help                 эта справка
+
+Переменные окружения:
+  AUTOINSTALL=1               то же, что --auto
+  AWG2_UPDATE_CHANNEL=beta    разовый запуск на бета-канале
+EOF
+    exit 0
+    ;;
+  --interactive|--post-update)
+    :
+    ;;
+  --add-client)
+    [[ -n "${2:-}" ]] || { err "Использование: awg2 --add-client ИМЯ"; exit 1; }
+    AUTO_MODE=1
+    check_deps
+    do_add_client_noninteractive "$2"
+    exit 0
+    ;;
+  -auto|--auto)
+    AUTO_MODE=1
+    check_deps
+    do_autoinstall
+    exit 0
+    ;;
+  "")
+    if [[ "${AUTOINSTALL:-}" == "1" ]]; then
+      AUTO_MODE=1
+      check_deps
+      do_autoinstall
+      exit 0
+    fi
+    ;;
+  *)
+    err "Неизвестный аргумент: $1"
+    info "awg2 --help — список аргументов"
+    exit 1
+    ;;
 esac
 
 # Фоновая проверка новой версии — один раз за запуск, результат в кэш.
