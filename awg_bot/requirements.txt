@@ -1,3 +1,11 @@
-aiogram>=3.7,<4
+# aiogram 3.31 — Bot API 10.3. Нижняя граница не косметическая: бот использует
+# events_isolation у Dispatcher, Router.outer_middleware, ErrorEvent и типовые
+# исключения aiogram.exceptions. На 3.7 (прежняя нижняя граница) часть этого
+# либо отсутствует, либо ведёт себя иначе.
+# Верхняя граница <4 — 4.x будет с ломающими изменениями.
+aiogram>=3.31,<4
 qrcode[pil]>=7.4
 pexpect>=4.9
+# Нужен только когда BOT_PROXY указывает на socks5/socks4: без него
+# aiogram не умеет socks-схемы. Для http-прокси хватает самого aiohttp.
+aiohttp-socks>=0.9
