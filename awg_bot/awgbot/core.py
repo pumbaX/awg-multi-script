@@ -15,12 +15,14 @@ core.py — низкоуровневая работа с AmneziaWG.
 
 from __future__ import annotations
 
+import functools
 import os
 import random
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -32,6 +34,33 @@ SERVER_CONF = os.environ.get("AWG_SERVER_CONF", "/etc/amnezia/amneziawg/awg0.con
 IFACE = os.environ.get("AWG_IFACE", "awg0")
 CLIENT_DIR = os.environ.get("AWG_CLIENT_DIR", "/root")
 SUSPEND_IP = "127.0.0.2/32"  # AllowedIPs у заблокированных по сроку (как в awg2)
+
+
+# ───────────────────────── сериализация изменений ─────────────────────────
+# Все операции, которые правят awg0.conf, файлы клиентов или состояние WARP,
+# идут строго по одной.
+#
+# Без этого гонка не гипотетическая: бот выполняет каждое обновление Telegram
+# отдельной задачей и уводит блокирующие вызовы в asyncio.to_thread, поэтому
+# два админа (или один, нажавший кнопку дважды) легко попадают в add_client
+# одновременно. Каждый поток читает конфиг, выбирает СВОЙ «свободный» IP из
+# одного и того же состояния и переписывает файл целиком — второй записанный
+# результат затирает первого. Тем же путём ходит и фоновый мониторинг:
+# enforce_expirations правит конфиг сам по себе, без участия пользователя.
+#
+# RLock, а не Lock: мутирующие функции вызывают друг друга в том же потоке
+# (add_client -> apply_syncconf, set_monitor -> set_note), и обычный мьютекс
+# намертво заклинил бы на вложенном вызове.
+_MUTEX = threading.RLock()
+
+
+def _serialized(fn):
+    """Пускает функцию только когда ни одна другая мутация не выполняется."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _MUTEX:
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 # ───────────────────────── exec helpers ─────────────────────────
@@ -111,6 +140,7 @@ class ServerInfo:
     profile: str = ""
     proto: str = ""            # версия протокола AmneziaWG: "2.0", "3.0", "3.1"
     obf_level: int = 0         # 1 = без I1-I5, 2 = только I1, 3 = полный I1-I5
+    cps_budget: int = -1       # бюджет цепочки (# AWG_CPS_BUDGET), -1 = метки нет
     mimicry: str = ""          # профиль мимикрии сервера (# AWG_MIMICRY=)
     mimicry_domain: str = ""   # домен мимикрии сервера (# AWG_MIMICRY_DOMAIN=)
     endpoint_domain: str = ""  # домен для Endpoint; пусто — используется IP
@@ -214,6 +244,10 @@ def get_server_info() -> ServerInfo:
         # выданные клиенты. Иначе бот выдаёт свой набор, не совпадающий с
         # остальными конфигами того же сервера.
         info.obf_level = _obf_level_from_clients()
+    # Бюджет цепочки, выбранный админом в awg2 (0 = без лимита). Метки нет —
+    # сервер создан старой версией, остаёмся на компактном значении бота.
+    if m := re.search(r"^#\s*AWG_CPS_BUDGET=(\d+)", text, re.M):
+        info.cps_budget = int(m.group(1))
 
     _, peers = _split_blocks(text)
     info.peers_count = len(peers)
@@ -334,6 +368,7 @@ def get_peer(name: str) -> Peer | None:
 
 
 # ───────────────────────── atomic conf write ─────────────────────────
+@_serialized
 def restore_backup(archive_bytes: bytes) -> tuple[bool, str]:
     """
     Восстанавливает конфиг сервера и клиентов из .tar.gz бэкапа (формат нашего
@@ -432,6 +467,7 @@ def _write_text_atomic(path: str, text: str, mode: int = 0o600) -> None:
         raise
 
 
+@_serialized
 def apply_syncconf() -> tuple[bool, str]:
     """Применяет конфиг без обрыва туннеля (как awg2 _expire_apply)."""
     if not have("awg") or not have("awg-quick"):
@@ -456,6 +492,7 @@ def apply_syncconf() -> tuple[bool, str]:
             pass
 
 
+@_serialized
 def restart_iface() -> tuple[bool, str]:
     run(["awg-quick", "down", SERVER_CONF])
     rc, _, err = run(["awg-quick", "up", SERVER_CONF])
@@ -487,6 +524,7 @@ def _find_free_ip(base_ip: str) -> str | None:
     return None
 
 
+@_serialized
 def add_client(name: str, expires: int | None = None,
                profile: str = "", domain: str = "") -> tuple[bool, str, str | None]:
     """
@@ -618,7 +656,10 @@ def add_client(name: str, expires: int | None = None,
             # оставляем непроставленной, а не выдаём "none" за факт.
             used_profile = None
         elif want_full:
-            packets = cps.gen_full(profile, domain)
+            # Бюджет берём с сервера: свой компактный резал цепочку до одного
+            # пакета там, где awg2 выдавал пять.
+            budget = _srv.cps_budget if _srv.cps_budget >= 0 else cps.DEFAULT_BUDGET
+            packets = cps.gen_full(profile, domain, budget)
             if packets:
                 for n, pkt in enumerate(packets[:5], start=1):
                     cli_lines.append(f"I{n} = {pkt}")
@@ -658,6 +699,7 @@ def add_client(name: str, expires: int | None = None,
     return True, ("Клиент создан." + prof_suffix + " " + msg), conf_path
 
 
+@_serialized
 def change_client_mimicry(name: str, profile: str,
                           domain: str = "") -> tuple[bool, str, str | None]:
     """
@@ -748,6 +790,7 @@ def change_client_mimicry(name: str, profile: str,
     return True, msg, conf_path
 
 
+@_serialized
 def delete_client(name: str) -> tuple[bool, str]:
     if not server_installed():
         return False, "Сервер не установлен"
@@ -775,6 +818,7 @@ def delete_client(name: str) -> tuple[bool, str]:
     return True, f"Клиент '{name}' удалён. {msg}"
 
 
+@_serialized
 def rename_client(old: str, new: str) -> tuple[bool, str]:
     if not NAME_RE.match(new):
         return False, "Новое имя: только A-Z a-z 0-9 _ -"
@@ -830,6 +874,7 @@ def _set_peer_comment(name: str, key: str, value: str | None) -> bool:
     return changed
 
 
+@_serialized
 def set_expire(name: str, ts: int) -> tuple[bool, str]:
     if not get_peer(name):
         return False, f"Клиент '{name}' не найден"
@@ -838,6 +883,7 @@ def set_expire(name: str, ts: int) -> tuple[bool, str]:
     return True, f"Срок установлен: {datetime.fromtimestamp(ts):%Y-%m-%d %H:%M}"
 
 
+@_serialized
 def clear_expire(name: str) -> tuple[bool, str]:
     p = get_peer(name)
     if not p:
@@ -1136,6 +1182,7 @@ def get_note(name: str) -> str:
     return _load_notes().get(name, "")
 
 
+@_serialized
 def set_note(name: str, note: str) -> tuple[bool, str]:
     if not get_peer(name):
         return False, f"Клиент '{name}' не найден"
@@ -1163,6 +1210,7 @@ def _delete_note(name: str) -> None:
         _save_notes(notes)
 
 
+@_serialized
 def enforce_expirations() -> list[str]:
     """
     Блокирует клиентов с истёкшим сроком (как awg2-expire.timer): меняет
@@ -1198,6 +1246,7 @@ def _replace_allowed_ip(name: str, new_ip: str) -> None:
     _write_conf_atomic(header + "".join(out))
 
 
+@_serialized
 def cleanup_legacy_notes() -> int:
     """
     Убирает из awg0.conf legacy-строки '# note=...', которые ранние версии
@@ -1218,6 +1267,49 @@ def cleanup_legacy_notes() -> int:
 
 def is_monitored(name: str) -> bool:
     return MONITOR_TAG.lower() in get_note(name).lower()
+
+
+def strip_monitor_tag(note: str) -> str:
+    """Текст заметки без служебного маркера #ping."""
+    if not note:
+        return ""
+    cleaned = re.sub(re.escape(MONITOR_TAG), " ", note, flags=re.I)
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+@_serialized
+def set_monitor(name: str, on: bool) -> tuple[bool, str]:
+    """
+    Включает/выключает мониторинг активности клиента (кнопка «Активность»).
+
+    Источник истины остаётся прежним — маркер #ping в заметке. Так кнопка и
+    заметка, введённая руками, не расходятся, а старые клиенты с #ping в
+    тексте продолжают мониториться без миграции.
+    """
+    if not get_peer(name):
+        return False, f"Клиент '{name}' не найден"
+    note = get_note(name)
+    has = MONITOR_TAG.lower() in note.lower()
+
+    if on:
+        if has:
+            return True, "Мониторинг активности уже включён"
+        base = strip_monitor_tag(note)
+        # заметка ограничена 200 символами — освобождаем место под маркер
+        limit = 200 - len(MONITOR_TAG) - 1
+        if len(base) > limit:
+            base = base[:limit].rstrip()
+        ok, _ = set_note(name, f"{base} {MONITOR_TAG}".strip())
+        if not ok:
+            return False, "Не удалось включить мониторинг"
+        return True, "🔔 Мониторинг активности включён"
+
+    if not has:
+        return True, "Мониторинг активности уже выключен"
+    ok, _ = set_note(name, strip_monitor_tag(note))
+    if not ok:
+        return False, "Не удалось выключить мониторинг"
+    return True, "🔕 Мониторинг активности выключен"
 
 
 
@@ -1249,6 +1341,7 @@ def get_dns_upstream() -> str:
     return m.group(1).strip() if m else ""
 
 
+@_serialized
 def set_dns_upstream(key: str) -> tuple[bool, str]:
     """Меняет upstream DNSCrypt и перезапускает сервис (как awg2)."""
     if not dnscrypt_installed():
@@ -1337,6 +1430,7 @@ def _peer_ip_only(p: "Peer") -> str:
     return p.allowed_ips.split("/")[0].split(",")[0].strip()
 
 
+@_serialized
 def warp_enable_client(name: str) -> tuple[bool, str]:
     p = get_peer(name)
     if not p:
@@ -1357,6 +1451,7 @@ def warp_enable_client(name: str) -> tuple[bool, str]:
     return True, f"'{name}' добавлен в WARP (применится при старте warp0)"
 
 
+@_serialized
 def warp_disable_client(name: str) -> tuple[bool, str]:
     p = get_peer(name)
     if not p:
@@ -1412,6 +1507,7 @@ def warp_status() -> str:
     return "\n".join(lines)
 
 
+@_serialized
 def warp_hard_restart() -> tuple[bool, str]:
     """Жёсткий перезапуск WARP без pexpect: down → parse conf → up."""
     WARP_CONF  = "/etc/wireguard/warp0.conf"

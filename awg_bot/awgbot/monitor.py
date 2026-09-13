@@ -25,6 +25,12 @@ import os
 import time
 from pathlib import Path
 
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
+
 from . import core
 
 log = logging.getLogger("awgbot.monitor")
@@ -150,11 +156,34 @@ async def monitor_loop(bot, admins_src) -> None:
 
 
 async def _send(bot, admin_ids: set[int], text: str) -> None:
+    """Рассылает уведомление админам, разбирая причины недоставки по типам.
+
+    Раньше здесь был один `except Exception` на всё, и в логе оставалась строка
+    без понятной причины. Разница существенная: заблокировавший бота админ —
+    это навсегда (и лечится только с его стороны), а flood control — это
+    «через N секунд можно», и алерт мониторинга стоит того, чтобы дождаться.
+    """
     for uid in admin_ids:
-        try:
-            await bot.send_message(uid, text)
-        except Exception as e:
-            log.warning("Не смог отправить уведомление %s: %s", uid, e)
+        for attempt in (1, 2):
+            try:
+                await bot.send_message(uid, text)
+                break
+            except TelegramRetryAfter as e:
+                if attempt == 2:
+                    log.warning("Уведомление %s не ушло даже после ожидания", uid)
+                    break
+                # Ждём столько, сколько просит Telegram, и пробуем ещё раз.
+                # Потолок на случай абсурдного значения: висеть в цикле
+                # мониторинга дольше его периода нельзя.
+                delay = min(int(e.retry_after) + 1, 60)
+                log.warning("Flood control на %s: жду %s с", uid, delay)
+                await asyncio.sleep(delay)
+            except TelegramForbiddenError:
+                log.warning("Админ %s заблокировал бота — уведомления ему не доходят", uid)
+                break
+            except TelegramAPIError as e:
+                log.warning("Не смог отправить уведомление %s: %s", uid, e)
+                break
 
 
 async def _notify_offline(bot, admin_ids: set[int], p: core.Peer) -> None:
@@ -164,7 +193,7 @@ async def _notify_offline(bot, admin_ids: set[int], p: core.Peer) -> None:
         f"👤 {html.escape(p.name)}\n"
         f"IP: <code>{html.escape(p.allowed_ips)}</code>\n"
         f"Последняя активность: {last}\n"
-        f"Заметка: {html.escape(p.note or '—')}"
+        f"Заметка: {html.escape(core.strip_monitor_tag(p.note) or '—')}"
     ))
 
 
@@ -179,7 +208,7 @@ async def _notify_back(bot, admin_ids: set[int], p: core.Peer, since: int) -> No
         f"👤 {html.escape(p.name)}\n"
         f"IP: <code>{html.escape(p.allowed_ips)}</code>\n"
         f"{gone}"
-        f"Заметка: {html.escape(p.note or '—')}"
+        f"Заметка: {html.escape(core.strip_monitor_tag(p.note) or '—')}"
     ))
 
 

@@ -160,13 +160,18 @@ def client_card(idx: int, monitored: bool = False, warp_state=None) -> InlineKey
         b.button(text="☁ WARP: вкл", callback_data=f"cl_warp_on:{idx}")
     else:
         b.button(text="☁ WARP (не установлен)", callback_data="warp_not_installed")
-    note_label = "📝 Заметка" + (" 🔔" if monitored else "")
-    b.button(text=note_label, callback_data=f"cl_note:{idx}")
+    b.button(text="📝 Заметка", callback_data=f"cl_note:{idx}")
+    # Мониторинг активности (офлайн/онлайн-алерты). Кнопка называет действие,
+    # как у WARP выше: включено — предлагаем выключить.
+    if monitored:
+        b.button(text="🔕 Активность: выкл", callback_data=f"cl_mon:{idx}:0")
+    else:
+        b.button(text="🔔 Активность: вкл", callback_data=f"cl_mon:{idx}:1")
     b.button(text="🎭 Мимикрия", callback_data=f"cl_mim:{idx}")
     b.button(text="✏️ Переименовать", callback_data=f"cl_ren:{idx}")
     b.button(text="🗑 Удалить", callback_data=f"cl_del:{idx}")
     b.button(text="‹ К списку", callback_data="clients")
-    b.adjust(2, 2, 2, 1, 1, 1)
+    b.adjust(2, 2, 2, 2, 1, 1)
     return b.as_markup()
 
 

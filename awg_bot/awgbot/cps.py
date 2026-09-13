@@ -69,6 +69,18 @@ _MARKER_RES = (
 # символов: такой конфиг не собирается в QR и его неудобно передавать.
 DEFAULT_BUDGET = 1500
 
+# Потолок, выше которого цепочку выдавать нельзя (тот же CPS_HARD_LIMIT, что
+# в awg2). Ограничение не наше: в amneziawg-tools атрибуты I1-I5 уровня
+# устройства пишутся в netlink-буфер 4 КБ без проверки границ (issue #69).
+# Замеры оттуда: до 3598 символов всё работает, с 3600 `awg show` виснет и
+# отдаёт EMSGSIZE, с 3868 `awg set` падает и интерфейс больше не читается.
+# Для бота это не абстракция: на `awg show` держится выдача публичного ключа
+# при создании клиента и вся статистика.
+#
+# Ноль («без лимита») сюда приходит из маркера AWG_CPS_BUDGET в конфигах,
+# созданных до появления потолка, — там он и означал 12 000 символов.
+HARD_LIMIT = 3500
+
 _cached_code: str | None = None
 _cache_mtime: float = 0.0
 
@@ -143,10 +155,20 @@ def _supports_budget(code: str) -> bool:
     return "--budget" in code
 
 
+def clamp_budget(budget: int) -> int:
+    """Бюджет в безопасных пределах. 0 и всё, что выше потолка, -> HARD_LIMIT."""
+    if not isinstance(budget, int) or budget <= 0 or budget > HARD_LIMIT:
+        return HARD_LIMIT
+    return budget
+
+
 def _budget_args(code: str, budget: int) -> list[str]:
-    if budget and budget > 0 and _supports_budget(code):
-        return ["--budget", str(budget)]
-    return []
+    if not _supports_budget(code):
+        # Старый генератор без --budget обрезать нечем. Он же и цепочку
+        # длиннее потолка выдать может — но подставлять флаг, которого он не
+        # понимает, значит уронить генерацию целиком.
+        return []
+    return ["--budget", str(clamp_budget(budget))]
 
 
 def gen_i1(profile: str, domain: str = "") -> str | None:
