@@ -122,12 +122,29 @@ write_unit() {
   write_file "/etc/systemd/system/$1" 644 && systemctl daemon-reload
 }
 
+# Таймер в состоянии «active (elapsed)» больше не сработает никогда, хотя
+# is-active отвечает «active». Так глох таймер сроков и лимитов (v1.2.0-1.2.2):
+# с Persistent=true systemd при старте таймера берёт время прошлого запуска
+# из метки в /var/lib/systemd/timers, считает OnBootSec прошедшим, а
+# OnUnitActiveSec отсчитывать не от чего — служба после переустановки ещё не
+# запускалась. Такой таймер — перезапустить без метки: сработает сразу,
+# дальше по расписанию.
+timer_heal() {
+  local u st
+  for u in "$@"; do
+    st=$(systemctl show -p SubState --value "$u" 2>/dev/null)
+    [[ "$st" == waiting || "$st" == running ]] && continue
+    rm -f "/var/lib/systemd/timers/stamp-$u"
+    systemctl restart "$u" &>/dev/null || true
+  done
+}
+
 remove_unit() {
   local u
   for u in "$@"; do
     systemctl disable --now "$u" >/dev/null 2>&1 || true
     systemctl reset-failed "$u" >/dev/null 2>&1 || true
-    rm -f "/etc/systemd/system/$u"
+    rm -f "/etc/systemd/system/$u" "/var/lib/systemd/timers/stamp-$u"
   done
   systemctl daemon-reload 2>/dev/null || true
 }
@@ -195,6 +212,21 @@ ufw_active() { command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qiE 
 ufw_allow() {  # порт/протокол комментарий
   ufw_active || return 0
   ufw allow "$1" comment "$2" >/dev/null 2>&1
+}
+
+# Снять правила UFW с комментарием ровно $1. ufw_delete_matching ищет подстроку —
+# «awg-web» (веб-панель) задевал и «awg-webapp» (порт Mini App).
+ufw_delete_comment() {
+  command -v ufw &>/dev/null || return 0
+  local n guard=0
+  while (( guard++ < 64 )); do
+    n=$(ufw status numbered 2>/dev/null | awk -v c="$1" '{
+          s = $0; sub(/[ \t]+$/, "", s); i = index(s, "# ")
+          if (i && substr(s, i + 2) == c && match(s, /^\[ *[0-9]+ *\]/)) {
+            n = substr(s, 2, RLENGTH - 2); gsub(/ /, "", n); print n; exit } }')
+    [[ -n "$n" ]] || break
+    ufw --force delete "$n" >/dev/null 2>&1 || break
+  done
 }
 
 # Снять все правила UFW, в комментарии которых есть $1.

@@ -13,26 +13,84 @@ from aiogram import Bot, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
 
-from .. import api, ask, jobs, store, ui
+from .. import access, alerts, api, ask, jobs, store, ui
 from ..ui import esc
 
 router = Router()
 act = ui.Actions(router, "bk")
+abk = ui.Actions(router, "abk", owner="Автобэкап настраивает только владелец")
 
 UPLOADS = store.STATE_DIR / "uploads"
 
 
+def auto_line(b: dict) -> str:
+    """«ежедневно · хранить 7 · последний 02.10 04:00»."""
+    if b["mode"] == "off":
+        return "выключен"
+    last = time.strftime("%d.%m %H:%M", time.localtime(b["last"])) if b.get("last") else "ещё не было"
+    tail = f" · ⚠️ {b['error']}" if b.get("error") else ""
+    return f"{alerts.BACKUP_MODES[b['mode']]} · хранить {b['keep']} · последний {last}{tail}"
+
+
 @act()
 async def show(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
+    owner = access.is_owner(cb.from_user.id)
     await ui.render(cb, "<b>💾 Бэкапы</b>\n\nПолный бэкап: сервер и клиенты, аккаунт WARP, WG + обфускатор, "
                         "настройки туннелей. Хранятся в <code>~/awg_backup</code> на сервере.\n\n"
                         "• Создать — бэкап сразу приходит сюда файлом\n"
                         "• Сохранённые — скачать или восстановить бэкап с сервера\n"
-                        "• Из файла — восстановить из присланного архива",
+                        "• Из файла — восстановить из присланного архива\n\n"
+                        f"🕒 Автобэкап: {esc(auto_line(alerts.backup_info()))}",
                     ui.kb(("💾 Создать", act.data("create")),
                           ("📂 Сохранённые", act.data("list")),
                           ("📤 Из файла", act.data("upload")),
+                          ("🕒 Автобэкап", abk.data()) if owner else None,
                           ui.back()))
+
+
+# ── Автобэкап ─────────────────────────────────────────────
+@abk()
+async def _auto(cb: CallbackQuery, state: FSMContext, arg: str = "", note: str = "") -> None:
+    b = alerts.backup_info()
+    mark = lambda ok: "🔘" if ok else "⚪️"                                  # noqa: E731
+    # Ряд чисел без подписи непонятен — подпись текстом, как в Mini App
+    await ui.render(cb, "<b>🕒 Автобэкап</b>\n\nПолный бэкап по расписанию — файлом сюда, в чат, и только "
+                        "владельцам: в нём приватные ключи.\n\n"
+                        f"Сейчас: {esc(auto_line(b))}\n\n"
+                        "• Первый ряд — расписание\n"
+                        f"• Второй — хранить на сервере: последние {b['keep']} автобэкапов "
+                        "(сделанные вручную не трогаются)" + (f"\n\n{note}" if note else ""),
+                    ui.kb(ui.Row(*[(f"{mark(b['mode'] == m)} {label}", abk.data("m", m))
+                                   for m, label in (("off", "Выкл"), ("day", "День"), ("week", "Неделя"))]),
+                          ui.Row(*[(f"{mark(b['keep'] == n)} {n}", abk.data("k", str(n))) for n in alerts.BACKUP_KEEP]),
+                          ("💾 Сделать сейчас", abk.data("now")) if b["mode"] != "off" else None,
+                          ui.back("bk")))
+
+
+@abk("m")
+async def _auto_mode(cb: CallbackQuery, state: FSMContext, mode: str) -> None:
+    alerts.set_backup(mode=mode)
+    if mode != "off":
+        await cb.answer("Первый автобэкап придёт в течение пары минут")
+    await _auto(cb, state)
+
+
+@abk("k")
+async def _auto_keep(cb: CallbackQuery, state: FSMContext, n: str) -> None:
+    alerts.set_backup(keep=int(n) if n.isdigit() else None)
+    await _auto(cb, state)
+
+
+BACKUP_NOW = {"done": "✅ Автобэкап сделан — файл в чате",
+              "busy": "⏳ Сейчас идёт другая операция — нажми ещё раз, когда она закончится",
+              "fail": "❌ Не удался — причина выше, повтор через час"}
+
+
+@abk("now")
+async def _auto_now(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    await cb.answer("Делаю автобэкап…")
+    res = await alerts.backup_due(cb.bot, force=True)               # type: ignore[arg-type]
+    await _auto(cb, state, note=BACKUP_NOW.get(res, ""))
 
 
 async def _send_backup(bot: Bot, chat_id: int, st: dict) -> None:

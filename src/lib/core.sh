@@ -118,6 +118,34 @@ read_yesno() {
   printf -v "$__var" '%s' "$__v"
 }
 
+# Путь, подменить который может только root: он сам и все каталоги до /
+# принадлежат root и закрыты на запись группе и остальным. Код оттуда можно
+# запускать от root; из /tmp или домашнего каталога пользователя — нет:
+# туда подложит или переименует любой пользователь сервера.
+root_only_path() {  # путь
+  local p m
+  p=$(readlink -f -- "$1" 2>/dev/null) && [[ -e "$p" ]] || return 1
+  while :; do
+    [[ "$(stat -c %u -- "$p" 2>/dev/null)" == 0 ]] || return 1
+    m=$(stat -c %a -- "$p" 2>/dev/null) || return 1
+    (( 8#$m & 8#022 )) && return 1
+    [[ "$p" == / ]] && return 0
+    p=$(dirname -- "$p")
+  done
+}
+
+# То же для каталога и всего, что в нём.
+root_only_tree() {  # каталог
+  local p
+  # find — по настоящему пути: каталог-ссылку он сам не обходит
+  p=$(readlink -f -- "$1" 2>/dev/null) && root_only_path "$p" || return 1
+  [[ -z "$(find "$p" \( ! -user 0 -o \( ! -type l -perm /022 \) \) -print -quit 2>/dev/null)" ]]
+}
+
+# Путь для вывода через echo -e: без управляющих символов и \-последовательностей
+# (имя каталога задаёт кто угодно — оно не должно перерисовать вопрос).
+shown() { local s="${1//\\/\\\\}"; printf '%s' "$s" | tr '\000-\037\177' '?'; }
+
 # ask_yes "вопрос" [y|n] — то же как условие: if ask_yes ...; then
 ask_yes() {
   local __a
@@ -267,7 +295,30 @@ ver_num() { echo "${1#v}" | awk -F'[.-]' '{printf "%d%03d%03d\n", $1, $2, $3}'; 
 
 # Встроенный Python читается с дескриптора: код не упирается в предел длины
 # аргумента (128 КБ), а stdin остаётся свободным для данных.
-py()  { python3 /dev/fd/3 "$@" 3<<< "$_PY_HELPER"; }
+# Помощник один раз на версию кладётся файлом в $STATE_DIR/py — Python
+# кэширует его байткод рядом, и запуск не компилирует ~90 КБ кода заново
+# (а awg2 api зовёт помощник дважды на вызов). Нет прав или места — как
+# раньше, с дескриптора. В служебных скриптах (emit_script) _py_mod нет.
+_PY_MOD=""
+_py_mod() {
+  local d="$STATE_DIR/py/$_PY_HELPER_SUM" tmp
+  [[ -n "$_PY_MOD" ]] && return 0
+  [[ -n "${_PY_HELPER_SUM:-}" ]] || return 1
+  if [[ ! -f "$d/awg2helper.py" ]]; then
+    mkdir -p "$d" 2>/dev/null && chmod 700 "$STATE_DIR/py" "$d" 2>/dev/null || return 1
+    tmp="$d/.awg2helper.$$"
+    printf '%s' "$_PY_HELPER" > "$tmp" 2>/dev/null && mv -f "$tmp" "$d/awg2helper.py" || { rm -f "$tmp"; return 1; }
+    find "$STATE_DIR/py" -mindepth 1 -maxdepth 1 -type d ! -name "$_PY_HELPER_SUM" -exec rm -rf {} + 2>/dev/null
+  fi
+  _PY_MOD="$d"
+}
+py() {
+  if declare -F _py_mod >/dev/null && _py_mod; then
+    python3 -I -S -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); import awg2helper; awg2helper.main()' "$_PY_MOD" "$@"
+  else
+    python3 /dev/fd/3 "$@" 3<<< "$_PY_HELPER"
+  fi
+}
 cps() { python3 /dev/fd/3 "$@" 3<<< "$_CPS_GENERATOR"; }
 
 # Самостоятельный служебный скрипт из функций и переменных awg2.

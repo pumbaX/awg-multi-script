@@ -5,7 +5,11 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.1.9"
+VERSION="v1.2.28"
+# Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
+# в сравнении версий не участвует. У выпущенной сборки пусто.
+BUILD=""
+VERSION_SHOW="$VERSION$BUILD"
 
 # ═════ core ═════
 # Базовые примитивы: вывод, ввод, журнал, временные файлы, случайные числа,
@@ -127,6 +131,34 @@ read_yesno() {
   done
   printf -v "$__var" '%s' "$__v"
 }
+
+# Путь, подменить который может только root: он сам и все каталоги до /
+# принадлежат root и закрыты на запись группе и остальным. Код оттуда можно
+# запускать от root; из /tmp или домашнего каталога пользователя — нет:
+# туда подложит или переименует любой пользователь сервера.
+root_only_path() {  # путь
+  local p m
+  p=$(readlink -f -- "$1" 2>/dev/null) && [[ -e "$p" ]] || return 1
+  while :; do
+    [[ "$(stat -c %u -- "$p" 2>/dev/null)" == 0 ]] || return 1
+    m=$(stat -c %a -- "$p" 2>/dev/null) || return 1
+    (( 8#$m & 8#022 )) && return 1
+    [[ "$p" == / ]] && return 0
+    p=$(dirname -- "$p")
+  done
+}
+
+# То же для каталога и всего, что в нём.
+root_only_tree() {  # каталог
+  local p
+  # find — по настоящему пути: каталог-ссылку он сам не обходит
+  p=$(readlink -f -- "$1" 2>/dev/null) && root_only_path "$p" || return 1
+  [[ -z "$(find "$p" \( ! -user 0 -o \( ! -type l -perm /022 \) \) -print -quit 2>/dev/null)" ]]
+}
+
+# Путь для вывода через echo -e: без управляющих символов и \-последовательностей
+# (имя каталога задаёт кто угодно — оно не должно перерисовать вопрос).
+shown() { local s="${1//\\/\\\\}"; printf '%s' "$s" | tr '\000-\037\177' '?'; }
 
 # ask_yes "вопрос" [y|n] — то же как условие: if ask_yes ...; then
 ask_yes() {
@@ -277,7 +309,30 @@ ver_num() { echo "${1#v}" | awk -F'[.-]' '{printf "%d%03d%03d\n", $1, $2, $3}'; 
 
 # Встроенный Python читается с дескриптора: код не упирается в предел длины
 # аргумента (128 КБ), а stdin остаётся свободным для данных.
-py()  { python3 /dev/fd/3 "$@" 3<<< "$_PY_HELPER"; }
+# Помощник один раз на версию кладётся файлом в $STATE_DIR/py — Python
+# кэширует его байткод рядом, и запуск не компилирует ~90 КБ кода заново
+# (а awg2 api зовёт помощник дважды на вызов). Нет прав или места — как
+# раньше, с дескриптора. В служебных скриптах (emit_script) _py_mod нет.
+_PY_MOD=""
+_py_mod() {
+  local d="$STATE_DIR/py/$_PY_HELPER_SUM" tmp
+  [[ -n "$_PY_MOD" ]] && return 0
+  [[ -n "${_PY_HELPER_SUM:-}" ]] || return 1
+  if [[ ! -f "$d/awg2helper.py" ]]; then
+    mkdir -p "$d" 2>/dev/null && chmod 700 "$STATE_DIR/py" "$d" 2>/dev/null || return 1
+    tmp="$d/.awg2helper.$$"
+    printf '%s' "$_PY_HELPER" > "$tmp" 2>/dev/null && mv -f "$tmp" "$d/awg2helper.py" || { rm -f "$tmp"; return 1; }
+    find "$STATE_DIR/py" -mindepth 1 -maxdepth 1 -type d ! -name "$_PY_HELPER_SUM" -exec rm -rf {} + 2>/dev/null
+  fi
+  _PY_MOD="$d"
+}
+py() {
+  if declare -F _py_mod >/dev/null && _py_mod; then
+    python3 -I -S -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); import awg2helper; awg2helper.main()' "$_PY_MOD" "$@"
+  else
+    python3 /dev/fd/3 "$@" 3<<< "$_PY_HELPER"
+  fi
+}
 cps() { python3 /dev/fd/3 "$@" 3<<< "$_CPS_GENERATOR"; }
 
 # Самостоятельный служебный скрипт из функций и переменных awg2.
@@ -329,13 +384,26 @@ MOD_LOG="/var/log/awg-mod-update.log"
 MOD_FALLBACK_TAG="v3.1.20260906"
 TOOLS_FALLBACK_TAG="v3.1.20260812"
 UPSTREAM_CACHE="$STATE_DIR/upstream_tags"
+COUNTRY_CACHE="$STATE_DIR/country"     # «NL 1791500000»: страна сервера (флаг в шапке панели)
 UPSTREAM_TTL=21600
 
 # ── Обновление скрипта ────────────────────────────────────
 UPDATE_REPO_STABLE="pumbaX/awg-multi-script"
 UPDATE_REPO_BETA="genaRijoff/awg-multi-script"
 UPDATE_CHANNEL_FILE="$STATE_DIR/channel"
-UPDATE_CHECK_TTL=21600
+# Проверка версии в канале (4 КБ файла): бета выходит по нескольку раз в день —
+# раз в 6 часов уведомление бота о новой версии запаздывало на полдня
+UPDATE_CHECK_TTL=3600 UPDATE_CHECK_TTL_BETA=1200
+# Подпись сборок: awg2.sh.sig рядом с awg2.sh (ssh-keygen -Y sign, ставит
+# GitHub Actions). Ключ релизов вшит сюда — подменить сборку на зеркале
+# или по пути без закрытого ключа нельзя. Сборки старше UPDATE_SIG_SINCE
+# выходили без подписи.
+UPDATE_SIG_NS="awg-toolza"
+UPDATE_SIGNER="awg-toolza-release"
+UPDATE_SIG_SINCE="v1.2.0"
+UPDATE_SIGNERS=(
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMSoLr9/XltV/DHvw8sMTsKqMkxxGQRezmGJgBKczeAk"   # awg-toolza-release, 2026-10
+)
 
 # ── Бэкапы ────────────────────────────────────────────────
 # В домашнем каталоге того, кто запустил sudo: так было всегда, и уже
@@ -429,11 +497,10 @@ EXITS_SCRIPT="/usr/local/bin/awg2-exits-routing.sh"
 
 # ── Срок действия клиентов ────────────────────────────────
 EXPIRE_BIN="/usr/local/bin/awg2-expire-check"
-EXPIRE_SERVICE="/etc/systemd/system/awg2-expire.service"
-EXPIRE_TIMER="/etc/systemd/system/awg2-expire.timer"
 EXPIRE_STATE_DIR="/var/lib/awg2-expire"
 EXPIRE_LOG="/var/log/awg2-expire.log"
 EXPIRE_SUSPEND_IP="127.0.0.2/32"
+TRAFFIC_DB="$STATE_DIR/traffic.json"          # трафик клиентов по дням (таймер сроков)
 
 # ── WG + обфускатор ───────────────────────────────────────
 WGOBF_VERSION="v1.6"
@@ -457,6 +524,11 @@ BOT_CONF="/etc/awg-bot.conf"
 BOT_ADMINS="/var/lib/awg-bot/admins.json"   # приглашённые админы (ведёт бот)
 BOT_DIR="/opt/awg-bot"
 BOT_UNIT="awg-bot.service"
+# Веб-панель (awgbot.web): конфиг с хешем пароля, журнал входов, самоподписанный сертификат
+WEB_CONF="/etc/awg-web.conf"
+WEB_UNIT="awg-web.service"
+WEB_LOG="/var/log/awg-web.log"
+WEB_DIR="/etc/awg-web"
 BOT_PROXY_SCHEMES="http https socks4 socks5 socks5h iface"
 WEBAPP_PORT_DEFAULT=8443                    # Mini App бота (WEBAPP_PORT в BOT_CONF)
 
@@ -470,6 +542,20 @@ ACME_HOME="/var/lib/awg2/acme"              # аккаунт и сертифик
 CERT_SERVICE="awg2-cert.service"
 CERT_TIMER="awg2-cert.timer"
 CERT_TAG="awg2-cert"
+
+# ── Антисканер (сети сканеров РКН и госорганов — DROP новых входящих) ──
+ANTISCAN_DIR="$STATE_DIR/antiscan"          # списки, исключения, состояние
+ANTISCAN_CONF="$ANTISCAN_DIR/antiscan.conf" # ON, LISTS, UPDATED, ERROR, ENTRIES, ADDRS
+ANTISCAN_ALLOW="$ANTISCAN_DIR/allow"        # исключения: адрес или подсеть в строке
+ANTISCAN_SCRIPT="/usr/local/bin/awg2-antiscan"
+ANTISCAN_LOG="/var/log/awg2-antiscan.log"
+ANTISCAN_SET="awg2-antiscan" ANTISCAN_SET6="awg2-antiscan6" ANTISCAN_TAG="awg2-antiscan"
+ANTISCAN_UNIT="awg2-antiscan.service" ANTISCAN_TIMER="awg2-antiscan-update.timer"
+ANTISCAN_SRC="https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public"
+# Предел охвата одного списка. Настоящие: ~310 тыс. адресов IPv4 (самая широкая
+# запись /19) и ~20 сетей /32 IPv6. Подменённый источник с тысячами /12 прошёл бы
+# проверку записей, но закрыл бы почти весь IPv4 — такой список не принимается
+ANTISCAN_MAX4=16777216 ANTISCAN_MAX6=4096   # 2^24 адресов IPv4; 2^12 сетей /32 IPv6 (записи /32 и шире)
 
 # Интерфейсы, которые поднимает сам awg2: их адрес не может быть Endpoint
 # клиента, и маршрут через них — не аплинк сервера.
@@ -602,12 +688,29 @@ write_unit() {
   write_file "/etc/systemd/system/$1" 644 && systemctl daemon-reload
 }
 
+# Таймер в состоянии «active (elapsed)» больше не сработает никогда, хотя
+# is-active отвечает «active». Так глох таймер сроков и лимитов (v1.2.0-1.2.2):
+# с Persistent=true systemd при старте таймера берёт время прошлого запуска
+# из метки в /var/lib/systemd/timers, считает OnBootSec прошедшим, а
+# OnUnitActiveSec отсчитывать не от чего — служба после переустановки ещё не
+# запускалась. Такой таймер — перезапустить без метки: сработает сразу,
+# дальше по расписанию.
+timer_heal() {
+  local u st
+  for u in "$@"; do
+    st=$(systemctl show -p SubState --value "$u" 2>/dev/null)
+    [[ "$st" == waiting || "$st" == running ]] && continue
+    rm -f "/var/lib/systemd/timers/stamp-$u"
+    systemctl restart "$u" &>/dev/null || true
+  done
+}
+
 remove_unit() {
   local u
   for u in "$@"; do
     systemctl disable --now "$u" >/dev/null 2>&1 || true
     systemctl reset-failed "$u" >/dev/null 2>&1 || true
-    rm -f "/etc/systemd/system/$u"
+    rm -f "/etc/systemd/system/$u" "/var/lib/systemd/timers/stamp-$u"
   done
   systemctl daemon-reload 2>/dev/null || true
 }
@@ -677,6 +780,21 @@ ufw_allow() {  # порт/протокол комментарий
   ufw allow "$1" comment "$2" >/dev/null 2>&1
 }
 
+# Снять правила UFW с комментарием ровно $1. ufw_delete_matching ищет подстроку —
+# «awg-web» (веб-панель) задевал и «awg-webapp» (порт Mini App).
+ufw_delete_comment() {
+  command -v ufw &>/dev/null || return 0
+  local n guard=0
+  while (( guard++ < 64 )); do
+    n=$(ufw status numbered 2>/dev/null | awk -v c="$1" '{
+          s = $0; sub(/[ \t]+$/, "", s); i = index(s, "# ")
+          if (i && substr(s, i + 2) == c && match(s, /^\[ *[0-9]+ *\]/)) {
+            n = substr(s, 2, RLENGTH - 2); gsub(/ /, "", n); print n; exit } }')
+    [[ -n "$n" ]] || break
+    ufw --force delete "$n" >/dev/null 2>&1 || break
+  done
+}
+
 # Снять все правила UFW, в комментарии которых есть $1.
 ufw_delete_matching() {
   command -v ufw &>/dev/null || return 0
@@ -691,10 +809,25 @@ ufw_delete_matching() {
 # ═════ net ═════
 # Сеть: проверка адресов, аплинк, публичный IP, порты, домены.
 
+# Октеты без ведущих нулей, как у портов и масок: «010.0.0.1» iptables
+# отвергает, а ip_is_private (по тексту) счёл бы его публичным.
 valid_ip() {
   local ip="$1" o
-  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
-  for o in "${BASH_REMATCH[@]:1}"; do (( 10#$o <= 255 )) || return 1; done
+  [[ "$ip" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do (( o <= 255 )) || return 1; done
+}
+
+# DNS для клиентов: IPv4 через запятую (и/или пробел), каждый — настоящий адрес:
+# «999.999.999.999» иначе уходил в конфиги всех клиентов
+valid_dns_list() {  # «1.1.1.1, 1.0.0.1»
+  local -a a
+  local d
+  # Одна строка из цифр, точек, запятых и пробелов: перевод строки дописал бы в конфиг
+  # клиента свои строки, а read ниже проверяет только первую
+  [[ "$1" =~ ^[0-9.,\ ]+$ ]] || return 1
+  IFS=', ' read -ra a <<< "$1"
+  (( ${#a[@]} )) || return 1
+  for d in "${a[@]}"; do valid_ip "$d" || return 1; done
 }
 
 valid_cidr() {
@@ -711,7 +844,9 @@ valid_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 )); }
 valid_domain() {
   local d="$1"
   [[ -n "$d" && ${#d} -le 253 ]] || return 1
-  valid_ip "$d" && return 1
+  # Одни цифры и точки — это адрес, а не домен: и «010.0.0.1», который
+  # valid_ip (без ведущих нулей) не принимает, тоже
+  [[ "$d" =~ ^[0-9.]+$ ]] && return 1
   [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
 }
 
@@ -758,6 +893,36 @@ _PUBLIC_IP=""
 public_ip_cached() {
   [[ -n "$_PUBLIC_IP" ]] || _PUBLIC_IP=$(public_ip || true)
   echo "$_PUBLIC_IP"
+}
+
+# Страна сервера — флаг в шапке панели. Код страны IP сервера по геобазе
+# Cloudflare (cdn-cgi/trace, строка «loc=»): без ключей и своих баз. В кэше
+# на сутки (не узнали — повтор через час), обновляется в фоне: статус сеть не ждёт.
+server_country() { awk 'NR == 1 && $1 ~ /^[A-Z][A-Z]$/ {print $1}' "$COUNTRY_CACHE" 2>/dev/null || true; }
+
+country_refresh() {
+  local loc="" ts
+  command -v curl &>/dev/null || return 0
+  loc=$(curl -s --max-time 6 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^loc=//p' | head -1 || true)
+  ts=$(date +%s)
+  if ! [[ "$loc" =~ ^[A-Z]{2}$ && "$loc" != XX ]]; then
+    # Не ответили: прежняя страна остаётся (флаг не пропадает на час из-за одного сбоя),
+    # метка сдвинута так, чтобы повтор был через час, а не через сутки
+    loc=$(server_country); ts=$(( ts - 86400 + 3600 ))
+    [[ -n "$loc" ]] || { loc="-"; ts=$(date +%s); }
+  fi
+  printf '%s %s\n' "$loc" "$ts" | write_file "$COUNTRY_CACHE" 644
+}
+
+country_refresh_async() {
+  local cc="" ts=0 ttl=86400
+  [[ -n "${AWG_NO_UPDATE_CHECK:-}" ]] && return 0
+  read -r cc ts 2>/dev/null < "$COUNTRY_CACHE" || true
+  [[ "$ts" =~ ^[0-9]+$ ]] || ts=0
+  [[ "$cc" =~ ^[A-Z]{2}$ ]] || ttl=3600
+  (( $(date +%s) - ts < ttl )) && return 0
+  ( country_refresh ) </dev/null >/dev/null 2>&1 3>&- 4>&- 8>&- &
+  disown 2>/dev/null || true
 }
 
 udp_listening() { ss -lunH "sport = :$1" 2>/dev/null | grep -q .; }
@@ -989,16 +1154,21 @@ client_files_sync_suffix() {
   done < <(client_files)
 }
 
-# Клиенты сервера: строки «имя<TAB>ключ<TAB>AllowedIPs<TAB>expires<TAB>orig_ips<TAB>mimicry».
+# Клиенты сервера: строки «имя<TAB>ключ<TAB>AllowedIPs<TAB>expires<TAB>orig_ips<TAB>mimicry
+# <TAB>limit<TAB>blocked_by».
 clients_tsv() { server_exists || return 0; py peers "$SERVER_CONF"; }
 # То же через «|»: табуляция для read — пробельный разделитель, подряд идущие
 # табы схлопываются, и пустые колонки (срок, orig_ips) сдвигают соседние.
 clients_psv() { clients_tsv | tr '\t' '|'; }
 
-# «имя|ip» для меню туннелей — только клиенты с именем.
+# «имя|ip» для меню туннелей — только клиенты с именем. У заблокированного
+# AllowedIPs — адрес-заглушка, настоящий лежит в orig_ips: без этого
+# peers_sync выкидывал его из списков WARP/Xray/exit, и после разблокировки
+# клиент шёл мимо туннеля.
 clients_name_ip() {
-  local name aip _
-  while IFS='|' read -r name _ aip _ _ _; do
+  local name aip orig _
+  while IFS='|' read -r name _ aip _ orig _; do
+    [[ -n "$orig" ]] && aip="$orig"
     [[ -n "$name" && -n "$aip" ]] || continue
     echo "${name}|${aip%%/*}"
   done < <(clients_psv)
@@ -1008,7 +1178,7 @@ client_exists() { clients_tsv | awk -F'\t' -v n="$1" '$1 == n {f = 1} END {exit 
 
 peer_meta_get() {  # имя ключ
   clients_tsv | awk -F'\t' -v n="$1" -v k="$2" '
-    BEGIN { col["expires"] = 4; col["orig_ips"] = 5; col["mimicry"] = 6 }
+    BEGIN { col["expires"] = 4; col["orig_ips"] = 5; col["mimicry"] = 6; col["limit"] = 7; col["blocked_by"] = 8 }
     $1 == n { print $(col[k]); exit }'
 }
 
@@ -1125,6 +1295,31 @@ mod_stale() {
   (( newest > 0 && kt > 0 && newest > kt ))
 }
 
+# Ядра, в которые сервер может загрузиться (работающее и новее), без
+# собранного модуля — после перезагрузки в такое ядро awg0 не поднимется.
+# Так бывает, когда apt поставил новое ядро, а DKMS не смог собрать под него
+# модуль (Ubuntu 7.0.0-38) или заголовков к нему нет. Строки «ядро» или
+# «ядро нет-заголовков»; пусто — всё в порядке.
+kernel_gap() {
+  local k running
+  command -v dkms &>/dev/null && [[ -d "$MOD_SRC_DIR" ]] || return 0
+  running=$(uname -r)
+  for k in $(installed_kernels); do
+    [[ "$(printf '%s\n%s\n' "$running" "$k" | sort -V | head -1)" == "$running" ]] || continue
+    mod_built_for "$k" && continue
+    [[ "$k" == "$running" ]] && mod_loaded && continue
+    if [[ -d "/lib/modules/$k/build" ]]; then echo "$k"; else echo "$k нет-заголовков"; fi
+  done
+}
+
+# Одной строкой для сводок: «6.8.0-150» или «6.8.0-150 (нет заголовков)».
+# others — без работающего ядра (о нём говорит reboot_reason).
+kernel_gap_line() {  # [others]
+  local skip=""
+  [[ "${1:-}" == others ]] && skip=$(uname -r)
+  kernel_gap | awk -v r="$skip" 'r == "" || $1 != r' | sed 's/ нет-заголовков$/ (нет заголовков)/' | paste -sd, - | sed 's/,/, /g'
+}
+
 # Почему нужна перезагрузка (сервера или модуля). Пусто — не нужна.
 reboot_reason() {
   local running newest
@@ -1144,37 +1339,51 @@ reboot_reason() {
   fi
 }
 
+# Чего не хватает для версии $1 (3.0 | 3.1) — по надёжным признакам:
+# components — awg не установлен; tools — amneziawg-tools не знают её ключа
+# (они сами разбирают конфиг); module — модуль на диске собран из тега без неё;
+# check — признаков «нет» нет, решает проба (proto_supported).
+proto_why() {  # версия
+  local key=HeaderProtectionKey fam
+  [[ "$1" == 3.1 ]] && key=RandomTrailers
+  command -v awg &>/dev/null || { echo components; return 0; }
+  grep -qa "$key" "$(command -v awg)" || { echo tools; return 0; }
+  fam=$(tag_family "$(mod_tag)")
+  if [[ -n "$fam" ]] && [[ "$fam" == 2.0 || ( "$1" == 3.1 && "$fam" == 3.0 ) ]]; then echo module; return 0; fi
+  echo check
+}
+
 # Умеют ли компоненты версию протокола $1 (3.0 | 3.1).
 # 0 — да, 1 — точно нет, 2 — подтвердить не удалось.
 # «Нет» говорим только по надёжным признакам: tools не знают ключа (они сами
 # разбирают конфиг) или модуль на диске собран из тега без поддержки.
 _PROTO_PROBE=()
 proto_supported() {
-  local proto="$1" key val fam rc dev tmp
+  local proto="$1" key val rc dev tmp
   [[ -n "${_PROTO_PROBE[${proto//./}]:-}" ]] && return "${_PROTO_PROBE[${proto//./}]}"
   case "$proto" in
     3.1) key=RandomTrailers; val=on ;;
     *)   key=HeaderProtectionKey; val="" ;;
   esac
   rc=2
-  if ! command -v awg &>/dev/null || ! grep -qa "$key" "$(command -v awg)"; then
+  if [[ "$(proto_why "$proto")" != check ]]; then
     rc=1
+  elif awg showconf "$AWG_IF" 2>/dev/null | grep -q "^$key"; then
+    rc=0
   else
-    fam=$(tag_family "$(mod_tag)")
-    if [[ -n "$fam" ]] && [[ "$fam" == 2.0 || ( "$proto" == 3.1 && "$fam" == 3.0 ) ]]; then
-      rc=1
-    elif awg showconf "$AWG_IF" 2>/dev/null | grep -q "^$key"; then
-      rc=0
-    else
-      dev="awgprb$$"
-      if ip link add dev "$dev" type amneziawg 2>/dev/null; then
-        tmp=$(mktemp)
-        [[ -n "$val" ]] || val=$(awg genkey)
-        printf '[Interface]\nPrivateKey = %s\n%s = %s\n' "$(awg genkey)" "$key" "$val" > "$tmp"
-        awg setconf "$dev" "$tmp" &>/dev/null && rc=0
-        rm -f "$tmp"
-        ip link del dev "$dev" &>/dev/null || true
-      fi
+    # Проба, прерванная раньше (тайм-аут бота, kill), оставляла интерфейс
+    for dev in $(ip -o link show type amneziawg 2>/dev/null | awk -F': ' '{sub(/@.*/, "", $2); print $2}'); do
+      [[ "$dev" =~ ^awgprb([0-9]+)$ ]] && ! kill -0 "${BASH_REMATCH[1]}" 2>/dev/null \
+        && ip link del dev "$dev" &>/dev/null
+    done
+    dev="awgprb$BASHPID"
+    if ip link add dev "$dev" type amneziawg 2>/dev/null; then
+      tmp=$(mktemp)
+      [[ -n "$val" ]] || val=$(awg genkey)
+      printf '[Interface]\nPrivateKey = %s\n%s = %s\n' "$(awg genkey)" "$key" "$val" > "$tmp"
+      awg setconf "$dev" "$tmp" &>/dev/null && rc=0
+      rm -f "$tmp"
+      ip link del dev "$dev" &>/dev/null || true
     fi
   fi
   _PROTO_PROBE[${proto//./}]=$rc
@@ -1236,12 +1445,19 @@ tools_update_available() {
 
 # Строка состояния для шапки меню.
 components_summary() {
-  local tag upd reason
+  local tag upd reason gap
   command -v awg &>/dev/null || { echo -e "${R}не установлены${N} ${D}— Сервер → Установить компоненты${N}"; return; }
   tag=$(mod_tag)
   reason=$(reboot_reason)
   upd=$(mod_update_available)
-  if [[ -n "$reason" ]]; then
+  # Работающее ядро без модуля — это reboot_reason; но и оно не должно
+  # прятать более новое ядро без модуля (раньше — проверка по префиксу)
+  gap=$(kernel_gap_line others)
+  if [[ -n "$gap" ]]; then
+    echo -e "${R}${tag:-?} ▲ ядро $gap без модуля AWG${N} ${D}— после перезагрузки VPN не поднимется:${N}"
+    echo -e "               ${D}Сервер → Модуль ядра → 5) Пересобрать${N}"
+    [[ -n "$reason" ]] && echo -e "               ${Y}▲ ${reason}${N}"
+  elif [[ -n "$reason" ]]; then
     echo -e "${Y}${tag:-?} ▲ ${reason}${N}"
   elif [[ -n "$upd" ]]; then
     echo -e "${W}${tag}${N} ${G}⬆ есть $upd${N} ${D}— Сервер → Модуль ядра${N}"
@@ -1282,6 +1498,7 @@ components_report() {
 
   for k in $(installed_kernels); do
     s="${R}✗ не собран${N}"
+    [[ -n "$(kernel_gap | awk -v k="$k" '$1 == k')" ]] && s="${R}✗ не собран — пункт 5${N}"
     mod_built_for "$k" && s="${G}✓ собран${N}"
     [[ -d "/lib/modules/$k/build" ]] || s+=" ${D}(нет заголовков)${N}"
     [[ "$k" == "$running" ]] && s+=" ${D}← работает${N}"
@@ -1487,7 +1704,7 @@ mod_reload() {
 
   cmd="for u in $units; do systemctl stop \"\$u\"; done
 for i in $ifaces; do ip link show \"\$i\" >/dev/null 2>&1 && { awg-quick down \"\$i\" 2>/dev/null || ip link del \"\$i\"; }; done
-rmmod $MOD_NAME || exit 3
+rmmod $MOD_NAME || { for u in $units; do systemctl start \"\$u\"; done; exit 3; }
 modprobe $MOD_NAME || exit 4
 for u in $units; do systemctl start \"\$u\"; done
 exit 0"
@@ -1504,7 +1721,7 @@ exit 0"
   mod_log "перезагрузка модуля rc=$rc: $(tr '\n' ';' <<< "$out")"
   case $rc in
     0) _PROTO_PROBE=(); ok "Модуль перезагружен, в памяти новая сборка" ;;
-    3) err "rmmod не выгрузил модуль — его держит ещё какой-то интерфейс"
+    3) err "rmmod не выгрузил модуль — его держит ещё какой-то интерфейс; туннели подняты на прежней сборке"
        info "Проверь: ip -all netns exec ip link show type amneziawg"
        info "Надёжно — перезагрузка сервера: новая сборка уже на диске"
        return 1 ;;
@@ -1532,6 +1749,12 @@ mod_update_flow() {
   if mod_loaded; then mod_reload || true; else modprobe "$MOD_NAME" 2>/dev/null || true; fi
 }
 
+# Модуль и tools разом: для 3.1 нужны оба — бот и панель предлагают одну кнопку.
+components_update_flow() {
+  mod_update_flow || return 1
+  tools_update_flow
+}
+
 tools_update_flow() {  # [force]
   local tag
   components_deps || return 1
@@ -1542,8 +1765,22 @@ tools_update_flow() {  # [force]
   tools_install_tag "$tag"
 }
 
+# Сборка под все ядра. Ядрам, в которые сервер может загрузиться, сначала
+# ставятся недостающие заголовки — иначе их сборка молча пропускается.
 mod_rebuild_all() {
-  components_deps && run_step "Сборка DKMS под все ядра" _mod_dkms_install_all
+  local k _
+  components_deps || return 1
+  while read -r k _; do
+    [[ -n "$k" && ! -d "/lib/modules/$k/build" ]] || continue
+    run_step "Заголовки ядра $k" ensure_headers "$k" || warn "Заголовков для $k в репозитории нет"
+  done < <(kernel_gap)
+  run_step "Сборка DKMS под все ядра" _mod_dkms_install_all || return 1
+  if [[ -n "$(kernel_gap)" ]]; then
+    warn "Модуль не собран под: $(kernel_gap_line) — после перезагрузки в это ядро awg0 не поднимется"
+    info "Журнал сборки: $MOD_LOG и /var/lib/dkms/$MOD_NAME/$MOD_DKMS_VER/build/make.log"
+    return 1
+  fi
+  ok "Модуль собран под все ядра"
 }
 
 mod_backups() { ls -1t "$MOD_BACKUP_DIR"/src-*.tar.gz 2>/dev/null || true; }
@@ -1602,7 +1839,7 @@ do_components_menu() {
     echo -e "  ${C}2)${N} Выбрать версию модуля из списка"
     echo -e "  ${C}3)${N} Обновить amneziawg-tools ${D}${tupd:+до $tupd}${N}"
     echo -e "  ${C}4)${N} Перезагрузить модуль ${D}— без ребута${N}"
-    echo -e "  ${C}5)${N} Пересобрать под все установленные ядра"
+    echo -e "  $([[ -n "$(kernel_gap)" ]] && echo "${Y}" || echo "${C}")5)${N} Пересобрать под все установленные ядра"
     echo -e "  ${C}6)${N} Откат модуля из резервной копии"
     echo -e "  ${C}7)${N} Проверить обновления сейчас"
     echo -e "  ${W}0)${N} ← Назад"
@@ -1811,8 +2048,8 @@ conf_hp_min_s_violations() {
 # Цепочка I1-I5 — клиентская: у каждого устройства своя, сервер её не видит.
 # Поэтому у выданного клиента профиль мимикрии можно сменить, не трогая сервер.
 
-# Пулы доменов. Свой домен пользователя всегда лучше встроенного: пул одинаков
-# у всех, кто пользуется скриптом. Проверяются на доступность перед выдачей.
+# Пулы доменов — по региону сервера: российские сайты для сервера в РФ,
+# мировые — для остальных. Проверяются на доступность перед выдачей.
 CPS_DOMAINS=(
   yastatic.net mc.yandex.ru avatars.mds.yandex.net ok.ru st.mycdn.me vk.ru
   kinopoisk.ru hh.ru 2gis.ru lenta.ru mos.ru citilink.ru
@@ -1988,6 +2225,12 @@ choose_cps_budget() {
   case "$c" in 1) CPS_BUDGET=1500 ;; 2) CPS_BUDGET=3000 ;; *) CPS_BUDGET=$CPS_HARD_LIMIT ;; esac
 }
 
+# Регион для пула доменов: при создании сервера — выбранный в мастере
+# (конфига ещё нет), потом — из конфига.
+mimicry_region() {
+  if server_exists; then server_region; else echo "${S_REGION:-world}"; fi
+}
+
 # Один домен на всю цепочку: настоящий клиент за одно рукопожатие ходит на
 # один хост. Результат — CPS_DOMAIN (пусто = генератор возьмёт свой).
 choose_cps_domain() {
@@ -2000,12 +2243,13 @@ choose_cps_domain() {
   else
     echo ""
     hdr "Домен мимикрии (один на все I1-I5)"
-    echo -e "  ${G}1${N} Ввести свой ${C}(рекомендуется)${N}"
-    echo -e "  ${G}2${N} Из встроенного пула"
-    echo -e "  ${D}  Свой — живой сайт, куда ходят с устройства клиента.${N}"
+    echo -e "  ${G}1${N} Автоматически ${C}(рекомендуется)${N}"
+    echo -e "  ${D}    доступный сайт из пула: $([[ "$(mimicry_region)" == ru ]] && echo "российские" || echo "мировые") — по региону сервера${N}"
+    echo -e "  ${G}2${N} Ввести свой"
+    echo -e "  ${D}    живой сайт, куда ходят с устройства клиента${N}"
     [[ "$MIMICRY" == *quic ]] && echo -e "  ${Y}  Для QUIC сайт должен отдавать HTTP/3.${N}"
     read_choice c "${C}  Выбор [1-2] (Enter = 1): ${N}" 1 2 1
-    [[ "$c" == 2 ]] && ask_own=0
+    [[ "$c" == 1 ]] && ask_own=0
   fi
   if (( ask_own )); then
     while true; do
@@ -2027,9 +2271,10 @@ mimicry_pool_domain() {
   local kind pool=()
   case "$MIMICRY" in
     quic|curl_quic) kind=quic; pool=("${QUIC_DOMAINS[@]}")
-                    [[ "$(server_region)" == ru ]] && pool+=("${QUIC_DOMAINS_RU[@]}") ;;
+                    [[ "$(mimicry_region)" == ru ]] && pool+=("${QUIC_DOMAINS_RU[@]}") ;;
     sip) kind=sip; pool=("${SIP_DOMAINS[@]}") ;;
-    *) kind=tls; pool=("${CPS_DOMAINS[@]}") ;;
+    *) kind=tls
+       if [[ "$(mimicry_region)" == ru ]]; then pool=("${CPS_DOMAINS[@]}"); else pool=("${TLS_DOMAINS[@]}"); fi ;;
   esac
   info "Проверяю доступность доменов пула..."
   scan_domains "$kind" "${pool[@]}"
@@ -2335,6 +2580,55 @@ write_client_conf() {
   } | write_file "$f" 600
 }
 
+# Умеют ли модуль и tools AWG 3.1, когда сервера ещё нет. Проверка создаёт
+# пробный интерфейс, а бот спрашивает сводку раз в минуту — ответ помнится до
+# смены модуля или tools. «Не подтверждено» (модуль не загружен) не помнится.
+proto31_cached() {
+  local f="$STATE_DIR/proto31" bin key k v rc=0
+  bin=$(command -v awg) || return 1
+  key="$(mod_tag)|$(stat -c %s:%Y "$bin" 2>/dev/null)|$(cat "/sys/module/$MOD_NAME/srcversion" 2>/dev/null)"
+  if [[ -f "$f" ]] && IFS=$'\t' read -r k v < "$f" && [[ "$k" == "$key" && "$v" =~ ^[01]$ ]]; then
+    _PROTO_PROBE[31]=$v           # proto_upgrade_hint в том же вызове не пробует заново
+    return "$v"
+  fi
+  proto_supported 3.1 || rc=$?
+  (( rc == 2 )) || { mkdir -p "$STATE_DIR" && printf '%s\t%s\n' "$key" "$rc" > "$f"; } 2>/dev/null
+  return "$rc"
+}
+
+# Внешний интерфейс в правиле NAT awg0.conf — аплинк, на котором создан сервер.
+conf_uplink() {
+  [[ -f "$SERVER_CONF" ]] || return 1
+  sed -nE 's/^PostUp *=.*POSTROUTING -s [^ ]+ -o ([^ ]+) -j MASQUERADE.*/\1/p' "$SERVER_CONF" | head -1 | grep .
+}
+
+# Сервер восстановлен на другом VPS (или интерфейс переименован): у аплинка
+# другое имя (ens3 вместо eth0) — клиенты подключаются, но без NAT остаются
+# без интернета. Правило NAT в PostUp/PostDown переводится на аплинк этого
+# сервера. Для «Проверить и починить» — только если прежнего интерфейса здесь
+# нет: есть — значит NAT через него выбран сознательно (второй аплинк,
+# туннель). Восстановление бэкапа (force) переносит всегда: интерфейс с тем
+# же именем на новом VPS может быть совсем другим (приватный eth0). Поднятый
+# awg0 опускается до правки — его PostDown снимает старое правило NAT, иначе
+# оно оставалось в iptables — и поднимается снова. 0 — awg0.conf поправлен.
+conf_uplink_sync() {  # [force]
+  local old dev up=0 rc=0
+  old=$(conf_uplink) || return 1
+  dev=$(uplink_iface) || return 1
+  [[ "$old" != "$dev" ]] || return 1
+  [[ "${1:-}" != force ]] && ip link show "$old" &>/dev/null && return 1
+  if iface_up; then
+    up=1
+    awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+  fi
+  sed -i -E "/^Post(Up|Down) *=/ s#(POSTROUTING -s [^ ]+ -o )${old//./\\.}( -j MASQUERADE)#\1$dev\2#g" "$SERVER_CONF" \
+    && [[ "$(conf_uplink)" == "$dev" ]] || rc=1
+  (( up )) && { awg_up_diag || rc=1; }
+  (( rc )) && return 1
+  info "Внешний интерфейс сервера: $old → $dev (NAT в $SERVER_CONF)"
+  log_info "NAT awg0: $old → $dev"
+}
+
 # Создаёт awg0.conf и первого клиента из S_* и выбранной мимикрии.
 server_write() {
   local net="$S_NET" base srv_priv cli_priv psk dev
@@ -2406,30 +2700,33 @@ _choose_dns() {
     5) while true; do
          read_line d "${C}  DNS через запятую: ${N}"
          [[ -n "$d" ]] || { S_DNS="1.1.1.1, 1.0.0.1"; break; }
-         [[ "$d" =~ ^[0-9.,[:space:]]+$ ]] && { S_DNS="$d"; break; }
+         valid_dns_list "$d" && { S_DNS="$d"; break; }
          warn "Нужны IPv4-адреса через запятую"
        done ;;
   esac
 }
 
 _choose_mtu() {  # $1 — значение по умолчанию
-  local c v
-  echo -e "  ${C}1)${N} $1 ${C}(рекомендуется)${N}"
-  echo -e "  ${C}2)${N} 1420"
-  echo -e "  ${C}3)${N} 1380"
-  echo -e "  ${C}4)${N} 1320"
-  echo -e "  ${C}5)${N} 1280"
-  echo -e "  ${C}6)${N} Вручную"
-  read_choice c "${C}  MTU [1-6] (Enter = 1): ${N}" 1 6 1
-  case "$c" in
-    1) MTU=$1 ;; 2) MTU=1420 ;; 3) MTU=1380 ;; 4) MTU=1320 ;; 5) MTU=1280 ;;
-    6) while true; do
-         read_line v "${C}  MTU (1280-1500): ${N}"
-         [[ -n "$v" ]] || { MTU=$1; break; }
-         [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) && { MTU=$v; break; }
-         warn "Число 1280-1500"
-       done ;;
-  esac
+  local c v i opts=("$1")
+  # Рекомендуемое — первым, остальные стандартные без повтора
+  for v in 1420 1380 1320 1280; do [[ "$v" == "$1" ]] || opts+=("$v"); done
+  echo ""
+  hdr "MTU"
+  for i in "${!opts[@]}"; do
+    echo -e "  ${C}$((i + 1)))${N} ${opts[$i]}$( (( i == 0 )) && echo -e " ${C}(рекомендуется)${N}")"
+  done
+  echo -e "  ${C}$(( ${#opts[@]} + 1 )))${N} Вручную"
+  read_choice c "${C}  MTU [1-$(( ${#opts[@]} + 1 ))] (Enter = 1): ${N}" 1 $(( ${#opts[@]} + 1 )) 1
+  if (( c <= ${#opts[@]} )); then
+    MTU=${opts[$((c - 1))]}
+  else
+    while true; do
+      read_line v "${C}  MTU (1280-1500): ${N}"
+      [[ -n "$v" ]] || { MTU=$1; break; }
+      [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) && { MTU=$v; break; }
+      warn "Число 1280-1500"
+    done
+  fi
 }
 
 # Версия протокола нового сервера. 3.1 по умолчанию, если компоненты её умеют.
@@ -2600,7 +2897,7 @@ server_create_opts() {
       profile) [[ "$v" =~ ^(lite|pro)$ ]] || { err "profile: lite | pro"; return 1; }; S_PROFILE="$v" ;;
       proto) [[ "$v" =~ ^(2\.0|3\.1)$ ]] || { err "proto: 2.0 | 3.1"; return 1; }; S_PROTO="$v" ;;
       region) [[ "$v" =~ ^(world|ru)$ ]] || { err "region: world | ru"; return 1; }; S_REGION="$v" ;;
-      dns) [[ "$v" =~ ^[0-9.,[:space:]]+$ ]] || { err "dns: IPv4 через запятую"; return 1; }; S_DNS="$v" ;;
+      dns) valid_dns_list "$v" || { err "dns: IPv4 через запятую"; return 1; }; S_DNS="$v" ;;
       mtu) [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) || { err "mtu: 1280-1500"; return 1; }; MTU="$v" ;;
       port) valid_port "$v" && (( v >= 1024 )) || { err "port: 1024-65535"; return 1; }
             udp_port_busy "$v" && { err "UDP $v занят"; return 1; }; S_PORT="$v" ;;
@@ -2698,7 +2995,7 @@ _issue() { REPAIR_ISSUES=$((REPAIR_ISSUES + 1)); warn "$1"; }
 _fixed() { REPAIR_FIXED=$((REPAIR_FIXED + 1)); ok "$1"; }
 
 do_repair() {
-  local bad conf_n live_n dev net perm rc
+  local bad conf_n live_n dev net perm rc old
   REPAIR_ISSUES=0 REPAIR_FIXED=0
   echo ""
   hdr "Проверка и ремонт"
@@ -2714,6 +3011,10 @@ do_repair() {
     else err "Не удалось — Сервер → Модуль ядра"; fi
   fi
   mod_stale && _issue "В памяти прежняя сборка модуля — Сервер → Модуль ядра → перезагрузить модуль"
+  if [[ -n "$(kernel_gap)" ]]; then
+    _issue "Ядро $(kernel_gap_line) без модуля AWG — после перезагрузки awg0 не поднимется"
+    mod_rebuild_all && _fixed "Модуль собран под все ядра"
+  fi
   if grep -qs "^$MOD_NAME" "$MODULES_LOAD_FILE"; then ok "Автозагрузка модуля"
   else _issue "Нет автозагрузки модуля"; mod_autoload && _fixed "Автозагрузка настроена"; fi
 
@@ -2745,6 +3046,18 @@ do_repair() {
     else ok "awg0 работает, пиров: $live_n"; fi
   fi
   dev=$(uplink_iface || true); net=$(server_net || true)
+  old=$(conf_uplink || true)
+  if [[ -n "$dev" && -n "$old" && "$old" != "$dev" ]]; then
+    if ip link show "$old" &>/dev/null; then
+      info "NAT в awg0.conf — на $old (маршрут по умолчанию — через $dev): оставляю как настроено"
+    else
+      _issue "NAT в awg0.conf — на $old, такого интерфейса нет; выход сервера — $dev"
+      conf_uplink_sync && _fixed "NAT перенесён на $dev"
+    fi
+  fi
+  # NAT проверяется на интерфейсе из awg0.conf: выбранный сознательно не
+  # перебивается правилом на аплинк по умолчанию
+  old=$(conf_uplink || true); [[ -n "$old" ]] && ip link show "$old" &>/dev/null && dev="$old"
   if [[ -n "$dev" && -n "$net" ]]; then
     if iptables -t nat -C POSTROUTING -s "$net" -o "$dev" -j MASQUERADE 2>/dev/null; then ok "NAT на $dev"
     else _issue "Нет NAT для $net на $dev"; ipt_add -t nat POSTROUTING -s "$net" -o "$dev" -j MASQUERADE && _fixed "NAT добавлен"; fi
@@ -3066,10 +3379,14 @@ server_reset() {
   tunnels_panic_reset quiet
   awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   rm -f "$SERVER_CONF" "$SERVER_CONF".bak.* "$SERVER_CONF".pre_* "$CLIENT_DIR"/*_awg[23].conf
+  rm -f "$TRAFFIC_DB" "$TRAFFIC_DB.lock"
   ufw_delete_matching AmneziaWG
   : > "$WARP_PEERS" 2>/dev/null || true
   : > "$XRAY_PEERS" 2>/dev/null || true
   : > "$EXITS_PEERS" 2>/dev/null || true
+  # Снимок счётчиков — метка жизни таймера: старый после сброса заставил бы
+  # сторож «чинить» таймер посреди создания нового сервера
+  rm -f "$EXPIRE_STATE_DIR/transfer"
   ok "Сервер сброшен. Создать новый: Сервер → Создать сервер"
   log_info "сервер сброшен"
 }
@@ -3121,7 +3438,10 @@ client_add() {
 # Удаляет пира по ключу: из конфига, из ядра, файл клиента и списки туннелей.
 client_delete() {
   local pub="$1" name ip
-  ip=$(clients_tsv | awk -F'\t' -v k="$pub" '$2 == k {split($3, a, "/"); print a[1]; exit}')
+  # У заблокированного в AllowedIPs заглушка 127.0.0.2, настоящий адрес — в
+  # orig_ips: иначе его строки в туннелях и ip rule оставались, а адрес
+  # доставался новому клиенту — вместе с чужим туннелем и выходом Xray
+  ip=$(clients_tsv | awk -F'\t' -v k="$pub" '$2 == k {split($5 != "" ? $5 : $3, a, "/"); print a[1]; exit}')
   name=$(py peer-del "$SERVER_CONF" "$pub") || return 1
   iface_up && awg set "$AWG_IF" peer "$pub" remove 2>/dev/null
   [[ -n "$name" ]] && rm -f "$CLIENT_DIR/${name}_awg2.conf" "$CLIENT_DIR/${name}_awg3.conf"
@@ -3191,7 +3511,8 @@ client_expire_set() {  # имя unix-время
   expire_install
   # Заблокированному сначала вернуть адрес: expire-set правит только метку,
   # и клиент остался бы на 127.0.0.2 с новым сроком — «заблокирован» без причины.
-  if [[ -n "$(peer_meta_get "$1" orig_ips)" ]]; then
+  # Блокировку за трафик новый срок не снимает — её снимает лимит.
+  if [[ -n "$(peer_meta_get "$1" orig_ips)" && "$(peer_meta_get "$1" blocked_by)" != traffic ]]; then
     py expire-clear "$SERVER_CONF" "$1" "$EXPIRE_SUSPEND_IP" >/dev/null || return 1
     _expire_apply
   fi
@@ -3202,17 +3523,55 @@ client_expire_set() {  # имя unix-время
 
 # Снять срок; заблокированный клиент получает прежний адрес.
 client_expire_clear() {
+  local r
   client_exists "$1" || { err "Клиента $1 нет"; return 1; }
-  py expire-clear "$SERVER_CONF" "$1" "$EXPIRE_SUSPEND_IP" >/dev/null || return 1
+  r=$(py expire-clear "$SERVER_CONF" "$1" "$EXPIRE_SUSPEND_IP") || return 1
   _expire_apply
   ok "$1 — бессрочный"
+  [[ "$r" == traffic ]] && warn "$1 остаётся заблокирован: исчерпан лимит трафика"
+  return 0
 }
 
+# Лимит трафика: РАЗМЕР (50G, 500M) за месяц или всего; off — снять.
+# Применяется сразу: превысивший блокируется, уложившийся — разблокируется.
+client_limit_set() {  # имя размер|off [month|total]
+  local name="$1" size="$2" period="${3:-month}" v tr
+  client_exists "$name" || { err "Клиента $name нет"; return 1; }
+  [[ "$period" == month || "$period" == total ]] || { err "Период: month или total"; return 1; }
+  expire_install
+  tr=$(_traffic_snapshot) || return 1
+  v=$(py limit-set "$SERVER_CONF" "$TRAFFIC_DB" "$name" "$size" "$period" "$tr" \
+      "$(cat "/sys/class/net/$AWG_IF/ifindex" 2>/dev/null)") || { rm -f "$tr"; return 1; }
+  rm -f "$tr"
+  traffic_tick 1
+  if [[ "$size" == off ]]; then ok "$name — без лимита трафика"
+  else ok "Лимит $name: $v $([[ "$period" == month ]] && echo "в месяц" || echo "всего")"; fi
+}
+
+client_limit_reset() {  # имя
+  local tr
+  client_exists "$1" || { err "Клиента $1 нет"; return 1; }
+  tr=$(_traffic_snapshot) || return 1
+  py limit-reset "$SERVER_CONF" "$TRAFFIC_DB" "$1" "$tr" "$(cat "/sys/class/net/$AWG_IF/ifindex" 2>/dev/null)" \
+    || { rm -f "$tr"; return 1; }
+  rm -f "$tr"
+  traffic_tick 1
+  ok "Счётчик лимита $1 обнулён"
+}
+
+# «12.3 ГБ из 50.0 ГБ за месяц» для меню.
+limit_fmt() {  # метка limit (БАЙТ/период) использовано
+  local n="${1%/*}" p="${1#*/}"
+  echo "$(fmt_bytes "${2:-0}") из $(fmt_bytes "$n") $([[ "$p" == month ]] && echo "за месяц" || echo "всего")"
+}
+
+# Удалить клиентов с истёкшим сроком. Заблокированных за трафик не трогает:
+# они разблокируются сами в новом месяце или после смены лимита.
 clients_purge_blocked() {
   local pub n=0
   while IFS= read -r pub; do client_delete "$pub" && n=$((n + 1)); done \
-    < <(clients_tsv | awk -F'\t' '$5 != "" {print $2}')
-  ok "Удалено заблокированных: $n"
+    < <(clients_tsv | awk -F'\t' '$5 != "" && $8 != "traffic" {print $2}')
+  ok "Удалено с истёкшим сроком: $n"
 }
 
 # Архив всех конфигов → путь в EXPORT_PATH.
@@ -3433,9 +3792,13 @@ do_show_client_qr() { _pick_client_file && share_config "$CHOSEN" qr; }
 
 do_list_clients() {
   server_exists || { err "Сервер не создан"; return 1; }
-  local dump now name pub aip exp orig _ hs rx tx ep st i=0 age
+  local dump now name pub aip exp orig _ hs rx tx ep st i=0 age lim per used month today by
+  local -A tl=()
   dump=$(awg show "$AWG_IF" dump 2>/dev/null | tail -n +2)
   now=$(date +%s)
+  while IFS='|' read -r name lim per used month today by; do
+    [[ -n "$name" ]] && tl[x$name]="$lim|$per|$used|$month|$today|$by"
+  done < <(traffic_rows)
   echo ""
   hdr "Клиенты"
   while IFS='|' read -r name pub aip exp orig _; do
@@ -3452,9 +3815,13 @@ do_list_clients() {
     fi
     echo -e "  ${W}$i) ${name:-без имени}${N}  ${D}$aip${N}"
     echo -e "     $st  ↑ $(fmt_bytes "${tx:-0}")  ↓ $(fmt_bytes "${rx:-0}")${ep:+  ${D}${ep%:*}${N}}"
+    IFS='|' read -r lim per used month today by <<< "${tl[x$name]:-0|||0|0|}"
+    (( ${month:-0} )) && echo -e "     ${D}за месяц $(fmt_bytes "$month"), сегодня $(fmt_bytes "${today:-0}")${N}"
+    if [[ "$by" == traffic ]]; then echo -e "     ${R}заблокирован: исчерпан лимит — $(limit_fmt "$lim/$per" "$used")${N}"
+    elif [[ "${lim:-0}" != 0 ]]; then echo -e "     ${D}лимит: $(limit_fmt "$lim/$per" "$used")${N}"; fi
     if [[ -n "$exp" ]]; then
-      if [[ -n "$orig" ]]; then echo -e "     ${R}заблокирован: срок истёк $(expire_fmt "$exp")${N}"
-      else echo -e "     ${Y}срок: $(expire_fmt "$exp")${N}"; fi
+      if [[ -n "$orig" && "$by" != traffic ]]; then echo -e "     ${R}заблокирован: срок истёк $(expire_fmt "$exp")${N}"
+      elif [[ -z "$orig" ]]; then echo -e "     ${Y}срок: $(expire_fmt "$exp")${N}"; fi
     fi
   done < <(clients_psv)
   (( i )) || info "Клиентов нет"
@@ -3494,7 +3861,7 @@ do_clients_menu() {
     echo -e "  ${C}4)${N} Показать QR"
     echo -e "  ${C}5)${N} Переименовать"
     echo -e "  ${G}6)${N} Создать несколько"
-    echo -e "  ${C}7)${N} Срок действия"
+    echo -e "  ${C}7)${N} Сроки и лимиты трафика"
     echo -e "  ${C}8)${N} Экспорт всех (zip)"
     echo -e "  ${C}9)${N} Сменить мимикрию"
     echo -e "  ${R}10)${N} Удалить"
@@ -3523,6 +3890,9 @@ do_clients_menu() {
 # бота: таймер работает и тогда, когда сам бот остановлен.
 _expire_notify() {
   local token="" proxy="" id ids=() via=()
+  # Проход таймера под замком API: сообщения — после замка (curl до 8 с на
+  # каждого админа держал бы замок, и правки из бота и панели получали отказ)
+  if [[ -n "${EXPIRE_DEFER:-}" ]]; then EXPIRE_QUEUE+=("$1"); return 0; fi
   [[ -f "$BOT_CONF" ]] || return 0
   { read -r token; read -r proxy; mapfile -t ids; } < <(py tg-targets "$BOT_CONF" "$BOT_ADMINS" 2>/dev/null)
   [[ -n "$token" ]] && (( ${#ids[@]} )) || return 0
@@ -3541,62 +3911,167 @@ EOF
   done
 }
 
-# Точка входа таймера (awg2-expire-check).
-expire_check_run() {
-  local out ev name arg stripped
+# Имя клиента в HTML-сообщении Telegram: конфиг, правленный руками, может
+# нести в имени что угодно.
+_expire_esc() { local s="${1//&/&amp;}"; s="${s//</&lt;}"; printf '%s' "${s//>/&gt;}"; }
+
+_expire_sync() {
+  local stripped
+  stripped=$(awg-quick strip "$AWG_IF" 2>/dev/null) \
+    && awg syncconf "$AWG_IF" <(printf '%s\n' "$stripped") 2>>"$EXPIRE_LOG"
+}
+
+# Трафик клиентов: прирост счётчиков — в базу по дням, превысившие лимит
+# блокируются, в новом месяце (или после смены лимита) — разблокируются.
+# Снимок счётчиков — свой файл на каждый вызов: таймер и команда из меню
+# или API, писавшие в один файл, читали бы недописанные строки друг друга.
+_traffic_snapshot() {  # → путь к снимку в stdout
+  local tr
+  mkdir -p "$EXPIRE_STATE_DIR"
+  tr=$(mktemp "$EXPIRE_STATE_DIR/transfer.XXXXXX") || return 1
+  awg show "$AWG_IF" transfer > "$tr" 2>/dev/null || : > "$tr"
+  printf '%s\n' "$tr"
+}
+
+traffic_tick() {  # [1 — записать базу сейчас]
+  local out ev name arg text tr ifx=""
   [[ -f "$SERVER_CONF" ]] || return 0
-  out=$(py expire-check "$SERVER_CONF" "$EXPIRE_SUSPEND_IP" "$EXPIRE_STATE_DIR" 2>>"$EXPIRE_LOG") || return 0
+  tr=$(_traffic_snapshot) || return 0
+  ifx=$(cat "/sys/class/net/$AWG_IF/ifindex" 2>/dev/null || true)
+  out=$(py traffic-tick "$SERVER_CONF" "$EXPIRE_SUSPEND_IP" "$TRAFFIC_DB" "$tr" "$ifx" "${1:-0}" 2>>"$EXPIRE_LOG") || out=""
+  # Прочитанный снимок — на место $EXPIRE_STATE_DIR/transfer одним rename:
+  # по его времени expire_watchdog видит, что таймер жив
+  mv -f "$tr" "$EXPIRE_STATE_DIR/transfer" 2>/dev/null || rm -f "$tr"
+  while IFS=$'\t' read -r ev name arg text; do
+    case "$ev" in
+      CHANGED) _expire_sync ;;
+      LIMIT)
+        echo "$(date '+%F %T') limit: $name ($text)" >> "$EXPIRE_LOG"
+        command -v conntrack >/dev/null && conntrack -D -s "${arg%%/*}" >/dev/null 2>&1
+        _expire_notify "🚫 Клиент <b>$(_expire_esc "$name")</b> заблокирован: исчерпан лимит трафика — ${text}." ;;
+      WARN90)
+        echo "$(date '+%F %T') limit90: $name ($arg)" >> "$EXPIRE_LOG"
+        _expire_notify "⚠️ Клиент <b>$(_expire_esc "$name")</b> израсходовал 90% лимита трафика: ${arg}." ;;
+      UNLIMIT)
+        echo "$(date '+%F %T') unlimit: $name ($arg)" >> "$EXPIRE_LOG"
+        _expire_notify "✅ Клиент <b>$(_expire_esc "$name")</b> разблокирован — трафик в пределах лимита: ${arg}." ;;
+    esac
+  done <<< "$out"
+  return 0
+}
+
+# Точка входа таймера (awg2-expire-check). Конфиг сервера правят и вызовы
+# API (бот, панель) — под их замком; занят дольше 10 с — проход пропускается,
+# следующий через 15 с. Таймер при этом жив — сторожу это видно по времени
+# снимка. Долгая задача API (сборка модуля, установка) держит замок минутами:
+# сроки и лимиты ждут её не дольше EXPIRE_LOCK_MAX, дальше проход идёт без замка.
+EXPIRE_LOCK_MAX=120
+expire_check_run() {
+  local out ev name arg busy="$EXPIRE_STATE_DIR/lock_busy"
+  local EXPIRE_DEFER=1 EXPIRE_QUEUE=()
+  [[ -f "$SERVER_CONF" ]] || return 0
+  mkdir -p "$STATE_DIR" "$EXPIRE_STATE_DIR"
+  exec 9>>"$STATE_DIR/api.lock" || return 0
+  if flock -w "${EXPIRE_LOCK_WAIT:-10}" 9; then
+    rm -f "$busy"
+  else
+    [[ -f "$busy" ]] || : > "$busy"
+    if (( $(date +%s) - $(stat -c %Y "$busy" 2>/dev/null || date +%s) < ${EXPIRE_LOCK_MAX:-120} )); then
+      [[ -f "$EXPIRE_STATE_DIR/transfer" ]] && touch "$EXPIRE_STATE_DIR/transfer"
+      return 0
+    fi
+  fi
+  out=$(py expire-check "$SERVER_CONF" "$EXPIRE_SUSPEND_IP" "$EXPIRE_STATE_DIR" 2>>"$EXPIRE_LOG") || out=""
   while IFS=$'\t' read -r ev name arg; do
     case "$ev" in
-      CHANGED)
-        stripped=$(awg-quick strip "$AWG_IF" 2>/dev/null) \
-          && awg syncconf "$AWG_IF" <(printf '%s\n' "$stripped") 2>>"$EXPIRE_LOG" ;;
+      CHANGED) _expire_sync ;;
       EXPIRED)
         echo "$(date '+%F %T') expired: $name (было $arg)" >> "$EXPIRE_LOG"
         command -v conntrack >/dev/null && conntrack -D -s "${arg%%/*}" >/dev/null 2>&1
-        _expire_notify "🚫 Клиент <b>${name}</b> заблокирован: срок действия истёк." ;;
+        _expire_notify "🚫 Клиент <b>$(_expire_esc "$name")</b> заблокирован: срок действия истёк." ;;
       WARN1H)
         echo "$(date '+%F %T') warn1h: $name ($arg мин)" >> "$EXPIRE_LOG"
-        _expire_notify "⚠️ Клиент <b>${name}</b> истекает через ${arg} мин." ;;
+        _expire_notify "⚠️ Клиент <b>$(_expire_esc "$name")</b> истекает через ${arg} мин." ;;
     esac
   done <<< "$out"
+  traffic_tick
+  exec 9>&-
+  EXPIRE_DEFER=""
+  # Telegram недоступен: curl по 8 с на каждого админа — бюджет 60 с, чтобы
+  # проход не затягивался; не ушедшее — в журнале
+  local i t0=$SECONDS
+  for (( i = 0; i < ${#EXPIRE_QUEUE[@]}; i++ )); do
+    if (( SECONDS - t0 >= ${EXPIRE_NOTIFY_BUDGET:-60} )); then
+      echo "$(date '+%F %T') уведомления: не отправлено $(( ${#EXPIRE_QUEUE[@]} - i )) — Telegram не отвечает" >> "$EXPIRE_LOG"
+      break
+    fi
+    _expire_notify "${EXPIRE_QUEUE[$i]}"
+  done
   return 0
 }
 
 expire_install() {
   mkdir -p "$EXPIRE_STATE_DIR"
   emit_script "$EXPIRE_BIN" 'expire_check_run' \
-    SERVER_CONF AWG_IF EXPIRE_SUSPEND_IP EXPIRE_STATE_DIR EXPIRE_LOG BOT_CONF BOT_ADMINS _PY_HELPER \
-    py _expire_notify expire_check_run || return 1
-  write_file "$EXPIRE_SERVICE" 644 <<EOF
+    SERVER_CONF AWG_IF EXPIRE_SUSPEND_IP EXPIRE_STATE_DIR EXPIRE_LOG BOT_CONF BOT_ADMINS TRAFFIC_DB _PY_HELPER STATE_DIR EXPIRE_LOCK_MAX \
+    py _expire_notify _expire_esc _expire_sync _traffic_snapshot traffic_tick expire_check_run || return 1
+  write_unit awg2-expire.service <<EOF
 [Unit]
-Description=AWG Toolza — проверка сроков клиентов
+Description=AWG Toolza — сроки и трафик клиентов
 After=awg-quick@awg0.service network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=$EXPIRE_BIN
+# У oneshot тайм-аута нет: зависший проход (awg show, syncconf) навсегда
+# останавливал бы и таймер — сторож его перезапуском не снимает
+TimeoutStartSec=120
+# Запуск каждые 15 с: «Starting/Finished» в журнал не пишем, сбои — пишем
+LogLevelMax=notice
 EOF
-  write_file "$EXPIRE_TIMER" 644 <<'EOF'
+  # Каждые 15 секунд по часам: превысивший лимит блокируется не позже чем
+  # через 15 с (что успеет скачать за это время — перерасход). Прежний
+  # OnUnitActiveSec отсчитывал от прошлого запуска службы и после
+  # переустановки сервера мог не сработать больше никогда (см. timer_heal);
+  # расписание по часам от истории не зависит.
+  write_unit awg2-expire.timer <<'EOF'
 [Unit]
-Description=AWG Toolza — таймер проверки сроков
+Description=AWG Toolza — таймер сроков и трафика клиентов
 
 [Timer]
-OnBootSec=30s
-OnUnitActiveSec=1min
-AccuracySec=10s
-Persistent=true
+OnCalendar=*-*-* *:*:00/15
+AccuracySec=1s
 
 [Install]
 WantedBy=timers.target
 EOF
-  systemctl daemon-reload
   systemctl enable --now awg2-expire.timer &>/dev/null || warn "Таймер сроков не запустился: systemctl status awg2-expire.timer"
+  timer_heal awg2-expire.timer
+}
+
+# Сторож таймера: каждый проход таймера пишет счётчики в $EXPIRE_STATE_DIR/transfer.
+# Файл старше 5 минут — таймер молчит, и сроки с лимитами не блокируют: поставить
+# таймер заново, перезапустить и сразу сделать проход. Зовётся при каждом запуске
+# awg2 (меню, бот, панель) — стоит одного stat.
+EXPIRE_STALE=300
+expire_watchdog() {
+  local tr="$EXPIRE_STATE_DIR/transfer" age
+  server_exists || return 0
+  [[ -f "$tr" ]] || return 0            # таймер ещё ни разу не проходил — поставит expire_install
+  age=$(( $(date +%s) - $(stat -c %Y "$tr" 2>/dev/null || echo 0) ))
+  (( age < EXPIRE_STALE )) && return 0
+  mkdir -p "$(dirname "$EXPIRE_LOG")"
+  echo "$(date '+%F %T') watchdog: таймер молчал ${age}с — перезапуск" >> "$EXPIRE_LOG"
+  log_warn "таймер сроков и лимитов молчал ${age}с — перезапуск"
+  touch "$tr"                           # параллельные вызовы awg2 не перезапускают его разом
+  expire_install &>/dev/null
+  systemctl restart awg2-expire.timer &>/dev/null || true
+  systemctl start --no-block awg2-expire.service &>/dev/null || true
 }
 
 expire_remove() {
   remove_unit awg2-expire.timer awg2-expire.service
-  rm -f "$EXPIRE_BIN"
+  rm -f "$EXPIRE_BIN" "$TRAFFIC_DB" "$TRAFFIC_DB.lock"
   rm -rf "$EXPIRE_STATE_DIR"
 }
 
@@ -3617,28 +4092,75 @@ _expire_apply() {
   stripped=$(awg-quick strip "$AWG_IF" 2>/dev/null) && awg syncconf "$AWG_IF" <(printf '%s\n' "$stripped")
 }
 
+# Строки трафика для меню: «имя|лимит|период|по лимиту|за месяц|сегодня|причина».
+traffic_rows() {
+  local tr
+  server_exists || return 0
+  mktmp tr || return 1
+  awg show "$AWG_IF" transfer > "$tr" 2>/dev/null || true
+  py traffic-rows "$SERVER_CONF" "$TRAFFIC_DB" "$tr" | tr '\t' '|'
+}
+
+_ask_limit() {  # → «РАЗМЕР ПЕРИОД» в stdout или пусто
+  local v p
+  echo -e "  ${D}Размер: 50G, 500M, 1.5T; число без буквы — гигабайты${N}" >&2
+  read -rp "  Лимит: " v
+  [[ -n "$v" ]] || return 0
+  py size-parse "$v" >/dev/null 2>&1 || { warn "Размер не распознан: $v" >&2; return 0; }
+  echo -e "  ${C}1)${N} В месяц ${D}— счётчик обнуляется 1-го числа, клиент разблокируется сам${N}" >&2
+  echo -e "  ${C}2)${N} Всего ${D}— без сброса, с этой минуты${N}" >&2
+  read_choice p "${C}  Период [1-2]: ${N}" 1 2 1
+  echo "$v $([[ "$p" == 2 ]] && echo total || echo month)"
+}
+
+do_traffic_days() {
+  local tr
+  server_exists || { err "Сервер не создан"; return 1; }
+  mktmp tr || return 1
+  awg show "$AWG_IF" transfer > "$tr" 2>/dev/null || true
+  echo ""
+  hdr "Трафик по дням"
+  py traffic-report "$SERVER_CONF" "$TRAFFIC_DB" "$tr" 14 | sed 's/^/  /'
+  [[ -f "$TRAFFIC_DB" ]] || info "Учёт идёт с момента установки $VERSION — данные копятся каждые 15 секунд"
+}
+
 do_expire_menu() {
   server_exists || { err "Сервер не создан"; return 1; }
   expire_install
-  local c name pub ts now rows=() n=0 exp orig
+  local c name pub ts rows=() n=0 exp orig lim per used month _ by ans
+  local -A tl=()
   while true; do
     echo ""
-    hdr "Срок действия клиентов"
-    now=$(date +%s)
+    hdr "Сроки и лимиты трафика"
+    tl=()
+    while IFS='|' read -r name lim per used month _ by; do
+      [[ -n "$name" && "$lim" != 0 ]] && tl[x$name]="$lim/$per|$used|$by"
+    done < <(traffic_rows)
     while IFS='|' read -r name pub _ exp orig _; do
-      [[ -n "$exp" ]] || continue
+      [[ -n "$exp" || -n "${tl[x$name]:-}" ]] || continue
       n=$((n + 1))
-      if [[ -n "$orig" ]]; then echo -e "  ${R}🚫 ${name}${N} ${D}— заблокирован, $(expire_fmt "$exp")${N}"
-      else echo -e "  ${Y}⏰ ${name}${N} ${D}— $(expire_fmt "$exp")${N}"; fi
+      by="${tl[x$name]:-}"; by="${by##*|}"
+      if [[ -n "$orig" && "$by" == traffic ]]; then echo -e "  ${R}🚫 ${name}${N} ${D}— заблокирован: исчерпан лимит${N}"
+      elif [[ -n "$orig" ]]; then echo -e "  ${R}🚫 ${name}${N} ${D}— заблокирован, $(expire_fmt "$exp")${N}"
+      elif [[ -n "$exp" ]]; then echo -e "  ${Y}⏰ ${name}${N} ${D}— $(expire_fmt "$exp")${N}"
+      else echo -e "  ${C}📶 ${name}${N}"; fi
+      if [[ -n "${tl[x$name]:-}" ]]; then
+        IFS='|' read -r lim used _ <<< "${tl[x$name]}"
+        echo -e "     ${D}трафик: $(limit_fmt "$lim" "$used")${N}"
+      fi
     done < <(clients_psv)
-    (( n )) || echo -e "  ${D}Сроков нет — все клиенты бессрочные${N}"
+    (( n )) || echo -e "  ${D}Сроков и лимитов нет — все клиенты бессрочные и без лимита${N}"
     n=0
     echo ""
     echo -e "  ${C}1)${N} Поставить срок"
     echo -e "  ${C}2)${N} Снять срок / разблокировать"
-    echo -e "  ${R}3)${N} Удалить заблокированных"
+    echo -e "  ${C}3)${N} Лимит трафика"
+    echo -e "  ${C}4)${N} Снять лимит трафика"
+    echo -e "  ${C}5)${N} Обнулить счётчик лимита"
+    echo -e "  ${C}6)${N} Трафик по дням"
+    echo -e "  ${R}7)${N} Удалить с истёкшим сроком"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-3]: ${N}" 0 3 0
+    read_choice c "${C}  Выбор [0-7]: ${N}" 0 7 0
     case "$c" in
       1) _pick_client || continue
          name="${CHOSEN%%$'\t'*}"
@@ -3647,8 +4169,18 @@ do_expire_menu() {
          [[ -n "$ts" ]] && { client_expire_set "$name" "$ts" || true; } ;;
       2) _pick_client || continue
          client_expire_clear "${CHOSEN%%$'\t'*}" || true ;;
-      3) mapfile -t rows < <(clients_tsv | awk -F'\t' '$5 != "" {print $1}')
-         (( ${#rows[@]} )) || { info "Заблокированных нет"; continue; }
+      3) _pick_client || continue
+         name="${CHOSEN%%$'\t'*}"
+         [[ -n "$name" ]] || { warn "У клиента нет имени"; continue; }
+         ans=$(_ask_limit)
+         [[ -n "$ans" ]] && { client_limit_set "$name" "${ans% *}" "${ans#* }" || true; } ;;
+      4) _pick_client || continue
+         client_limit_set "${CHOSEN%%$'\t'*}" off || true ;;
+      5) _pick_client || continue
+         client_limit_reset "${CHOSEN%%$'\t'*}" || true ;;
+      6) do_traffic_days || true; pause ;;
+      7) mapfile -t rows < <(clients_tsv | awk -F'\t' '$5 != "" && $8 != "traffic" {print $1}')
+         (( ${#rows[@]} )) || { info "Клиентов с истёкшим сроком нет"; continue; }
          warn "Будут удалены навсегда: ${rows[*]}"
          read_confirm "${R}  Подтверди (введи yes): ${N}" && clients_purge_blocked ;;
       0) return 0 ;;
@@ -3735,6 +4267,26 @@ peers_sync() {
   mv -f "$f.tmp" "$f"
 }
 
+# Все клиенты через туннель; строки «IP|выход» (свой выход Xray) остаются.
+peers_all() {  # файл
+  local ip
+  mkdir -p "$(dirname "$1")"
+  clients_name_ip | cut -d'|' -f2 | while IFS= read -r ip; do
+    grep -E "^${ip//./\\.}(\||$)" "$1" 2>/dev/null | head -1 | grep . || echo "$ip"
+  done > "$1.new"
+  mv -f "$1.new" "$1"
+}
+
+# Свои выходы клиентов Xray живут в конфиге самого Xray (правила по адресу):
+# изменились — без пересборки конфига клиент оставался на прежнем выходе,
+# хотя список показывал «по умолчанию» или «напрямую».
+_xray_outs() { grep -F '|' "$XRAY_PEERS" 2>/dev/null | sort; }
+_xray_outs_apply() {  # прежний вывод _xray_outs
+  [[ "$(_xray_outs)" != "$1" ]] && xray_is_up || return 0
+  _xray_prepare || return 1
+  info "Перезапускаю туннель"; xray_restart
+}
+
 peers_seed() {
   [[ -f "$1" ]] && return 0
   mkdir -p "$(dirname "$1")"
@@ -3761,10 +4313,16 @@ rt_rules_clear() {  # таблица
 }
 
 # NAT и FORWARD между awg0 и туннелем. Правила помечены «awg2-tun-<dev>».
-rt_fw_up() {  # устройство
+rt_fw_up() {  # устройство [nonat]
   local dev="$1" net tag="awg2-tun-$1"
   net=$(server_net) || return 1
-  ipt_add -t nat POSTROUTING -s "$net" -o "$dev" -j MASQUERADE -m comment --comment "$tag"
+  # nonat — устройство должно видеть адреса клиентов (inbound tun Xray
+  # выбирает выход клиента по его адресу)
+  if [[ "${2:-}" == nonat ]]; then
+    ipt_del -t nat POSTROUTING -s "$net" -o "$dev" -j MASQUERADE -m comment --comment "$tag"
+  else
+    ipt_add -t nat POSTROUTING -s "$net" -o "$dev" -j MASQUERADE -m comment --comment "$tag"
+  fi
   ipt_ins FORWARD -i "$AWG_IF" -o "$dev" -j ACCEPT -m comment --comment "$tag"
   ipt_ins FORWARD -i "$dev" -o "$AWG_IF" -j ACCEPT -m comment --comment "$tag"
   # MSS по MTU маршрута: у туннеля MTU меньше, а ICMP «нужна фрагментация»
@@ -3794,7 +4352,7 @@ rt_fw_down() {  # устройство
 
 # rt_up УСТРОЙСТВО ТАБЛИЦА ФАЙЛ_КЛИЕНТОВ|- [SRC]
 # «-» вместо файла — вся подсеть клиентов (как у tun2socks).
-rt_up() {
+rt_up() {  # устройство таблица peers|- [src] [nonat]
   local dev="$1" table="$2" peers="$3" src="${4:-}" net ip line
   net=$(server_net) || return 1
   if [[ -n "$src" ]]; then
@@ -3811,7 +4369,7 @@ rt_up() {
       valid_ip "$ip" && ip rule add from "$ip" lookup "$table" priority "$table"
     done < "$peers"
   fi
-  rt_fw_up "$dev"
+  rt_fw_up "$dev" "${5:-}"
 }
 
 rt_down() {  # устройство таблица
@@ -3893,7 +4451,7 @@ _tunnel_rules_refresh() {  # файл устройство таблица
 
 # tunnel_client warp|xray ИМЯ|all|none on|off
 tunnel_client() {
-  local file dev table ip
+  local file dev table ip outs
   case "$1" in
     warp) file="$WARP_PEERS"; dev="$WARP_IF"; table="$WARP_TABLE" ;;
     xray) file="$XRAY_PEERS"; dev="$XRAY_IF"; table="$XRAY_TABLE" ;;
@@ -3901,22 +4459,29 @@ tunnel_client() {
   esac
   mkdir -p "$(dirname "$file")"
   peers_sync "$file"
-  case "$2" in
-    all) clients_name_ip | cut -d'|' -f2 > "$file" ;;
+  outs=$(_xray_outs)
+  # all / none без третьего аргумента — все клиенты; с ним — клиент с таким
+  # именем: «tunnels client xray all off» не должно включать всех
+  case "$2${3:+|}" in
+    all) peers_all "$file" ;;
     none) : > "$file" ;;
     *) ip=$(clients_name_ip | awk -F'|' -v n="$2" '$1 == n {print $2; exit}')
        [[ -n "$ip" ]] || { err "Клиента $2 нет"; return 1; }
        peers_seed "$file"
-       if [[ "${3:-on}" == on ]]; then peers_add "$file" "$ip"; else peers_del "$file" "$ip"; fi ;;
+       if [[ "${3:-on}" == on ]]; then peers_has "$file" "$ip" || peers_add "$file" "$ip"
+       else peers_del "$file" "$ip"; fi ;;
   esac
   _tunnel_rules_refresh "$file" "$dev" "$table"
   ok "Клиенты ${1^^}: $(grep -c . "$file" || true) через туннель"
+  if [[ "$1" == xray ]]; then _xray_outs_apply "$outs" || return 1; fi
+  return 0
 }
 # tunnel_peers_menu ЗАГОЛОВОК ФАЙЛ УСТРОЙСТВО ТАБЛИЦА
 tunnel_peers_menu() {
-  local title="$1" file="$2" dev="$3" table="$4" rows=() i c name ip
+  local title="$1" file="$2" dev="$3" table="$4" rows=() i c name ip outs
   while true; do
     peers_sync "$file"
+    outs=$(_xray_outs)
     mapfile -t rows < <(clients_name_ip)
     (( ${#rows[@]} )) || { warn "Клиентов нет"; return 0; }
     echo ""
@@ -3932,12 +4497,13 @@ tunnel_peers_menu() {
     read_choice c "${C}  Номер — вкл/выкл: ${N}" 0 "${#rows[@]}" 0 "a|n"
     case "$c" in
       0) return 0 ;;
-      a) clients_name_ip | cut -d'|' -f2 > "$file" ;;
+      a) peers_all "$file" ;;
       n) : > "$file" ;;
       *) ip="${rows[$((c - 1))]#*|}"
          if peers_has "$file" "$ip"; then peers_del "$file" "$ip"; else peers_add "$file" "$ip"; fi ;;
     esac
     _tunnel_rules_refresh "$file" "$dev" "$table"
+    [[ "$file" == "$XRAY_PEERS" ]] && { _xray_outs_apply "$outs" || true; }
   done
 }
 
@@ -4984,11 +5550,19 @@ cascade_add() {
 }
 
 # cascade_rule_add udp|tcp|both ВХОД ЦЕЛЬ ВЫХОД [комментарий]
+# Порты и адрес цели правила; причина отказа — в stdout. Общая для
+# добавления и для правил из бэкапа: те раньше проверялись только по формату
+# и могли увести порт сервера во внутреннюю сеть.
+_cascade_rule_invalid() {  # вход цель выход
+  valid_port "$1" && valid_port "$3" || { echo "Порт 1-65535"; return 0; }
+  valid_ip "$2" && ! ip_is_private "$2" || { echo "Нужен публичный IPv4, например 5.6.7.8"; return 0; }
+  return 1
+}
+
 cascade_rule_add() {
   local protos=() proto in="$2" dst="$3" out="$4" comment="${5//[|$'\n\r']/ }" why added=0
   case "$1" in udp|tcp) protos=("$1") ;; both) protos=(udp tcp) ;; *) err "Протокол: udp | tcp | both"; return 1 ;; esac
-  valid_port "$in" && valid_port "$out" || { err "Порт 1-65535"; return 1; }
-  valid_ip "$dst" && ! ip_is_private "$dst" || { err "Нужен публичный IPv4, например 5.6.7.8"; return 1; }
+  if why=$(_cascade_rule_invalid "$in" "$dst" "$out"); then err "$why"; return 1; fi
   ip_forward_enable
   mkdir -p "$CASCADE_DIR"
   for proto in "${protos[@]}"; do
@@ -5164,6 +5738,11 @@ do_cascade_menu() {
 # умеет — tun2socks поверх SOCKS-входа Xray на 127.0.0.1:10808. Дальше
 # маршрутизация одна: клиенты из peers.list → таблица 201 → xray0.
 #
+# Клиенту можно назначить свой выход: строка «IP|выход» в peers.list, в
+# конфиге Xray — правило по адресу клиента (source) перед общим. Адрес
+# клиента виден только inbound tun самого Xray — поэтому перед xray0 в этом
+# режиме нет NAT; через tun2socks все соединения приходят с 127.0.0.1.
+#
 # Три постоянных юнита, чтобы туннель переживал перезагрузку:
 #   awg-xray.service          — сам Xray;
 #   awg-xray-tun.service      — tun2socks (только если нет inbound tun);
@@ -5203,13 +5782,21 @@ xray_test() {
 
 # Умеет ли бинарь inbound tun. Апстримный XTLS/Xray-core долго его не имел,
 # поэтому спрашиваем сам бинарь, а не гадаем по версии.
+# Ответ запоминается и в $STATE_DIR/xray_tun до смены бинаря: проба
+# запускает сам Xray, а спрашивают её на каждом экране клиента в боте.
 _XRAY_TUN=""
 xray_tun_supported() {
-  local probe
+  local probe key cache="$STATE_DIR/xray_tun"
   if [[ -z "$_XRAY_TUN" ]]; then
-    _XRAY_TUN=0
-    mktmp probe .json || return 1
-    py xray-tun-probe "$probe" && xray_test "$probe" >/dev/null && _XRAY_TUN=1
+    key=$(stat -c '%Y:%s' "$XRAY_BIN" 2>/dev/null || true)
+    if [[ -n "$key" && "$(cut -d' ' -f1 "$cache" 2>/dev/null)" == "$key" ]]; then
+      _XRAY_TUN=$(cut -d' ' -f2 "$cache")
+    else
+      _XRAY_TUN=0
+      mktmp probe .json || return 1
+      py xray-tun-probe "$probe" && xray_test "$probe" >/dev/null && _XRAY_TUN=1
+      [[ -n "$key" ]] && mkdir -p "$STATE_DIR" && echo "$key $_XRAY_TUN" > "$cache" 2>/dev/null
+    fi
   fi
   [[ "$_XRAY_TUN" == 1 ]]
 }
@@ -5261,7 +5848,7 @@ xray_install() {  # [update] — без вопроса обновить уже �
 xray_add_outbound() {
   local link
   xray_installed || { err "Сначала установи Xray"; return 1; }
-  read_line link "${C}  Ссылка (vless:// vmess:// hysteria2://): ${N}"
+  read_line link "${C}  Ссылка (vless:// vmess:// trojan:// ss:// hysteria2://): ${N}"
   link="${link//[[:space:]]/}"
   [[ -n "$link" ]] || return 0
   xray_add_link "$link"
@@ -5282,7 +5869,7 @@ xray_add_link() {  # ссылка
   if ! why=$(xray_test "$probe"); then
     err "Этот Xray не принимает такой выход:"
     sed 's/^/      /' <<< "$why"
-    [[ "$link" =~ ^(hysteria2|hy2):// ]] && info "hysteria2 есть не во всех сборках Xray — используй vless/vmess"
+    [[ "$link" =~ ^(hysteria2|hy2):// ]] && info "Hysteria2 есть в Xray 26 и новее — обнови Xray: Установить / обновить"
     return 1
   fi
   py xray-add "$XRAY_CONF" <<< "$ob" 2>/dev/null || rc=$?
@@ -5308,11 +5895,109 @@ xray_del_outbound() {
   xray_del_tag "$CHOSEN"
 }
 
+# Клиенты удалённых выходов — на выход по умолчанию; печатает, сколько их.
+_xray_peers_untag() {  # тег...
+  local f="$XRAY_PEERS"
+  [[ -f "$f" ]] || { echo 0; return 0; }
+  awk -F'|' 'NR == FNR {d[$0] = 1; next} NF > 1 && ($2 in d) {c++} END {print c + 0}' \
+    <(printf '%s\n' "$@") "$f"
+  awk -F'|' 'NR == FNR {d[$0] = 1; next} NF > 1 && ($2 in d) {print $1; next} {print}' \
+    <(printf '%s\n' "$@") "$f" > "$f.tmp" && mv -f "$f.tmp" "$f"
+}
+
 xray_del_tag() {  # тег
+  local n
   xray_tags | grep -qxF "$1" || { err "Выхода $1 нет"; return 1; }
   py xray-del "$XRAY_CONF" "$1"
-  py xray-prepare "$XRAY_CONF" "$(xray_tun_supported && echo native || echo tun2socks)" || true
+  n=$(_xray_peers_untag "$1")
+  _xray_prepare
   ok "Выход $1 удалён"
+  (( ${n:-0} )) && info "Его клиенты ($n) — теперь на выходе по умолчанию"
+  xray_is_up && xray_restart
+  return 0
+}
+
+# Режим входа Xray: native — свой inbound tun, tun2socks — через SOCKS.
+xray_mode() { if xray_tun_supported; then echo native; else echo tun2socks; fi; }
+
+_xray_prepare() { py xray-prepare "$XRAY_CONF" "$(xray_mode)" "$XRAY_PEERS"; }
+
+# Выход по умолчанию — для клиентов без своего выхода. Балансировщик выключается.
+xray_main_set() {  # тег
+  xray_installed || { err "Xray не установлен"; return 1; }
+  xray_tags | grep -qxF "$1" || { err "Выхода $1 нет"; return 1; }
+  py xray-main "$XRAY_CONF" "$1" || return 1
+  ok "Выход по умолчанию: $1"
+  if xray_is_up; then info "Перезапускаю туннель"; xray_restart; fi
+  return 0
+}
+
+# Выход клиента: тег или default (выход по умолчанию / балансировщик).
+# Клиент заодно включается в Xray.
+xray_client_out() {  # имя тег|default
+  local name="$1" tag="$2" ip old new
+  xray_installed || { err "Xray не установлен"; return 1; }
+  ip=$(clients_name_ip | awk -F'|' -v n="$name" '$1 == n {print $2; exit}')
+  [[ -n "$ip" ]] || { err "Клиента $name нет"; return 1; }
+  if [[ "$tag" != default ]]; then
+    xray_tags | grep -qxF "$tag" || { err "Выхода $tag нет"; return 1; }
+    if ! xray_tun_supported; then
+      err "Свой выход клиенту — только с inbound tun в самом Xray, а эта сборка его не умеет"
+      info "Обнови Xray: Туннели → Xray → Установить / обновить"
+      return 1
+    fi
+  fi
+  peers_sync "$XRAY_PEERS"; peers_seed "$XRAY_PEERS"
+  old=$(grep -E "^${ip//./\\.}(\||$)" "$XRAY_PEERS" | head -1)
+  new="$ip"; [[ "$tag" == default ]] || new="$ip|$tag"
+  peers_add "$XRAY_PEERS" "$ip" "$new"
+  ok "$name → $([[ "$tag" == default ]] && echo "выход по умолчанию" || echo "$tag")"
+  xray_is_up || return 0
+  # Правила по адресу в конфиге Xray меняются, только если выход клиента был
+  # или стал своим; иначе хватает маршрута клиента в xray0
+  if [[ "$old" != "$new" && ( "$old" == *"|"* || "$new" == *"|"* ) ]]; then
+    _xray_prepare
+    info "Перезапускаю туннель"; xray_restart
+  else
+    _tunnel_rules_refresh "$XRAY_PEERS" "$XRAY_IF" "$XRAY_TABLE"
+  fi
+  return 0
+}
+
+# «имя|ip|выход» клиентов Xray со своим выходом.
+xray_client_outs() {
+  local name ip line
+  [[ -f "$XRAY_PEERS" ]] || return 0
+  while IFS='|' read -r name ip; do
+    line=$(grep -E "^${ip//./\\.}\|" "$XRAY_PEERS" | head -1)
+    [[ -n "$line" ]] && echo "$name|$ip|${line#*|}"
+  done < <(clients_name_ip)
+  return 0
+}
+
+xray_main_menu() {
+  local tags=() i c
+  mapfile -t tags < <(xray_tags)
+  (( ${#tags[@]} )) || { warn "Выходов нет — добавь выход ссылкой"; return 0; }
+  echo -e "  Сейчас: ${W}$(py xray-main-get "$XRAY_CONF" | sed 's/^balancer$/балансировщик/')${N}"
+  _xray_pick_tag || return 0
+  xray_main_set "$CHOSEN"
+}
+
+xray_client_menu() {
+  local tags=() i c name cur
+  xray_installed || { err "Xray не установлен"; return 1; }
+  mapfile -t tags < <(xray_tags)
+  (( ${#tags[@]} >= 2 )) || { warn "Свой выход клиенту — когда выходов хотя бы два"; return 0; }
+  _pick_client || return 0
+  name="${CHOSEN%%$'\t'*}"
+  [[ -n "$name" ]] || { warn "У клиента нет имени"; return 0; }
+  cur=$(xray_client_outs | awk -F'|' -v n="$name" '$1 == n {print $3}')
+  echo -e "  Сейчас: ${W}${cur:-выход по умолчанию}${N}"
+  echo -e "  ${C}0)${N} Выход по умолчанию ${D}($(py xray-main-get "$XRAY_CONF" | sed 's/^balancer$/балансировщик/'))${N}"
+  for i in "${!tags[@]}"; do echo -e "  ${C}$((i + 1)))${N} ${tags[$i]}"; done
+  read_choice c "${C}  Выход [0-${#tags[@]}]: ${N}" 0 "${#tags[@]}" 0
+  if (( c == 0 )); then xray_client_out "$name" default; else xray_client_out "$name" "${tags[$((c - 1))]}"; fi
 }
 
 xray_balancer() {  # стратегия
@@ -5425,8 +6110,10 @@ xray_ru_set() {
 
 # ── Маршрутизация (awg-xray-routing.service) ──────────────
 xray_routing_run() {
-  local i
+  local i nat=""
   if [[ "${1:-}" == stop ]]; then rt_down "$XRAY_IF" "$XRAY_TABLE"; return 0; fi
+  # Inbound tun самого Xray выбирает выход клиента по его адресу — без NAT
+  grep -qx 'tun_mode=native' "$XRAY_STATE" 2>/dev/null && nat=nonat
   for i in $(seq 1 40); do ip link show "$XRAY_IF" &>/dev/null && break; sleep 0.5; done
   ip link show "$XRAY_IF" &>/dev/null || { echo "$XRAY_IF не появился" >&2; return 1; }
   ip addr add "$XRAY_TUN_ADDR" dev "$XRAY_IF" 2>/dev/null || true
@@ -5434,17 +6121,21 @@ xray_routing_run() {
   # Мёртвый выход — не повод оставить клиентов без интернета: ждём до
   # минуты (при загрузке сеть поднимается не сразу), потом идём напрямую.
   for i in $(seq 1 8); do
-    socks_probe "$XRAY_SOCKS" >/dev/null && { rt_up "$XRAY_IF" "$XRAY_TABLE" "$XRAY_PEERS"; return; }
+    socks_probe "$XRAY_SOCKS" >/dev/null && { rt_up "$XRAY_IF" "$XRAY_TABLE" "$XRAY_PEERS" "" "$nat"; return; }
     sleep 5
   done
   echo "через Xray трафик не идёт — клиенты остаются на прямом маршруте" >&2
   return 1
 }
 
+_xray_emit_routing() {
+  emit_script "$XRAY_ROUTING_SCRIPT" 'xray_routing_run "$@"' XRAY_IF XRAY_TABLE XRAY_PEERS XRAY_STATE \
+    XRAY_TUN_ADDR XRAY_SOCKS socks_probe "${RT_FUNCS[@]}" xray_routing_run
+}
+
 _xray_write_units() {  # режим
   local mode="$1" after="$XRAY_UNIT"
-  emit_script "$XRAY_ROUTING_SCRIPT" 'xray_routing_run "$@"' XRAY_IF XRAY_TABLE XRAY_PEERS \
-    XRAY_TUN_ADDR XRAY_SOCKS socks_probe "${RT_FUNCS[@]}" xray_routing_run || return 1
+  _xray_emit_routing || return 1
   write_unit "$XRAY_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — Xray
@@ -5516,7 +6207,8 @@ xray_up() {
     info "Эта сборка Xray без inbound tun — xray0 поднимет tun2socks"
     t2s_install_bin || return 1
   fi
-  py xray-prepare "$XRAY_CONF" "$mode" || { err "Не удалось подготовить конфиг"; return 1; }
+  peers_sync "$XRAY_PEERS"; peers_seed "$XRAY_PEERS"
+  py xray-prepare "$XRAY_CONF" "$mode" "$XRAY_PEERS" || { err "Не удалось подготовить конфиг"; return 1; }
   # Прежние версии запускали Xray временными юнитами с теми же именами
   systemctl stop "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
   systemctl reset-failed "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
@@ -5533,7 +6225,6 @@ xray_up() {
     info "Разбор по выходам — «Диагностика»"
     return 1
   fi
-  peers_sync "$XRAY_PEERS"; peers_seed "$XRAY_PEERS"
   printf 'active\nclient_net=%s\niface=%s\ntun_dev=%s\ntun_mode=%s\n' \
     "$(server_net)" "$(uplink_iface)" "$XRAY_IF" "$mode" | write_file "$XRAY_STATE" 644
   _xray_write_units "$mode" || return 1
@@ -5586,7 +6277,7 @@ xray_uninstall() {
 
 # ── Статус и диагностика ──────────────────────────────────
 xray_status() {
-  local tags=() n total
+  local tags=() n total name tag
   if ! xray_installed; then echo -e "  Xray      : ${D}○ не установлен${N}"; return 0; fi
   echo -e "  Версия    : $("$XRAY_BIN" version 2>/dev/null | head -1 | awk '{print $2}')"
   if ip link show "$XRAY_IF" &>/dev/null; then
@@ -5601,6 +6292,10 @@ xray_status() {
   mapfile -t tags < <(xray_tags)
   echo -e "  Выходы    : ${W}${tags[*]:-нет}${N}"
   echo -e "  Балансир  : $(py xray-balancer-get "$XRAY_CONF" 2>/dev/null || echo off)"
+  (( ${#tags[@]} )) && echo -e "  По умолч. : ${W}$(py xray-main-get "$XRAY_CONF" 2>/dev/null | sed 's/^balancer$/балансировщик/')${N}"
+  xray_client_outs | while IFS='|' read -r name _ tag; do
+    echo -e "  ${D}  $name → $tag$(xray_tags | grep -qxF "$tag" || echo " (выхода нет — по умолчанию)")${N}"
+  done
   xray_ru_on && echo -e "  РФ-сайты  : ${G}напрямую${N}"
   return 0
 }
@@ -5618,8 +6313,11 @@ xray_bad_outbounds() {
 xray_fix() {
   local bad=()
   mapfile -t bad < <(xray_bad_outbounds)
-  (( ${#bad[@]} )) && py xray-del "$XRAY_CONF" "${bad[@]}"
-  py xray-prepare "$XRAY_CONF" "$(xray_tun_supported && echo native || echo tun2socks)"
+  if (( ${#bad[@]} )); then
+    py xray-del "$XRAY_CONF" "${bad[@]}"
+    _xray_peers_untag "${bad[@]}" >/dev/null
+  fi
+  _xray_prepare
   if xray_test >/dev/null; then ok "Конфиг принят Xray${bad[*]:+, убраны: ${bad[*]}}"
   else err "Конфиг всё ещё отвергается"; return 1; fi
 }
@@ -5662,6 +6360,8 @@ do_xray_menu() {
     echo -e "  ${C}2)${N} Добавить выход (ссылка)"
     echo -e "  ${C}3)${N} Удалить выход"
     echo -e "  ${C}4)${N} Балансировщик"
+    echo -e "  ${C}m)${N} Выход по умолчанию"
+    echo -e "  ${C}o)${N} Свой выход клиенту"
     echo -e "  ${C}5)${N} Включить туннель"
     echo -e "  ${C}6)${N} Выключить туннель"
     echo -e "  ${C}7)${N} Перезапустить туннель"
@@ -5670,12 +6370,14 @@ do_xray_menu() {
     echo -e "  ${C}r)${N} РФ-сайты напрямую $(xray_ru_on && echo -e "${G}● вкл${N}" || echo -e "${D}○ выкл${N}")"
     echo -e "  ${R}d)${N} Удалить Xray"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор: ${N}" 0 9 0 "r|d"
+    read_choice c "${C}  Выбор: ${N}" 0 9 0 "r|d|m|o"
     case "$c" in
       1) xray_install || true ;;
       2) xray_add_outbound || true ;;
       3) xray_del_outbound || true ;;
       4) xray_balancer_menu || true ;;
+      m) xray_main_menu || true ;;
+      o) xray_client_menu || true ;;
       5) xray_up || true ;;
       6) xray_down ;;
       7) xray_restart || true ;;
@@ -5987,6 +6689,20 @@ WantedBy=multi-user.target
 EOF
 }
 
+# Список «выбранных» при переходе в них из режима «все клиенты». all —
+# действие над одним клиентом относительно «все» (exits_client, меню): в
+# списке все клиенты. Иначе («выбранные» кнопкой, exits up peers) — прежний
+# выбор, а если его нет или он пуст (после «никто», сброса сервера) — тоже
+# все: пустой список увёл бы мимо нод вообще всех. В режиме «выбранные»
+# пустой список — сознательное «никто», его не трогаем.
+_exits_seed_peers() {  # [all]
+  mkdir -p "$(dirname "$EXITS_PEERS")"
+  peers_sync "$EXITS_PEERS"
+  if [[ "$(exits_state_get mode)" == peers ]]; then peers_seed "$EXITS_PEERS"; return 0; fi
+  if [[ "${1:-}" == all ]] || ! grep -q . "$EXITS_PEERS" 2>/dev/null; then peers_all "$EXITS_PEERS"; fi
+  return 0
+}
+
 exits_reapply() { exits_is_up && systemctl restart "$EXITS_UNIT" &>/dev/null; return 0; }
 
 # ── Включение / выключение ────────────────────────────────
@@ -5997,7 +6713,7 @@ exits_up() {  # all|peers
   [[ -n "$(exits_up_nodes)" ]] || { err "Ни одна exit-нода не поднята — добавь или перезапусти ноду"; return 1; }
   # Список клиентов режима peers — до проверки «уже включено»: иначе при
   # переключении all → peers на ходу файла нет, и маршруты не получает никто.
-  if [[ "$mode" == peers ]]; then peers_sync "$EXITS_PEERS"; peers_seed "$EXITS_PEERS"; fi
+  if [[ "$mode" == peers ]]; then _exits_seed_peers; fi
   if exits_is_up; then exits_state_set mode "$mode"; exits_reapply; ok "Режим: $mode"; return 0; fi
   tunnel_guard exits || return 1
   exits_state_set state active mode "$mode"
@@ -6159,12 +6875,33 @@ exits_balance() {
 }
 
 # Клиент и exit-ноды: exits_client ИМЯ off|shared|НОДА. Переводит в выборочный режим.
+# exits_client ИМЯ|all|none off|shared|НОДА — выход клиента; all — все клиенты
+# через ноды (у кого своя нода, она остаётся), none — никто: все напрямую.
+# Режим при этом — «выбранные клиенты»; маршруты перезапускаются один раз.
+# Массовая форма — только без второго аргумента: клиент может называться
+# «all» или «none», и «exits client all off» — про него, а не про всех.
 exits_client() {
   local ip
+  if [[ ( "$1" == all || "$1" == none ) && -z "${2:-}" ]]; then
+    mkdir -p "$(dirname "$EXITS_PEERS")"
+    peers_sync "$EXITS_PEERS"
+    if [[ "$1" == all ]]; then
+      peers_all "$EXITS_PEERS"
+    else
+      : > "$EXITS_PEERS"
+    fi
+    exits_state_set mode peers
+    exits_reapply
+    ok "Через exit-ноды: $(grep -c . "$EXITS_PEERS" || true) из $(clients_name_ip | grep -c . || true)"
+    return 0
+  fi
   ip=$(clients_name_ip | awk -F'|' -v n="$1" '$1 == n {print $2; exit}')
   [[ -n "$ip" ]] || { err "Клиента $1 нет"; return 1; }
+  # Из «все клиенты» в «выбранные»: список — все клиенты (свои ноды остаются),
+  # а не то, что лежало в файле. После «никто» или сброса сервера он пуст, и
+  # «alice — напрямую» уводило мимо нод вообще всех.
   if [[ "$(exits_state_get mode)" != peers ]]; then
-    peers_seed "$EXITS_PEERS"
+    _exits_seed_peers all
     exits_state_set mode peers
   fi
   case "$2" in
@@ -6175,6 +6912,16 @@ exits_client() {
   esac
   exits_reapply
   ok "$1: ${2/shared/общий выход}"
+}
+
+# exits_mode all|peers — кого вести через ноды, не включая и не выключая их
+exits_mode() {
+  [[ "${1:-}" == all || "${1:-}" == peers ]] || { err "Режим: all | peers"; return 1; }
+  if [[ "$1" == peers ]]; then _exits_seed_peers; fi
+  exits_state_set mode "$1"
+  exits_reapply
+  if [[ "$1" == all ]]; then ok "Через exit-ноды — все клиенты"
+  else ok "Через exit-ноды — выбранные: $(grep -c . "$EXITS_PEERS" || true)"; fi
 }
 
 exits_toggle() {
@@ -6208,7 +6955,7 @@ exits_peers_menu() {
   # Выбор клиентов имеет смысл только в режиме «выборочно»
   if [[ "$(exits_state_get mode)" != peers ]]; then
     info "Сейчас через exit-ноды идут все клиенты — переключаю на выборочный режим"
-    peers_seed "$EXITS_PEERS"
+    _exits_seed_peers all
     exits_state_set mode peers
     exits_reapply
   fi
@@ -6234,7 +6981,7 @@ exits_peers_menu() {
     read_choice c "${C}  Номер — вкл/выкл: ${N}" 0 "${#rows[@]}" 0 "e|a|n"
     case "$c" in
       0) return 0 ;;
-      a) clients_name_ip | cut -d'|' -f2 > "$EXITS_PEERS" ;;
+      a) peers_all "$EXITS_PEERS" ;;          # свои ноды клиентов остаются
       n) : > "$EXITS_PEERS" ;;
       e) read_choice sel "${C}  Номер клиента: ${N}" 1 "${#rows[@]}"
          _exits_assign "${rows[$((sel - 1))]#*|}" "${rows[$((sel - 1))]%%|*}" ;;
@@ -6499,7 +7246,7 @@ _wgobf_write_keenetic() {
   {
     echo "Keenetic + AWG Manager — клиент $name"
     echo ""
-    echo "Способ 1 — вкладка «Phobos», одной вставкой."
+    echo "Способ 1 — вкладка «Phobos», одной вставкой в НИЖНЕЕ поле."
     echo "AWG Manager → Новый туннель → «Phobos» → поле «Или конфиг .conf с секцией"
     echo "[instance] / ссылка phobos://» → ссылка из phobos-link.txt (или phobos.conf)."
     echo "Поле «Ссылка установки Phobos» — пустым. Во вкладке «Обфускатор» НЕ включать"
@@ -6798,7 +7545,7 @@ wgobf_install_opts() {
             udp_port_busy "$v" && { err "UDP $v занят"; return 1; }; port="$v" ;;
       masking) [[ "$v" =~ ^(STUN|NONE)$ ]] || { err "masking: STUN | NONE"; return 1; }; mask="$v" ;;
       clean) [[ "$v" =~ ^[01]$ ]] || { err "clean: 0 | 1"; return 1; }; clean="$v" ;;
-      dns) [[ "$v" =~ ^[0-9.,[:space:]]+$ ]] || { err "dns: IPv4 через запятую"; return 1; }; dns="$v" ;;
+      dns) valid_dns_list "$v" || { err "dns: IPv4 через запятую"; return 1; }; dns="$v" ;;
       endpoint) valid_ip "$v" || { err "endpoint: IPv4"; return 1; }; ep="$v" ;;
       client) [[ -z "$v" || "$v" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || { err "Имя клиента недопустимо"; return 1; }; first="$v" ;;
       *) err "Неизвестный параметр: $k"; return 1 ;;
@@ -6881,7 +7628,11 @@ _wgobf_hooks_reset() {
     sed 's/^/    /; s/\t/ = /' <<< "$bad"
   fi
   sed -i -E '/^[[:space:]]*(PreUp|PostUp|PreDown|PostDown|SaveConfig)[[:space:]]*=/Id' "$WGOBF_WG_CONF"
+  # Заголовок секции — в канонический вид: awg-quick примет и « [interface]»
+  # и CRLF, а вставка ниже ищет ровно «[Interface]» — иначе файрвол не встал бы
+  sed -i -E 's/\r$//; s/^[[:space:]]*\[[[:space:]]*interface[[:space:]]*\][[:space:]]*$/[Interface]/I' "$WGOBF_WG_CONF"
   sed -i "0,/^\[Interface\]/s|^\[Interface\]|[Interface]\nPostUp = $WGOBF_FW up\nPostDown = $WGOBF_FW down|" "$WGOBF_WG_CONF"
+  grep -qxF "PostUp = $WGOBF_FW up" "$WGOBF_WG_CONF" || { err "В $WGOBF_IF.conf из бэкапа нет секции [Interface]"; return 1; }
 }
 
 # Из папки бэкапа (<бэкап>/wgobf): ключи, настройки и клиенты — из бэкапа,
@@ -6897,7 +7648,7 @@ wgobf_restore() {
   install -m 600 "$src/etc/${WGOBF_STATE##*/}" "$WGOBF_STATE"
   install -m 600 "$src/$WGOBF_IF.conf" "$WGOBF_WG_CONF"
   # Хуки wgobf0 пишет только Тулза: чужие команды из бэкапа — прочь, свои — на место
-  _wgobf_hooks_reset
+  _wgobf_hooks_reset || return 1
   if [[ -d "$src/clients" ]]; then
     mkdir -p "$WGOBF_CLIENTS" && cp -a "$src/clients/." "$WGOBF_CLIENTS/" && chmod 700 "$WGOBF_CLIENTS"
   fi
@@ -7255,11 +8006,23 @@ auto_backup() {  # причина
 do_backup() { backup_create; }
 
 # Полный бэкап → каталог в BACKUP_PATH; с «archive» ещё и .tar.gz рядом (для бота).
+# «archive auto [N]» — автобэкап бота по расписанию: только архив
+# awg2_backup_<время>_auto.tar.gz, из таких хранятся N последних (по умолчанию 7).
 BACKUP_PATH=""
 backup_create() {
-  local ts dir n=0 f
-  ts=$(date +%Y%m%d_%H%M%S)
-  dir="$BACKUP_DIR/awg2_backup_$ts"
+  local ts dir n=0 f auto=0 keep=7
+  if [[ "${2:-}" == auto ]]; then
+    auto=1
+    [[ "${3:-}" =~ ^[0-9]{1,3}$ ]] && (( 10#$3 >= 1 )) && keep=$((10#$3))
+  fi
+  # Имя — по секундам: второй бэкап в ту же секунду писал бы в тот же архив
+  while :; do
+    ts=$(date +%Y%m%d_%H%M%S)
+    dir="$BACKUP_DIR/awg2_backup_$ts"
+    (( auto )) && dir+="_auto"
+    [[ -e "$dir" || -e "$dir.tar.gz" ]] || break
+    sleep 1
+  done
   mkdir -p "$dir" && chmod 700 "$BACKUP_DIR" "$dir"
   if [[ -f "$SERVER_CONF" ]]; then cp -a "$SERVER_CONF" "$dir/awg0.conf"; n=$((n + 1)); ok "Сервер: awg0.conf"
   else warn "Серверного конфига нет"; fi
@@ -7296,7 +8059,21 @@ backup_create() {
   chmod -R go-rwx "$dir"
   BACKUP_PATH="$dir"
   if [[ "${1:-}" == archive ]]; then
-    tar -czf "$dir.tar.gz" -C "$BACKUP_DIR" "${dir##*/}" && chmod 600 "$dir.tar.gz" && BACKUP_PATH="$dir.tar.gz"
+    # Архив не записался (кончилось место) — обрезок не оставлять: в нём
+    # приватные ключи, а среди автобэкапов он вытеснил бы целые при ротации
+    if ! (umask 077 && tar -czf "$dir.tar.gz" -C "$BACKUP_DIR" "${dir##*/}"); then
+      rm -f "$dir.tar.gz"
+      (( auto )) && rm -rf "$dir"
+      err "Архив бэкапа не записан — проверь место на диске: df -h $BACKUP_DIR"
+      return 1
+    fi
+    chmod 600 "$dir.tar.gz"
+    BACKUP_PATH="$dir.tar.gz"
+  fi
+  if (( auto )) && [[ "$BACKUP_PATH" == *.tar.gz ]]; then
+    rm -rf "$dir"
+    find "$BACKUP_DIR" -maxdepth 1 -type f -name 'awg2_backup_*_auto.tar.gz' -printf '%f\n' 2>/dev/null \
+      | sort -r | tail -n +$((keep + 1)) | while IFS= read -r f; do rm -f "${BACKUP_DIR:?}/$f"; done
   fi
   success_box "Бэкап: $BACKUP_PATH"
   log_info "бэкап: $BACKUP_PATH"
@@ -7385,7 +8162,11 @@ _restore_tunnels() {  # каталог бэкапа
   mktmp x -d || return 1
   py safe-untar "$arch" "$x" || { warn "Настройки туннелей не распаковались"; return 0; }
   if [[ -f "$x$XRAY_CONF" ]]; then
-    if py xray-tags "$x$XRAY_CONF" >/dev/null 2>&1; then install -D -m 600 "$x$XRAY_CONF" "$XRAY_CONF"
+    # Xray работает от root: из чужого конфига — только выходы и маршруты,
+    # входы (SOCKS на 0.0.0.0, API) и журналы Тулза пишет сама
+    if n=$(py xray-restore-clean "$x$XRAY_CONF" 2>/dev/null); then
+      install -D -m 600 "$x$XRAY_CONF" "$XRAY_CONF"
+      [[ -n "$n" ]] && warn "Из конфига Xray бэкапа убрано: $n"
     else warn "Конфиг Xray из бэкапа не разобран — пропущен"; fi
   fi
   [[ -f "$x$XRAY_PEERS" ]] && install -D -m 600 "$x$XRAY_PEERS" "$XRAY_PEERS"
@@ -7398,10 +8179,7 @@ _restore_tunnels() {  # каталог бэкапа
     [[ "$n" =~ ^[A-Za-z0-9_]{1,6}$ ]] || { warn "Пропущен конфиг exit-ноды: ${f##*/}"; continue; }
     py exit-conf-fix "$f" && install -m 600 "$f" "$EXITS_DIR/awg-exit-$n.conf"
   done
-  if [[ -f "$x$CASCADE_RULES" ]]; then
-    grep -E '^(udp|tcp)\|[0-9]{1,5}\|[0-9]{1,3}(\.[0-9]{1,3}){3}\|[0-9]{1,5}\|' "$x$CASCADE_RULES" \
-      | write_file "$CASCADE_RULES" 600
-  fi
+  [[ -f "$x$CASCADE_RULES" ]] && _restore_cascade_rules "$x$CASCADE_RULES"
   if [[ -f "$x$T2S_CONF" ]]; then
     n=$(head -1 "$x$T2S_CONF" | tr -d '[:space:]')
     [[ "$n" =~ ^[A-Za-z0-9._-]+:[0-9]{1,5}$ ]] && echo "$n" | write_file "$T2S_CONF" 600
@@ -7416,6 +8194,33 @@ _restore_tunnels() {  # каталог бэкапа
   for n in $(exits_nodes); do systemctl enable --now "awg-quick@awg-exit-$n" &>/dev/null || warn "Нода $n не поднялась"; done
   (( $(cascade_count) )) && { _cascade_persist; systemctl restart awg-cascade.service &>/dev/null; }
   ok "Настройки туннелей восстановлены; маршрутизация клиентов выключена"
+}
+
+# Правила каскада из бэкапа — с теми же проверками, что при добавлении:
+# публичный адрес цели, порты 1-65535, вход не занят AmneziaWG, обфускатором
+# или локальным сервисом. Не прошедшее — пропускается с причиной.
+_restore_cascade_rules() {  # файл правил из бэкапа
+  local p in dst out comment why seen=" " kept=()
+  # || [[ -n $p ]]: последняя строка без перевода строки (файл правили руками)
+  # иначе молча терялась
+  while IFS='|' read -r p in dst out comment || [[ -n "$p" ]]; do
+    [[ "$p" == udp || "$p" == tcp ]] || continue
+    out="${out//[$'\r']/}" comment="${comment//[$'\r']/}"
+    # Поля из чужого файла идут в warn (echo -e) — без управляющих символов и \\
+    in="${in//[$'\001'-$'\037'$'\177'\\]/?}" dst="${dst//[$'\001'-$'\037'$'\177'\\]/?}"
+    out="${out//[$'\001'-$'\037'$'\177'\\]/?}"
+    if why=$(_cascade_rule_invalid "$in" "$dst" "$out"); then
+      warn "Каскад из бэкапа: пропущено ${p^^} $in → $dst:$out — $why"; continue
+    fi
+    [[ "$seen" == *" $p|$in "* ]] && continue
+    if why=$(CASCADE_RULES=/dev/null _cascade_port_conflict "$p" "$in"); then
+      warn "Каскад из бэкапа: пропущено ${p^^} $in — $why"; continue
+    fi
+    seen+="$p|$in "
+    kept+=("$p|$in|$dst|$out|$comment")
+  done < "$1"
+  if (( ${#kept[@]} )); then printf '%s\n' "${kept[@]}" | write_file "$CASCADE_RULES" 600
+  else rm -f "$CASCADE_RULES"; fi
 }
 
 # Хуки конфига из бэкапа (PostUp и т. п.) выполняются от root при подъёме
@@ -7467,6 +8272,8 @@ backup_restore() {
   [[ -f "$SERVER_CONF" ]] && cp -a "$SERVER_CONF" "$SERVER_CONF.pre_restore.$(date +%s)"
   _restore_awg_files "$src"
   _restore_hooks "$SERVER_CONF" || return 1
+  # Бэкап с другого VPS: NAT — на аплинк этого сервера
+  conf_uplink_sync force || true
   client_files_sync_suffix
   ok "Сервер и клиенты: $(client_files | wc -l) кл."
   _restore_warp "$src"
@@ -7512,14 +8319,16 @@ update_channel_label() { [[ "$UPDATE_CHANNEL" == beta ]] && echo "бета" || e
 
 update_channel_init() { update_channel_apply "${AWG2_UPDATE_CHANNEL:-$(update_channel_read)}"; }
 
-# Фоновая проверка раз в 6 часов: шапка меню читает только кэш и сеть не ждёт.
+# Фоновая проверка раз в час (бета — раз в 20 минут): шапка меню и сводка
+# для бота читают только кэш и сеть не ждут.
 # Качаем первые 4 КБ — VERSION= стоит в начале файла.
 update_check_async() {
-  local ts now
+  local ts now ttl="$UPDATE_CHECK_TTL"
   [[ -n "${AWG_NO_UPDATE_CHECK:-}" ]] && return 0
+  [[ "$UPDATE_CHANNEL" == beta ]] && ttl="$UPDATE_CHECK_TTL_BETA"
   now=$(date +%s)
   ts=$(awk '{print $2 + 0; exit}' "$UPDATE_CACHE" 2>/dev/null || echo 0)
-  (( now - ${ts:-0} < UPDATE_CHECK_TTL )) && return 0
+  (( now - ${ts:-0} < ttl )) && return 0
   mkdir -p "$STATE_DIR"
   update_peek </dev/null &>/dev/null 3>&- 4>&- 8>&- &
   disown 2>/dev/null || true
@@ -7575,6 +8384,63 @@ _update_download() {  # файл
   return 1
 }
 
+# Подпись awg2.sh.sig — напрямую и через зеркала: подделать её зеркало не может.
+_update_download_sig() {  # файл
+  local mp url
+  url="${UPDATE_URL%/*}/awg2.sh.sig?nocache=$(date +%s)"
+  for mp in "${GH_MIRRORS[@]}"; do
+    curl -fsSL --connect-timeout 10 --max-time 30 --max-filesize 16384 -H 'Cache-Control: no-cache' \
+      "${mp}${url}" -o "$1" 2>/dev/null || continue
+    grep -q 'BEGIN SSH SIGNATURE' "$1" && return 0
+  done
+  return 1
+}
+
+# Проверка подписи файла $1 подписью $2 ключом релизов. 0 — верна.
+update_sig_ok() {
+  local allowed s
+  (( ${#UPDATE_SIGNERS[@]} )) || return 1
+  command -v ssh-keygen &>/dev/null || need_cmds ssh-keygen:openssh-client >/dev/null || return 1
+  mktmp allowed || return 1
+  for s in "${UPDATE_SIGNERS[@]}"; do
+    printf '%s namespaces="%s" %s\n' "$UPDATE_SIGNER" "$UPDATE_SIG_NS" "$s"
+  done > "$allowed"
+  ssh-keygen -Y verify -f "$allowed" -I "$UPDATE_SIGNER" -n "$UPDATE_SIG_NS" -s "$2" < "$1" &>/dev/null
+}
+
+# Подпись скачанной сборки. Без подписи ставится только сборка старше
+# UPDATE_SIG_SINCE (откат на старую версию) и только из меню, после «yes»:
+# новая сборка без подписи — это подмена или сбой, а не выпуск.
+update_verify() {  # файл
+  local sig
+  # Ключ вшивается в каждую выпущенную сборку (тест сборки это проверяет);
+  # без него — только локальная тестовая сборка, ей проверять нечем
+  if (( ${#UPDATE_SIGNERS[@]} == 0 )); then
+    warn "Тестовая сборка без ключа релизов — подпись обновления не проверяется"
+    return 0
+  fi
+  mktmp sig || return 1
+  if ! _update_download_sig "$sig"; then
+    if (( 10#$(ver_num "$UPDATE_NEW") >= 10#$(ver_num "$UPDATE_SIG_SINCE") )); then
+      err "У сборки $UPDATE_NEW нет подписи (awg2.sh.sig) — не ставлю. Повтори через пару минут"
+      return 1
+    fi
+    warn "Сборка $UPDATE_NEW вышла до подписей ($UPDATE_SIG_SINCE) — подлинность не проверить"
+    if ! read_confirm "${Y}  Поставить без проверки подписи? (введи yes): ${N}"; then
+      (( AUTO_MODE )) && err "Сборку без подписи ставлю только из меню awg2 — Обновление"
+      return 1
+    fi
+    return 0
+  fi
+  if ! update_sig_ok "$1" "$sig"; then
+    err "Подпись сборки $UPDATE_NEW не сходится — файл изменён по пути (зеркало?) или только что выложен."
+    info "Повтори через пару минут; не помогло — напиши в t.me/awgToolza"
+    log_info "обновление $UPDATE_NEW отклонено: подпись не сходится"
+    return 1
+  fi
+  ok "Подпись сборки верна"
+}
+
 # Скачать сборку из канала и проверить её → UPDATE_FILE, UPDATE_NEW.
 UPDATE_FILE="" UPDATE_NEW=""
 update_fetch() {
@@ -7587,9 +8453,10 @@ update_fetch() {
     return 1
   fi
   UPDATE_NEW=$(head -c 4096 "$UPDATE_FILE" | grep -m1 '^VERSION=' | cut -d'"' -f2)
-  [[ -n "$UPDATE_NEW" ]] || { err "В скачанном файле нет VERSION"; return 1; }
-  printf '%s %s\n' "$UPDATE_NEW" "$(date +%s)" > "$UPDATE_CACHE" 2>/dev/null || true
+  [[ "$UPDATE_NEW" =~ ^v?[0-9]+\.[0-9]+ ]] || { err "В скачанном файле нет VERSION"; return 1; }
   echo "Текущая: $VERSION, в канале: $UPDATE_NEW"
+  update_verify "$UPDATE_FILE" || return 1
+  printf '%s %s\n' "$UPDATE_NEW" "$(date +%s)" > "$UPDATE_CACHE" 2>/dev/null || true
 }
 
 # Поставить скачанное. Замена через rename: работающие копии awg2 дочитывают
@@ -7597,9 +8464,18 @@ update_fetch() {
 update_install() {
   local target="$SCRIPT_PATH"
   [[ -f "$target" ]] || target=$(readlink -f "$0")
-  if (( 10#$(ver_num "$UPDATE_NEW") < 10#$(ver_num "$VERSION") )) && [[ "${1:-}" != force ]]; then
-    err "В канале версия старше текущей ($UPDATE_NEW) — откат только явно"
-    return 1
+  if (( 10#$(ver_num "$UPDATE_NEW") < 10#$(ver_num "$VERSION") )); then
+    # Подпись не привязана к версии: зеркало может отдать старую, но верно
+    # подписанную сборку. Из бота и панели («Переустановить» = force) откат
+    # не ставится никогда — только из меню awg2, где он назван откатом.
+    if (( API_MODE )); then
+      err "В канале версия старше текущей ($UPDATE_NEW) — откат только из меню awg2"
+      return 1
+    fi
+    if [[ "${1:-}" != force ]]; then
+      err "В канале версия старше текущей ($UPDATE_NEW) — откат только явно"
+      return 1
+    fi
   fi
   if cmp -s "$target" "$UPDATE_FILE"; then ok "Уже последняя версия ($VERSION)"; return 0; fi
   cp -a "$target" "$target.bak" 2>/dev/null && info "Прежняя версия: $target.bak"
@@ -7608,6 +8484,45 @@ update_install() {
   hash -r
   ok "Установлено: $UPDATE_NEW"
   log_info "самообновление $VERSION → $UPDATE_NEW"
+}
+
+_script_ver() {  # файл awg2 → v1.2.0d (версия и буква тестовой сборки)
+  head -c 4096 "$1" 2>/dev/null | awk -F'"' '/^VERSION="/ && !v {v=$2} /^BUILD="/ && !b {b=$2; nb=1}
+    END {printf "%s%s", v, (nb ? b : "")}'
+}
+
+# Запуск из распакованного архива (sudo bash awg2.sh): бот, таймеры и команда
+# awg2 работают с установленной копией $SCRIPT_PATH — предложить заменить её.
+self_install_offer() {
+  local self cur def=y
+  # $0 без «/» — не путь к файлу («bash» при запуске через curl | bash):
+  # readlink нашёл бы ./bash в текущем каталоге и предложил поставить его
+  [[ "$0" == */* ]] || return 0
+  self=$(readlink -f "$0" 2>/dev/null) || return 0
+  [[ -f "$self" && "$self" != "$(readlink -f "$SCRIPT_PATH" 2>/dev/null)" ]] || return 0
+  head -c 4096 "$self" | grep -q '^VERSION="' || return 0
+  cmp -s "$self" "$SCRIPT_PATH" && return 0
+  echo ""
+  if [[ ! -f "$SCRIPT_PATH" ]]; then
+    warn "Команда awg2 не установлена: бот и таймеры ищут $SCRIPT_PATH"
+  else
+    cur=$(_script_ver "$SCRIPT_PATH")
+    warn "Запущена копия $(shown "$self") ($VERSION_SHOW), а установлена ${cur:-другая} в $SCRIPT_PATH"
+    info "Бот, панель и команда awg2 работают с установленной"
+    if [[ "$cur" =~ ^v?[0-9] ]] && (( 10#$(ver_num "$cur") > 10#$(ver_num "$VERSION") )); then
+      warn "Установленная новее — замена будет откатом"
+      def=n
+    fi
+  fi
+  ask_yes "  Установить эту копию ($(shown "$self")) в $SCRIPT_PATH? [$([[ $def == y ]] && echo Y/n || echo y/N)]: " "$def" || return 0
+  [[ -f "$SCRIPT_PATH" ]] && cp -a "$SCRIPT_PATH" "$SCRIPT_PATH.bak" 2>/dev/null \
+    && info "Прежняя копия: $SCRIPT_PATH.bak"
+  # Через rename: работающие копии awg2 дочитывают свой файл, а не новый
+  install -m 755 "$self" "$SCRIPT_PATH.new" && mv -f "$SCRIPT_PATH.new" "$SCRIPT_PATH" \
+    || { rm -f "$SCRIPT_PATH.new"; err "Не удалось записать $SCRIPT_PATH"; return 0; }
+  hash -r
+  ok "Установлено: $SCRIPT_PATH ($VERSION_SHOW)"
+  log_info "awg2 $VERSION_SHOW установлен из $self"
 }
 
 do_self_update() {
@@ -7654,8 +8569,10 @@ do_switch_channel() {
 # После смены версии перегенерируем их у уже включённых компонентов — иначе
 # при загрузке работала бы логика прежней версии.
 helpers_refresh() {
-  local mark="$STATE_DIR/version"
-  [[ "$(cat "$mark" 2>/dev/null)" == "$VERSION" ]] && return 0
+  # Отметка — версия и хеш сборки: тестовые сборки одной версии (v1.2.0c → d)
+  # тоже перегенерируют скрипты
+  local mark="$STATE_DIR/version" stamp="$VERSION_SHOW ${_BUILD_SUM:-}"
+  [[ "$(cat "$mark" 2>/dev/null)" == "$stamp" ]] && return 0
   mkdir -p "$STATE_DIR"
   server_exists && expire_install &>/dev/null
   # Исходник модуля в DKMS поставила прежняя версия: без правки автосборка
@@ -7681,11 +8598,14 @@ helpers_refresh() {
   [[ -f "$T2S_ROUTING_SCRIPT" ]] && emit_script "$T2S_ROUTING_SCRIPT" 't2s_routing_run "$@"' \
     T2S_IF T2S_TABLE T2S_ADDR "${RT_FUNCS[@]}" t2s_routing_run
   [[ -f "$EXITS_SCRIPT" ]] && _exits_write_unit
+  antiscan_on && _antiscan_emit &>/dev/null
+  # Маршруты Xray: с v1.2.0 перед inbound tun нет NAT (свой выход клиенту)
+  [[ -f "$XRAY_ROUTING_SCRIPT" ]] && _xray_emit_routing
   # Xray прежних версий жил во временных юнитах и перезагрузку не переживал
   [[ -f "$XRAY_STATE" && ! -f "/etc/systemd/system/$XRAY_UNIT" ]] && ! xray_is_up && rm -f "$XRAY_STATE"
   wgobf_installed && _wgobf_write_service_files
-  echo "$VERSION" > "$mark"
-  log_info "служебные скрипты обновлены под $VERSION"
+  echo "$stamp" > "$mark"
+  log_info "служебные скрипты обновлены под $VERSION_SHOW"
 }
 
 do_update_menu() {
@@ -7693,7 +8613,7 @@ do_update_menu() {
   while true; do
     echo ""
     hdr "Обновление скрипта"
-    echo -e "  Версия : ${W}$VERSION${N}"
+    echo -e "  Версия : ${W}$VERSION_SHOW${N}"
     echo -e "  Канал  : $([[ "$UPDATE_CHANNEL" == beta ]] && echo -e "${Y}бета${N}" || echo -e "${G}стабильный${N}") ${D}($UPDATE_REPO)${N}"
     upd=$(update_available || true)
     [[ -n "$upd" ]] && echo -e "  Доступна: ${G}$upd${N}"
@@ -7723,12 +8643,13 @@ BOT_VENV_PY="$BOT_DIR/venv/bin/python"
 
 # Любой след бота, а не только маркер: после частичного удаления его
 # остатки тоже надо уметь добить.
-bot_installed() { [[ -f /usr/local/bin/awg-bot.py || -d "$BOT_DIR" || -f "/etc/systemd/system/$BOT_UNIT" ]]; }
-
-bot_version() {
-  sed -n "s/^__version__[[:space:]]*=[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" \
-    "$BOT_DIR/awgbot/__init__.py" 2>/dev/null | head -1
+# Код в $BOT_DIR ставит и веб-панель (--web-only) — при ней это ещё не бот
+bot_installed() {
+  [[ -f /usr/local/bin/awg-bot.py || -f "/etc/systemd/system/$BOT_UNIT" ]] && return 0
+  [[ -d "$BOT_DIR" ]] && ! web_installed
 }
+
+bot_version() { _bot_src_version "$BOT_DIR"; }
 
 # ── Прокси до Telegram ────────────────────────────────────
 # Значение ключа из конфига бота (кавычки и пробелы по краям снимаются).
@@ -7777,6 +8698,7 @@ webapp_port() {
 
 webapp_fw() {
   local p
+  [[ -f "/etc/systemd/system/$BOT_UNIT" ]] || return 0
   p=$(webapp_port)
   [[ "$p" == off ]] || ufw_allow "$p/tcp" awg-webapp
   return 0
@@ -7982,15 +8904,33 @@ bot_restart() {
 # ── Установка / удаление ──────────────────────────────────
 # Код бота из распакованного архива рядом: при проверке правок на GitHub
 # ещё старая версия.
+# Версия кода бота в каталоге с awgbot/ (как __version__ у установленного).
+_bot_src_version() {
+  sed -n "s/^__version__[[:space:]]*=[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" \
+    "$1/awgbot/__init__.py" 2>/dev/null | head -1
+}
+
+# Локальный код бота из распакованного архива Тулзы: рядом с awg2, в
+# текущем каталоге, в /opt, /root и /home/*. Из нескольких — самая новая
+# версия бота (дата файла после распаковки ни о чём не говорит), при
+# равных — найденная раньше. Только каталоги, которые может менять лишь
+# root (root_only_tree): установщик и код бота из них запускаются от root,
+# а из бота и панели — ещё и без вопроса. Иначе любой пользователь сервера
+# подложил бы ~/awg-toolza-x с версией побольше и получил root.
 _bot_local_src() {
-  local d best="" ts best_ts=0
-  d=$(dirname "$(readlink -f "$0")")
-  [[ -d "$d/awg_bot/awgbot" && -f "$d/awg_bot/run.py" ]] && { echo "$d/awg_bot"; return 0; }
-  for d in /opt/awg-toolza-*/ /root/awg-toolza-*/ /opt/awg-toolza/; do
-    d="${d%/}"
-    [[ -f "$d/awg_bot/run.py" ]] || continue
-    ts=$(stat -c %Y "$d/awg_bot/run.py")
-    (( ts >= best_ts )) && { best="$d/awg_bot"; best_ts=$ts; }
+  local d best="" bv="" v
+  for d in "$(dirname "$(readlink -f "$0")")" "$PWD" /opt/awg-toolza-*/ /root/awg-toolza-*/ \
+           /home/*/awg-toolza-*/ /opt/awg-toolza/; do
+    # Дальше — только настоящий путь: проверенный каталог-ссылку подменили
+    # бы между проверкой и запуском установщика
+    [[ "$d" != *$'\n'* ]] && d=$(readlink -f -- "$d" 2>/dev/null) || continue
+    [[ -n "$d" && "$d" != *$'\n'* && -d "$d/awg_bot/awgbot" && -f "$d/awg_bot/run.py" ]] || continue
+    root_only_tree "$d/awg_bot" || continue
+    [[ ! -e "$d/awg-bot-install.sh" ]] || root_only_path "$d/awg-bot-install.sh" || continue
+    v=$(_bot_src_version "$d/awg_bot")
+    if [[ -z "$best" ]] || [[ "$v" != "$bv" && "$(printf '%s\n%s\n' "$bv" "$v" | sort -V | tail -1)" == "$v" ]]; then
+      best="$d/awg_bot"; bv="$v"
+    fi
   done
   [[ -n "$best" ]] && echo "$best"
 }
@@ -7998,8 +8938,13 @@ _bot_local_src() {
 bot_install() {
   local src installer
   src=$(_bot_local_src || true)
-  mktmp installer || return 1
-  if [[ -n "$src" ]] && ask_yes "  Найден локальный код бота ($src). Ставить из него? [Y/n]: " y; then
+  # Установщик — в своём каталоге (700): рядом с ним он ищет awg_bot/, и в
+  # общем /tmp его мог подложить любой пользователь
+  mktmp installer -d || return 1
+  installer+="/awg-bot-install.sh"
+  local lv iv
+  lv=$(_bot_src_version "$src"); iv=$(bot_version)
+  if [[ -n "$src" ]] && ask_yes "  Найден локальный код бота $(shown "${lv:-?}") ($(shown "$src"))${iv:+, установлен $iv}. Ставить из него? [Y/n]: " y; then
     if [[ -f "${src%/awg_bot}/awg-bot-install.sh" ]]; then
       bash "${src%/awg_bot}/awg-bot-install.sh" --src "$src"
       return
@@ -8027,10 +8972,17 @@ bot_uninstall() {
     cp -a "$BOT_CONF" "$saved" || saved=""
   fi
   systemctl disable --now "$BOT_UNIT" &>/dev/null || true
-  for p in "${BOT_ARTIFACTS[@]}"; do rm -rf "$p"; done
+  local arts=("${BOT_ARTIFACTS[@]}")
+  # Код, venv и заметки нужны веб-панели — с ней остаются
+  if web_installed; then
+    arts=(); for p in "${BOT_ARTIFACTS[@]}"; do [[ "$p" == "$BOT_DIR" || "$p" == /var/lib/awg-bot ]] || arts+=("$p"); done
+    info "Код бота остаётся — на нём работает веб-панель"
+    rm -f "$BOT_ADMINS"           # приглашённые админы — бота, а не панели
+  fi
+  for p in "${arts[@]}"; do rm -rf "$p"; done
   systemctl daemon-reload
   systemctl reset-failed "$BOT_UNIT" &>/dev/null || true
-  for p in "${BOT_ARTIFACTS[@]}"; do [[ -e "$p" ]] && left+=("$p"); done
+  for p in "${arts[@]}"; do [[ -e "$p" ]] && left+=("$p"); done
   if (( ${#left[@]} )); then warn "Не удалось удалить: ${left[*]}"; else ok "Бот удалён"; fi
   [[ -n "$saved" ]] && info "Конфиг с токеном сохранён: $saved"
   log_info "бот удалён"
@@ -8076,6 +9028,948 @@ do_bot_menu() {
     esac
     pause
   done
+}
+
+# ═════ web ═════
+# Веб-панель: та же панель, что Mini App бота, но в браузере по логину и
+# паролю (служба awg-web, код — awg_bot: python -m awgbot.web). Telegram-бот
+# ей не нужен: код и venv ставит тот же установщик с --web-only.
+#
+# Адрес — https://IP-или-домен:порт/<секретный путь>/; всё остальное на этом
+# порту — 404. Пароль хранится только хешем scrypt в $WEB_CONF (600).
+# Сертификат — тот же, что у Mini App (/etc/awg2/cert: Let's Encrypt на IP или
+# домен, готовый сертификат сервера); его нет — самоподписанный.
+
+web_installed() { [[ -f "/etc/systemd/system/$WEB_UNIT" ]]; }
+web_active() { unit_active "$WEB_UNIT"; }
+web_code_ready() { [[ -x "$BOT_VENV_PY" && -f "$BOT_DIR/awgbot/web.py" ]]; }
+
+web_conf_get() { sed -n "s/^$1=//p" "$WEB_CONF" 2>/dev/null | tail -1; }
+web_conf_set() {  # KEY значение
+  { grep -v "^$1=" "$WEB_CONF" 2>/dev/null || true; echo "$1=$2"; } | write_file "$WEB_CONF" 600
+}
+
+web_host() { if cert_installed; then cert_get name; else public_ip_cached; fi; }
+web_url() {
+  local p path
+  p=$(web_conf_get WEB_PORT); path=$(web_conf_get WEB_PATH)
+  [[ -n "$p" && -n "$path" ]] || return 1
+  echo "https://$(web_host):$p/$path/"
+}
+
+web_random_path() { tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 14; }
+web_port_busy() { ss -Hltn "sport = :$1" 2>/dev/null | grep -q .; }
+web_random_port() {
+  local p i
+  for (( i = 0; i < 50; i++ )); do
+    p=$(( RANDOM % 40000 + 20000 ))
+    web_port_busy "$p" || { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+# Пароль без эха; EOF — пусто
+_read_secret() {
+  local __var="$1" __v=""
+  _flush_stdin
+  IFS= read -rs -p "$(echo -e "$2")" __v || __v=""
+  echo >&2
+  printf -v "$__var" '%s' "$__v"
+}
+
+# Спросить пароль (Enter — сгенерировать) → WEB_NEW_HASH; сгенерированный — в WEB_PASS_SHOWN
+web_ask_password() {
+  local a b
+  WEB_PASS_SHOWN="" WEB_NEW_HASH=""
+  while true; do
+    _read_secret a "${C}  Пароль (от 10 символов, Enter — сгенерировать): ${N}"
+    [[ -n "$a" ]] || { web_gen_password; return; }
+    (( ${#a} >= 10 )) || { warn "Нужно не меньше 10 символов"; continue; }
+    # Вход принимает до 256 символов — длиннее не войти никогда
+    (( ${#a} <= 256 )) || { warn "Не больше 256 символов"; continue; }
+    _read_secret b "${C}  Ещё раз: ${N}"
+    [[ "$a" == "$b" ]] && break
+    warn "Пароли не совпали"
+  done
+  WEB_NEW_HASH=$(printf '%s' "$a" | py web-hash) && [[ "$WEB_NEW_HASH" == scrypt\$* ]]
+}
+
+# Новый случайный пароль → WEB_PASS_SHOWN (показать один раз) и WEB_NEW_HASH
+web_gen_password() {
+  WEB_PASS_SHOWN=$(tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 18)
+  [[ ${#WEB_PASS_SHOWN} -eq 18 ]] || return 1
+  WEB_NEW_HASH=$(printf '%s' "$WEB_PASS_SHOWN" | py web-hash) && [[ "$WEB_NEW_HASH" == scrypt\$* ]]
+}
+
+# Код и venv панели: из распакованного архива (рядом, /root, /home) или из
+# канала обновлений. Бот при этом не ставится и не трогается.
+web_code_install() {
+  local src installer
+  src=$(_bot_local_src || true)
+  if [[ -n "$src" && -f "$src/awgbot/web.py" && -f "${src%/awg_bot}/awg-bot-install.sh" ]]; then
+    info "Код панели: $(shown "$src")"
+    bash "${src%/awg_bot}/awg-bot-install.sh" --src "$src" --web-only
+    return
+  fi
+  # Свой каталог (700): рядом с установщиком он ищет awg_bot/ (см. bot_install)
+  mktmp installer -d || return 1
+  installer+="/awg-bot-install.sh"
+  curl -fsSL "$BOT_INSTALL_URL" -o "$installer" || { err "Не скачался установщик: $BOT_INSTALL_URL"; return 1; }
+  if ! grep -q -- '--web-only' "$installer"; then
+    err "В канале $(update_channel_label) веб-панели ещё нет — поставь её из архива с панелью"
+    return 1
+  fi
+  AWG_REPO_URL="https://github.com/$UPDATE_REPO" bash "$installer" --web-only
+}
+
+web_write_unit() {
+  write_unit "$WEB_UNIT" <<EOF
+[Unit]
+Description=AWG Toolza — веб-панель
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$BOT_DIR
+ExecStart=$BOT_VENV_PY -m awgbot.web
+Environment=AWG_WEB_CONF=$WEB_CONF AWG_WEB_LOG=$WEB_LOG AWG2_BIN=$SCRIPT_PATH AWG_BOT_CONF=$BOT_CONF PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+web_restart() {
+  local i
+  systemctl enable "$WEB_UNIT" &>/dev/null || true
+  systemctl restart "$WEB_UNIT" || true
+  for (( i = 0; i < 8; i++ )); do sleep 1; web_active && break; done
+  if web_active; then ok "Веб-панель работает"
+  else err "Веб-панель не запустилась: journalctl -u ${WEB_UNIT%.service} -n 30"; return 1; fi
+}
+
+web_show_access() {
+  success_box "Веб-панель: $(web_url)"
+  echo -e "  Логин : ${W}$(web_conf_get WEB_USER)${N}"
+  [[ -n "${WEB_PASS_SHOWN:-}" ]] && echo -e "  Пароль: ${W}$WEB_PASS_SHOWN${N} ${D}— сохрани: на сервере только хеш, больше не покажу${N}"
+  cert_installed || warn "Сертификата нет — панель на самоподписанном, браузер предупредит. Настоящий: пункты «Сертификат»"
+  return 0
+}
+
+_web_code_ensure() {
+  web_code_ready && return 0
+  web_code_install || return 1
+  web_code_ready || { err "Код веб-панели не установился (нет $BOT_DIR/awgbot/web.py)"; return 1; }
+}
+
+web_install() {
+  local user v
+  _web_code_ensure || return 1
+  user=$(web_conf_get WEB_USER)
+  while true; do
+    read_line v "${C}  Логин [Enter = ${user:-admin}]: ${N}"
+    v="${v:-${user:-admin}}"
+    [[ "$v" =~ ^[A-Za-z0-9._-]{3,32}$ ]] && break
+    warn "Логин: 3-32 символа — латиница, цифры, . _ -"
+  done
+  user="$v"
+  web_ask_password || { err "Пароль не захеширован"; return 1; }
+  _web_setup "$user" && web_show_access
+}
+
+# Без вопросов (бот): логин — прежний или admin, пароль — новый случайный,
+# его показывают один раз (WEB_PASS_SHOWN).
+web_install_auto() {
+  local user
+  _web_code_ensure || return 1
+  user=$(web_conf_get WEB_USER)
+  web_gen_password || { err "Пароль не захеширован"; return 1; }
+  _web_setup "${user:-admin}"
+}
+
+# Логин и хеш пароля, порт и секретный путь (прежние или случайные), UFW, служба.
+_web_setup() {  # логин
+  local user="$1" port path
+  port=$(web_conf_get WEB_PORT); [[ -n "$port" ]] || port=$(web_random_port) || { err "Нет свободного порта"; return 1; }
+  path=$(web_conf_get WEB_PATH); [[ -n "$path" ]] || path=$(web_random_path)
+  web_conf_set WEB_USER "$user"
+  web_conf_set WEB_PASS "$WEB_NEW_HASH"
+  web_conf_set WEB_PORT "$port"
+  web_conf_set WEB_PATH "$path"
+  ufw_allow "$port/tcp" awg-web
+  web_write_unit
+  web_restart || return 1
+  log_info "веб-панель установлена: порт $port"
+}
+
+# Новый случайный пароль; все сессии завершаются (служба перезапускается).
+web_password_new() {
+  web_installed || { err "Веб-панель не установлена"; return 1; }
+  web_gen_password || { err "Пароль не захеширован"; return 1; }
+  web_conf_set WEB_PASS "$WEB_NEW_HASH" && web_restart || return 1
+  log_info "веб-панель: новый пароль"
+  ok "Пароль сменён, все сессии завершены"
+}
+
+# Новый секретный путь: прежний адрес перестаёт открываться.
+web_path_new() {
+  web_installed || { err "Веб-панель не установлена"; return 1; }
+  web_conf_set WEB_PATH "$(web_random_path)" && web_restart || return 1
+  log_info "веб-панель: новый путь"
+}
+
+web_stop() {
+  systemctl disable --now "$WEB_UNIT" &>/dev/null || { err "Веб-панель не остановилась"; return 1; }
+  ok "Веб-панель остановлена"
+}
+
+web_set_port() {
+  local v old
+  old=$(web_conf_get WEB_PORT)
+  read_line v "${C}  Порт (1024-65535, Enter — случайный): ${N}"
+  [[ -n "$v" ]] || v=$(web_random_port) || return 1
+  # 10#: «010000» — не восьмеричное 4096, а 10000 (так его прочтут Python и ufw)
+  [[ "$v" =~ ^[0-9]{1,9}$ ]] && v=$((10#$v)) && (( v >= 1024 && v <= 65535 )) || { err "Порт: 1024-65535"; return 1; }
+  [[ "$v" == "$old" ]] && return 0
+  web_port_busy "$v" && { err "Порт $v занят"; return 1; }
+  [[ "$v" == "$(server_port 2>/dev/null)" || "$v" == "$(webapp_port)" ]] && { err "Порт $v занят AWG или Mini App"; return 1; }
+  web_conf_set WEB_PORT "$v"
+  ufw_delete_comment awg-web
+  ufw_allow "$v/tcp" awg-web
+  web_restart && web_show_access
+}
+
+web_remove() {
+  if [[ "${1:-}" != quiet ]]; then
+    read_confirm "${R}  Удалить веб-панель? (введи yes): ${N}" || return 0
+  fi
+  remove_unit "$WEB_UNIT"
+  systemctl daemon-reload
+  rm -rf "$WEB_CONF" "$WEB_DIR" "$WEB_LOG"
+  ufw_delete_comment awg-web
+  # Код и venv ставились только ради панели — бот их не использует
+  if [[ ! -f "/etc/systemd/system/$BOT_UNIT" ]]; then rm -rf "$BOT_DIR" /var/lib/awg-bot; fi
+  ok "Веб-панель удалена"
+  log_info "веб-панель удалена"
+}
+
+do_web_menu() {
+  local c v n st
+  while true; do
+    echo ""
+    hdr "Веб-панель"
+    echo -e "  ${D}Все разделы Тулзы в браузере — вход по логину и паролю, без Telegram.${N}"
+    if ! web_installed; then
+      echo -e "  Статус     : ${D}не установлена${N}"
+      echo ""
+      echo -e "  ${G}1)${N} Установить"
+      echo -e "  ${W}0)${N} ← Назад"
+      read_choice c "${C}  Выбор [0-1]: ${N}" 0 1 0
+      case "$c" in
+        1) web_install || true ;;
+        0) return 0 ;;
+      esac
+      pause
+      continue
+    fi
+    if web_active; then st="${G}● работает${N}"; else st="${R}○ остановлена${N}"; fi
+    echo -e "  Статус     : $st"
+    echo -e "  Адрес      : ${W}$(web_url)${N}"
+    echo -e "  Логин      : $(web_conf_get WEB_USER)"
+    if cert_installed; then echo -e "  Сертификат : $(cert_state_line)"
+    else echo -e "  Сертификат : ${Y}самоподписанный${N} ${D}— браузер предупреждает; настоящий — пункты 6-8${N}"; fi
+    echo ""
+    n=$(cert_find | grep -c . || true)
+    echo -e "  ${C}1)${N} Перезапустить"
+    echo -e "  ${C}2)${N} Сменить пароль"
+    echo -e "  ${C}3)${N} Сменить логин"
+    echo -e "  ${C}4)${N} Порт ${D}— $(web_conf_get WEB_PORT)${N}"
+    echo -e "  ${C}5)${N} Новый секретный путь ${D}— старый адрес перестанет открываться${N}"
+    echo -e "  ${C}6)${N} Сертификат на IP ${D}— Let's Encrypt, $(public_ip_cached)${N}"
+    echo -e "  ${C}7)${N} Сертификат на домен"
+    echo -e "  ${C}8)${N} Готовый сертификат сервера ${D}— найдено $n${N}"
+    echo -e "  ${C}9)${N} Журнал входов"
+    echo -e "  ${C}s)${N} $(web_active && echo "Остановить" || echo "Запустить")"
+    echo -e "  ${C}u)${N} Обновить код панели ${D}— из архива или канала${N}"
+    echo -e "  ${R}d)${N} Удалить веб-панель"
+    echo -e "  ${W}0)${N} ← Назад"
+    read_choice c "${C}  Выбор: ${N}" 0 9 0 "s|u|d"
+    case "$c" in
+      1) web_restart || true ;;
+      2) web_ask_password && web_conf_set WEB_PASS "$WEB_NEW_HASH" && web_restart \
+           && { ok "Пароль сменён, все сессии завершены"; [[ -n "$WEB_PASS_SHOWN" ]] \
+           && echo -e "  Пароль: ${W}$WEB_PASS_SHOWN${N} ${D}— сохрани, больше не покажу${N}"; } ;;
+      3) read_line v "${C}  Новый логин: ${N}"
+         if [[ "$v" =~ ^[A-Za-z0-9._-]{3,32}$ ]]; then web_conf_set WEB_USER "$v" && web_restart && ok "Логин: $v"
+         elif [[ -n "$v" ]]; then warn "Логин: 3-32 символа — латиница, цифры, . _ -"; fi ;;
+      4) web_set_port || true ;;
+      5) web_path_new && web_show_access ;;
+      6) _cert_issue_menu ip ;;
+      7) read_line v "${C}  Домен (A-запись → $(public_ip_cached)): ${N}"
+         [[ -n "$v" ]] && _cert_issue_menu domain "$v" ;;
+      8) _cert_use_menu ;;
+      9) if [[ -s "$WEB_LOG" ]]; then tail -n 30 "$WEB_LOG"; else info "Журнал пуст"; fi ;;
+      s) if web_active; then web_stop || true; else web_restart || true; fi ;;
+      u) web_code_install && web_restart || true ;;
+      d) web_remove; return 0 ;;
+      0) return 0 ;;
+    esac
+    pause
+  done
+}
+
+# ═════ antiscan ═════
+# Антисканер: новые входящие подключения из сетей сканеров (РКН, СКИПА) и
+# госорганов отбрасываются до служб сервера — SSH, Xray, панелей, Mini App.
+# Сервер реже попадает в базы, которые собирают по итогам сканирований.
+#
+# Списки — публичные (shadow-netlab/traffic-guard-lists). Чужому списку на
+# слово не верим: каждая запись проверяется, частные и служебные сети и
+# слишком широкие подсети отбрасываются, короткий (оборванный) список не
+# заменяет прежний.
+#
+# Как устроено: наборы ipset hash:net (IPv4 и IPv6) и одно правило первым в
+# INPUT — DROP только НОВЫХ соединений: уже открытые (текущий SSH) не рвутся.
+# Трафик клиентов через VPN (FORWARD) не трогается. Исключения — записи
+# nomatch: адрес внутри подсети списка остаётся доступным. SSH-адрес, с
+# которого включают, и адреса самого сервера попадают в исключения сами.
+#
+# Служба awg2-antiscan.service ставит наборы и правило при загрузке (раньше
+# UFW и netfilter-persistent), таймер раз в час возвращает правило на место,
+# если его сбросили или подвинули, и раз в сутки обновляет списки. Без сети
+# работает на сохранённых списках. iptables-persistent не нужен.
+
+# id<TAB>файл в репозитории списков<TAB>подпись<TAB>минимум записей
+_antiscan_lists() {
+  printf '%s\t%s\t%s\t%s\n' \
+    scan antiscanner.list "Сканеры" 20 \
+    skipa skipa.list "СКИПА — сканеры РКН" 20 \
+    gov government_networks.list "Сети госорганов" 300
+}
+
+_antiscan_get() {  # КЛЮЧ — значение из antiscan.conf (файл не исполняется)
+  sed -n "s/^$1=//p" "$ANTISCAN_CONF" 2>/dev/null | tail -1
+}
+
+_antiscan_set() {  # КЛЮЧ ЗНАЧЕНИЕ
+  local v="${2//[$'\n\r']/ }"
+  mkdir -p "$ANTISCAN_DIR" && chmod 700 "$ANTISCAN_DIR"
+  { grep -v "^$1=" "$ANTISCAN_CONF" 2>/dev/null; printf '%s=%s\n' "$1" "$v"; } | write_file "$ANTISCAN_CONF" 600
+}
+
+_antiscan_log() { mkdir -p "$(dirname "$ANTISCAN_LOG")"; echo "[$(date '+%F %T')] $*" >> "$ANTISCAN_LOG"; }
+
+# Включённые списки: id через пробел, только известные (по умолчанию все)
+_antiscan_enabled_lists() {
+  local want id out=()
+  want=" $(_antiscan_get LISTS) "
+  [[ "$want" == "  " ]] && want=" scan skipa gov "
+  while IFS=$'\t' read -r id _; do
+    [[ "$want" == *" $id "* ]] && out+=("$id")
+  done < <(_antiscan_lists)
+  echo "${out[*]}"
+}
+
+# Записи списка → нормализованные подсети одного семейства (4 или 6).
+# allow=1 — для исключений: без запрета частных сетей и ширины.
+_antiscan_parse() {  # 4|6 [allow]
+  awk -v fam="$1" -v allow="${2:-0}" '
+    function ip2n(s,  a) { split(s, a, "."); return ((a[1] * 256 + a[2]) * 256 + a[3]) * 256 + a[4] }
+    function n2ip(n,  a, i) { for (i = 4; i >= 1; i--) { a[i] = n % 256; n = int(n / 256) }
+                              return a[1] "." a[2] "." a[3] "." a[4] }
+    BEGIN {
+      # Частные, служебные, документационные и multicast: там сети самого
+      # сервера и клиентов VPN, блокировать их нельзя ни при каком списке
+      split("0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 " \
+            "192.0.0.0/24 192.0.2.0/24 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 " \
+            "203.0.113.0/24 224.0.0.0/3", res, " ")
+      for (i in res) { split(res[i], q, "/"); rs[i] = ip2n(q[1]); re[i] = rs[i] + 2 ^ (32 - q[2]) - 1 }
+    }
+    { sub(/#.*/, ""); gsub(/[ \t\r]/, "") }
+    $0 == "" { next }
+    fam == 4 && /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/ {
+      split($0, p, "/"); len = (p[2] == "" ? 32 : p[2] + 0); split(p[1], o, ".")
+      for (i = 1; i <= 4; i++) if (o[i] + 0 > 255 || o[i] ~ /^0[0-9]/) next
+      if (len > 32 || (!allow && len < 12) || len < 8) next
+      size = 2 ^ (32 - len); s = ip2n(p[1]); s -= s % size; e = s + size - 1
+      if (!allow) for (i in rs) if (s <= re[i] && e >= rs[i]) next
+      print n2ip(s) "/" len; next
+    }
+    fam == 6 && /:/ {
+      if (split(tolower($0), p, "/") > 2) next
+      ip = p[1]; len = (p[2] == "" ? 128 : p[2] + 0)
+      if (p[2] != "" && p[2] !~ /^[0-9]+$/) next
+      if (ip !~ /^[0-9a-f:]+$/ || ip ~ /:::/ || len > 128 || (!allow && len < 24) || len < 16) next
+      t = ip; dbl = gsub(/::/, "", t)
+      if (dbl > 1 || ip ~ /^:[^:]/ || ip ~ /[^:]:$/) next   # одинокое «:» с краю — не адрес, ipset restore упал бы целиком
+      n = split(ip, g, ":"); cnt = 0
+      for (i = 1; i <= n; i++) { if (length(g[i]) > 4) next; if (g[i] != "") cnt++ }
+      if ((dbl == 0 && (n != 8 || cnt != 8)) || (dbl == 1 && cnt > 7)) next
+      # Только глобальные адреса 2000::/3, без документационной 2001:db8::/32
+      if (!allow && (g[1] !~ /^[23][0-9a-f][0-9a-f][0-9a-f]$/ || ip ~ /^2001:0?db8:/)) next
+      print ip "/" len; next
+    }
+  '
+}
+
+# Подписи сетей из комментариев списка госсетей: «подсеть<TAB>организация».
+_antiscan_names() {
+  awk '
+    /^# Networks announced by/ { org = ""; asn = ""; next }
+    /^# AS-Name:/ { asn = $0; sub(/^# AS-Name:[ \t]*/, "", asn); next }
+    /^#/ { if (org == "" && asn != "") { org = $0; sub(/^#[ \t]*/, "", org) } next }
+    NF { n = $1; sub(/\/(32|128)$/, "", n); print n "\t" substr(org != "" ? org : asn, 1, 80) }
+  ' | tr -d '\000-\010\013-\037\177'
+}
+
+# Адреса, которые не блокируются никогда: адреса сервера и SSH-сессии
+# (текущая — из SSH_CONNECTION, остальные — установленные соединения sshd).
+_antiscan_server_addrs() { ip -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}'; }
+
+# Отпечаток адресов сервера: на загрузке (служба раньше сети) их ещё нет, а при
+# смене адреса исключения устаревают — таймер пересобирает набор, если он другой
+_antiscan_addr_sig() { _antiscan_server_addrs | sort -u | cksum | cut -d' ' -f1; }
+
+_antiscan_auto_allow() {
+  {
+    _antiscan_server_addrs
+    [[ -n "${SSH_CONNECTION:-}" ]] && echo "${SSH_CONNECTION%% *}"
+    ss -tnpH state established 2>/dev/null | awk '/"sshd/ {print $4}' | sed -E 's/^\[?([^]]*)\]?:[0-9]+$/\1/'
+  } | sed 's/^::ffff://' | grep -E '^[0-9a-fA-F.:]+$' | sort -u
+}
+
+_antiscan_ssh_peers() {
+  {
+    [[ -n "${SSH_CONNECTION:-}" ]] && echo "${SSH_CONNECTION%% *}"
+    ss -tnpH state established 2>/dev/null | awk '/"sshd/ {print $4}' | sed -E 's/^\[?([^]]*)\]?:[0-9]+$/\1/'
+  } | sed 's/^::ffff://' | grep -E '^[0-9a-fA-F.:]+$' | sort -u
+}
+
+# Адрес, с которого включают из панели или Mini App: бот передаёт в
+# AWG_CLIENT_IP адрес самого соединения (не X-Forwarded-For). Не адрес — пропуск.
+_antiscan_client_ip() {
+  local a="${AWG_CLIENT_IP:-}"
+  a="${a#::ffff:}"
+  [[ "$a" =~ ^[0-9A-Fa-f.:]{2,39}$ ]] || return 0
+  if valid_ip "$a" || [[ -n "$(printf '%s\n' "$a" | _antiscan_parse 6 1)" ]]; then echo "${a,,}"; fi
+}
+
+# Записей, охват IPv4 (адресов) и IPv6 (сетей /32 — по записям /32 и шире)
+# в разобранном списке. %.0f, а не %d: mawk обрезал бы большие числа до 2^31
+_antiscan_span() {
+  awk -F/ '{ n++; if ($1 ~ /:/) { if ($2 <= 32) s6 += 2 ^ (32 - $2) } else s4 += 2 ^ (32 - $2) }
+    END { printf "%d %.0f %.0f\n", n, s4, s6 }'
+}
+
+# Скачать включённые списки. Оборванный или пустой ответ прежний список не
+# заменяет. Ошибки — в ERROR, время удачного обновления — в UPDATED.
+_antiscan_fetch_all() {
+  local id file label min tmp n s4 s6 errs=() ok=0
+  mkdir -p "$ANTISCAN_DIR/lists"
+  while IFS=$'\t' read -r id file label min; do
+    [[ " $(_antiscan_enabled_lists) " == *" $id "* ]] || continue
+    tmp=$(mktemp "$ANTISCAN_DIR/.dl.XXXXXX") || return 1
+    if ! curl -fsS --proto '=https' --max-time 40 --max-filesize 8000000 -o "$tmp" "$ANTISCAN_SRC/$file" 2>/dev/null; then
+      errs+=("$label: не скачался"); rm -f "$tmp"; continue
+    fi
+    read -r n s4 s6 < <({ _antiscan_parse 4 < "$tmp"; _antiscan_parse 6 < "$tmp"; } | _antiscan_span)
+    if (( n < min || n > 200000 )); then   # 200000 — предел _antiscan_apply_in: раздутый список прежний не вытесняет
+      errs+=("$label: в ответе $n записей — оставлен прежний"); rm -f "$tmp"; continue
+    fi
+    if (( s4 > ANTISCAN_MAX4 || s6 > ANTISCAN_MAX6 )); then
+      errs+=("$label: слишком широкий охват (IPv4 $s4 адресов, IPv6 $s6 сетей /32) — оставлен прежний"); rm -f "$tmp"; continue
+    fi
+    chmod 600 "$tmp" && mv -f "$tmp" "$ANTISCAN_DIR/lists/$id.list"
+    ok=$((ok + 1))
+  done < <(_antiscan_lists)
+  if (( ${#errs[@]} )); then
+    _antiscan_set ERROR "${errs[*]}"
+    _antiscan_log "списки: ${errs[*]}"
+  else
+    _antiscan_set ERROR ""
+    _antiscan_set UPDATED "$(date +%s)"
+  fi
+  (( ok > 0 ))
+}
+
+_antiscan_rule() {  # набор → ANTISCAN_RULE
+  ANTISCAN_RULE=(-m conntrack --ctstate NEW -m set --match-set "$1" src -m comment --comment "$ANTISCAN_TAG" -j DROP)
+}
+
+# Правило — выше всего, что может пропустить снаружи: ACCEPT и переходы в
+# чужие цепочки (UFW, fail2ban), вставленные позже, иначе пропускали бы сканер
+# раньше него. Сдвинуто ниже — снимается и ставится первым.
+_antiscan_rule_up() {  # iptables|ip6tables набор
+  local ipt="$1"
+  _antiscan_rule "$2"
+  if "$ipt" -C INPUT "${ANTISCAN_RULE[@]}" 2>/dev/null; then
+    _antiscan_rule_first "$ipt" && return 0
+    while "$ipt" -D INPUT "${ANTISCAN_RULE[@]}" 2>/dev/null; do :; done
+  fi
+  "$ipt" -I INPUT 1 "${ANTISCAN_RULE[@]}"
+}
+
+_antiscan_rule_down() {  # iptables|ip6tables набор
+  local guard=0
+  command -v "$1" &>/dev/null || return 0
+  _antiscan_rule "$2"
+  while (( guard++ < 32 )) && "$1" -D INPUT "${ANTISCAN_RULE[@]}" 2>/dev/null; do :; done
+  return 0
+}
+
+# Выше нашего правила можно только то, что сканер не пропускает: DROP и
+# REJECT (порт WireGuard обфускатора) и правила для своих интерфейсов Тулзы
+# (ACCEPT DNS с awg0) — их трафик и так не из внешних сетей.
+_antiscan_rule_first() {  # iptables|ip6tables
+  "$1" -S INPUT 2>/dev/null | awk -v tag="$ANTISCAN_TAG" -v own=" $OWN_IFACES lo " '
+    $1 != "-A" { next }
+    {
+      for (i = 1; i <= NF; i++) if ($i == "--comment" && ($(i + 1) == tag || $(i + 1) == "\"" tag "\"")) { ok = 1; exit }
+      for (i = 1; i <= NF; i++) if ($i == "-j" && ($(i + 1) == "DROP" || $(i + 1) == "REJECT")) next
+      for (i = 2; i < NF; i++) if ($i == "-i" && $(i - 1) != "!" && index(own, " " $(i + 1) " ")) next
+      exit
+    }
+    END { exit !ok }'
+}
+
+# Правила на месте: есть набор — правило выше всего, что пропускает снаружи
+antiscan_rules_ok() {
+  ipset list -n "$ANTISCAN_SET" &>/dev/null && _antiscan_rule_first iptables || return 1
+  if ipset list -n "$ANTISCAN_SET6" &>/dev/null; then _antiscan_rule_first ip6tables || return 1; fi
+  return 0
+}
+
+# Загрузить набор атомарно: новый под временным именем, затем swap —
+# правило не остаётся без набора ни на миг.
+_antiscan_load() {  # набор inet|inet6 файл_записей файл_исключений
+  local set="$1" family="$2" tmpset="${1}-new" n
+  n=$(wc -l < "$3")
+  {
+    echo "create $tmpset hash:net family $family hashsize 4096 maxelem 262144 counters -exist"
+    echo "flush $tmpset"
+    sed "s|^|add $tmpset |; s|$| -exist|" "$3"
+    sed "s|^|add $tmpset |; s|$| nomatch -exist|" "$4"
+  } | ipset restore || { ipset destroy "$tmpset" 2>/dev/null; return 1; }
+  ipset create "$set" hash:net family "$family" hashsize 4096 maxelem 262144 counters -exist || return 1
+  ipset swap "$tmpset" "$set" && ipset destroy "$tmpset"
+  echo "$n"
+}
+
+# Подсети со входа (нормализованные _antiscan_parse), которые лежат целиком
+# внутри (in) или не внутри (out) какой-нибудь подсети из файла. Сравнение по
+# префиксу группами по 16 бит (IPv4 — две, IPv6 — восемь): без чисел больше
+# 2^16 — mawk считает в double. Каждая длина префикса из файла — один поиск.
+_antiscan_inside() {  # in|out файл
+  awk -v mode="$1" -v f="$2" '
+    function hex(h,  i, v) { v = 0; for (i = 1; i <= length(h); i++) v = v * 16 + index("0123456789abcdef", substr(h, i, 1)) - 1; return v }
+    function net(s,  p, a, b, i, n, hn, tn) {   # → F (4|6), L, G[1..8]
+      split(s, p, "/")
+      if (p[1] ~ /:/) {
+        F = 6; L = (p[2] == "" ? 128 : p[2] + 0); s = tolower(p[1]); i = index(s, "::")
+        if (i) { hn = (i > 1 ? split(substr(s, 1, i - 1), a, ":") : 0); tn = (substr(s, i + 2) != "" ? split(substr(s, i + 2), b, ":") : 0) }
+        else { hn = split(s, a, ":"); tn = 0 }
+        for (n = 1; n <= hn; n++) G[n] = hex(a[n])
+        for (; n <= 8 - tn; n++) G[n] = 0
+        for (i = 1; i <= tn; i++) G[n++] = hex(b[i])
+      } else {
+        F = 4; L = (p[2] == "" ? 32 : p[2] + 0); split(p[1], a, ".")
+        G[1] = a[1] * 256 + a[2]; G[2] = a[3] * 256 + a[4]
+      }
+    }
+    function key(len,  k, i) {
+      k = F
+      for (i = 1; i <= int(len / 16); i++) k = k ":" G[i]
+      if (len % 16) k = k ":" int(G[i] / 2 ^ (16 - len % 16))
+      return k
+    }
+    BEGIN {
+      while ((getline l < f) > 0) {
+        if (l == "") continue
+        net(l); nets[key(L)] = 1
+        if (!((F, L) in seen)) { seen[F, L] = 1; nl[F]++; ll[F, nl[F]] = L }
+      }
+    }
+    NF {
+      net($1); hit = 0
+      for (j = 1; j <= nl[F] && !hit; j++) if (ll[F, j] <= L && (key(ll[F, j]) in nets)) hit = 1
+      if (hit == (mode == "in")) print
+    }'
+}
+
+# Адрес (IPv4 или IPv6) внутри какой-нибудь подсети из файла?
+_antiscan_covers() {  # файл адрес
+  local n
+  [[ "$2" != */* ]] || return 1
+  n=$(printf '%s\n' "$2" | _antiscan_parse 4 1; printf '%s\n' "$2" | _antiscan_parse 6 1)
+  [[ -n "$n" && -n "$(printf '%s\n' "$n" | _antiscan_inside in "$1")" ]]
+}
+
+# Собрать наборы из сохранённых списков и поставить правила.
+_antiscan_apply() {
+  local d rc=0
+  # Выключили, пока качались списки (выключение ждёт замок не дольше 20 с), —
+  # правило обратно не ставить
+  [[ "$(_antiscan_get ON)" == 1 ]] || { antiscan_down; return 0; }
+  d=$(mktemp -d "$ANTISCAN_DIR/.apply.XXXXXX") || return 1
+  _antiscan_apply_in "$d" || rc=$?
+  rm -rf "$d"
+  return "$rc"
+}
+
+_antiscan_apply_in() {  # временный каталог
+  local d="$1" id ip who n4 n6=0
+  : > "$d/v4"; : > "$d/v6"
+  for id in $(_antiscan_enabled_lists); do
+    [[ -f "$ANTISCAN_DIR/lists/$id.list" ]] || continue
+    _antiscan_parse 4 < "$ANTISCAN_DIR/lists/$id.list" >> "$d/v4"
+    _antiscan_parse 6 < "$ANTISCAN_DIR/lists/$id.list" >> "$d/v6"
+  done
+  sort -u -o "$d/v4" "$d/v4"; sort -u -o "$d/v6" "$d/v6"
+  if [[ ! -s "$d/v4" && ! -s "$d/v6" ]]; then
+    _antiscan_log "нечего применять: списки ещё не скачаны"
+    return 3
+  fi
+  if (( $(wc -l < "$d/v4") + $(wc -l < "$d/v6") > 200000 )); then
+    _antiscan_log "в списках больше 200000 записей — не применяю"
+    return 4
+  fi
+  [[ -f "$ANTISCAN_DIR/lists/gov.list" ]] && _antiscan_names < "$ANTISCAN_DIR/lists/gov.list" > "$ANTISCAN_DIR/names"
+  # Адрес админа внутри списка — SSH-сессии и того, кто включает из панели, —
+  # в исключения насовсем: иначе после следующего обновления он бы не вошёл
+  _antiscan_allow_rows > "$d/allow"
+  { _antiscan_parse 4 1 < "$d/allow"; _antiscan_parse 6 1 < "$d/allow"; } > "$d/al"
+  while read -r ip who; do
+    _antiscan_covers "$d/v4" "$ip" || _antiscan_covers "$d/v6" "$ip" || continue
+    _antiscan_covers "$d/al" "$ip" && continue
+    printf '%s # %s — добавлен сам %s\n' "$ip" "$who" "$(date '+%F')" >> "$ANTISCAN_ALLOW"
+    chmod 600 "$ANTISCAN_ALLOW"
+    printf '%s\n' "$ip" | _antiscan_parse 4 1 >> "$d/al"; printf '%s\n' "$ip" | _antiscan_parse 6 1 >> "$d/al"
+    _antiscan_log "$who: адрес $ip есть в списке — добавлен в исключения"
+  done < <(_antiscan_ssh_peers | sed 's/$/ SSH/'; _antiscan_client_ip | sed 's/$/ панель/')
+  { _antiscan_allow_rows; _antiscan_auto_allow; } > "$d/allow"
+  _antiscan_parse 4 1 < "$d/allow" | sort -u > "$d/a4"
+  _antiscan_parse 6 1 < "$d/allow" | sort -u > "$d/a6"
+  # Запись списка целиком внутри исключения в набор не идёт: в hash:net
+  # побеждает самый узкий префикс, и «1.2.3.77/32» из списка перекрыла бы
+  # исключение «1.2.3.0/24 nomatch». Записи шире исключения остаются.
+  _antiscan_inside out "$d/a4" < "$d/v4" > "$d/v4.f" && mv -f "$d/v4.f" "$d/v4"
+  _antiscan_inside out "$d/a6" < "$d/v6" > "$d/v6.f" && mv -f "$d/v6.f" "$d/v6"
+  n4=$(_antiscan_load "$ANTISCAN_SET" inet "$d/v4" "$d/a4") || { _antiscan_log "ipset: набор IPv4 не загрузился"; return 5; }
+  _antiscan_rule_up iptables "$ANTISCAN_SET" || { _antiscan_log "iptables: правило не поставилось"; return 5; }
+  if [[ -s "$d/v6" ]] && command -v ip6tables &>/dev/null \
+      && n6=$(_antiscan_load "$ANTISCAN_SET6" inet6 "$d/v6" "$d/a6") \
+      && _antiscan_rule_up ip6tables "$ANTISCAN_SET6"; then
+    :
+  else
+    n6=0
+    _antiscan_rule_down ip6tables "$ANTISCAN_SET6"
+    ipset destroy "$ANTISCAN_SET6" 2>/dev/null || true
+  fi
+  _antiscan_set ENTRIES "$n4 $n6"
+  _antiscan_set ADDRS "$(_antiscan_addr_sig)"
+  _antiscan_log "применено: IPv4 $n4, IPv6 $n6"
+  return 0
+}
+
+_antiscan_allow_rows() { grep -v '^\s*#' "$ANTISCAN_ALLOW" 2>/dev/null | awk 'NF {print $1}'; }
+
+antiscan_down() {
+  _antiscan_rule_down iptables "$ANTISCAN_SET"
+  _antiscan_rule_down ip6tables "$ANTISCAN_SET6"
+  command -v ipset &>/dev/null || return 0
+  ipset destroy "$ANTISCAN_SET" 2>/dev/null || true
+  ipset destroy "$ANTISCAN_SET6" 2>/dev/null || true
+  # временные наборы замены — остаются, если загрузку прервали
+  ipset destroy "$ANTISCAN_SET-new" 2>/dev/null || true
+  ipset destroy "$ANTISCAN_SET6-new" 2>/dev/null || true
+  return 0
+}
+
+# Точка входа службы и таймера (и awg2): apply | update | heal | off.
+antiscan_run() {
+  local mode="${1:-heal}" rc=0 upd
+  mkdir -p "$ANTISCAN_DIR" && chmod 700 "$ANTISCAN_DIR"
+  exec 9>"$ANTISCAN_DIR/.lock"
+  flock -w 180 9 || { _antiscan_log "$mode: занято другой операцией"; return 75; }
+  if [[ "$mode" == off || "$(_antiscan_get ON)" != 1 ]]; then
+    antiscan_down
+    return 0
+  fi
+  case "$mode" in
+    update) _antiscan_fetch_all || true; _antiscan_apply || rc=$? ;;
+    apply) _antiscan_apply || rc=$? ;;
+    heal)
+      touch "$ANTISCAN_DIR/heal"
+      upd=$(_antiscan_get UPDATED)
+      if (( $(date +%s) - ${upd:-0} > 86400 )); then
+        _antiscan_fetch_all || true
+        _antiscan_apply || rc=$?
+      elif ! antiscan_rules_ok || [[ "$(_antiscan_addr_sig)" != "$(_antiscan_get ADDRS)" ]]; then
+        _antiscan_log "правило пропало или сдвинуто, либо адреса сервера сменились — применяю заново"
+        _antiscan_apply || rc=$?
+      fi ;;
+    *) echo "использование: ${0##*/} apply|update|heal|off" >&2; return 2 ;;
+  esac
+  return "$rc"
+}
+
+# ── Установка ─────────────────────────────────────────────
+_antiscan_emit() {
+  emit_script "$ANTISCAN_SCRIPT" 'antiscan_run "$@"' \
+    ANTISCAN_DIR ANTISCAN_CONF ANTISCAN_ALLOW ANTISCAN_LOG ANTISCAN_SET ANTISCAN_SET6 ANTISCAN_TAG ANTISCAN_SRC \
+    OWN_IFACES \
+    ANTISCAN_MAX4 ANTISCAN_MAX6 \
+    write_file valid_ip _antiscan_lists _antiscan_get _antiscan_set _antiscan_log _antiscan_enabled_lists _antiscan_parse \
+    _antiscan_names _antiscan_server_addrs _antiscan_addr_sig _antiscan_auto_allow _antiscan_ssh_peers _antiscan_client_ip \
+    _antiscan_span _antiscan_fetch_all _antiscan_rule _antiscan_rule_up \
+    _antiscan_rule_down _antiscan_rule_first antiscan_rules_ok _antiscan_load _antiscan_inside _antiscan_covers _antiscan_allow_rows \
+    _antiscan_apply _antiscan_apply_in antiscan_down \
+    antiscan_run || return 1
+  # Раньше UFW и netfilter-persistent, как сам ufw.service: их правила
+  # встанут после нашего, а восстановление iptables-persistent найдёт набор
+  write_unit "$ANTISCAN_UNIT" <<EOF
+[Unit]
+Description=AWG Toolza — антисканер: сети сканеров не доходят до служб сервера
+DefaultDependencies=no
+Wants=network-pre.target local-fs.target
+After=local-fs.target systemd-modules-load.service
+Before=network-pre.target ufw.service netfilter-persistent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$ANTISCAN_SCRIPT apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  write_unit "${ANTISCAN_TIMER%.timer}.service" <<EOF
+[Unit]
+Description=AWG Toolza — антисканер: правило на месте, списки раз в сутки
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$ANTISCAN_SCRIPT heal
+EOF
+  write_unit "$ANTISCAN_TIMER" <<'EOF'
+[Unit]
+Description=AWG Toolza — антисканер: проверка раз в час
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=3600
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+antiscan_on() { [[ "$(_antiscan_get ON)" == 1 ]]; }
+
+antiscan_enable() {
+  local rc=0
+  need_cmds ipset:ipset flock:util-linux || return 1
+  [[ -n "$(_antiscan_get LISTS)" ]] || _antiscan_set LISTS "scan skipa gov"
+  _antiscan_set ON 1
+  _antiscan_emit || { err "Не удалось записать службу антисканера"; return 1; }
+  info "Скачиваю и проверяю списки..."
+  "$ANTISCAN_SCRIPT" update || rc=$?
+  if (( rc )); then
+    _antiscan_set ON 0
+    "$ANTISCAN_SCRIPT" off &>/dev/null || true
+    case $rc in
+      3) err "Списки не скачались: $(_antiscan_get ERROR)" ;;
+      75) err "Антисканер занят другой операцией — повтори через минуту" ;;
+      *) err "Не удалось применить правила (код $rc) — журнал: $ANTISCAN_LOG" ;;
+    esac
+    return 1
+  fi
+  systemctl enable "$ANTISCAN_UNIT" &>/dev/null || true
+  systemctl enable --now "$ANTISCAN_TIMER" &>/dev/null || true
+  log_info "антисканер включён"
+  ok "Антисканер включён: $(antiscan_summary)"
+  [[ -n "$(_antiscan_get ERROR)" ]] && warn "$(_antiscan_get ERROR)"
+  return 0
+}
+
+antiscan_disable() {
+  local held=0
+  _antiscan_set ON 0
+  remove_unit "$ANTISCAN_TIMER" "${ANTISCAN_TIMER%.timer}.service" "$ANTISCAN_UNIT"
+  # Замок прохода таймера: проход, уже увидевший ON=1, иначе поставил бы правило
+  # обратно после нас. Не дольше 20 с — качающий проход сам увидит ON=0 перед применением
+  mkdir -p "$ANTISCAN_DIR" && chmod 700 "$ANTISCAN_DIR"
+  exec 9>"$ANTISCAN_DIR/.lock"
+  flock -w 20 9 && held=1
+  antiscan_down
+  (( held )) || _antiscan_log "выключение: замок занят дольше 20 с — снято без него"
+  exec 9>&-
+  log_info "антисканер выключен"
+  ok "Антисканер выключен — правила и наборы сняты"
+}
+
+antiscan_update() {
+  antiscan_on || { err "Антисканер выключен"; return 1; }
+  _antiscan_emit || return 1
+  "$ANTISCAN_SCRIPT" update || { err "Не удалось применить списки — журнал: $ANTISCAN_LOG"; return 1; }
+  if [[ -n "$(_antiscan_get ERROR)" ]]; then warn "$(_antiscan_get ERROR)"; fi
+  ok "Списки обновлены: $(antiscan_summary)"
+}
+
+# Какие списки блокировать: id через запятую или пробел (хотя бы один)
+antiscan_lists_set() {
+  local want=" ${*//,/ } " id out=()
+  while IFS=$'\t' read -r id _; do [[ "$want" == *" $id "* ]] && out+=("$id"); done < <(_antiscan_lists)
+  (( ${#out[@]} )) || { err "Нужен хотя бы один список: scan, skipa, gov"; return 1; }
+  _antiscan_set LISTS "${out[*]}"
+  antiscan_on || { ok "Списки: ${out[*]}"; return 0; }
+  if ! { _antiscan_emit && "$ANTISCAN_SCRIPT" update; }; then err "Не удалось применить — журнал: $ANTISCAN_LOG"; return 1; fi
+  ok "Списки: ${out[*]} — $(antiscan_summary)"
+}
+
+# Исключение — адрес или подсеть IPv4/IPv6
+antiscan_allow() {  # add|del АДРЕС
+  local op="${1:-}" v="${2:-}" norm short m
+  norm=$(printf '%s\n' "$v" | _antiscan_parse 4 1)
+  [[ -n "$norm" ]] || norm=$(printf '%s\n' "$v" | _antiscan_parse 6 1)
+  # Верный адрес со слишком широкой маской — своим текстом, а не «нужен адрес»
+  if [[ -z "$norm" && "$v" =~ ^[0-9A-Fa-f.:]+/([0-9]{1,3})$ ]]; then
+    m=$((10#${BASH_REMATCH[1]}))
+    if { (( m < 8 )) && valid_ip "${v%/*}"; } || { (( m < 16 )) && [[ -n "$(printf '%s\n' "${v%/*}" | _antiscan_parse 6 1)" ]]; }; then
+      err "Слишком широкая подсеть $(shown "$v"): исключение — не шире /8 для IPv4 и /16 для IPv6"; return 1
+    fi
+  fi
+  [[ -n "$norm" && "$v" != *[[:space:]]* && "$norm" != *$'\n'* ]] \
+    || { err "Нужен IPv4 или IPv6 адрес (можно с /маской): $(shown "$v")"; return 1; }
+  short="${norm%/32}"; short="${short%/128}"
+  mkdir -p "$ANTISCAN_DIR" && chmod 700 "$ANTISCAN_DIR"
+  touch "$ANTISCAN_ALLOW" && chmod 600 "$ANTISCAN_ALLOW"
+  case "$op" in
+    add) _antiscan_allow_rows | grep -qxF -e "$norm" -e "$short" || echo "$norm" >> "$ANTISCAN_ALLOW" ;;
+    del) _antiscan_allow_rows | grep -qxF -e "$norm" -e "$short" || { err "Такого исключения нет: $norm"; return 1; }
+         awk -v n="$norm" -v s="$short" '$1 != n && $1 != s' "$ANTISCAN_ALLOW" > "$ANTISCAN_ALLOW.new"
+         mv -f "$ANTISCAN_ALLOW.new" "$ANTISCAN_ALLOW"; chmod 600 "$ANTISCAN_ALLOW" ;;
+    *) err "allow add|del АДРЕС"; return 2 ;;
+  esac
+  if antiscan_on; then
+    if ! { _antiscan_emit && "$ANTISCAN_SCRIPT" apply; }; then err "Не удалось применить — журнал: $ANTISCAN_LOG"; return 1; fi
+  fi
+  ok "Исключения: $([[ "$op" == add ]] && echo "добавлен" || echo "убран") $norm"
+}
+
+# Отбито пакетов новых подключений с установки правила: обновление списков счётчик не
+# сбрасывает, перезагрузка и переустановка правила — сбрасывают
+antiscan_dropped() {
+  { iptables-save -c -t filter 2>/dev/null; ip6tables-save -c -t filter 2>/dev/null; } \
+    | awk -v tag="$ANTISCAN_TAG" 'index($0, "--comment " tag) && /^\[/ {
+        split(substr($1, 2), c, ":"); n += c[1] } END { print n + 0 }'
+}
+
+# Чаще всего стучавшиеся подсети: «пакетов<TAB>подсеть<TAB>организация»
+antiscan_top() {
+  local n="${1:-5}"
+  { ipset list "$ANTISCAN_SET" 2>/dev/null; ipset list "$ANTISCAN_SET6" 2>/dev/null; } \
+    | awk '$2 == "packets" && $3 > 0 {print $3 "\t" $1}' | sort -t$'\t' -k1,1nr | head -n "$n" \
+    | awk -F'\t' -v names="$ANTISCAN_DIR/names" '
+        BEGIN { while ((getline l < names) > 0) { split(l, a, "\t"); org[a[1]] = a[2] } }
+        { k = $2; sub(/\/(32|128)$/, "", k); print $1 "\t" $2 "\t" org[k] }'
+}
+
+antiscan_summary() {
+  local e
+  read -r -a e <<< "$(_antiscan_get ENTRIES)"
+  echo "подсетей IPv4 ${e[0]:-0}, IPv6 ${e[1]:-0}"
+}
+
+# ── Меню ──────────────────────────────────────────────────
+_antiscan_show() {
+  local id file label min on n upd err ssh
+  hdr "Антисканер"
+  echo -e "  ${D}Новые входящие подключения из сетей сканеров РКН и госорганов"
+  echo -e "  отбрасываются до SSH, Xray и панелей. VPN-трафик клиентов не трогается.${N}"
+  echo ""
+  if antiscan_on; then
+    if antiscan_rules_ok; then echo -e "  Состояние : ${G}● включён${N} — $(antiscan_summary)"
+    else echo -e "  Состояние : ${Y}▲ включён, правило не на месте${N} — вернёт таймер или «Обновить списки»"; fi
+    echo -e "  Отбито    : ${W}$(antiscan_dropped)${N} ${D}новых подключений с установки правила (сбрасывается при перезагрузке)${N}"
+  else
+    echo -e "  Состояние : ${D}○ выключен${N}"
+  fi
+  upd=$(_antiscan_get UPDATED)
+  [[ -n "$upd" ]] && echo -e "  Списки    : обновлены $(date -d "@$upd" '+%d.%m.%Y %H:%M' 2>/dev/null)"
+  err=$(_antiscan_get ERROR)
+  [[ -n "$err" ]] && echo -e "  ${Y}▲ $err${N}"
+  while IFS=$'\t' read -r id file label min; do
+    on="${D}○${N}"; [[ " $(_antiscan_enabled_lists) " == *" $id "* ]] && on="${G}●${N}"
+    n=0; [[ -f "$ANTISCAN_DIR/lists/$id.list" ]] && n=$(( $(_antiscan_parse 4 < "$ANTISCAN_DIR/lists/$id.list" | wc -l) + $(_antiscan_parse 6 < "$ANTISCAN_DIR/lists/$id.list" | wc -l) ))
+    echo -e "    $on $label ${D}— $n подсетей${N}"
+  done < <(_antiscan_lists)
+  n=$(_antiscan_allow_rows | wc -l)
+  echo -e "  Исключения: ${W}$n${N}${D} + адреса сервера и SSH-сессий${N}"
+  ssh=$(_antiscan_ssh_peers | head -3 | tr '\n' ' ')
+  [[ -n "$ssh" ]] && echo -e "  ${D}Твой SSH: $ssh— не блокируется${N}"
+}
+
+do_antiscan_menu() {
+  local c v id file label min
+  while true; do
+    echo ""
+    _antiscan_show
+    echo ""
+    if antiscan_on; then echo -e "  ${C}1)${N} Выключить"; else echo -e "  ${C}1)${N} Включить"; fi
+    echo -e "  ${C}2)${N} Обновить списки сейчас"
+    echo -e "  ${C}3)${N} Списки — что блокировать"
+    echo -e "  ${C}4)${N} Исключения — добавить адрес"
+    echo -e "  ${C}5)${N} Исключения — убрать адрес"
+    echo -e "  ${W}0)${N} ← Назад"
+    read_choice c "${C}  Выбор [0-5]: ${N}" 0 5 0
+    case "$c" in
+      1) if antiscan_on; then antiscan_disable
+         else
+           # Включение отрезает целые сети — сначала сказать, кого это заденет
+           echo -e "  ${Y}Новые подключения из сетей списков не пройдут — и клиентов VPN, и, может быть, тебя"
+           echo -e "  самого с другого адреса. Адрес этой SSH-сессии попадёт в исключения сам.${N}"
+           echo -e "  ${D}Выключить можно здесь или в боте: «Сервер → Антисканер».${N}"
+           ask_yes "  Включить антисканер? [y/N]: " n && { antiscan_enable || true; }
+         fi ;;
+      2) antiscan_update || true ;;
+      3) echo ""
+         while IFS=$'\t' read -r id file label min; do echo -e "  ${C}$id${N} — $label"; done < <(_antiscan_lists)
+         read_line v "${C}  Какие блокировать (через пробел) [$(_antiscan_enabled_lists)]: ${N}"
+         [[ -n "$v" ]] && { antiscan_lists_set "$v" || true; } ;;
+      4) read_line v "${C}  Адрес или подсеть (1.2.3.4 или 1.2.3.0/24): ${N}"
+         [[ -n "$v" ]] && { antiscan_allow add "$v" || true; } ;;
+      5) _antiscan_allow_rows | sed 's/^/    /'
+         read_line v "${C}  Какой убрать: ${N}"
+         [[ -n "$v" ]] && { antiscan_allow del "$v" || true; } ;;
+      0) return 0 ;;
+    esac
+    pause
+  done
+}
+
+# Таймер молчит дольше трёх часов (сброшен, заглох) — перезапустить
+antiscan_watchdog() {
+  local age
+  antiscan_on || return 0
+  [[ -f "$ANTISCAN_DIR/heal" ]] || return 0
+  age=$(( $(date +%s) - $(stat -c %Y "$ANTISCAN_DIR/heal" 2>/dev/null || echo 0) ))
+  (( age < 10800 )) && return 0
+  touch "$ANTISCAN_DIR/heal"
+  timer_heal "$ANTISCAN_TIMER"
+  systemctl start --no-block "${ANTISCAN_TIMER%.timer}.service" &>/dev/null || true
+}
+
+antiscan_remove() {
+  remove_unit "$ANTISCAN_TIMER" "${ANTISCAN_TIMER%.timer}.service" "$ANTISCAN_UNIT"
+  antiscan_down
+  rm -rf "$ANTISCAN_DIR" "$ANTISCAN_SCRIPT" "$ANTISCAN_LOG"
 }
 
 # ═════ uninstall ═════
@@ -8139,8 +10033,23 @@ _tools_files() {
        /usr/lib/systemd/system/awg-quick@.service /usr/lib/systemd/system/awg-quick.target
 }
 
+# Распакованные архивы Тулзы (с awg2.sh и awg_bot): из них «Установить бота»
+# берёт локальный код, поэтому после полного удаления о них спрашиваем.
+# Только свои (root_only_path) и без перевода строки в имени: список
+# читается построчно, и «awg-toolza-x\nroot» дал бы rm -rf root —
+# относительный путь от текущего каталога.
+toolza_unpacked() {
+  local d
+  for d in /root/awg-toolza-*/ /home/*/awg-toolza-*/; do
+    d="${d%/}"
+    [[ "$d" != *$'\n'* && -d "$d" && -f "$d/awg2.sh" && -d "$d/awg_bot" ]] || continue
+    root_only_path "$d" && echo "$d"
+  done
+  return 0
+}
+
 do_uninstall() {
-  local del_bot=n del_wgobf=n del_self=n opts
+  local del_bot=n del_wgobf=n del_web=n del_self=n del_src=n opts src=() d
   hdr "Удаление AWG Toolza"
   warn "Будет удалено:"
   echo -e "  ${R}—${N} сервер awg0, его клиенты и автозапуск"
@@ -8149,17 +10058,30 @@ do_uninstall() {
   echo -e "  ${R}—${N} таймер сроков клиентов, правила UFW с меткой AmneziaWG"
   bot_installed && echo -e "  ${R}—${N} Telegram-бот ${D}(спрошу отдельно)${N}"
   wgobf_installed && echo -e "  ${R}—${N} WG + обфускатор ${D}(спрошу отдельно)${N}"
+  web_installed && echo -e "  ${R}—${N} веб-панель ${D}(спрошу отдельно)${N}"
   echo -e "  ${R}—${N} сам скрипт $SCRIPT_PATH ${D}(спрошу отдельно)${N}"
   echo -e "  ${D}Перед удалением делается полный бэкап в $BACKUP_DIR — он остаётся.${N}"
   read_confirm "${R}  Подтверди удаление (введи yes): ${N}" || return 0
   bot_installed && read_yesno del_bot "  Удалить и Telegram-бота? [Y/n]: " y
   wgobf_installed && read_yesno del_wgobf "  Удалить и WG + обфускатор? [Y/n]: " y
+  web_installed && read_yesno del_web "  Удалить и веб-панель? [Y/n]: " y
   read_yesno del_self "  Удалить сам скрипт awg2? [Y/n]: " y
+  mapfile -t src < <(toolza_unpacked)
+  if (( ${#src[@]} )); then
+    echo -e "  ${D}Распакованные архивы Тулзы — из них ставится бот «из локального кода»:${N}"
+    for d in "${src[@]}"; do printf "  ${D}  %s${N}\n" "$(shown "$d")"; done
+    read_yesno del_src "  Удалить и их? [y/N]: " n
+  fi
   opts=()
   [[ "$del_bot" == y ]] && opts+=(bot)
   [[ "$del_wgobf" == y ]] && opts+=(wgobf)
+  [[ "$del_web" == y ]] && opts+=(web)
   [[ "$del_self" == y ]] && opts+=(self)
   uninstall_all "${opts[@]}"
+  if [[ "$del_src" == y ]]; then
+    for d in "${src[@]}"; do [[ "$d" == /* ]] && rm -rf -- "$d"; done
+    ok "Распакованные архивы удалены: ${#src[@]}"
+  fi
   (( UNINSTALLED_SELF )) && exit 0
   return 0
 }
@@ -8167,10 +10089,16 @@ do_uninstall() {
 # uninstall_all [bot] [wgobf] [self] — без вопросов; полный бэкап делается всегда.
 UNINSTALLED_SELF=0
 uninstall_all() {
-  local v o del_bot=n del_wgobf=n del_self=n
+  local v o del_bot=n del_wgobf=n del_web=n del_self=n
   for o in "$@"; do
-    case "$o" in bot) del_bot=y ;; wgobf) del_wgobf=y ;; self) del_self=y ;; esac
+    case "$o" in bot) del_bot=y ;; wgobf) del_wgobf=y ;; web) del_web=y ;; self) del_self=y ;; esac
   done
+  # Веб-панель работает через awg2: без него она осталась бы открытым входом,
+  # который ничего не может, и убрать её было бы уже нечем
+  if [[ "$del_self" == y && "$del_web" != y ]] && web_installed; then
+    del_web=y
+    info "Без awg2 веб-панель не работает — удаляю и её"
+  fi
 
   server_exists && do_backup
   awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
@@ -8200,11 +10128,19 @@ uninstall_all() {
   ufw_delete_matching AmneziaWG
   if [[ "$del_wgobf" == y ]]; then wgobf_remove quiet
   elif wgobf_installed; then info "WG + обфускатор оставлен и продолжит работать сам"; fi
+  if [[ "$del_web" == y ]] && web_installed; then web_remove quiet
+  elif web_installed; then info "Веб-панель оставлена — сервера AWG в ней больше нет"; fi
+  # Антисканер работает через свой скрипт и без awg2, но управлять им без
+  # awg2 нечем — уходит вместе со скриптом, иначе остаётся защищать сервер
+  if [[ "$del_self" == y ]]; then antiscan_remove
+  elif antiscan_on; then info "Антисканер оставлен и продолжит работать"; fi
   if [[ "$del_bot" == y ]]; then
     bot_uninstall quiet
-    # Сертификат нужен только Mini App бота
-    [[ -f "$CERT_STATE" || -d "$CERT_DIR" ]] && cert_remove &>/dev/null
-    rm -rf "$ACME_DIR" "$ACME_HOME"
+    # Сертификат — для Mini App бота и веб-панели
+    if ! web_installed; then
+      [[ -f "$CERT_STATE" || -d "$CERT_DIR" ]] && cert_remove &>/dev/null
+      rm -rf "$ACME_DIR" "$ACME_HOME"
+    fi
   fi
   log_info "полное удаление"
   if [[ "$del_self" != y ]]; then
@@ -8366,7 +10302,7 @@ do_client_dpi_hint() {
 # Сводка для «awg2 --status» и меню диагностики.
 do_status() {
   local n
-  hdr "AWG Toolza $VERSION"
+  hdr "AWG Toolza $VERSION_SHOW"
   os_detect
   echo -e "  Система   : $OS_LABEL, ядро $(uname -r)"
   echo -e "  Компоненты: $(components_summary)"
@@ -8421,7 +10357,7 @@ show_header() {
   [[ "$UPDATE_CHANNEL" == beta ]] && ch=" ${Y}[beta]${N}"
   upd=$(update_available || true)
   echo -e "${B}${LINE}${N}"
-  echo -e "  ${W}AWG Toolza $VERSION${N}$ch${upd:+   ${G}⬆ есть $upd${N} ${D}— Обновление${N}}"
+  echo -e "  ${W}AWG Toolza $VERSION_SHOW${N}$ch${upd:+   ${G}⬆ есть $upd${N} ${D}— Обновление${N}}"
   echo -e "  ${C}TG: @awgToolza${N}"
   echo -e "${B}${LINE}${N}"
   why=$(os_supported) || echo -e "  ${Y}▲ $why${N}"
@@ -8454,8 +10390,9 @@ do_server_menu() {
     echo -e "  ${C}6)${N} Проверить и починить"
     echo -e "  ${C}7)${N} Endpoint ${D}— ${ep:-IP сервера}${N}"
     echo -e "  ${Y}8)${N} Сбросить сервер"
+    echo -e "  ${C}9)${N} Антисканер ${D}— $(antiscan_on && echo "включён" || echo "сети сканеров РКН")${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-8]: ${N}" 0 8 0
+    read_choice c "${C}  Выбор [0-9]: ${N}" 0 9 0
     case "$c" in
       1) do_install || true ;;
       2) do_create_server || true ;;
@@ -8465,6 +10402,7 @@ do_server_menu() {
       6) do_repair || true ;;
       7) do_endpoint_menu || true ;;
       8) do_reset_server || true ;;
+      9) do_antiscan_menu || true; continue ;;
       0) return 0 ;;
     esac
     pause
@@ -8515,8 +10453,9 @@ main_menu() {
     echo -e "  ${R}7)${N} Удаление        ${D}— очистка${N}"
     echo -e "  ${M}8)${N} Обновление      ${D}— $(update_channel_label)${N}"
     echo -e "  ${C}9)${N} WG + обфускатор ${D}— $(wgobf_installed && echo "установлен" || echo "как Phobos")${N}"
+    echo -e "  ${C}w)${N} Веб-панель      ${D}— $(web_installed && { web_active && echo "работает" || echo "остановлена"; } || echo "в браузере")${N}"
     echo -e "  ${W}0)${N} Выход"
-    read_choice c "${C}  Выбор [0-9]: ${N}" 0 9
+    read_choice c "${C}  Выбор [0-9, w]: ${N}" 0 9 "" "w"
     case "$c" in
       1) do_server_menu ;;
       2) _need_server && { do_clients_menu || true; } ;;
@@ -8527,6 +10466,7 @@ main_menu() {
       7) do_danger_menu ;;
       8) do_update_menu ;;
       9) do_wgobf_menu ;;
+      w) do_web_menu ;;
       0) echo -e "\n  ${G}В путь!${N} ${D}t.me/awgToolza${N}\n"; return 0 ;;
     esac
   done
@@ -8609,11 +10549,13 @@ _api_status() {
   os_detect
   update_check_async || true
   upstream_refresh_async || true
+  country_refresh_async || true
   server_exists && n=$(clients_tsv | grep -c . || true)
   {
-    _kv version "$VERSION"; _kv api:n "$API_VERSION"
+    _kv version "$VERSION_SHOW"; _kv api:n "$API_VERSION"
     _kv channel "$UPDATE_CHANNEL"; _kv update "$(update_available || true)"
-    _kv host "$(hostname)"; _kv ip "$(public_ip_cached)"
+    _kv host "$(hostname)"; _kv ip "$(public_ip_cached)"; _kv country "$(server_country)"
+    _kv uptime:n "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
     _kv os "$OS_LABEL"; _kv kernel "$(uname -r)"
     _kv components.installed:b "$(_b command -v awg)"
     _kv components.module "$(mod_tag)"; _kv components.tools "$(tools_tag)"
@@ -8621,6 +10563,7 @@ _api_status() {
     _kv components.module_update "$(mod_update_available)"
     _kv components.tools_update "$(tools_update_available)"
     _kv components.reboot "$(reboot_reason)"
+    _kv components.kernel_gap "$(kernel_gap_line)"
     _kv server.exists:b "$(_b server_exists)"
     if server_exists; then
       _kv server.up:b "$(_b iface_up)"
@@ -8653,10 +10596,16 @@ _api_server() {
   shift || true
   case "$a" in
     info)
-      if server_exists; then proto_supported 3.1 || rc=$?; else rc=1; fi
+      # Поддержка 3.1 — из кэша (модуль, tools и сборка в памяти не менялись):
+      # server info зовут почти все экраны бота и панели, а проба на сервере
+      # 2.0 — это пробный интерфейс на каждый вызов. Сервера ещё нет — мастеру
+      # нужен тот же честный ответ, что и меню.
+      proto31_cached || rc=$?
       {
         _kv installed:b "$(_b command -v awg)"; _kv exists:b "$(_b server_exists)"
         _kv proto31:b "$([[ $rc == 0 ]] && echo 1 || echo 0)"
+        # Почему нет 3.1: components | tools | module | check (не прошла проба)
+        _kv proto31_why "$([[ $rc == 0 ]] || proto_why 3.1)"
         _kv reboot "$(reboot_reason)"
         if server_exists; then
           _kv up:b "$(_b iface_up)"; _kv proto "$(server_proto)"
@@ -8724,6 +10673,7 @@ _api_module() {
         _kv module_update "$(mod_update_available)"; _kv tools_update "$(tools_update_available)"
         _kv module_latest "$(upstream_latest mod)"; _kv tools_latest "$(upstream_latest tools)"
         _kv reboot "$(reboot_reason)"; _kv secure_boot:b "$(_b secure_boot_on)"
+        _kv kernel_gap "$(kernel_gap_line)"
         _kv backups:n "$(mod_backups | grep -c . || true)"
       } | api_obj
       components_report ;;
@@ -8741,6 +10691,7 @@ _api_module() {
       [[ -z "$tag" || "$tag" =~ ^v?[0-9][0-9A-Za-z._-]*$ ]] || { err "Тег вида v3.1.20260906"; return 1; }
       mod_update_flow "$tag" "$force" ;;
     tools) tools_update_flow "${1:-}" ;;
+    all) components_update_flow ;;
     reload) mod_reload ;;
     rebuild) mod_rebuild_all ;;
     backups)
@@ -8749,7 +10700,7 @@ _api_module() {
     rollback)
       [[ -n "${1:-}" ]] || { _api_usage "module rollback ФАЙЛ"; return; }
       mod_rollback "$1" ;;
-    *) _api_usage "module report|check|tags|update [ТЕГ] [force]|tools [force]|reload|rebuild|backups|rollback ФАЙЛ" ;;
+    *) _api_usage "module report|check|tags|update [ТЕГ] [force]|tools [force]|all|reload|rebuild|backups|rollback ФАЙЛ" ;;
   esac
 }
 
@@ -8762,7 +10713,7 @@ _api_clients() {
       server_exists || { echo '[]' > "$API_DATA"; return 0; }
       mktmp dump || return 1
       awg show "$AWG_IF" dump > "$dump" 2>/dev/null || true
-      py clients-json "$SERVER_CONF" "$dump" "$CLIENT_DIR" "$WARP_PEERS" "$XRAY_PEERS" "$EXITS_PEERS" > "$API_DATA" ;;
+      py clients-json "$SERVER_CONF" "$dump" "$CLIENT_DIR" "$WARP_PEERS" "$XRAY_PEERS" "$EXITS_PEERS" "$TRAFFIC_DB" > "$API_DATA" ;;
     bulk) _api_clients_bulk "$@" ;;
     del) _api_clients_del "$@" ;;
     export)
@@ -8809,7 +10760,7 @@ _api_client_opts() {
                 (( _O_EXPIRE > $(date +%s) + 60 )) || { err "Срок уже прошёл: $v"; return 1; }
               fi ;;
       mimicry) _O_MIM="$v" ;;
-      dns) [[ "$v" =~ ^[0-9.,[:space:]]+$ ]] || { err "dns: IPv4 через запятую"; return 1; }; _O_DNS="$v" ;;
+      dns) valid_dns_list "$v" || { err "dns: IPv4 через запятую"; return 1; }; _O_DNS="$v" ;;
       mtu) [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) || { err "mtu: 1280-1500"; return 1; }
            _O_MTU="$v" ;;
       *) err "Неизвестный параметр: ${kv%%=*}"; return 1 ;;
@@ -8858,7 +10809,7 @@ _api_clients_bulk() {
 
 _api_client() {
   local a="${1:-}" name="${2:-}" f
-  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire ИМЯ ..."; return; }
+  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset ИМЯ ..."; return; }
   shift 2
   case "$a" in
     add)
@@ -8883,7 +10834,11 @@ _api_client() {
       [[ -n "${1:-}" ]] || { _api_usage "client expire ИМЯ unix-время|+30d|+12h|дата"; return; }
       client_expire_set "$name" "$(_api_ts "$1")" ;;
     unexpire) client_expire_clear "$name" ;;
-    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire ИМЯ ..." ;;
+    limit)
+      [[ -n "${1:-}" ]] || { _api_usage "client limit ИМЯ 50G|500M|off [month|total]"; return; }
+      client_limit_set "$name" "$1" "${2:-month}" ;;
+    limit-reset) client_limit_reset "$name" ;;
+    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset ИМЯ ..." ;;
   esac
 }
 
@@ -8893,6 +10848,33 @@ _api_mimicry() {
     IFS='|' read -r id label hint <<< "$i"
     printf '%s\t%s\t%s\t%s\n' "$id" "$label" "$hint" "$(_profile_needs_domain "$id" && echo 1 || echo 0)"
   done | api_rows id label hint domain:b
+}
+
+# ── Трафик по дням ────────────────────────────────────────
+_api_traffic() {
+  local tr wtr name="" days=30
+  case "${1:-}" in
+    daily)
+      # Два аргумента — всегда «ИМЯ|all ДНЕЙ»: имя клиента может быть числом
+      if (( $# >= 3 )); then name="$2"; [[ "$3" =~ ^[0-9]+$ ]] && days="$3"
+      elif [[ "${2:-}" =~ ^[0-9]+$ ]]; then days="$2"
+      else name="${2:-}"; fi
+      [[ "$name" == all ]] && name=""
+      server_exists || { err "Сервер не создан"; return 1; }
+      mktmp tr || return 1
+      awg show "$AWG_IF" transfer > "$tr" 2>/dev/null || true
+      py traffic-daily "$SERVER_CONF" "$TRAFFIC_DB" "$tr" "$name" "$days" > "$API_DATA" ;;
+    now)
+      # Счётчики прямо сейчас — панель считает по ним живую скорость:
+      # клиенты awg0 и отдельно клиенты WG + обфускатора (wgobf0)
+      server_exists || { err "Сервер не создан"; return 1; }
+      mktmp tr || return 1
+      mktmp wtr || return 1
+      awg show "$AWG_IF" transfer > "$tr" 2>/dev/null || true
+      if wgobf_installed; then wg show "$WGOBF_IF" transfer > "$wtr" 2>/dev/null || true; fi
+      py traffic-now "$SERVER_CONF" "$tr" "$WGOBF_WG_CONF" "$wtr" > "$API_DATA" ;;
+    *) _api_usage "traffic daily [ИМЯ|all] [ДНЕЙ] | now" ;;
+  esac
 }
 
 # ── Диагностика ───────────────────────────────────────────
@@ -8915,7 +10897,7 @@ _api_backup() {
   shift || true
   case "$a" in
     create)
-      backup_create archive || return 1
+      backup_create archive "${1:-}" "${2:-}" || return 1
       { _kv path "$BACKUP_PATH"; _kv size:n "$(stat -c %s "$BACKUP_PATH")"; } | api_obj ;;
     list)
       while IFS= read -r p; do
@@ -8933,7 +10915,7 @@ _api_backup() {
     restore)
       [[ -n "${1:-}" ]] || { _api_usage "backup restore ПУТЬ [wgobf] [tunnels]"; return; }
       backup_restore "$@" ;;
-    *) _api_usage "backup create|list|inspect ПУТЬ|restore ПУТЬ [wgobf] [tunnels]" ;;
+    *) _api_usage "backup create [auto [ХРАНИТЬ]]|list|inspect ПУТЬ|restore ПУТЬ [wgobf] [tunnels]" ;;
   esac
 }
 
@@ -8962,7 +10944,7 @@ _api_tunnels() {
       done | api_rows name ip on:b ;;
     client)
       [[ -n "${3:-}" ]] || { _api_usage "tunnels client warp|xray ИМЯ|all|none [on|off]"; return; }
-      tunnel_client "$2" "$3" "${4:-on}" ;;
+      tunnel_client "$2" "$3" "${4:-}" ;;
     *) _api_usage "tunnels status|panic|clients warp|xray|client warp|xray ИМЯ|all|none [on|off]" ;;
   esac
 }
@@ -9016,6 +10998,9 @@ _api_xray() {
         _kv mode "$(xray_state_get tun_mode)"
         _kv tags:j "$(xray_tags | py json-list)"
         _kv balancer "$(xray_installed && py xray-balancer-get "$XRAY_CONF" 2>/dev/null || echo off)"
+        _kv main "$(xray_installed && py xray-main-get "$XRAY_CONF" 2>/dev/null)"
+        _kv per_client:b "$(xray_installed && _b xray_tun_supported || echo 0)"
+        _kv clients:j "$(xray_client_outs | py json-rows name ip out)"
         _kv ru:b "$(_b xray_ru_on)"; } | api_obj
       xray_status ;;
     install) xray_install update ;;
@@ -9030,6 +11015,12 @@ _api_xray() {
         || { _api_usage "xray balancer random|roundRobin|leastPing|leastLoad|off"; return; }
       xray_installed || { err "Xray не установлен"; return 1; }
       xray_balancer "$1" ;;
+    main)
+      [[ -n "${1:-}" ]] || { _api_usage "xray main ТЕГ"; return; }
+      xray_main_set "$1" ;;
+    client)
+      [[ -n "${2:-}" ]] || { _api_usage "xray client ИМЯ ТЕГ|default"; return; }
+      xray_client_out "$1" "$2" ;;
     up) xray_up ;;
     down) xray_down ;;
     restart) xray_restart ;;
@@ -9040,7 +11031,7 @@ _api_xray() {
     diag) xray_diagnose ;;
     fix) xray_fix ;;
     remove) xray_uninstall ;;
-    *) _api_usage "xray status|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|up|down|restart|ru on|off|ru-update|diag|fix|remove" ;;
+    *) _api_usage "xray status|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|diag|fix|remove" ;;
   esac
 }
 
@@ -9079,10 +11070,12 @@ _api_exits() {
     balance)
       [[ -n "${1:-}" ]] || { _api_usage "exits balance single НОДА|ecmp"; return; }
       exits_balance "$1" "${2:-}" ;;
+    mode) exits_mode "${1:-}" ;;
     client)
-      [[ -n "${2:-}" ]] || { _api_usage "exits client ИМЯ off|shared|НОДА"; return; }
-      exits_client "$1" "$2" ;;
-    *) _api_usage "exits status|add ИМЯ (stdin)|del ИМЯ|up [all|peers]|down|balance single НОДА|ecmp|client ИМЯ off|shared|НОДА" ;;
+      # all / none без второго аргумента — все клиенты; с ним — клиент с таким именем
+      [[ "${1:-}" == all || "${1:-}" == none || -n "${2:-}" ]] || { _api_usage "exits client ИМЯ off|shared|НОДА | all | none"; return; }
+      exits_client "$1" "${2:-}" ;;
+    *) _api_usage "exits status|add ИМЯ (stdin)|del ИМЯ|up [all|peers]|down|mode all|peers|balance single НОДА|ecmp|client ИМЯ off|shared|НОДА|all|none" ;;
   esac
 }
 
@@ -9132,7 +11125,7 @@ _api_dns() {
 }
 
 _api_wgobf() {
-  local a="${1:-}" name dir f dump now pub ip hs
+  local a="${1:-}" name dir f dump now pub ip hs rx tx
   shift || true
   case "$a" in
     status)
@@ -9151,10 +11144,13 @@ _api_wgobf() {
       while IFS= read -r name; do
         pub=$(awk -v t="# client=$name" '$0 == t {f = 1; next} f && /^PublicKey = / {print $3; exit}' "$WGOBF_WG_CONF")
         ip=$(awk -v t="# client=$name" '$0 == t {f = 1; next} f && /^AllowedIPs = / {print $3; exit}' "$WGOBF_WG_CONF")
-        hs=$(awk -v k="$pub" '$1 == k {print $5; exit}' <<< "$dump")
-        [[ "$hs" =~ ^[0-9]+$ ]] && (( hs > 0 )) && hs=$((now - hs)) || hs=""
-        printf '%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs"
-      done < <(wgobf_clients) | api_rows name ip ago:n ;;
+        # Рукопожатие и трафик с подъёма wgobf0 (счётчики WireGuard)
+        hs="" rx="" tx=""          # у нового клиента строки в dump нет: прошлый не тянется
+        read -r hs rx tx < <(awk -v k="$pub" '$1 == k {print $5, $6, $7; exit}' <<< "$dump") || true
+        [[ "${hs:-}" =~ ^[0-9]+$ ]] && (( hs > 0 )) && hs=$((now - hs)) || hs=""
+        [[ "${rx:-}" =~ ^[0-9]+$ ]] || rx=0; [[ "${tx:-}" =~ ^[0-9]+$ ]] || tx=0
+        printf '%s\t%s\t%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs" "$rx" "$tx"
+      done < <(wgobf_clients) | api_rows name ip ago:n rx:n tx:n ;;
     add|del|bundle)
       name="${1:-}"
       [[ -n "$name" ]] || { _api_usage "wgobf $a ИМЯ"; return; }
@@ -9182,16 +11178,16 @@ _api_wgobf() {
 
 # ── Обновление, бот, удаление ─────────────────────────────
 _api_update() {
-  local a="${1:-}" v
+  local a="${1:-}" v c
   shift || true
   case "$a" in
     status)
       v=$(update_available || true)
-      { _kv version "$VERSION"; _kv channel "$UPDATE_CHANNEL"; _kv repo "$UPDATE_REPO"
+      { _kv version "$VERSION_SHOW"; _kv channel "$UPDATE_CHANNEL"; _kv repo "$UPDATE_REPO"
         _kv available "$v"; } | api_obj ;;
     check)
       v=$(update_peek) || { err "Канал обновлений недоступен ($UPDATE_REPO)"; return 1; }
-      { _kv version "$VERSION"; _kv latest "$v"; _kv channel "$UPDATE_CHANNEL"
+      { _kv version "$VERSION_SHOW"; _kv latest "$v"; _kv channel "$UPDATE_CHANNEL"
         _kv newer:b "$( (( 10#$(ver_num "$v") > 10#$(ver_num "$VERSION") )) && echo 1 || echo 0)"; } | api_obj
       info "Текущая: $VERSION, в канале: $v" ;;
     install)
@@ -9206,7 +11202,14 @@ _api_update() {
       ok "Канал: $(update_channel_label)" ;;
     changelog)
       update_changelog_fetch || { err "Список изменений недоступен ($UPDATE_REPO)"; return 1; }
-      py changelog-json "$VERSION" <<< "$UPDATE_CHANGELOG" > "$API_DATA" ;;
+      # В CHANGELOG канала версия новее, чем помнит кэш проверки (он живёт до
+      # часа), — спросить канал сейчас: иначе «Доступна» и кнопка показали бы
+      # прошлую версию, а обновление поставило бы новую
+      v=$(grep -m1 -oE '^## v[0-9]+\.[0-9]+\.[0-9]+' <<< "$UPDATE_CHANGELOG" | cut -c4-)
+      c=$(awk '{print $1; exit}' "$UPDATE_CACHE" 2>/dev/null)
+      [[ "$c" =~ ^v?[0-9]+\.[0-9]+ ]] || c="v0.0.0"
+      if [[ -n "$v" ]] && (( 10#$(ver_num "$v") > 10#$(ver_num "$c") )); then update_peek >/dev/null || true; fi
+      py changelog-json "$VERSION" "$(update_available || true)" <<< "$UPDATE_CHANGELOG" > "$API_DATA" ;;
     *) _api_usage "update status|check|install [force]|channel stable|beta|changelog" ;;
   esac
 }
@@ -9270,9 +11273,77 @@ _api_cert() {
   esac
 }
 
+# ── Веб-панель ────────────────────────────────────────────
+# Пароль в ответе — только новый, сгенерированный здесь (install, password):
+# на сервере лежит лишь его хеш, прежний показать нельзя.
+_api_web_access() {
+  { _kv url "$(web_url)"; _kv user "$(web_conf_get WEB_USER)"; _kv password "${WEB_PASS_SHOWN:-}"; } | api_obj
+}
+
+_api_web() {
+  local a="${1:-status}"
+  shift || true
+  case "$a" in
+    status)
+      { _kv installed:b "$(_b web_installed)"; _kv active:b "$(_b web_active)"
+        if web_installed; then
+          _kv url "$(web_url)"; _kv user "$(web_conf_get WEB_USER)"; _kv port:n "$(web_conf_get WEB_PORT)"
+        fi
+        _kv cert:b "$(_b cert_installed)"; _kv cert_name "$(cert_get name)"; _kv cert_expires:n "$(cert_expires)"
+      } | api_obj ;;
+    install)
+      web_installed && { err "Веб-панель уже установлена — новый пароль: web password"; return 1; }
+      web_install_auto && _api_web_access ;;
+    password) web_password_new && _api_web_access ;;
+    path) web_path_new && _api_web_access ;;
+    restart|start)
+      web_installed || { err "Веб-панель не установлена"; return 1; }
+      web_restart ;;
+    stop) web_stop ;;
+    remove) web_installed || { err "Веб-панель не установлена"; return 1; }; web_remove quiet ;;
+    *) _api_usage "web status|install|password|path|restart|start|stop|remove" ;;
+  esac
+}
+
+# ── Антисканер ────────────────────────────────────────────
+_api_antiscan_lists() {  # id<TAB>подпись<TAB>включён<TAB>записей
+  local id file label min n on f
+  while IFS=$'\t' read -r id file label min; do
+    f="$ANTISCAN_DIR/lists/$id.list" n=0 on=0
+    [[ -f "$f" ]] && n=$(( $(_antiscan_parse 4 < "$f" | wc -l) + $(_antiscan_parse 6 < "$f" | wc -l) ))
+    [[ " $(_antiscan_enabled_lists) " == *" $id "* ]] && on=1
+    printf '%s\t%s\t%s\t%s\n' "$id" "$label" "$on" "$n"
+  done < <(_antiscan_lists)
+}
+
+_api_antiscan() {
+  local a="${1:-status}" e on=0
+  shift || true
+  case "$a" in
+    status)
+      read -r -a e <<< "$(_antiscan_get ENTRIES)"
+      antiscan_on && on=1
+      { _kv enabled:b "$on"; _kv active:b "$( (( on )) && _b antiscan_rules_ok || echo 0)"
+        _kv v4:n "${e[0]:-0}"; _kv v6:n "${e[1]:-0}"
+        _kv updated:n "$(_antiscan_get UPDATED)"; _kv error "$(_antiscan_get ERROR)"
+        _kv dropped:n "$( (( on )) && antiscan_dropped || echo 0)"
+        _kv lists:j "$(_api_antiscan_lists | py json-rows id name on:b entries:n)"
+        _kv top:j "$( (( on )) && antiscan_top 5 | py json-rows packets:n net org || echo '[]')"
+        _kv allow:j "$(_antiscan_allow_rows | py json-list)"
+        _kv ssh:j "$(_antiscan_ssh_peers | py json-list)"
+      } | api_obj ;;
+    on) antiscan_enable ;;
+    off) antiscan_disable ;;
+    update) antiscan_update ;;
+    lists) antiscan_lists_set "$@" ;;
+    allow) antiscan_allow "$@" ;;
+    *) _api_usage "antiscan status|on|off|update|lists scan,skipa,gov|allow add|del АДРЕС" ;;
+  esac
+}
+
 _api_uninstall() {
   local o
-  for o in "$@"; do [[ "$o" =~ ^(bot|wgobf|self)$ ]] || { _api_usage "uninstall [bot] [wgobf] [self]"; return; }; done
+  for o in "$@"; do [[ "$o" =~ ^(bot|wgobf|web|self)$ ]] || { _api_usage "uninstall [bot] [wgobf] [web] [self]"; return; }; done
   uninstall_all "$@"
 }
 
@@ -9289,8 +11360,9 @@ _api_log() {
     xray) unit="$XRAY_UNIT" ;;           xray-routing) unit="$XRAY_ROUTING_UNIT" ;;
     tun2socks) unit="$T2S_UNIT" ;;       exits) unit="$EXITS_UNIT" ;;
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
-    bot) unit="$BOT_UNIT" ;;
-    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot [строк]"; return ;;
+    bot) unit="$BOT_UNIT" ;;             web) file="$WEB_LOG" ;;
+    antiscan) file="$ANTISCAN_LOG" ;;
+    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan [строк]"; return ;;
   esac
   if [[ -n "$file" ]]; then
     [[ -f "$file" ]] || { info "Журнала $file нет"; return 0; }
@@ -9366,17 +11438,23 @@ _api_job() {
 # Команды только для чтения идут мимо очереди: сводка не должна ждать,
 # пока задача собирает модуль.
 _api_readonly() {
-  case "$*" in
-    # Пишущие подкоманды «читающих» разделов — в очередь: bot webapp port и
-    # bot proxy set правят один /etc/awg-bot.conf, параллельно потеряли бы ключ.
-    "bot proxy set"*|"bot proxy clear"*|"bot webapp port"*|"server params set"*) return 1 ;;
-    "server params"|"server params check"*) return 0 ;;
+  local a="${1:-}" b="${2:-}" c="${3:-}"
+  # Разделы, где всё — чтение (задача job start сама идёт через замок, когда запустится)
+  case "$a" in status|version|help|mimicry|log|job|diag) return 0 ;; esac
+  # Дальше — точные команды по словам, а не маски по строке: лишнее слово в
+  # конце или слово с пробелом внутри («allow add X info») чтением не станут.
+  # Пишущие подкоманды «читающих» разделов (bot proxy set, bot webapp port,
+  # server params set — правят общие файлы) сюда не попадают — в очередь.
+  [[ "$a $b" != *[[:space:]]*[[:space:]]* ]] || return 1
+  case "$a $b $c" in
+    "server params "|"server params check"|"bot proxy get"|"bot proxy check"|"bot proxy candidates"|"bot webapp get") return 0 ;;
   esac
-  case "$1 ${2:-}" in
-    "status "|"version "|"help "|"mimicry "|"log "*|"job "*|"diag "*) return 0 ;;
-    *" status"|*" info"|*" report"|*" tags"|*" backups"|*" list"|*" conf"|*" inspect") return 0 ;;
-    "clients "|"tunnels "|"tunnels clients"|"xray diag"|"cascade diag"|"wgobf clients"|\
-    "bot proxy"|"bot webapp"|"update check"|"update changelog"|"module check"|"cert "|"cert find") return 0 ;;
+  case "$a $b" in
+    "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
+    "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"tunnels "|"tunnels status"|\
+    "tunnels clients"|"warp status"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
+    "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
+    "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status") return 0 ;;
   esac
   return 1
 }
@@ -9397,7 +11475,7 @@ api_dispatch() {
   local cmd="${1:-help}"
   shift || true
   case "$cmd" in
-    version) { _kv version "$VERSION"; _kv api:n "$API_VERSION"; _kv channel "$UPDATE_CHANNEL"
+    version) { _kv version "$VERSION_SHOW"; _kv api:n "$API_VERSION"; _kv channel "$UPDATE_CHANNEL"
                _kv update "$(update_available || true)"; } | api_obj ;;
     status) _api_status ;;
     server) _api_server "$@" ;;
@@ -9405,6 +11483,7 @@ api_dispatch() {
     clients) _api_clients "$@" ;;
     client) _api_client "$@" ;;
     mimicry) _api_mimicry ;;
+    traffic) _api_traffic "$@" ;;
     diag) _api_diag "$@" ;;
     backup) _api_backup "$@" ;;
     tunnels) _api_tunnels "$@" ;;
@@ -9418,12 +11497,14 @@ api_dispatch() {
     update) _api_update "$@" ;;
     bot) _api_bot "$@" ;;
     cert) _api_cert "$@" ;;
+    web) _api_web "$@" ;;
+    antiscan) _api_antiscan "$@" ;;
     uninstall) _api_uninstall "$@" ;;
     log) _api_log "$@" ;;
     job) _api_job "$@" ;;
     help)
-      echo "Разделы: status server module clients client mimicry diag backup tunnels warp xray t2s"
-      echo "         exits cascade dns wgobf update bot uninstall log job version"
+      echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
+      echo "         exits cascade dns wgobf update bot cert web antiscan uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
@@ -9465,6 +11546,8 @@ api_main() {
     err "Не удалось поставить базовые пакеты (curl, iptables, iproute2)"; rc=1
   else
     helpers_refresh || true
+    expire_watchdog || true
+    antiscan_watchdog || true
     if _api_readonly "${API_ARGS[@]}"; then
       api_dispatch "${API_ARGS[@]}" || rc=$?
     else
@@ -9543,7 +11626,7 @@ main() {
   local post=""
   case "${1:-}" in
     -h|--help) usage; exit 0 ;;
-    -v|--version) echo "awg2 $VERSION"; exit 0 ;;
+    -v|--version) echo "awg2 $VERSION_SHOW"; exit 0 ;;
   esac
   (( EUID == 0 )) || { echo "awg2: нужен root — sudo awg2" >&2; exit 1; }
   log_init
@@ -9554,6 +11637,7 @@ main() {
   update_channel_init
   base_deps
   helpers_refresh || true
+  expire_watchdog || true
 
   case "${1:-}" in
     --status) do_status; exit 0 ;;
@@ -9580,7 +11664,8 @@ main() {
     *) err "Неизвестный аргумент: $1"; info "awg2 --help — список аргументов"; exit 1 ;;
   esac
 
-  log_info "=== AWG Toolza $VERSION ==="
+  log_info "=== AWG Toolza $VERSION_SHOW ==="
+  [[ -z "$post" ]] && { self_install_offer || true; }
   update_check_async || true
   upstream_refresh_async || true
   client_files_sync_suffix || true
@@ -11409,6 +13494,7 @@ if __name__ == "__main__":
 '
 # CPS_GENERATOR_END v2
 
+_PY_HELPER_SUM=53b71a375d926f57
 IFS= read -r -d '' _PY_HELPER <<'__AWG2_PY_HELPER__' || true
 """Встроенный помощник awg2: разбор и атомарная правка конфигов, JSON Xray,
 расчёты подсетей, разбор pcap. Вызывается как `py <команда> [аргументы]`.
@@ -11418,19 +13504,35 @@ IFS= read -r -d '' _PY_HELPER <<'__AWG2_PY_HELPER__' || true
 с целевым и os.replace: обрыв на середине не оставляет битый конфиг.
 """
 import base64
-import ipaddress
+import importlib
 import json
 import os
-import random
 import re
-import secrets
-import shutil
-import string
 import struct
 import sys
-import tempfile
 import time
 import urllib.parse
+
+
+class _Lazy:
+    """Модуль, который загружается при первом обращении: большинство команд
+    его не трогает, а awg2 api зовёт помощник дважды на каждый вызов."""
+
+    def __init__(self, name):
+        self._name, self._mod = name, None
+
+    def __getattr__(self, attr):
+        if self._mod is None:
+            self._mod = importlib.import_module(self._name)
+        return getattr(self._mod, attr)
+
+
+ipaddress = _Lazy("ipaddress")
+random = _Lazy("random")
+secrets = _Lazy("secrets")
+shutil = _Lazy("shutil")
+string = _Lazy("string")
+tempfile = _Lazy("tempfile")
 
 
 def die(msg, code=1):
@@ -11534,7 +13636,7 @@ def cmd_peers(conf):
             continue
         print("\t".join([peer_name(b), pub, peer_field(b, "AllowedIPs"),
                          peer_meta(b, "expires"), peer_meta(b, "orig_ips"),
-                         peer_meta(b, "mimicry")]))
+                         peer_meta(b, "mimicry"), peer_meta(b, "limit"), peer_meta(b, "blocked_by")]))
 
 
 def cmd_meta_set(conf, name, key, value):
@@ -11849,10 +13951,16 @@ def cmd_expire_clear(conf, name, suspend):
     if i < 0:
         die("клиент %s не найден" % name, 2)
     b = peers[i]
+    if peer_meta(b, "blocked_by") == "traffic":
+        # Блокировку держит лимит трафика: снимается только срок
+        peers[i] = set_meta(b, "expires", "")
+        write_atomic(conf, head + "".join(peers))
+        print("traffic")
+        return
     orig = peer_meta(b, "orig_ips")
     if orig and peer_field(b, "AllowedIPs") == suspend:
         b = re.sub(r"^([ \t]*AllowedIPs\s*=\s*).+$", lambda m: m.group(1) + orig, b, count=1, flags=re.M | re.I)
-    b = set_meta(set_meta(b, "expires", ""), "orig_ips", "")
+    b = set_meta(set_meta(set_meta(b, "expires", ""), "orig_ips", ""), "blocked_by", "")
     peers[i] = b
     write_atomic(conf, head + "".join(peers))
     print(orig)
@@ -11897,6 +14005,406 @@ def cmd_expire_check(conf, suspend, state_dir):
         print("CHANGED")
     for e in events:
         print(e)
+
+
+# ── Трафик клиентов и лимиты ──
+# Счётчики `awg show transfer` живут, пока поднят интерфейс, поэтому таймер
+# каждые 15 с складывает их прирост в базу: по дням (DAYS_KEEP дней) и за
+# всё время. Ключ — публичный ключ: переименование историю не теряет.
+# Лимит — метка пира «# limit=БАЙТ/month|total»; превысивший блокируется
+# как истёкший (AllowedIPs → suspend), с меткой «# blocked_by=traffic» — по
+# ней таймер разблокирует его в новом месяце или после смены лимита.
+DAYS_KEEP = 92
+TRAFFIC_SAVE_EVERY = 300
+SIZE_UNITS = {"": 1024 ** 3, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+SIZE_MAX = 1024 ** 5
+
+
+def fmt_bytes(n):
+    n = float(n or 0)
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if n < 1024:
+            return "%d %s" % (n, unit) if unit == "Б" else "%.1f %s" % (n, unit)
+        n /= 1024
+    return "%.1f ТБ" % n
+
+
+def parse_size(text):
+    """«50G», «500M», «1.5T», «50» (гигабайты) → байты; None — не размер.
+    «500B» без K/M/G/T — не гигабайты, а ошибка; больше 1 ПБ — тоже."""
+    m = re.match(r"^\s*(\d{1,7}(?:[.,]\d{1,3})?)\s*([KMGT]?)(i?B)?\s*$", text or "", re.I | re.A)
+    if not m or (m.group(3) and not m.group(2)):
+        return None
+    n = int(float(m.group(1).replace(",", ".")) * SIZE_UNITS[m.group(2).upper()])
+    return n if 0 < n <= SIZE_MAX else None
+
+
+def parse_limit(value):
+    """Метка «БАЙТ/период» → (байт, период) или (0, "")."""
+    m = re.match(r"^(\d+)/(month|total)$", value or "")
+    return (int(m.group(1)), m.group(2)) if m else (0, "")
+
+
+def _read_transfer(path):
+    out = {}
+    try:
+        for line in read(path).splitlines():
+            f = line.split("\t")
+            if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
+                out[f[0]] = (int(f[1]), int(f[2]))
+    except OSError:
+        pass
+    return out
+
+
+class Traffic:
+    """База трафика: {"v", "ifindex", "saved", "last": {pub: [rx, tx]},
+    "total": {pub: n}, "days": {"ГГГГ-ММ-ДД": {pub: [rx, tx]}},
+    "reset": {pub: {"p": период, "b": байт}}, "warned": {pub: "период:лимит"}}."""
+
+    def __init__(self, path):
+        self.path = path
+        try:
+            data = json.loads(read(path))
+        except (OSError, ValueError):
+            data = {}
+        self.fresh = not isinstance(data, dict) or "last" not in data
+        if not isinstance(data, dict):
+            data = {}
+        self.d = {k: data.get(k) if isinstance(data.get(k), dict) else {}
+                  for k in ("last", "total", "days", "reset", "warned")}
+        self.ifindex = str(data.get("ifindex") or "")
+        self.saved = int(data.get("saved") or 0)
+
+    def apply(self, counters, ifindex=""):
+        """Прирост счётчиков с прошлого раза — в сегодняшний день. Новый
+        интерфейс (другой ifindex — awg0 пересоздан) или счётчик меньше
+        прежнего — отсчёт с нуля. Самый первый проход только запоминает
+        счётчики: накопленное до учёта к сегодняшнему дню не относится."""
+        if self.fresh and not counters:
+            # Счётчиков нет (интерфейс лежит) — запоминать нечего: иначе
+            # следующий проход посчитал бы всё накопленное до учёта
+            return
+        today = time.strftime("%Y-%m-%d")
+        last, total = self.d["last"], self.d["total"]
+        reborn = bool(ifindex) and bool(self.ifindex) and ifindex != self.ifindex
+        day = self.d["days"].setdefault(today, {})
+        for pub, (rx, tx) in counters.items():
+            prev = last.get(pub)
+            if self.fresh:
+                drx = dtx = 0
+            elif reborn or not isinstance(prev, list) or len(prev) != 2 or rx < prev[0] or tx < prev[1]:
+                drx, dtx = rx, tx
+            else:
+                drx, dtx = rx - prev[0], tx - prev[1]
+            last[pub] = [rx, tx]
+            if drx or dtx:
+                cur = day.get(pub) or [0, 0]
+                day[pub] = [cur[0] + drx, cur[1] + dtx]
+                total[pub] = int(total.get(pub) or 0) + drx + dtx
+        if ifindex:
+            self.ifindex = ifindex
+        self.fresh = False
+
+    @staticmethod
+    def period_key(period):
+        return time.strftime("%Y-%m") if period == "month" else "total"
+
+    def raw_used(self, pub, period):
+        if period == "month":
+            month = time.strftime("%Y-%m")
+            return sum(sum(v.get(pub) or [0, 0]) for d, v in self.d["days"].items() if d.startswith(month))
+        return int(self.d["total"].get(pub) or 0)
+
+    def used(self, pub, period):
+        raw = self.raw_used(pub, period)
+        r = self.d["reset"].get(pub)
+        if isinstance(r, dict) and r.get("p") == self.period_key(period):
+            return max(0, raw - int(r.get("b") or 0))
+        return raw
+
+    def reset(self, pub, period):
+        self.d["reset"][pub] = {"p": self.period_key(period), "b": self.raw_used(pub, period)}
+        self.d["warned"].pop(pub, None)
+
+    def series(self, pubs, days):
+        """Последние days дней (от старых к новым): даты, rx и tx по списку ключей."""
+        dates = [time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400 * i)) for i in range(days - 1, -1, -1)]
+        rx, tx = [], []
+        for d in dates:
+            v = self.d["days"].get(d) or {}
+            rx.append(sum((v.get(p) or [0, 0])[0] for p in pubs))
+            tx.append(sum((v.get(p) or [0, 0])[1] for p in pubs))
+        return dates, rx, tx
+
+    def save(self, alive=None):
+        """Старше DAYS_KEEP дней — прочь; у удалённых клиентов остаётся
+        только история по дням (она входит в общий трафик сервера)."""
+        cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400 * DAYS_KEEP))
+        self.d["days"] = {k: v for k, v in self.d["days"].items() if k >= cutoff and v}
+        if alive is not None:
+            for k in ("last", "total", "reset", "warned"):
+                self.d[k] = {p: v for p, v in self.d[k].items() if p in alive}
+        self.saved = int(time.time())
+        data = dict(self.d, v=1, ifindex=self.ifindex, saved=self.saved)
+        if self.fresh:
+            # Счётчики ещё не запомнены: следующий проход — снова первый
+            del data["last"]
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        write_atomic(self.path, json.dumps(data, separators=(",", ":")))
+
+
+def _block(b, suspend, aip, reason):
+    if not peer_meta(b, "orig_ips"):
+        b = set_meta(b, "orig_ips", aip)
+    b = re.sub(r"^([ \t]*AllowedIPs\s*=\s*).+$", lambda m: m.group(1) + suspend, b, count=1, flags=re.M | re.I)
+    return set_meta(b, "blocked_by", reason)
+
+
+def _unblock(b, suspend):
+    orig = peer_meta(b, "orig_ips")
+    if orig and peer_field(b, "AllowedIPs") == suspend:
+        b = re.sub(r"^([ \t]*AllowedIPs\s*=\s*).+$", lambda m: m.group(1) + orig, b, count=1, flags=re.M | re.I)
+    return set_meta(set_meta(b, "orig_ips", ""), "blocked_by", "")
+
+
+PERIOD_WORD = {"month": "за месяц", "total": "всего"}
+
+
+def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
+    """Проход таймера: прирост трафика в базу и проверка лимитов. События:
+    CHANGED; LIMIT<TAB>имя<TAB>адрес<TAB>текст; WARN90<TAB>имя<TAB>текст;
+    UNLIMIT<TAB>имя<TAB>текст."""
+    lock = _traffic_lock(db)
+    try:
+        text = read(conf)
+    except OSError:
+        return
+    t = Traffic(db)
+    t.apply(_read_transfer(transfer), ifindex)
+    now = int(time.time())
+    head, peers = split_peers(text)
+    events, changed, alive = [], False, set()
+    for i, b in enumerate(peers):
+        pub, aip = peer_field(b, "PublicKey"), peer_field(b, "AllowedIPs")
+        if not (pub and aip):
+            continue
+        alive.add(pub)
+        name = peer_name(b) or pub[:8]
+        limit, period = parse_limit(peer_meta(b, "limit"))
+        by_traffic = peer_meta(b, "blocked_by") == "traffic"
+        exp = peer_meta(b, "expires")
+        expired = exp.isdigit() and now >= int(exp)
+        used = t.used(pub, period) if limit else 0
+        word = "%s из %s %s" % (fmt_bytes(used), fmt_bytes(limit), PERIOD_WORD.get(period, "")) if limit else ""
+        if by_traffic and (not limit or used < limit):
+            if expired:
+                # Лимит отпустил, но истёк срок: блокировку держит уже он,
+                # и снимается она сроком
+                peers[i] = set_meta(b, "blocked_by", "")
+            else:
+                peers[i] = _unblock(b, suspend)
+                events.append("UNLIMIT\t%s\t%s" % (name, word or "лимит снят"))
+            changed = True
+        elif limit and used >= limit and aip != suspend:
+            peers[i] = _block(b, suspend, aip, "traffic")
+            changed = True
+            events.append("LIMIT\t%s\t%s\t%s" % (name, aip, word))
+        elif limit and used >= limit * 0.9 and aip != suspend:
+            mark = "%s:%d" % (t.period_key(period), limit)
+            if t.d["warned"].get(pub) != mark:
+                t.d["warned"][pub] = mark
+                events.append("WARN90\t%s\t%s" % (name, word))
+    if changed:
+        write_atomic(conf, head + "".join(peers))
+        print("CHANGED")
+    day_changed = time.strftime("%Y-%m-%d", time.localtime(t.saved)) != time.strftime("%Y-%m-%d")
+    if events or changed or day_changed or force_save == "1" or now - t.saved >= TRAFFIC_SAVE_EVERY:
+        t.save(alive)
+    del lock
+    for e in events:
+        print(e)
+
+
+def _traffic_lock(db):
+    """Таймер и вызовы API правят базу по очереди."""
+    import fcntl
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(db)), exist_ok=True)
+        f = open(db + ".lock", "a")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        return f
+    except OSError:
+        return None
+
+
+def cmd_limit_set(conf, db, name, size, period="month", transfer="", ifindex=""):
+    """Лимит клиенту: размер («50G»), off — снять. Лимит «всего» считается
+    с этой минуты; «за месяц» — с начала месяца. transfer — снимок
+    `awg show transfer`: прирост до этой минуты в новый отсчёт не попадает."""
+    if size != "off":
+        n = parse_size(size)
+        if n is None:
+            die("размер не распознан: %s (пример: 50G, 500M)" % size)
+        if period not in PERIOD_WORD:
+            die("период: month или total")
+    lock = _traffic_lock(db)
+    head, peers = split_peers(read(conf))
+    i = find_peer(peers, name=name)
+    if i < 0:
+        die("клиент %s не найден" % name, 2)
+    if size == "off":
+        peers[i] = set_meta(peers[i], "limit", "")
+        write_atomic(conf, head + "".join(peers))
+        return
+    pub = peer_field(peers[i], "PublicKey")
+    t = Traffic(db)
+    if transfer:
+        t.apply(_read_transfer(transfer), ifindex)
+    old, old_period = parse_limit(peer_meta(peers[i], "limit"))
+    if period == "total" and old_period != "total":
+        t.reset(pub, "total")
+    t.d["warned"].pop(pub, None)
+    t.save()
+    peers[i] = set_meta(peers[i], "limit", "%d/%s" % (n, period))
+    write_atomic(conf, head + "".join(peers))
+    del lock
+    print(fmt_bytes(n))
+
+
+def cmd_limit_reset(conf, db, name, transfer="", ifindex=""):
+    """Обнулить счётчик лимита (до конца периода)."""
+    lock = _traffic_lock(db)
+    _, peers = split_peers(read(conf))
+    i = find_peer(peers, name=name)
+    if i < 0:
+        die("клиент %s не найден" % name, 2)
+    limit, period = parse_limit(peer_meta(peers[i], "limit"))
+    if not limit:
+        die("у клиента %s нет лимита" % name)
+    t = Traffic(db)
+    if transfer:
+        t.apply(_read_transfer(transfer), ifindex)
+    t.reset(peer_field(peers[i], "PublicKey"), period)
+    t.save()
+    del lock
+
+
+def cmd_traffic_daily(conf, db, transfer, name="", days="30"):
+    """Трафик по дням: сервер целиком (с разбивкой по клиентам) или один
+    клиент. Несохранённый прирост счётчиков учитывается, база не пишется."""
+    try:
+        days = max(1, min(DAYS_KEEP, int(days)))
+    except ValueError:
+        days = 30
+    _, peers = split_peers(read(conf))
+    names = {peer_field(b, "PublicKey"): peer_name(b) for b in peers if peer_field(b, "PublicKey")}
+    t = Traffic(db)
+    t.apply(_read_transfer(transfer))
+    if name:
+        pubs = [p for p, n in names.items() if n == name]
+        if not pubs:
+            die("клиент %s не найден" % name, 2)
+    else:
+        pubs = sorted({p for v in t.d["days"].values() for p in v} | set(names))
+    dates, rx, tx = t.series(pubs, days)
+    out = {"name": name, "days": dates, "rx": rx, "tx": tx, "total": sum(rx) + sum(tx)}
+    if not name:
+        rows = []
+        for p, n in names.items():
+            _, r, s = t.series([p], days)
+            if sum(r) + sum(s):
+                rows.append({"name": n or p[:8], "rx": sum(r), "tx": sum(s)})
+        out["clients"] = sorted(rows, key=lambda c: -(c["rx"] + c["tx"]))
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def _wgobf_names(conf):
+    """wgobf0.conf: ключ клиента → имя из «# client=имя» в его [Peer]."""
+    names, name = {}, None
+    for line in read(conf).splitlines():
+        line = line.strip()
+        if line == "[Peer]":
+            name = None
+        elif line.startswith("# client="):
+            name = line[len("# client="):]
+        elif name and line.startswith("PublicKey") and "=" in line:
+            names[line.split("=", 1)[1].strip()] = name
+    return names
+
+
+def cmd_traffic_now(conf, transfer, wconf="", wtransfer=""):
+    """Счётчики awg0 сейчас — для живой скорости в панели: время (с долями
+    секунды) и {имя: [приём, отдача]}; клиенты WG + обфускатора (wgobf0) —
+    отдельно в wpeers, имена у них свои. Только чтение, база трафика не трогается."""
+    _, peers = split_peers(read(conf))
+    names = {peer_field(b, "PublicKey"): peer_name(b) for b in peers if peer_field(b, "PublicKey")}
+    out = {}
+    for pub, (rx, tx) in _read_transfer(transfer).items():
+        if pub in names:
+            out[names[pub] or pub[:8]] = [rx, tx]
+    wout = {}
+    if wconf and wtransfer and os.path.isfile(wconf):
+        wnames = _wgobf_names(wconf)
+        for pub, (rx, tx) in _read_transfer(wtransfer).items():
+            if pub in wnames:
+                wout[wnames[pub]] = [rx, tx]
+    print(json.dumps({"ts": round(time.time(), 3), "peers": out, "wpeers": wout}, ensure_ascii=False))
+
+
+def cmd_traffic_rows(conf, db, transfer):
+    """Для меню: имя, лимит (байт), период, использовано по лимиту, за
+    месяц, сегодня, причина блокировки — построчно через табуляцию."""
+    _, peers = split_peers(read(conf))
+    t = Traffic(db)
+    t.apply(_read_transfer(transfer))
+    today = time.strftime("%Y-%m-%d")
+    for b in peers:
+        pub = peer_field(b, "PublicKey")
+        if not pub:
+            continue
+        limit, period = parse_limit(peer_meta(b, "limit"))
+        by = peer_meta(b, "blocked_by") or ("expire" if peer_meta(b, "orig_ips") else "")
+        print("\t".join(str(x) for x in (
+            peer_name(b), limit, period, t.used(pub, period) if limit else 0, t.raw_used(pub, "month"),
+            sum((t.d["days"].get(today) or {}).get(pub) or [0, 0]), by)))
+
+
+def cmd_traffic_report(conf, db, transfer, days="14"):
+    """Трафик сервера по дням столбиками и клиенты за 30 дней — для меню."""
+    try:
+        days = max(1, min(DAYS_KEEP, int(days)))
+    except ValueError:
+        days = 14
+    _, peers = split_peers(read(conf))
+    names = {peer_field(b, "PublicKey"): peer_name(b) for b in peers if peer_field(b, "PublicKey")}
+    t = Traffic(db)
+    t.apply(_read_transfer(transfer))
+    pubs = sorted({p for v in t.d["days"].values() for p in v} | set(names))
+    dates, rx, tx = t.series(pubs, days)
+    top = max([a + b for a, b in zip(rx, tx)] + [1])
+    print("По дням (↓ от клиентов + ↑ к клиентам):")
+    for d, a, b in zip(dates, rx, tx):
+        bar = "▇" * int(round(28 * (a + b) / top)) if a + b else ""
+        print("  %s.%s  %-28s %s" % (d[8:], d[5:7], bar, fmt_bytes(a + b) if a + b else "—"))
+    print("  Итого за %d дн.: %s" % (days, fmt_bytes(sum(rx) + sum(tx))))
+    rows = []
+    for p, n in names.items():
+        _, r, s = t.series([p], 30)
+        if sum(r) + sum(s):
+            rows.append((sum(r) + sum(s), n or p[:8]))
+    if rows:
+        print("")
+        print("Клиенты за 30 дней:")
+        for total, n in sorted(rows, reverse=True)[:15]:
+            print("  %-24s %s" % (n, fmt_bytes(total)))
+
+
+def cmd_size_parse(text):
+    n = parse_size(text)
+    if n is None:
+        die("размер не распознан: %s" % text)
+    print(n)
 
 
 # ════════════════════════ сети ════════════════════════
@@ -12127,13 +14635,115 @@ def apply_tls(ss, get, fallback_sni):
             tls[dst] = get(src)
     if get("alpn"):
         tls["alpn"] = get("alpn").split(",")
-    if str(get("allowInsecure") or "").lower() in ("1", "true"):
-        tls["allowInsecure"] = True
+    if str(get("allowInsecure") or get("insecure") or "").lower() in ("1", "true"):
+        _note_insecure()
     ss["realitySettings" if sec == "reality" else "tlsSettings"] = tls
+
+
+def _note_insecure():
+    """Xray 26 убрал allowInsecure: с ним отвергается весь конфиг. Вместо
+    него — pinSHA256 (отпечаток сертификата сервера) или настоящий сертификат."""
+    sys.stderr.write("NOTE:allowInsecure пропущен — Xray 26 его не принимает; самоподписанному "
+                     "сертификату нужен pinSHA256 в ссылке\n")
+
+
+def _port_num(value, proto):
+    """Порт из ссылки: только ASCII-цифры, 1–65535; пусто — 443. Иначе
+    Xray получал порт 0 или 99999 (и отвергал весь конфиг), а «443» из
+    не-ASCII цифр падал трассировкой."""
+    if value in (None, ""):
+        return 443
+    if isinstance(value, float) and value.is_integer():     # vmess: "port": 443.0
+        value = int(value)
+    value = str(value)
+    if not re.fullmatch(r"[0-9]{1,9}", value) or not 1 <= int(value) <= 65535:
+        die("%s: неверный порт: %s" % (proto, value))
+    return int(value)
+
+
+def _url_port(u, proto):
+    """Порт из urlparse; «:0», «:99999» и не-цифры — ошибка, а не 443."""
+    _, sep, port = u.netloc.rpartition("@")[2].rpartition(":")
+    if not sep or "]" in port:
+        return 443
+    return _port_num(port, proto)
 
 
 def tag_for(host):
     return "proxy_" + re.sub(r"[^A-Za-z0-9]", "_", host or "server")
+
+
+def _hy2_outbound(link):
+    """hysteria2:// → outbound Xray 26+: protocol hysteria (version 2) и
+    транспорт hysteria; пароль — auth, TLS — SNI, ALPN (h3), ECH, pinSHA256.
+    Обфускация salamander — finalmask, порт-хоппинг (mport) не переносится."""
+    u = urllib.parse.urlparse(link)
+    qs = urllib.parse.parse_qs(u.query)
+
+    def get(k):
+        return qs[k][0] if qs.get(k) else None
+    host = u.hostname or ""
+    auth = urllib.parse.unquote(u.username or "")
+    if u.password is not None:
+        auth += ":" + urllib.parse.unquote(u.password)
+    if not host or not auth:
+        die("hysteria2: в ссылке нет адреса или пароля")
+    port = _url_port(u, "hysteria2")
+    tls = {"serverName": get("sni") or host, "alpn": (get("alpn") or "h3").split(",")}
+    if get("pinSHA256"):
+        tls["pinnedPeerCertSha256"] = get("pinSHA256")
+    if get("ech"):
+        tls["echConfigList"] = get("ech")
+    if str(get("insecure") or "").lower() in ("1", "true") and not get("pinSHA256"):
+        _note_insecure()
+    ss = {"network": "hysteria", "hysteriaSettings": {"version": 2, "auth": auth},
+          "security": "tls", "tlsSettings": tls}
+    if get("obfs"):
+        if get("obfs") != "salamander":
+            sys.stderr.write("UNSUPPORTED:obfs=%s\n" % get("obfs"))
+            die("hysteria2: обфускация %s не поддерживается" % get("obfs"))
+        if not get("obfs-password"):
+            die("hysteria2: для salamander нужен obfs-password")
+        ss["finalmask"] = {"udp": [{"type": "salamander", "settings": {"password": get("obfs-password")}}]}
+    if get("mport"):
+        sys.stderr.write("NOTE:порт-хоппинг (mport=%s) не переносится — только порт %d\n" % (get("mport"), port))
+    return {"protocol": "hysteria", "tag": tag_for(host),
+            "settings": {"version": 2, "address": host, "port": port}, "streamSettings": ss}
+
+
+def _ss_outbound(link):
+    """ss:// — SIP002 (метод:пароль в base64 или открыто @хост:порт) и
+    старый формат (всё в base64). Плагины (obfs, v2ray-plugin) не переносятся."""
+    body = link[5:].split("#", 1)[0]
+    body, _, query = body.partition("?")
+    body = body.rstrip("/")
+
+    def b64(text):
+        text = urllib.parse.unquote(text)
+        try:
+            return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4)).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+    if "@" in body:
+        userinfo, hostport = body.rsplit("@", 1)
+        dec = b64(userinfo)
+        cred = dec if dec and ":" in dec else urllib.parse.unquote(userinfo)
+    else:
+        dec = b64(body) or ""
+        if "@" not in dec:
+            die("ss: ссылка не разобрана")
+        cred, hostport = dec.rsplit("@", 1)
+    method, _, password = cred.partition(":")
+    host, _, port = hostport.rpartition(":")
+    host = host.strip("[]")
+    if not (method and password and host and port):
+        die("ss: нужен метод, пароль, адрес и порт")
+    port = _port_num(port, "ss")
+    if "plugin=" in query:
+        sys.stderr.write("UNSUPPORTED:ss-plugin\n")
+        die("ss: плагины (obfs, v2ray-plugin) не поддерживаются")
+    return {"protocol": "shadowsocks", "tag": tag_for(host),
+            "settings": {"servers": [{"address": host, "port": port, "method": method, "password": password}]}}
 
 
 def cmd_xray_link(link):
@@ -12146,7 +14756,7 @@ def cmd_xray_link(link):
             return qs[k][0] if qs.get(k) else None
         host = u.hostname or ""
         ob = {"protocol": "vless", "tag": tag_for(host),
-              "settings": {"vnext": [{"address": host, "port": u.port or 443,
+              "settings": {"vnext": [{"address": host, "port": _url_port(u, "vless"),
                                       "users": [{"id": urllib.parse.unquote(u.username or ""),
                                                  "encryption": get("encryption") or "none",
                                                  "flow": get("flow") or ""}]}]},
@@ -12163,29 +14773,35 @@ def cmd_xray_link(link):
             return str(v) if v not in (None, "") else None
         host = str(data.get("add") or "")
         ob = {"protocol": "vmess", "tag": tag_for(host),
-              "settings": {"vnext": [{"address": host, "port": int(data.get("port") or 443),
+              "settings": {"vnext": [{"address": host, "port": _port_num(data.get("port"), "vmess"),
                                       "users": [{"id": data.get("id"),
                                                  "alterId": int(data.get("aid") or 0),
                                                  "security": data.get("scy") or "auto"}]}]},
               "streamSettings": {"network": data.get("net") or "tcp",
                                  "security": data.get("tls") or "none"}}
-    elif link.startswith(("hysteria2://", "hy2://")):
+    elif link.startswith("trojan://"):
         u = urllib.parse.urlparse(link)
         qs = urllib.parse.parse_qs(u.query)
-        st = {"server": u.hostname, "port": u.port or 443,
-              "password": urllib.parse.unquote(u.username or "")}
-        if qs.get("sni"):
-            st["serverName"] = qs["sni"][0]
-        if qs.get("insecure"):
-            st["insecure"] = qs["insecure"][0] == "1"
-        if qs.get("obfs"):
-            st["obfs"] = {"type": qs["obfs"][0]}
-            if qs.get("obfs-password"):
-                st["obfs"]["password"] = qs["obfs-password"][0]
-        print(json.dumps({"protocol": "hysteria2", "tag": tag_for(u.hostname), "settings": st}))
+
+        def get(k):
+            return qs[k][0] if qs.get(k) else None
+        host = u.hostname or ""
+        # Пароль trojan — вся часть до «@»: «p:a@host» — это пароль «p:a»
+        password = urllib.parse.unquote(u.username or "")
+        if u.password is not None:
+            password += ":" + urllib.parse.unquote(u.password)
+        ob = {"protocol": "trojan", "tag": tag_for(host),
+              "settings": {"servers": [{"address": host, "port": _url_port(u, "trojan"),
+                                        "password": password}]},
+              "streamSettings": {"network": get("type") or "tcp", "security": get("security") or "tls"}}
+    elif link.startswith("ss://"):
+        print(json.dumps(_ss_outbound(link)))
+        return
+    elif link.startswith(("hysteria2://", "hy2://")):
+        print(json.dumps(_hy2_outbound(link)))
         return
     else:
-        die("поддерживаются vless://, vmess://, hysteria2://")
+        die("поддерживаются vless://, vmess://, trojan://, ss://, hysteria2://")
     apply_transport(ob["streamSettings"], ob["streamSettings"]["network"], get)
     apply_tls(ob["streamSettings"], get, host)
     print(json.dumps(ob))
@@ -12211,9 +14827,11 @@ def cmd_xray_add(path):
         die("outbound %s уже есть" % ob.get("tag"), 3)
     at = next((i for i, o in enumerate(outs) if o.get("protocol") == "freedom"), len(outs))
     outs.insert(at, ob)
-    # Новая ссылка становится активным выходом, если балансировщик не включён
+    # Новая ссылка становится выходом по умолчанию, если балансировщик не
+    # включён; клиенты со своим выходом остаются на нём
     for r in conf.get("routing", {}).get("rules", []):
-        if set(r.get("inboundTag") or []) & KNOWN_IN and not r.get("balancerTag"):
+        if set(r.get("inboundTag") or []) & KNOWN_IN and not r.get("balancerTag") \
+                and r.get("ruleTag") != XRAY_CLIENT_RULE:
             r["outboundTag"] = ob["tag"]
     jsave(path, conf)
 
@@ -12222,6 +14840,71 @@ def cmd_xray_del(path, *tags):
     conf = jload(path)
     conf["outbounds"] = [o for o in conf.get("outbounds", []) if o.get("tag") not in tags]
     jsave(path, conf)
+
+
+XRAY_RESTORE_KEEP = ("outbounds", "routing", "observatory")
+
+
+def _shown(v, n=40):
+    """Имя из чужого файла — для вывода в терминал и бот: без управляющих
+    символов и обратной косой (warn печатает через echo -e)."""
+    return re.sub(r"[\x00-\x1f\x7f\\]", "?", str(v))[:n]
+
+
+def cmd_xray_restore_clean(path):
+    """Конфиг Xray из бэкапа (бэкап мог прийти чужой, Xray работает от root):
+    остаются выходы, маршрутизация и observatory — то, что пишет сама Тулза.
+    Входы пересоберёт xray-prepare (SOCKS только на 127.0.0.1); api, stats,
+    reverse, log и прочие разделы, правила чужих входов и правила на
+    несуществующие выходы — убираются. Правила своего входа tun с чужим тегом
+    переводятся на tun-in: входов в конфиге уже нет, и xray-prepare их бы не
+    узнал. Кривые записи (не объект, тег — не строка) — тоже убираются, а не
+    роняют разбор всего конфига. Печатает, что убрано."""
+    conf = jload(path)
+    if not isinstance(conf, dict):
+        die("не объект JSON")
+    is_tag = lambda v: isinstance(v, str) and v != ""          # noqa: E731
+    as_list = lambda v: v if isinstance(v, list) else []       # noqa: E731
+    outs = [o for o in as_list(conf.get("outbounds"))
+            if isinstance(o, dict) and (o.get("tag") is None or is_tag(o.get("tag")))]
+    tags = {o["tag"] for o in outs if is_tag(o.get("tag"))}
+    if not any(is_tag(o.get("tag")) and o.get("protocol") not in SKIP_PROTO for o in outs):
+        die("нет выходов")
+    inbounds = [i for i in as_list(conf.get("inbounds")) if isinstance(i, dict)]
+    tun_tags = {i["tag"] for i in inbounds if i.get("protocol") == "tun" and is_tag(i.get("tag"))}
+    known = KNOWN_IN | tun_tags
+    routing = conf.get("routing") if isinstance(conf.get("routing"), dict) else {}
+    balancers = [b for b in as_list(routing.get("balancers")) if isinstance(b, dict) and is_tag(b.get("tag"))]
+    btags = {b["tag"] for b in balancers}
+    rules, dropped_rules = [], 0
+    for r in as_list(routing.get("rules")):
+        inb = r.get("inboundTag") if isinstance(r, dict) else None
+        ot = r.get("outboundTag") if isinstance(r, dict) else None
+        bt = r.get("balancerTag") if isinstance(r, dict) else None
+        if (not isinstance(r, dict)
+                or (inb and not (isinstance(inb, list) and all(is_tag(t) for t in inb) and set(inb) & known))
+                or (ot and not (is_tag(ot) and ot in tags))
+                or (bt and not (is_tag(bt) and bt in btags))):
+            dropped_rules += 1
+            continue
+        if inb:
+            r["inboundTag"] = list(dict.fromkeys("tun-in" if t in tun_tags else t for t in inb))
+        rules.append(r)
+    clean = {"inbounds": [], "outbounds": outs,
+             "routing": {"domainStrategy": routing.get("domainStrategy") if is_tag(routing.get("domainStrategy"))
+                         else "AsIs", "rules": rules}}
+    if balancers:
+        clean["routing"]["balancers"] = balancers
+    if isinstance(conf.get("observatory"), dict):
+        clean["observatory"] = conf["observatory"]
+    foreign = [_shown(i.get("tag") or i.get("protocol") or "?") for i in inbounds
+               if not (is_tag(i.get("tag")) and i["tag"] in KNOWN_IN) and i.get("protocol") != "tun"]
+    gone = ["входы: " + ", ".join(foreign)] if foreign else []
+    gone += sorted(_shown(k) for k in conf if k not in XRAY_RESTORE_KEEP + ("inbounds",))
+    if dropped_rules:
+        gone.append("правил: %d" % dropped_rules)
+    jsave(path, clean)
+    print("; ".join(gone))
 
 
 def cmd_xray_tags(path):
@@ -12275,8 +14958,7 @@ def cmd_xray_balancer(path, strategy):
     tags = proxy_tags(conf)
     routing = conf.setdefault("routing", {})
     rules = routing.setdefault("rules", [])
-    rule = next((r for r in rules if r.get("balancerTag") == "balancer"), None) \
-        or next((r for r in rules if set(r.get("inboundTag") or []) & KNOWN_IN), None)
+    rule = next((r for r in rules if r.get("balancerTag") == "balancer"), None) or _xray_main_rule(rules)
     if strategy == "off":
         routing.pop("balancers", None)
         conf.pop("observatory", None)
@@ -12334,12 +15016,51 @@ def cmd_xray_ru(path, mode):
     jsave(path, conf)
 
 
-def cmd_xray_prepare(path, mode):
+XRAY_CLIENT_RULE = "client-out"
+
+
+def _xray_main_rule(rules):
+    """Правило, ведущее весь вход туннеля в выход по умолчанию или балансировщик."""
+    return next((r for r in rules if set(r.get("inboundTag") or []) & KNOWN_IN
+                 and r.get("ruleTag") != XRAY_CLIENT_RULE), None)
+
+
+def cmd_xray_main(path, tag):
+    """Выход по умолчанию для клиентов без своего выхода; балансировщик выключается."""
+    conf = jload(path)
+    if tag not in proxy_tags(conf):
+        die("выхода %s нет" % tag, 2)
+    routing = conf.setdefault("routing", {})
+    rules = routing.setdefault("rules", [])
+    routing.pop("balancers", None)
+    conf.pop("observatory", None)
+    rule = _xray_main_rule(rules)
+    if rule is None:
+        rule = {"type": "field", "inboundTag": ["socks-in"]}
+        rules.append(rule)
+    rule.pop("balancerTag", None)
+    rule["outboundTag"] = tag
+    jsave(path, conf)
+
+
+def cmd_xray_main_get(path):
+    rule = _xray_main_rule(jload(path).get("routing", {}).get("rules", []))
+    print("balancer" if rule and rule.get("balancerTag") else (rule or {}).get("outboundTag", ""))
+
+
+def cmd_xray_prepare(path, mode, peers=""):
     """Привести конфиг к режиму входа: native (inbound tun в самом Xray) или
     tun2socks (только SOCKS на 127.0.0.1:10808, xray0 поднимает tun2socks).
     Заодно чинит висячие ссылки на удалённые outbounds и балансировщик —
-    с ними Xray отвергает конфиг целиком."""
+    с ними Xray отвергает конфиг целиком.
+
+    peers — список клиентов Xray («IP» или «IP|выход»): клиентам со своим
+    выходом — правила по адресу (source) перед общим правилом. Только для
+    native: inbound tun видит адрес клиента (перед xray0 нет NAT), а через
+    tun2socks все соединения приходят с 127.0.0.1."""
     conf = jload(path)
+    conf.setdefault("routing", {})["rules"] = [r for r in conf["routing"].get("rules") or []
+                                               if r.get("ruleTag") != XRAY_CLIENT_RULE]
     inb = [i for i in conf.get("inbounds") or []
            if not (i.get("tag") == "xray0" and i.get("protocol") == "dokodemo-door")]
     socks = next((i for i in inb if i.get("tag") == "socks-in"), None)
@@ -12350,13 +15071,19 @@ def cmd_xray_prepare(path, mode):
     socks["listen"] = "127.0.0.1"
     socks["port"] = socks.get("port") or 10808
     tun = next((i for i in inb if i.get("protocol") == "tun"), None)
+    # Тег входа tun — всегда свой: с чужим («tun» из правленного руками или
+    # восстановленного конфига) общее правило переставало узнаваться, и
+    # каждый проход дописывал новое, а старое продолжало вести в прежний выход
+    known = set(KNOWN_IN)
+    if tun is not None and tun.get("tag"):
+        known.add(tun["tag"])
     if mode == "native":
         if tun is None:
             tun = {"protocol": "tun", "tag": "tun-in",
                    "settings": {"mtu": 1200, "stack": "gvisor", "address": ["172.16.250.1/30"]},
                    "sniffing": SNIFF}
             inb.insert(0, tun)
-        tun["tag"] = tun.get("tag") or "tun-in"
+        tun["tag"] = "tun-in"
         want = tun["tag"]
     else:
         inb = [i for i in inb if i.get("protocol") != "tun"]
@@ -12369,7 +15096,7 @@ def cmd_xray_prepare(path, mode):
     touched = False
     for r in rules:
         tags = r.get("inboundTag")
-        if isinstance(tags, list) and any(t in KNOWN_IN for t in tags):
+        if isinstance(tags, list) and any(t in known for t in tags):
             r["inboundTag"] = [want]
             touched = True
     ptags = proxy_tags(conf)
@@ -12402,7 +15129,19 @@ def cmd_xray_prepare(path, mode):
                 r["outboundTag"] = ptags[0]
             else:
                 r.pop("outboundTag", None)
-    routing["rules"] = [r for r in rules if r.get("outboundTag") or r.get("balancerTag")]
+    rules = [r for r in rules if r.get("outboundTag") or r.get("balancerTag")]
+    lst = _peers_list(peers) if peers and mode == "native" else None
+    if lst:
+        by_tag = {}
+        for ip, tag in lst.items():
+            if tag in existing and tag in ptags:
+                by_tag.setdefault(tag, []).append(ip)
+        main = _xray_main_rule(rules)
+        at = rules.index(main) if main in rules else len(rules)
+        rules[at:at] = [{"type": "field", "ruleTag": XRAY_CLIENT_RULE, "inboundTag": [want],
+                         "source": sorted(ips, key=lambda x: [int(p) for p in x.split(".")] if x.count(".") == 3 else [0]),
+                         "outboundTag": tag} for tag, ips in by_tag.items()]
+    routing["rules"] = rules
     jsave(path, conf)
 
 
@@ -12574,8 +15313,9 @@ def _first_ip(value):
     return value.split(",")[0].split("/")[0].strip()
 
 
-def cmd_clients_json(conf, dump, client_dir, warp, xray, exits):
-    """Клиенты awg0 со статистикой `awg show dump` и туннелями — для бота."""
+def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
+    """Клиенты awg0 со статистикой `awg show dump`, туннелями и трафиком за
+    месяц и по лимиту — для бота."""
     _, peers = split_peers(read(conf))
     stats = {}
     try:
@@ -12585,6 +15325,10 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits):
                 stats[f[0]] = f
     except OSError:
         pass
+    traffic = Traffic(db) if db else None
+    if traffic:
+        traffic.apply({k: (int(f[5]), int(f[6])) for k, f in stats.items() if f[5].isdigit() and f[6].isdigit()})
+    today = time.strftime("%Y-%m-%d")
     now = int(time.time())
     tunnels = {"warp": _peers_list(warp), "xray": _peers_list(xray), "exit": _peers_list(exits)}
     rows = []
@@ -12613,6 +15357,13 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits):
             "rx": int(s[5]) if s[5].isdigit() else 0, "tx": int(s[6]) if s[6].isdigit() else 0,
             "endpoint": "" if s[2] in ("", "(none)") else s[2], "file": path,
         }
+        limit, period = parse_limit(peer_meta(b, "limit"))
+        by = peer_meta(b, "blocked_by")
+        row.update(limit=limit or None, period=period or None,
+                   blocked_by=(by or "expire") if orig else None,
+                   used=traffic.used(pub, period) if traffic and limit else None,
+                   month=traffic.raw_used(pub, "month") if traffic else None,
+                   today=sum((traffic.d["days"].get(today) or {}).get(pub) or [0, 0]) if traffic else None)
         for t, lst in tunnels.items():
             if lst is None:
                 row[t] = None
@@ -12620,6 +15371,8 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits):
                 row[t] = (lst[ip] or "shared") if ip in lst else "off"
             else:
                 row[t] = ip in lst
+        # Свой выход Xray клиента (пусто — выход по умолчанию)
+        row["xray_out"] = (tunnels["xray"] or {}).get(ip) or ""
         rows.append(row)
     print(json.dumps(rows, ensure_ascii=False))
 
@@ -12922,10 +15675,11 @@ def cmd_mod_compat_patch(src):
     print("patched")
 
 
-def cmd_changelog_json(current):
+def cmd_changelog_json(current, available=None):
     """CHANGELOG.md из stdin → разделы для экрана «Обновление»: новее
     установленной версии (сверху самая новая, не больше десяти), а если
-    новее нет — раздел текущей. Заголовок раздела: «## v1.1.1 — дата (бот 3.1.0)»."""
+    новее нет — раздел текущей. Заголовок раздела: «## v1.1.1 — дата (бот 3.1.0)».
+    available — версия к обновлению по свежему кэшу проверки (пусто — новее нет)."""
     sections, cur = [], None
     for line in sys.stdin.read().replace("\r", "").split("\n"):
         m = CL_HEAD.match(line)
@@ -12943,7 +15697,10 @@ def cmd_changelog_json(current):
     newer = sorted((s for s in sections if _ver_tuple(s["version"]) > now),
                    key=lambda s: _ver_tuple(s["version"]), reverse=True)[:10]
     shown = newer or [s for s in sections if _ver_tuple(s["version"]) == now][:1]
-    print(json.dumps({"current": current, "newer": bool(newer), "sections": shown}, ensure_ascii=False))
+    out = {"current": current, "newer": bool(newer), "sections": shown}
+    if available is not None:
+        out["available"] = available
+    print(json.dumps(out, ensure_ascii=False))
 
 
 def cmd_safe_untar(archive, dest):
@@ -12976,6 +15733,18 @@ def cmd_safe_untar(archive, dest):
         die("в архиве нет файлов")
 
 
+def cmd_web_hash():
+    """Пароль веб-панели (stdin) → scrypt-хеш в формате awgbot.web.hash_password."""
+    import base64
+    import hashlib
+    pw = sys.stdin.read()
+    if not pw:
+        die("пустой пароль")
+    salt = os.urandom(16)
+    dk = hashlib.scrypt(pw.encode(), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
+    print("scrypt$%d$%d$%d$%s$%s" % (2 ** 14, 8, 1, base64.b64encode(salt).decode(), base64.b64encode(dk).decode()))
+
+
 COMMANDS = {
     "peers": cmd_peers, "meta-set": cmd_meta_set, "peer-del": cmd_peer_del,
     "peer-rename": cmd_peer_rename, "peers-clear": cmd_peers_clear,
@@ -12983,15 +15752,20 @@ COMMANDS = {
     "i-replace": cmd_i_replace,
     "expire-set": cmd_expire_set, "expire-clear": cmd_expire_clear,
     "expire-check": cmd_expire_check,
+    "traffic-tick": cmd_traffic_tick, "traffic-daily": cmd_traffic_daily, "traffic-now": cmd_traffic_now,
+    "traffic-rows": cmd_traffic_rows, "traffic-report": cmd_traffic_report,
+    "limit-set": cmd_limit_set, "limit-reset": cmd_limit_reset, "size-parse": cmd_size_parse,
+    "web-hash": cmd_web_hash,
     "net-of": cmd_net_of, "pick-net": cmd_pick_net, "net-overlaps": cmd_net_overlaps,
     "allowed-except": cmd_allowed_except,
     "rand-key": cmd_rand_key, "phobos-link": cmd_phobos_link, "exit-conf-fix": cmd_exit_conf_fix,
     "conf-hooks": cmd_conf_hooks, "mod-compat-patch": cmd_mod_compat_patch,
     "xray-link": cmd_xray_link, "xray-default": cmd_xray_default, "xray-add": cmd_xray_add,
-    "xray-del": cmd_xray_del, "xray-tags": cmd_xray_tags, "xray-probe": cmd_xray_probe,
+    "xray-del": cmd_xray_del, "xray-tags": cmd_xray_tags, "xray-restore-clean": cmd_xray_restore_clean, "xray-probe": cmd_xray_probe,
     "xray-probe-tag": cmd_xray_probe_tag, "xray-tun-probe": cmd_xray_tun_probe,
     "xray-test-copy": cmd_xray_test_copy,
     "xray-balancer": cmd_xray_balancer, "xray-balancer-get": cmd_xray_balancer_get,
+    "xray-main": cmd_xray_main, "xray-main-get": cmd_xray_main_get,
     "xray-ru": cmd_xray_ru, "xray-prepare": cmd_xray_prepare,
     "pcap-analyze": cmd_pcap_analyze, "safe-untar": cmd_safe_untar,
     "cert-find": cmd_cert_find, "changelog-json": cmd_changelog_json,
@@ -13001,7 +15775,7 @@ COMMANDS = {
     "tg-targets": cmd_tg_targets,
 }
 
-if __name__ == "__main__":
+def main():
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         die("команда: " + ", ".join(sorted(COMMANDS)))
     # Байты не-UTF-8 из конфига (surrogateescape в read) печатаем как «?», а не падаем
@@ -13012,6 +15786,11 @@ if __name__ == "__main__":
         die("неверные аргументы %s: %s" % (sys.argv[1], e))
     except (OSError, ValueError) as e:
         die("%s: %s" % (sys.argv[1], e))
+
+
+if __name__ == "__main__":
+    main()
 __AWG2_PY_HELPER__
 
+_BUILD_SUM=9235d926916ea39f
 main "$@"

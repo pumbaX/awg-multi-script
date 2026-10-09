@@ -15,7 +15,7 @@ OUT="${1:-dist/awg2.sh}"
 LIBS=(
   core const sys net conf module params mimicry server clients expire
   tunnels warp dns cascade xray tun2socks exits wgobf cert
-  backup update bot uninstall diag menu api cli
+  backup update bot web antiscan uninstall diag menu api cli
 )
 
 die() { echo "build: $*" >&2; exit 1; }
@@ -28,8 +28,12 @@ grep -qx '__AWG2_PY_HELPER__' src/py/helper.py && die "в helper.py встреч
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 
+# Буква тестовой сборки — только в показ версии
+BUILD="${AWG_BUILD:-}"
+[[ -z "$BUILD" || "$BUILD" =~ ^[a-z]$ ]] || die "AWG_BUILD — одна строчная буква"
+
 {
-  cat src/head.sh
+  sed "s/^BUILD=\"\"$/BUILD=\"$BUILD\"/" src/head.sh
   for lib in "${LIBS[@]}"; do
     f="src/lib/${lib}.sh"
     [[ -f "$f" ]] || die "нет $f"
@@ -44,12 +48,17 @@ trap 'rm -f "$tmp"' EXIT
   cat src/py/cpsgen.py
   printf "'\n# CPS_GENERATOR_END v2\n\n"
 
+  # Хеш — имя каталога закэшированного помощника: новая версия кода — новый каталог
+  echo "_PY_HELPER_SUM=$(sha256sum src/py/helper.py | cut -c1-16)"
   echo "IFS= read -r -d '' _PY_HELPER <<'__AWG2_PY_HELPER__' || true"
   cat src/py/helper.py
   printf '__AWG2_PY_HELPER__\n\n'
-
-  echo 'main "$@"'
 } > "$tmp"
+# Хеш всей сборки: по нему awg2 замечает новую сборку той же версии
+{
+  echo "_BUILD_SUM=$(sha256sum "$tmp" | cut -c1-16)"
+  echo 'main "$@"'
+} >> "$tmp"
 
 bash -n "$tmp" || die "синтаксическая ошибка в собранном файле"
 mkdir -p "$(dirname "$OUT")"

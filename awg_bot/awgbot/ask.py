@@ -55,10 +55,11 @@ def on(key: str) -> Callable[[Answer], Answer]:
 
 
 async def ask(target: ui.Target, state: FSMContext, key: str, prompt: str, back_to: str,
-              buttons: list[ui.Button] | None = None, **data: Any) -> None:
-    """Попросить ввод. buttons — готовые ответы кнопками над «Отмена»."""
+              buttons: list[ui.Button] | None = None, _base: str = "", **data: Any) -> None:
+    """Попросить ввод. buttons — готовые ответы кнопками над «Отмена».
+    _base — вопрос без предупреждения (повтор после ошибки): копятся не «⚠️», а одно."""
     await state.set_state(Ask.waiting)
-    await state.update_data(ask=key, back=back_to, prompt=prompt, ctx=data,
+    await state.update_data(ask=key, back=back_to, prompt=_base or prompt, ctx=data,
                             buttons=[list(b) for b in buttons or []])
     await ui.render(target, prompt, ui.kb(buttons, ui.back(back_to, "✖️ Отмена")))
 
@@ -66,7 +67,7 @@ async def ask(target: ui.Target, state: FSMContext, key: str, prompt: str, back_
 async def retry(msg: Message, state: FSMContext, ctx: Ctx, why: str) -> None:
     """Неверный ввод: объяснить и спросить то же самое ещё раз."""
     await ask(msg, state, ctx.key, f"⚠️ {ui.esc(why)}\n\n{ctx.prompt}", ctx.back,
-              [tuple(b) for b in ctx.buttons], **ctx.data)
+              [tuple(b) for b in ctx.buttons], _base=ctx.prompt, **ctx.data)
 
 
 def text_of(msg: Message) -> str:

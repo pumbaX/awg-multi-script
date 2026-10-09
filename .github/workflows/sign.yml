@@ -1,0 +1,82 @@
+# Подпись сборки: после каждого пуша awg2.sh в main рядом кладётся
+# awg2.sh.sig (ssh-keygen -Y sign). awg2 на серверах при обновлении
+# проверяет её ключом релизов, вшитым в сам awg2 (UPDATE_SIGNERS в
+# src/lib/const.sh), — сборку, подменённую на зеркале или по пути, он не
+# поставит. Закрытый ключ — секрет репозитория AWG_RELEASE_KEY.
+#
+# Подпись уже верна (стабильный канал получает её вместе с файлами беты) —
+# ничего не делается, и секрет там не нужен.
+#
+# Подписывается только awg2.sh, который совпадает со сборкой src/
+# (./build.sh): ревью читает src/, а 700 КБ сгенерированного файла — нет,
+# и код, которого в src/ нет, получил бы подпись незамеченным.
+name: Подпись awg2.sh
+
+on:
+  push:
+    branches: [main]
+    paths: [awg2.sh]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sign-awg2
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Подписать и выложить
+        env:
+          KEY: ${{ secrets.AWG_RELEASE_KEY }}
+        run: |
+          set -euo pipefail
+          ns=awg-toolza id=awg-toolza-release
+          # Ключи из самого awg2 — подпись обязана сходиться именно с ними
+          grep -oE 'ssh-ed25519 [A-Za-z0-9+/=]+' src/lib/const.sh \
+            | sed "s/^/$id namespaces=\"$ns\" /" > "$RUNNER_TEMP/allowed"
+          [[ -s "$RUNNER_TEMP/allowed" ]] || { echo "::error::В src/lib/const.sh нет ключа релизов (UPDATE_SIGNERS)"; exit 1; }
+          verify() { ssh-keygen -Y verify -f "$RUNNER_TEMP/allowed" -I "$id" -n "$ns" -s awg2.sh.sig < awg2.sh >/dev/null 2>&1; }
+          # awg2.sh — ровно сборка src/ (с той же буквой тестовой сборки)
+          built() {
+            AWG_BUILD="$(sed -n 's/^BUILD="\(.*\)"$/\1/p' awg2.sh | head -1)" ./build.sh "$RUNNER_TEMP/built.sh" >/dev/null \
+              && cmp -s "$RUNNER_TEMP/built.sh" awg2.sh
+          }
+          for attempt in 1 2 3; do
+            built || { echo "::error::awg2.sh не совпадает со сборкой src/ (./build.sh) — не подписываю"; exit 1; }
+            if [[ -f awg2.sh.sig ]] && verify; then
+              echo "Подпись awg2.sh верна — делать нечего"
+              exit 0
+            fi
+            if [[ -z "${KEY:-}" ]]; then
+              echo "::error::Подписи нет или она устарела, а секрета AWG_RELEASE_KEY в репозитории нет"
+              exit 1
+            fi
+            umask 077
+            printf '%s\n' "$KEY" > "$RUNNER_TEMP/key"
+            rm -f awg2.sh.sig
+            ssh-keygen -q -Y sign -f "$RUNNER_TEMP/key" -n "$ns" awg2.sh
+            rm -f "$RUNNER_TEMP/key"
+            verify || { echo "::error::Секрет AWG_RELEASE_KEY не от ключа, вшитого в awg2 (UPDATE_SIGNERS)"; exit 1; }
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add awg2.sh.sig
+            git commit -q -m "Подпись awg2.sh $(grep -m1 '^VERSION=' awg2.sh | cut -d'"' -f2)"
+            if git push -q origin HEAD:main; then
+              echo "Подпись выложена"
+              exit 0
+            fi
+            # main ушёл вперёд — подписываем уже его
+            git fetch -q origin main
+            git reset -q --hard origin/main
+          done
+          echo "::error::Не удалось выложить подпись: main всё время меняется"
+          exit 1

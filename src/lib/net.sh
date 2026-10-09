@@ -1,9 +1,24 @@
 # Сеть: проверка адресов, аплинк, публичный IP, порты, домены.
 
+# Октеты без ведущих нулей, как у портов и масок: «010.0.0.1» iptables
+# отвергает, а ip_is_private (по тексту) счёл бы его публичным.
 valid_ip() {
   local ip="$1" o
-  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
-  for o in "${BASH_REMATCH[@]:1}"; do (( 10#$o <= 255 )) || return 1; done
+  [[ "$ip" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do (( o <= 255 )) || return 1; done
+}
+
+# DNS для клиентов: IPv4 через запятую (и/или пробел), каждый — настоящий адрес:
+# «999.999.999.999» иначе уходил в конфиги всех клиентов
+valid_dns_list() {  # «1.1.1.1, 1.0.0.1»
+  local -a a
+  local d
+  # Одна строка из цифр, точек, запятых и пробелов: перевод строки дописал бы в конфиг
+  # клиента свои строки, а read ниже проверяет только первую
+  [[ "$1" =~ ^[0-9.,\ ]+$ ]] || return 1
+  IFS=', ' read -ra a <<< "$1"
+  (( ${#a[@]} )) || return 1
+  for d in "${a[@]}"; do valid_ip "$d" || return 1; done
 }
 
 valid_cidr() {
@@ -20,7 +35,9 @@ valid_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 )); }
 valid_domain() {
   local d="$1"
   [[ -n "$d" && ${#d} -le 253 ]] || return 1
-  valid_ip "$d" && return 1
+  # Одни цифры и точки — это адрес, а не домен: и «010.0.0.1», который
+  # valid_ip (без ведущих нулей) не принимает, тоже
+  [[ "$d" =~ ^[0-9.]+$ ]] && return 1
   [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
 }
 
@@ -67,6 +84,36 @@ _PUBLIC_IP=""
 public_ip_cached() {
   [[ -n "$_PUBLIC_IP" ]] || _PUBLIC_IP=$(public_ip || true)
   echo "$_PUBLIC_IP"
+}
+
+# Страна сервера — флаг в шапке панели. Код страны IP сервера по геобазе
+# Cloudflare (cdn-cgi/trace, строка «loc=»): без ключей и своих баз. В кэше
+# на сутки (не узнали — повтор через час), обновляется в фоне: статус сеть не ждёт.
+server_country() { awk 'NR == 1 && $1 ~ /^[A-Z][A-Z]$/ {print $1}' "$COUNTRY_CACHE" 2>/dev/null || true; }
+
+country_refresh() {
+  local loc="" ts
+  command -v curl &>/dev/null || return 0
+  loc=$(curl -s --max-time 6 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^loc=//p' | head -1 || true)
+  ts=$(date +%s)
+  if ! [[ "$loc" =~ ^[A-Z]{2}$ && "$loc" != XX ]]; then
+    # Не ответили: прежняя страна остаётся (флаг не пропадает на час из-за одного сбоя),
+    # метка сдвинута так, чтобы повтор был через час, а не через сутки
+    loc=$(server_country); ts=$(( ts - 86400 + 3600 ))
+    [[ -n "$loc" ]] || { loc="-"; ts=$(date +%s); }
+  fi
+  printf '%s %s\n' "$loc" "$ts" | write_file "$COUNTRY_CACHE" 644
+}
+
+country_refresh_async() {
+  local cc="" ts=0 ttl=86400
+  [[ -n "${AWG_NO_UPDATE_CHECK:-}" ]] && return 0
+  read -r cc ts 2>/dev/null < "$COUNTRY_CACHE" || true
+  [[ "$ts" =~ ^[0-9]+$ ]] || ts=0
+  [[ "$cc" =~ ^[A-Z]{2}$ ]] || ttl=3600
+  (( $(date +%s) - ts < ttl )) && return 0
+  ( country_refresh ) </dev/null >/dev/null 2>&1 3>&- 4>&- 8>&- &
+  disown 2>/dev/null || true
 }
 
 udp_listening() { ss -lunH "sport = :$1" 2>/dev/null | grep -q .; }

@@ -9,7 +9,7 @@ from aiogram import Bot, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
-from .. import api, ask, jobs, media, ui
+from .. import api, ask, jobs, media, store, ui
 from ..ui import esc
 
 router = Router()
@@ -45,7 +45,9 @@ async def send_bundle(bot: Bot, chat_id: int, name: str) -> None:
     head = f"🛡 <b>{esc(name)}</b> — WG + обфускатор\n"
     parts = []
     if link:
-        parts.append(f"\n<b>Ссылка</b> — Keenetic, AWG Manager → «Phobos», одной вставкой:\n<code>{esc(link)}</code>\n")
+        parts.append(f"\n<b>Ссылка</b> — Keenetic, AWG Manager → Новый туннель → «Phobos» → <b>нижнее</b> поле "
+                     "«Или конфиг .conf … / ссылка phobos://». Верхнее «Ссылка установки Phobos» — пустым: оно "
+                     f"только для http(s)-ссылок панели Phobos.\n<code>{esc(link)}</code>\n")
     if conf:
         parts.append(f"\n<b>Конфиг</b> — WireGuard и [instance] обфускатора, как в файле ниже:\n<pre>{esc(conf)}</pre>")
     text = head + "".join(parts)
@@ -98,7 +100,7 @@ async def show(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
         (f"{'✅' if d.get('clean') else '⬜️'} Чистый WG", act.data("clean", "0" if d.get("clean") else "1")),
         ("🔄 Перезапустить", act.data("restart")),
         ("🔑 Сменить ключ", act.data("key")),
-        ("📜 Журнал", "diag:log:wgobf"),
+        ("📜 Журнал", "diag:log:wgobf|wo"),
         ("🗑 Удалить", act.data("rm")),
         ui.back()))
 
@@ -218,9 +220,15 @@ async def _list(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     def dot(r: dict) -> str:
         return "🟢" if r.get("ago") is not None and r["ago"] < 180 else "⚪️"
 
+    # Текст — те же клиенты, что и кнопки этой страницы (страница — как у ui.paged)
+    pages = max(1, (len(rows) + 19) // 20)
+    page = min(page, pages - 1)
     lines = [f"{dot(r)} <b>{esc(r['name'])}</b> <code>{esc(r['ip'])}</code>"
-             + (f" · {ui.fmt_dur(r['ago'])} назад" if r.get("ago") is not None else "") for r in rows[:40]]
-    await ui.render(cb, "<b>👥 Клиенты WG + обфускатор</b>\n\n" + ("\n".join(lines) or "Клиентов нет."),
+             + (f" · {ui.fmt_dur(r['ago'])} назад" if r.get("ago") is not None else "")
+             for r in rows[page * 20:(page + 1) * 20]]
+    await ui.render(cb, "<b>👥 Клиенты WG + обфускатор</b>"
+                        + (f" · стр. {page + 1} из {pages}" if pages > 1 else "") + "\n\n"
+                        + ("\n".join(lines) or "Клиентов нет."),
                     ui.kb(ui.paged([(f"{dot(r)} {r['name']}", act.data("v", r["name"])) for r in rows],
                                    page, lambda p: act.data("list", str(p))),
                           ui.back("wo")))
@@ -236,14 +244,30 @@ async def _view(cb: ui.Target, state: FSMContext, name: str) -> None:
     ago = c.get("ago")
     seen = ("не подключался" if ago is None
             else f"🟢 онлайн ({ui.fmt_dur(ago)} назад)" if ago < 180 else f"был {ui.fmt_dur(ago)} назад")
+    mon = store.monitored(store.WGOBF + name)
     await ui.render(cb, f"<b>🛡 {esc(name)}</b> — WG + обфускатор\n\nIP: <code>{esc(c['ip'])}</code>\n"
-                        f"Статус: {seen}\n\n"
+                        f"Статус: {seen}\n"
+                        f"Трафик с запуска: ↓ {ui.fmt_bytes(c.get('rx'))} · ↑ {ui.fmt_bytes(c.get('tx'))}\n"
+                        f"Мониторинг: {'🔔 вкл' if mon else '🔕 выкл'}\n\n"
                         "<i>📄 Конфиг — ссылка и конфиг текстом, плюс один файл .conf со всеми данными\n"
-                        "📦 Архив — wg.conf, obfuscator.conf и установщик для Linux</i>",
+                        "📦 Архив — wg.conf, obfuscator.conf и установщик для Linux\n"
+                        "🔔 Мониторинг — сообщу, когда клиент пропал (5 минут без связи) и вернулся</i>",
                     ui.kb(("📄 Конфиг", act.data("bundle", name)),
                           ("📦 Архив", act.data("zip", name)),
+                          ("🔕 Выключить мониторинг" if mon else "🔔 Мониторинг", act.data("mon", name)),
                           ("🗑 Удалить", act.data("del", name)),
                           ui.back(act.data("list"))))
+
+
+@act("mon")
+async def _mon(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    if not NAME_RE.match(name):
+        await cb.answer("Кнопка устарела — открой клиента заново", show_alert=True)
+        return
+    on = not store.monitored(store.WGOBF + name)
+    store.set_monitored(store.WGOBF + name, on)
+    await cb.answer("🔔 Мониторинг включён" if on else "🔕 Мониторинг выключен")
+    await _view(cb, state, name)
 
 
 @act("bundle")

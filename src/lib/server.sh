@@ -236,6 +236,55 @@ write_client_conf() {
   } | write_file "$f" 600
 }
 
+# Умеют ли модуль и tools AWG 3.1, когда сервера ещё нет. Проверка создаёт
+# пробный интерфейс, а бот спрашивает сводку раз в минуту — ответ помнится до
+# смены модуля или tools. «Не подтверждено» (модуль не загружен) не помнится.
+proto31_cached() {
+  local f="$STATE_DIR/proto31" bin key k v rc=0
+  bin=$(command -v awg) || return 1
+  key="$(mod_tag)|$(stat -c %s:%Y "$bin" 2>/dev/null)|$(cat "/sys/module/$MOD_NAME/srcversion" 2>/dev/null)"
+  if [[ -f "$f" ]] && IFS=$'\t' read -r k v < "$f" && [[ "$k" == "$key" && "$v" =~ ^[01]$ ]]; then
+    _PROTO_PROBE[31]=$v           # proto_upgrade_hint в том же вызове не пробует заново
+    return "$v"
+  fi
+  proto_supported 3.1 || rc=$?
+  (( rc == 2 )) || { mkdir -p "$STATE_DIR" && printf '%s\t%s\n' "$key" "$rc" > "$f"; } 2>/dev/null
+  return "$rc"
+}
+
+# Внешний интерфейс в правиле NAT awg0.conf — аплинк, на котором создан сервер.
+conf_uplink() {
+  [[ -f "$SERVER_CONF" ]] || return 1
+  sed -nE 's/^PostUp *=.*POSTROUTING -s [^ ]+ -o ([^ ]+) -j MASQUERADE.*/\1/p' "$SERVER_CONF" | head -1 | grep .
+}
+
+# Сервер восстановлен на другом VPS (или интерфейс переименован): у аплинка
+# другое имя (ens3 вместо eth0) — клиенты подключаются, но без NAT остаются
+# без интернета. Правило NAT в PostUp/PostDown переводится на аплинк этого
+# сервера. Для «Проверить и починить» — только если прежнего интерфейса здесь
+# нет: есть — значит NAT через него выбран сознательно (второй аплинк,
+# туннель). Восстановление бэкапа (force) переносит всегда: интерфейс с тем
+# же именем на новом VPS может быть совсем другим (приватный eth0). Поднятый
+# awg0 опускается до правки — его PostDown снимает старое правило NAT, иначе
+# оно оставалось в iptables — и поднимается снова. 0 — awg0.conf поправлен.
+conf_uplink_sync() {  # [force]
+  local old dev up=0 rc=0
+  old=$(conf_uplink) || return 1
+  dev=$(uplink_iface) || return 1
+  [[ "$old" != "$dev" ]] || return 1
+  [[ "${1:-}" != force ]] && ip link show "$old" &>/dev/null && return 1
+  if iface_up; then
+    up=1
+    awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+  fi
+  sed -i -E "/^Post(Up|Down) *=/ s#(POSTROUTING -s [^ ]+ -o )${old//./\\.}( -j MASQUERADE)#\1$dev\2#g" "$SERVER_CONF" \
+    && [[ "$(conf_uplink)" == "$dev" ]] || rc=1
+  (( up )) && { awg_up_diag || rc=1; }
+  (( rc )) && return 1
+  info "Внешний интерфейс сервера: $old → $dev (NAT в $SERVER_CONF)"
+  log_info "NAT awg0: $old → $dev"
+}
+
 # Создаёт awg0.conf и первого клиента из S_* и выбранной мимикрии.
 server_write() {
   local net="$S_NET" base srv_priv cli_priv psk dev
@@ -307,30 +356,33 @@ _choose_dns() {
     5) while true; do
          read_line d "${C}  DNS через запятую: ${N}"
          [[ -n "$d" ]] || { S_DNS="1.1.1.1, 1.0.0.1"; break; }
-         [[ "$d" =~ ^[0-9.,[:space:]]+$ ]] && { S_DNS="$d"; break; }
+         valid_dns_list "$d" && { S_DNS="$d"; break; }
          warn "Нужны IPv4-адреса через запятую"
        done ;;
   esac
 }
 
 _choose_mtu() {  # $1 — значение по умолчанию
-  local c v
-  echo -e "  ${C}1)${N} $1 ${C}(рекомендуется)${N}"
-  echo -e "  ${C}2)${N} 1420"
-  echo -e "  ${C}3)${N} 1380"
-  echo -e "  ${C}4)${N} 1320"
-  echo -e "  ${C}5)${N} 1280"
-  echo -e "  ${C}6)${N} Вручную"
-  read_choice c "${C}  MTU [1-6] (Enter = 1): ${N}" 1 6 1
-  case "$c" in
-    1) MTU=$1 ;; 2) MTU=1420 ;; 3) MTU=1380 ;; 4) MTU=1320 ;; 5) MTU=1280 ;;
-    6) while true; do
-         read_line v "${C}  MTU (1280-1500): ${N}"
-         [[ -n "$v" ]] || { MTU=$1; break; }
-         [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) && { MTU=$v; break; }
-         warn "Число 1280-1500"
-       done ;;
-  esac
+  local c v i opts=("$1")
+  # Рекомендуемое — первым, остальные стандартные без повтора
+  for v in 1420 1380 1320 1280; do [[ "$v" == "$1" ]] || opts+=("$v"); done
+  echo ""
+  hdr "MTU"
+  for i in "${!opts[@]}"; do
+    echo -e "  ${C}$((i + 1)))${N} ${opts[$i]}$( (( i == 0 )) && echo -e " ${C}(рекомендуется)${N}")"
+  done
+  echo -e "  ${C}$(( ${#opts[@]} + 1 )))${N} Вручную"
+  read_choice c "${C}  MTU [1-$(( ${#opts[@]} + 1 ))] (Enter = 1): ${N}" 1 $(( ${#opts[@]} + 1 )) 1
+  if (( c <= ${#opts[@]} )); then
+    MTU=${opts[$((c - 1))]}
+  else
+    while true; do
+      read_line v "${C}  MTU (1280-1500): ${N}"
+      [[ -n "$v" ]] || { MTU=$1; break; }
+      [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) && { MTU=$v; break; }
+      warn "Число 1280-1500"
+    done
+  fi
 }
 
 # Версия протокола нового сервера. 3.1 по умолчанию, если компоненты её умеют.
@@ -501,7 +553,7 @@ server_create_opts() {
       profile) [[ "$v" =~ ^(lite|pro)$ ]] || { err "profile: lite | pro"; return 1; }; S_PROFILE="$v" ;;
       proto) [[ "$v" =~ ^(2\.0|3\.1)$ ]] || { err "proto: 2.0 | 3.1"; return 1; }; S_PROTO="$v" ;;
       region) [[ "$v" =~ ^(world|ru)$ ]] || { err "region: world | ru"; return 1; }; S_REGION="$v" ;;
-      dns) [[ "$v" =~ ^[0-9.,[:space:]]+$ ]] || { err "dns: IPv4 через запятую"; return 1; }; S_DNS="$v" ;;
+      dns) valid_dns_list "$v" || { err "dns: IPv4 через запятую"; return 1; }; S_DNS="$v" ;;
       mtu) [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) || { err "mtu: 1280-1500"; return 1; }; MTU="$v" ;;
       port) valid_port "$v" && (( v >= 1024 )) || { err "port: 1024-65535"; return 1; }
             udp_port_busy "$v" && { err "UDP $v занят"; return 1; }; S_PORT="$v" ;;
@@ -599,7 +651,7 @@ _issue() { REPAIR_ISSUES=$((REPAIR_ISSUES + 1)); warn "$1"; }
 _fixed() { REPAIR_FIXED=$((REPAIR_FIXED + 1)); ok "$1"; }
 
 do_repair() {
-  local bad conf_n live_n dev net perm rc
+  local bad conf_n live_n dev net perm rc old
   REPAIR_ISSUES=0 REPAIR_FIXED=0
   echo ""
   hdr "Проверка и ремонт"
@@ -615,6 +667,10 @@ do_repair() {
     else err "Не удалось — Сервер → Модуль ядра"; fi
   fi
   mod_stale && _issue "В памяти прежняя сборка модуля — Сервер → Модуль ядра → перезагрузить модуль"
+  if [[ -n "$(kernel_gap)" ]]; then
+    _issue "Ядро $(kernel_gap_line) без модуля AWG — после перезагрузки awg0 не поднимется"
+    mod_rebuild_all && _fixed "Модуль собран под все ядра"
+  fi
   if grep -qs "^$MOD_NAME" "$MODULES_LOAD_FILE"; then ok "Автозагрузка модуля"
   else _issue "Нет автозагрузки модуля"; mod_autoload && _fixed "Автозагрузка настроена"; fi
 
@@ -646,6 +702,18 @@ do_repair() {
     else ok "awg0 работает, пиров: $live_n"; fi
   fi
   dev=$(uplink_iface || true); net=$(server_net || true)
+  old=$(conf_uplink || true)
+  if [[ -n "$dev" && -n "$old" && "$old" != "$dev" ]]; then
+    if ip link show "$old" &>/dev/null; then
+      info "NAT в awg0.conf — на $old (маршрут по умолчанию — через $dev): оставляю как настроено"
+    else
+      _issue "NAT в awg0.conf — на $old, такого интерфейса нет; выход сервера — $dev"
+      conf_uplink_sync && _fixed "NAT перенесён на $dev"
+    fi
+  fi
+  # NAT проверяется на интерфейсе из awg0.conf: выбранный сознательно не
+  # перебивается правилом на аплинк по умолчанию
+  old=$(conf_uplink || true); [[ -n "$old" ]] && ip link show "$old" &>/dev/null && dev="$old"
   if [[ -n "$dev" && -n "$net" ]]; then
     if iptables -t nat -C POSTROUTING -s "$net" -o "$dev" -j MASQUERADE 2>/dev/null; then ok "NAT на $dev"
     else _issue "Нет NAT для $net на $dev"; ipt_add -t nat POSTROUTING -s "$net" -o "$dev" -j MASQUERADE && _fixed "NAT добавлен"; fi
@@ -967,10 +1035,14 @@ server_reset() {
   tunnels_panic_reset quiet
   awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   rm -f "$SERVER_CONF" "$SERVER_CONF".bak.* "$SERVER_CONF".pre_* "$CLIENT_DIR"/*_awg[23].conf
+  rm -f "$TRAFFIC_DB" "$TRAFFIC_DB.lock"
   ufw_delete_matching AmneziaWG
   : > "$WARP_PEERS" 2>/dev/null || true
   : > "$XRAY_PEERS" 2>/dev/null || true
   : > "$EXITS_PEERS" 2>/dev/null || true
+  # Снимок счётчиков — метка жизни таймера: старый после сброса заставил бы
+  # сторож «чинить» таймер посреди создания нового сервера
+  rm -f "$EXPIRE_STATE_DIR/transfer"
   ok "Сервер сброшен. Создать новый: Сервер → Создать сервер"
   log_info "сервер сброшен"
 }

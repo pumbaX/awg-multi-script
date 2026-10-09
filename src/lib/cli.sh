@@ -56,7 +56,7 @@ main() {
   local post=""
   case "${1:-}" in
     -h|--help) usage; exit 0 ;;
-    -v|--version) echo "awg2 $VERSION"; exit 0 ;;
+    -v|--version) echo "awg2 $VERSION_SHOW"; exit 0 ;;
   esac
   (( EUID == 0 )) || { echo "awg2: нужен root — sudo awg2" >&2; exit 1; }
   log_init
@@ -67,6 +67,7 @@ main() {
   update_channel_init
   base_deps
   helpers_refresh || true
+  expire_watchdog || true
 
   case "${1:-}" in
     --status) do_status; exit 0 ;;
@@ -93,7 +94,8 @@ main() {
     *) err "Неизвестный аргумент: $1"; info "awg2 --help — список аргументов"; exit 1 ;;
   esac
 
-  log_info "=== AWG Toolza $VERSION ==="
+  log_info "=== AWG Toolza $VERSION_SHOW ==="
+  [[ -z "$post" ]] && { self_install_offer || true; }
   update_check_async || true
   upstream_refresh_async || true
   client_files_sync_suffix || true

@@ -38,7 +38,7 @@ async def show(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
     d = await api.data("tunnels", "status", default={}) or {}
 
     names = [("warp", "WARP", "warp"), ("xray", "Xray", "xr"), ("tun2socks", "tun2socks", "t2s"),
-             ("exits", "Exit-ноды", "ex"), ("dns", "Шифр. DNS", "dns")]
+             ("exits", "Exit-ноды WG", "ex"), ("dns", "Шифр. DNS", "dns")]
     n = d.get("cascade", 0)
     lines = [f"{ui.state_icon(d.get(k, 'none'))} {label} — {ui.state_word(d.get(k, 'none'))}" for k, label, _ in names]
     lines.insert(4, f"{'🟢' if n else '▫️'} Каскад портов — {'правил: ' + str(n) if n else 'правил нет'}")
@@ -302,8 +302,18 @@ async def _xr_link(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
 async def _xr_del(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     tags = (await api.data("xray", "status", default={}) or {}).get("tags") or []
     await ui.remember(state, "xtags", tags)
-    await ui.render(cb, "<b>➖ Удалить выход</b>", ui.kb([(t, xr.data("delok", str(i))) for i, t in enumerate(tags)],
+    await ui.render(cb, "<b>➖ Удалить выход</b>", ui.kb([(t, xr.data("delq", str(i))) for i, t in enumerate(tags)],
                                                       ui.back("xr")))
+
+
+# Удаление переспрашивает, как WARP, Xray целиком и клиенты: кнопки списка — рядом
+@xr("delq")
+async def _xr_del_ask(cb: CallbackQuery, state: FSMContext, idx: str) -> None:
+    tag = await ui.recall(state, "xtags", idx)
+    if not tag:
+        await _xr_del(cb, state, "")
+        return
+    await ui.confirm(cb, f"Удалить выход Xray <b>{esc(tag)}</b>?", ("🗑 Удалить", xr.data("delok", idx)), xr.data("del"))
 
 
 @xr("delok")
@@ -375,7 +385,7 @@ async def t2s_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> Non
                         + (f"\nПрокси: <code>{esc(proxy)}</code>" if proxy else ""),
                     ui.kb(("▶️ Включить", t2s.data("up")) if not d.get("up") else None,
                           ("⏹ Выключить", t2s.data("down")) if d.get("up") else None,
-                          ("📜 Журнал", "diag:log:tun2socks"),
+                          ("📜 Журнал", "diag:log:tun2socks|t2s"),
                           ("🗑 Удалить", t2s.data("rm")) if proxy else None,
                           ui.back("tun")))
 
@@ -470,8 +480,14 @@ async def _ex_conf(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
 async def _ex_del(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     nodes = (await api.data("exits", "status", default={}) or {}).get("nodes") or []
     await ui.render(cb, "<b>➖ Удалить ноду</b>\nЕё клиенты перейдут на общий выход.",
-                    ui.kb([(f"{'🟢' if n['up'] else '🔴'} {n['name']}", ex.data("delok", n["name"])) for n in nodes],
+                    ui.kb([(f"{'🟢' if n['up'] else '🔴'} {n['name']}", ex.data("delq", n["name"])) for n in nodes],
                           ui.back("ex")))
+
+
+@ex("delq")
+async def _ex_del_ask(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    await ui.confirm(cb, f"Удалить exit-ноду <b>{esc(name)}</b>? Её клиенты перейдут на общий выход.",
+                     ("🗑 Удалить", ex.data("delok", name)), ex.data("del"))
 
 
 @ex("delok")
@@ -652,8 +668,15 @@ async def _cas_del(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     rows = await api.data("cascade", "list", default=[]) or []
     await ui.render(cb, "<b>➖ Удалить правило</b>\n\n"
                         + "\n".join(f"{r['proto'].upper()} {r['in']} → {r['dst']}:{r['out']}" for r in rows),
-                    ui.kb([(f"{r['proto'].upper()} {r['in']}", cas.data("delok", f"{r['proto']}|{r['in']}"))
+                    ui.kb([(f"{r['proto'].upper()} {r['in']}", cas.data("delq", f"{r['proto']}|{r['in']}"))
                            for r in rows], ui.back("cas")))
+
+
+@cas("delq")
+async def _cas_del_ask(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    proto, _, port = arg.partition("|")
+    await ui.confirm(cb, f"Удалить правило каскада {esc(proto.upper())} {esc(port)}?",
+                     ("🗑 Удалить", cas.data("delok", arg)), cas.data("del"))
 
 
 @cas("delok")
@@ -711,7 +734,7 @@ async def dns_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> Non
         ("⚠️ Принудительно", dns.data("force")) if not inst else None,
         ("🔄 Перезапустить", dns.data("restart")) if inst else None,
         ("🌐 Резолверы", dns.data("up")) if inst else None,
-        ("📜 Журнал", "diag:log:dns"),
+        ("📜 Журнал", "diag:log:dns|dns"),
         ("⏹ Выключить", dns.data("rm")) if inst else None,
         ui.back("tun")))
 

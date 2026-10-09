@@ -76,6 +76,26 @@ peers_sync() {
   mv -f "$f.tmp" "$f"
 }
 
+# Все клиенты через туннель; строки «IP|выход» (свой выход Xray) остаются.
+peers_all() {  # файл
+  local ip
+  mkdir -p "$(dirname "$1")"
+  clients_name_ip | cut -d'|' -f2 | while IFS= read -r ip; do
+    grep -E "^${ip//./\\.}(\||$)" "$1" 2>/dev/null | head -1 | grep . || echo "$ip"
+  done > "$1.new"
+  mv -f "$1.new" "$1"
+}
+
+# Свои выходы клиентов Xray живут в конфиге самого Xray (правила по адресу):
+# изменились — без пересборки конфига клиент оставался на прежнем выходе,
+# хотя список показывал «по умолчанию» или «напрямую».
+_xray_outs() { grep -F '|' "$XRAY_PEERS" 2>/dev/null | sort; }
+_xray_outs_apply() {  # прежний вывод _xray_outs
+  [[ "$(_xray_outs)" != "$1" ]] && xray_is_up || return 0
+  _xray_prepare || return 1
+  info "Перезапускаю туннель"; xray_restart
+}
+
 peers_seed() {
   [[ -f "$1" ]] && return 0
   mkdir -p "$(dirname "$1")"
@@ -102,10 +122,16 @@ rt_rules_clear() {  # таблица
 }
 
 # NAT и FORWARD между awg0 и туннелем. Правила помечены «awg2-tun-<dev>».
-rt_fw_up() {  # устройство
+rt_fw_up() {  # устройство [nonat]
   local dev="$1" net tag="awg2-tun-$1"
   net=$(server_net) || return 1
-  ipt_add -t nat POSTROUTING -s "$net" -o "$dev" -j MASQUERADE -m comment --comment "$tag"
+  # nonat — устройство должно видеть адреса клиентов (inbound tun Xray
+  # выбирает выход клиента по его адресу)
+  if [[ "${2:-}" == nonat ]]; then
+    ipt_del -t nat POSTROUTING -s "$net" -o "$dev" -j MASQUERADE -m comment --comment "$tag"
+  else
+    ipt_add -t nat POSTROUTING -s "$net" -o "$dev" -j MASQUERADE -m comment --comment "$tag"
+  fi
   ipt_ins FORWARD -i "$AWG_IF" -o "$dev" -j ACCEPT -m comment --comment "$tag"
   ipt_ins FORWARD -i "$dev" -o "$AWG_IF" -j ACCEPT -m comment --comment "$tag"
   # MSS по MTU маршрута: у туннеля MTU меньше, а ICMP «нужна фрагментация»
@@ -135,7 +161,7 @@ rt_fw_down() {  # устройство
 
 # rt_up УСТРОЙСТВО ТАБЛИЦА ФАЙЛ_КЛИЕНТОВ|- [SRC]
 # «-» вместо файла — вся подсеть клиентов (как у tun2socks).
-rt_up() {
+rt_up() {  # устройство таблица peers|- [src] [nonat]
   local dev="$1" table="$2" peers="$3" src="${4:-}" net ip line
   net=$(server_net) || return 1
   if [[ -n "$src" ]]; then
@@ -152,7 +178,7 @@ rt_up() {
       valid_ip "$ip" && ip rule add from "$ip" lookup "$table" priority "$table"
     done < "$peers"
   fi
-  rt_fw_up "$dev"
+  rt_fw_up "$dev" "${5:-}"
 }
 
 rt_down() {  # устройство таблица
@@ -234,7 +260,7 @@ _tunnel_rules_refresh() {  # файл устройство таблица
 
 # tunnel_client warp|xray ИМЯ|all|none on|off
 tunnel_client() {
-  local file dev table ip
+  local file dev table ip outs
   case "$1" in
     warp) file="$WARP_PEERS"; dev="$WARP_IF"; table="$WARP_TABLE" ;;
     xray) file="$XRAY_PEERS"; dev="$XRAY_IF"; table="$XRAY_TABLE" ;;
@@ -242,22 +268,29 @@ tunnel_client() {
   esac
   mkdir -p "$(dirname "$file")"
   peers_sync "$file"
-  case "$2" in
-    all) clients_name_ip | cut -d'|' -f2 > "$file" ;;
+  outs=$(_xray_outs)
+  # all / none без третьего аргумента — все клиенты; с ним — клиент с таким
+  # именем: «tunnels client xray all off» не должно включать всех
+  case "$2${3:+|}" in
+    all) peers_all "$file" ;;
     none) : > "$file" ;;
     *) ip=$(clients_name_ip | awk -F'|' -v n="$2" '$1 == n {print $2; exit}')
        [[ -n "$ip" ]] || { err "Клиента $2 нет"; return 1; }
        peers_seed "$file"
-       if [[ "${3:-on}" == on ]]; then peers_add "$file" "$ip"; else peers_del "$file" "$ip"; fi ;;
+       if [[ "${3:-on}" == on ]]; then peers_has "$file" "$ip" || peers_add "$file" "$ip"
+       else peers_del "$file" "$ip"; fi ;;
   esac
   _tunnel_rules_refresh "$file" "$dev" "$table"
   ok "Клиенты ${1^^}: $(grep -c . "$file" || true) через туннель"
+  if [[ "$1" == xray ]]; then _xray_outs_apply "$outs" || return 1; fi
+  return 0
 }
 # tunnel_peers_menu ЗАГОЛОВОК ФАЙЛ УСТРОЙСТВО ТАБЛИЦА
 tunnel_peers_menu() {
-  local title="$1" file="$2" dev="$3" table="$4" rows=() i c name ip
+  local title="$1" file="$2" dev="$3" table="$4" rows=() i c name ip outs
   while true; do
     peers_sync "$file"
+    outs=$(_xray_outs)
     mapfile -t rows < <(clients_name_ip)
     (( ${#rows[@]} )) || { warn "Клиентов нет"; return 0; }
     echo ""
@@ -273,12 +306,13 @@ tunnel_peers_menu() {
     read_choice c "${C}  Номер — вкл/выкл: ${N}" 0 "${#rows[@]}" 0 "a|n"
     case "$c" in
       0) return 0 ;;
-      a) clients_name_ip | cut -d'|' -f2 > "$file" ;;
+      a) peers_all "$file" ;;
       n) : > "$file" ;;
       *) ip="${rows[$((c - 1))]#*|}"
          if peers_has "$file" "$ip"; then peers_del "$file" "$ip"; else peers_add "$file" "$ip"; fi ;;
     esac
     _tunnel_rules_refresh "$file" "$dev" "$table"
+    [[ "$file" == "$XRAY_PEERS" ]] && { _xray_outs_apply "$outs" || true; }
   done
 }
 

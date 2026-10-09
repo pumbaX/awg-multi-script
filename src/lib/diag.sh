@@ -126,7 +126,7 @@ do_client_dpi_hint() {
 # Сводка для «awg2 --status» и меню диагностики.
 do_status() {
   local n
-  hdr "AWG Toolza $VERSION"
+  hdr "AWG Toolza $VERSION_SHOW"
   os_detect
   echo -e "  Система   : $OS_LABEL, ядро $(uname -r)"
   echo -e "  Компоненты: $(components_summary)"

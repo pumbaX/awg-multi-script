@@ -1,4 +1,4 @@
-"""media.py — файлы для отправки: QR-код конфига и zip из нескольких файлов."""
+"""media.py — файлы для отправки: QR-код конфига и zip из файлов или из байтов."""
 
 from __future__ import annotations
 
@@ -35,4 +35,13 @@ def zip_files(paths: list[str]) -> bytes:
         for p in paths:
             if p and os.path.isfile(p):
                 z.write(p, arcname=os.path.basename(p))
+    return buf.getvalue()
+
+
+def zip_data(files: dict[str, bytes]) -> bytes:
+    """Zip из готовых данных: имя в архиве → содержимое."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in files.items():
+            z.writestr(name, data)
     return buf.getvalue()

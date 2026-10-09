@@ -6,19 +6,35 @@
 с целевым и os.replace: обрыв на середине не оставляет битый конфиг.
 """
 import base64
-import ipaddress
+import importlib
 import json
 import os
-import random
 import re
-import secrets
-import shutil
-import string
 import struct
 import sys
-import tempfile
 import time
 import urllib.parse
+
+
+class _Lazy:
+    """Модуль, который загружается при первом обращении: большинство команд
+    его не трогает, а awg2 api зовёт помощник дважды на каждый вызов."""
+
+    def __init__(self, name):
+        self._name, self._mod = name, None
+
+    def __getattr__(self, attr):
+        if self._mod is None:
+            self._mod = importlib.import_module(self._name)
+        return getattr(self._mod, attr)
+
+
+ipaddress = _Lazy("ipaddress")
+random = _Lazy("random")
+secrets = _Lazy("secrets")
+shutil = _Lazy("shutil")
+string = _Lazy("string")
+tempfile = _Lazy("tempfile")
 
 
 def die(msg, code=1):
@@ -122,7 +138,7 @@ def cmd_peers(conf):
             continue
         print("\t".join([peer_name(b), pub, peer_field(b, "AllowedIPs"),
                          peer_meta(b, "expires"), peer_meta(b, "orig_ips"),
-                         peer_meta(b, "mimicry")]))
+                         peer_meta(b, "mimicry"), peer_meta(b, "limit"), peer_meta(b, "blocked_by")]))
 
 
 def cmd_meta_set(conf, name, key, value):
@@ -437,10 +453,16 @@ def cmd_expire_clear(conf, name, suspend):
     if i < 0:
         die("клиент %s не найден" % name, 2)
     b = peers[i]
+    if peer_meta(b, "blocked_by") == "traffic":
+        # Блокировку держит лимит трафика: снимается только срок
+        peers[i] = set_meta(b, "expires", "")
+        write_atomic(conf, head + "".join(peers))
+        print("traffic")
+        return
     orig = peer_meta(b, "orig_ips")
     if orig and peer_field(b, "AllowedIPs") == suspend:
         b = re.sub(r"^([ \t]*AllowedIPs\s*=\s*).+$", lambda m: m.group(1) + orig, b, count=1, flags=re.M | re.I)
-    b = set_meta(set_meta(b, "expires", ""), "orig_ips", "")
+    b = set_meta(set_meta(set_meta(b, "expires", ""), "orig_ips", ""), "blocked_by", "")
     peers[i] = b
     write_atomic(conf, head + "".join(peers))
     print(orig)
@@ -485,6 +507,406 @@ def cmd_expire_check(conf, suspend, state_dir):
         print("CHANGED")
     for e in events:
         print(e)
+
+
+# ── Трафик клиентов и лимиты ──
+# Счётчики `awg show transfer` живут, пока поднят интерфейс, поэтому таймер
+# каждые 15 с складывает их прирост в базу: по дням (DAYS_KEEP дней) и за
+# всё время. Ключ — публичный ключ: переименование историю не теряет.
+# Лимит — метка пира «# limit=БАЙТ/month|total»; превысивший блокируется
+# как истёкший (AllowedIPs → suspend), с меткой «# blocked_by=traffic» — по
+# ней таймер разблокирует его в новом месяце или после смены лимита.
+DAYS_KEEP = 92
+TRAFFIC_SAVE_EVERY = 300
+SIZE_UNITS = {"": 1024 ** 3, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+SIZE_MAX = 1024 ** 5
+
+
+def fmt_bytes(n):
+    n = float(n or 0)
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if n < 1024:
+            return "%d %s" % (n, unit) if unit == "Б" else "%.1f %s" % (n, unit)
+        n /= 1024
+    return "%.1f ТБ" % n
+
+
+def parse_size(text):
+    """«50G», «500M», «1.5T», «50» (гигабайты) → байты; None — не размер.
+    «500B» без K/M/G/T — не гигабайты, а ошибка; больше 1 ПБ — тоже."""
+    m = re.match(r"^\s*(\d{1,7}(?:[.,]\d{1,3})?)\s*([KMGT]?)(i?B)?\s*$", text or "", re.I | re.A)
+    if not m or (m.group(3) and not m.group(2)):
+        return None
+    n = int(float(m.group(1).replace(",", ".")) * SIZE_UNITS[m.group(2).upper()])
+    return n if 0 < n <= SIZE_MAX else None
+
+
+def parse_limit(value):
+    """Метка «БАЙТ/период» → (байт, период) или (0, "")."""
+    m = re.match(r"^(\d+)/(month|total)$", value or "")
+    return (int(m.group(1)), m.group(2)) if m else (0, "")
+
+
+def _read_transfer(path):
+    out = {}
+    try:
+        for line in read(path).splitlines():
+            f = line.split("\t")
+            if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
+                out[f[0]] = (int(f[1]), int(f[2]))
+    except OSError:
+        pass
+    return out
+
+
+class Traffic:
+    """База трафика: {"v", "ifindex", "saved", "last": {pub: [rx, tx]},
+    "total": {pub: n}, "days": {"ГГГГ-ММ-ДД": {pub: [rx, tx]}},
+    "reset": {pub: {"p": период, "b": байт}}, "warned": {pub: "период:лимит"}}."""
+
+    def __init__(self, path):
+        self.path = path
+        try:
+            data = json.loads(read(path))
+        except (OSError, ValueError):
+            data = {}
+        self.fresh = not isinstance(data, dict) or "last" not in data
+        if not isinstance(data, dict):
+            data = {}
+        self.d = {k: data.get(k) if isinstance(data.get(k), dict) else {}
+                  for k in ("last", "total", "days", "reset", "warned")}
+        self.ifindex = str(data.get("ifindex") or "")
+        self.saved = int(data.get("saved") or 0)
+
+    def apply(self, counters, ifindex=""):
+        """Прирост счётчиков с прошлого раза — в сегодняшний день. Новый
+        интерфейс (другой ifindex — awg0 пересоздан) или счётчик меньше
+        прежнего — отсчёт с нуля. Самый первый проход только запоминает
+        счётчики: накопленное до учёта к сегодняшнему дню не относится."""
+        if self.fresh and not counters:
+            # Счётчиков нет (интерфейс лежит) — запоминать нечего: иначе
+            # следующий проход посчитал бы всё накопленное до учёта
+            return
+        today = time.strftime("%Y-%m-%d")
+        last, total = self.d["last"], self.d["total"]
+        reborn = bool(ifindex) and bool(self.ifindex) and ifindex != self.ifindex
+        day = self.d["days"].setdefault(today, {})
+        for pub, (rx, tx) in counters.items():
+            prev = last.get(pub)
+            if self.fresh:
+                drx = dtx = 0
+            elif reborn or not isinstance(prev, list) or len(prev) != 2 or rx < prev[0] or tx < prev[1]:
+                drx, dtx = rx, tx
+            else:
+                drx, dtx = rx - prev[0], tx - prev[1]
+            last[pub] = [rx, tx]
+            if drx or dtx:
+                cur = day.get(pub) or [0, 0]
+                day[pub] = [cur[0] + drx, cur[1] + dtx]
+                total[pub] = int(total.get(pub) or 0) + drx + dtx
+        if ifindex:
+            self.ifindex = ifindex
+        self.fresh = False
+
+    @staticmethod
+    def period_key(period):
+        return time.strftime("%Y-%m") if period == "month" else "total"
+
+    def raw_used(self, pub, period):
+        if period == "month":
+            month = time.strftime("%Y-%m")
+            return sum(sum(v.get(pub) or [0, 0]) for d, v in self.d["days"].items() if d.startswith(month))
+        return int(self.d["total"].get(pub) or 0)
+
+    def used(self, pub, period):
+        raw = self.raw_used(pub, period)
+        r = self.d["reset"].get(pub)
+        if isinstance(r, dict) and r.get("p") == self.period_key(period):
+            return max(0, raw - int(r.get("b") or 0))
+        return raw
+
+    def reset(self, pub, period):
+        self.d["reset"][pub] = {"p": self.period_key(period), "b": self.raw_used(pub, period)}
+        self.d["warned"].pop(pub, None)
+
+    def series(self, pubs, days):
+        """Последние days дней (от старых к новым): даты, rx и tx по списку ключей."""
+        dates = [time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400 * i)) for i in range(days - 1, -1, -1)]
+        rx, tx = [], []
+        for d in dates:
+            v = self.d["days"].get(d) or {}
+            rx.append(sum((v.get(p) or [0, 0])[0] for p in pubs))
+            tx.append(sum((v.get(p) or [0, 0])[1] for p in pubs))
+        return dates, rx, tx
+
+    def save(self, alive=None):
+        """Старше DAYS_KEEP дней — прочь; у удалённых клиентов остаётся
+        только история по дням (она входит в общий трафик сервера)."""
+        cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400 * DAYS_KEEP))
+        self.d["days"] = {k: v for k, v in self.d["days"].items() if k >= cutoff and v}
+        if alive is not None:
+            for k in ("last", "total", "reset", "warned"):
+                self.d[k] = {p: v for p, v in self.d[k].items() if p in alive}
+        self.saved = int(time.time())
+        data = dict(self.d, v=1, ifindex=self.ifindex, saved=self.saved)
+        if self.fresh:
+            # Счётчики ещё не запомнены: следующий проход — снова первый
+            del data["last"]
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        write_atomic(self.path, json.dumps(data, separators=(",", ":")))
+
+
+def _block(b, suspend, aip, reason):
+    if not peer_meta(b, "orig_ips"):
+        b = set_meta(b, "orig_ips", aip)
+    b = re.sub(r"^([ \t]*AllowedIPs\s*=\s*).+$", lambda m: m.group(1) + suspend, b, count=1, flags=re.M | re.I)
+    return set_meta(b, "blocked_by", reason)
+
+
+def _unblock(b, suspend):
+    orig = peer_meta(b, "orig_ips")
+    if orig and peer_field(b, "AllowedIPs") == suspend:
+        b = re.sub(r"^([ \t]*AllowedIPs\s*=\s*).+$", lambda m: m.group(1) + orig, b, count=1, flags=re.M | re.I)
+    return set_meta(set_meta(b, "orig_ips", ""), "blocked_by", "")
+
+
+PERIOD_WORD = {"month": "за месяц", "total": "всего"}
+
+
+def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
+    """Проход таймера: прирост трафика в базу и проверка лимитов. События:
+    CHANGED; LIMIT<TAB>имя<TAB>адрес<TAB>текст; WARN90<TAB>имя<TAB>текст;
+    UNLIMIT<TAB>имя<TAB>текст."""
+    lock = _traffic_lock(db)
+    try:
+        text = read(conf)
+    except OSError:
+        return
+    t = Traffic(db)
+    t.apply(_read_transfer(transfer), ifindex)
+    now = int(time.time())
+    head, peers = split_peers(text)
+    events, changed, alive = [], False, set()
+    for i, b in enumerate(peers):
+        pub, aip = peer_field(b, "PublicKey"), peer_field(b, "AllowedIPs")
+        if not (pub and aip):
+            continue
+        alive.add(pub)
+        name = peer_name(b) or pub[:8]
+        limit, period = parse_limit(peer_meta(b, "limit"))
+        by_traffic = peer_meta(b, "blocked_by") == "traffic"
+        exp = peer_meta(b, "expires")
+        expired = exp.isdigit() and now >= int(exp)
+        used = t.used(pub, period) if limit else 0
+        word = "%s из %s %s" % (fmt_bytes(used), fmt_bytes(limit), PERIOD_WORD.get(period, "")) if limit else ""
+        if by_traffic and (not limit or used < limit):
+            if expired:
+                # Лимит отпустил, но истёк срок: блокировку держит уже он,
+                # и снимается она сроком
+                peers[i] = set_meta(b, "blocked_by", "")
+            else:
+                peers[i] = _unblock(b, suspend)
+                events.append("UNLIMIT\t%s\t%s" % (name, word or "лимит снят"))
+            changed = True
+        elif limit and used >= limit and aip != suspend:
+            peers[i] = _block(b, suspend, aip, "traffic")
+            changed = True
+            events.append("LIMIT\t%s\t%s\t%s" % (name, aip, word))
+        elif limit and used >= limit * 0.9 and aip != suspend:
+            mark = "%s:%d" % (t.period_key(period), limit)
+            if t.d["warned"].get(pub) != mark:
+                t.d["warned"][pub] = mark
+                events.append("WARN90\t%s\t%s" % (name, word))
+    if changed:
+        write_atomic(conf, head + "".join(peers))
+        print("CHANGED")
+    day_changed = time.strftime("%Y-%m-%d", time.localtime(t.saved)) != time.strftime("%Y-%m-%d")
+    if events or changed or day_changed or force_save == "1" or now - t.saved >= TRAFFIC_SAVE_EVERY:
+        t.save(alive)
+    del lock
+    for e in events:
+        print(e)
+
+
+def _traffic_lock(db):
+    """Таймер и вызовы API правят базу по очереди."""
+    import fcntl
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(db)), exist_ok=True)
+        f = open(db + ".lock", "a")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        return f
+    except OSError:
+        return None
+
+
+def cmd_limit_set(conf, db, name, size, period="month", transfer="", ifindex=""):
+    """Лимит клиенту: размер («50G»), off — снять. Лимит «всего» считается
+    с этой минуты; «за месяц» — с начала месяца. transfer — снимок
+    `awg show transfer`: прирост до этой минуты в новый отсчёт не попадает."""
+    if size != "off":
+        n = parse_size(size)
+        if n is None:
+            die("размер не распознан: %s (пример: 50G, 500M)" % size)
+        if period not in PERIOD_WORD:
+            die("период: month или total")
+    lock = _traffic_lock(db)
+    head, peers = split_peers(read(conf))
+    i = find_peer(peers, name=name)
+    if i < 0:
+        die("клиент %s не найден" % name, 2)
+    if size == "off":
+        peers[i] = set_meta(peers[i], "limit", "")
+        write_atomic(conf, head + "".join(peers))
+        return
+    pub = peer_field(peers[i], "PublicKey")
+    t = Traffic(db)
+    if transfer:
+        t.apply(_read_transfer(transfer), ifindex)
+    old, old_period = parse_limit(peer_meta(peers[i], "limit"))
+    if period == "total" and old_period != "total":
+        t.reset(pub, "total")
+    t.d["warned"].pop(pub, None)
+    t.save()
+    peers[i] = set_meta(peers[i], "limit", "%d/%s" % (n, period))
+    write_atomic(conf, head + "".join(peers))
+    del lock
+    print(fmt_bytes(n))
+
+
+def cmd_limit_reset(conf, db, name, transfer="", ifindex=""):
+    """Обнулить счётчик лимита (до конца периода)."""
+    lock = _traffic_lock(db)
+    _, peers = split_peers(read(conf))
+    i = find_peer(peers, name=name)
+    if i < 0:
+        die("клиент %s не найден" % name, 2)
+    limit, period = parse_limit(peer_meta(peers[i], "limit"))
+    if not limit:
+        die("у клиента %s нет лимита" % name)
+    t = Traffic(db)
+    if transfer:
+        t.apply(_read_transfer(transfer), ifindex)
+    t.reset(peer_field(peers[i], "PublicKey"), period)
+    t.save()
+    del lock
+
+
+def cmd_traffic_daily(conf, db, transfer, name="", days="30"):
+    """Трафик по дням: сервер целиком (с разбивкой по клиентам) или один
+    клиент. Несохранённый прирост счётчиков учитывается, база не пишется."""
+    try:
+        days = max(1, min(DAYS_KEEP, int(days)))
+    except ValueError:
+        days = 30
+    _, peers = split_peers(read(conf))
+    names = {peer_field(b, "PublicKey"): peer_name(b) for b in peers if peer_field(b, "PublicKey")}
+    t = Traffic(db)
+    t.apply(_read_transfer(transfer))
+    if name:
+        pubs = [p for p, n in names.items() if n == name]
+        if not pubs:
+            die("клиент %s не найден" % name, 2)
+    else:
+        pubs = sorted({p for v in t.d["days"].values() for p in v} | set(names))
+    dates, rx, tx = t.series(pubs, days)
+    out = {"name": name, "days": dates, "rx": rx, "tx": tx, "total": sum(rx) + sum(tx)}
+    if not name:
+        rows = []
+        for p, n in names.items():
+            _, r, s = t.series([p], days)
+            if sum(r) + sum(s):
+                rows.append({"name": n or p[:8], "rx": sum(r), "tx": sum(s)})
+        out["clients"] = sorted(rows, key=lambda c: -(c["rx"] + c["tx"]))
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def _wgobf_names(conf):
+    """wgobf0.conf: ключ клиента → имя из «# client=имя» в его [Peer]."""
+    names, name = {}, None
+    for line in read(conf).splitlines():
+        line = line.strip()
+        if line == "[Peer]":
+            name = None
+        elif line.startswith("# client="):
+            name = line[len("# client="):]
+        elif name and line.startswith("PublicKey") and "=" in line:
+            names[line.split("=", 1)[1].strip()] = name
+    return names
+
+
+def cmd_traffic_now(conf, transfer, wconf="", wtransfer=""):
+    """Счётчики awg0 сейчас — для живой скорости в панели: время (с долями
+    секунды) и {имя: [приём, отдача]}; клиенты WG + обфускатора (wgobf0) —
+    отдельно в wpeers, имена у них свои. Только чтение, база трафика не трогается."""
+    _, peers = split_peers(read(conf))
+    names = {peer_field(b, "PublicKey"): peer_name(b) for b in peers if peer_field(b, "PublicKey")}
+    out = {}
+    for pub, (rx, tx) in _read_transfer(transfer).items():
+        if pub in names:
+            out[names[pub] or pub[:8]] = [rx, tx]
+    wout = {}
+    if wconf and wtransfer and os.path.isfile(wconf):
+        wnames = _wgobf_names(wconf)
+        for pub, (rx, tx) in _read_transfer(wtransfer).items():
+            if pub in wnames:
+                wout[wnames[pub]] = [rx, tx]
+    print(json.dumps({"ts": round(time.time(), 3), "peers": out, "wpeers": wout}, ensure_ascii=False))
+
+
+def cmd_traffic_rows(conf, db, transfer):
+    """Для меню: имя, лимит (байт), период, использовано по лимиту, за
+    месяц, сегодня, причина блокировки — построчно через табуляцию."""
+    _, peers = split_peers(read(conf))
+    t = Traffic(db)
+    t.apply(_read_transfer(transfer))
+    today = time.strftime("%Y-%m-%d")
+    for b in peers:
+        pub = peer_field(b, "PublicKey")
+        if not pub:
+            continue
+        limit, period = parse_limit(peer_meta(b, "limit"))
+        by = peer_meta(b, "blocked_by") or ("expire" if peer_meta(b, "orig_ips") else "")
+        print("\t".join(str(x) for x in (
+            peer_name(b), limit, period, t.used(pub, period) if limit else 0, t.raw_used(pub, "month"),
+            sum((t.d["days"].get(today) or {}).get(pub) or [0, 0]), by)))
+
+
+def cmd_traffic_report(conf, db, transfer, days="14"):
+    """Трафик сервера по дням столбиками и клиенты за 30 дней — для меню."""
+    try:
+        days = max(1, min(DAYS_KEEP, int(days)))
+    except ValueError:
+        days = 14
+    _, peers = split_peers(read(conf))
+    names = {peer_field(b, "PublicKey"): peer_name(b) for b in peers if peer_field(b, "PublicKey")}
+    t = Traffic(db)
+    t.apply(_read_transfer(transfer))
+    pubs = sorted({p for v in t.d["days"].values() for p in v} | set(names))
+    dates, rx, tx = t.series(pubs, days)
+    top = max([a + b for a, b in zip(rx, tx)] + [1])
+    print("По дням (↓ от клиентов + ↑ к клиентам):")
+    for d, a, b in zip(dates, rx, tx):
+        bar = "▇" * int(round(28 * (a + b) / top)) if a + b else ""
+        print("  %s.%s  %-28s %s" % (d[8:], d[5:7], bar, fmt_bytes(a + b) if a + b else "—"))
+    print("  Итого за %d дн.: %s" % (days, fmt_bytes(sum(rx) + sum(tx))))
+    rows = []
+    for p, n in names.items():
+        _, r, s = t.series([p], 30)
+        if sum(r) + sum(s):
+            rows.append((sum(r) + sum(s), n or p[:8]))
+    if rows:
+        print("")
+        print("Клиенты за 30 дней:")
+        for total, n in sorted(rows, reverse=True)[:15]:
+            print("  %-24s %s" % (n, fmt_bytes(total)))
+
+
+def cmd_size_parse(text):
+    n = parse_size(text)
+    if n is None:
+        die("размер не распознан: %s" % text)
+    print(n)
 
 
 # ════════════════════════ сети ════════════════════════
@@ -715,13 +1137,115 @@ def apply_tls(ss, get, fallback_sni):
             tls[dst] = get(src)
     if get("alpn"):
         tls["alpn"] = get("alpn").split(",")
-    if str(get("allowInsecure") or "").lower() in ("1", "true"):
-        tls["allowInsecure"] = True
+    if str(get("allowInsecure") or get("insecure") or "").lower() in ("1", "true"):
+        _note_insecure()
     ss["realitySettings" if sec == "reality" else "tlsSettings"] = tls
+
+
+def _note_insecure():
+    """Xray 26 убрал allowInsecure: с ним отвергается весь конфиг. Вместо
+    него — pinSHA256 (отпечаток сертификата сервера) или настоящий сертификат."""
+    sys.stderr.write("NOTE:allowInsecure пропущен — Xray 26 его не принимает; самоподписанному "
+                     "сертификату нужен pinSHA256 в ссылке\n")
+
+
+def _port_num(value, proto):
+    """Порт из ссылки: только ASCII-цифры, 1–65535; пусто — 443. Иначе
+    Xray получал порт 0 или 99999 (и отвергал весь конфиг), а «443» из
+    не-ASCII цифр падал трассировкой."""
+    if value in (None, ""):
+        return 443
+    if isinstance(value, float) and value.is_integer():     # vmess: "port": 443.0
+        value = int(value)
+    value = str(value)
+    if not re.fullmatch(r"[0-9]{1,9}", value) or not 1 <= int(value) <= 65535:
+        die("%s: неверный порт: %s" % (proto, value))
+    return int(value)
+
+
+def _url_port(u, proto):
+    """Порт из urlparse; «:0», «:99999» и не-цифры — ошибка, а не 443."""
+    _, sep, port = u.netloc.rpartition("@")[2].rpartition(":")
+    if not sep or "]" in port:
+        return 443
+    return _port_num(port, proto)
 
 
 def tag_for(host):
     return "proxy_" + re.sub(r"[^A-Za-z0-9]", "_", host or "server")
+
+
+def _hy2_outbound(link):
+    """hysteria2:// → outbound Xray 26+: protocol hysteria (version 2) и
+    транспорт hysteria; пароль — auth, TLS — SNI, ALPN (h3), ECH, pinSHA256.
+    Обфускация salamander — finalmask, порт-хоппинг (mport) не переносится."""
+    u = urllib.parse.urlparse(link)
+    qs = urllib.parse.parse_qs(u.query)
+
+    def get(k):
+        return qs[k][0] if qs.get(k) else None
+    host = u.hostname or ""
+    auth = urllib.parse.unquote(u.username or "")
+    if u.password is not None:
+        auth += ":" + urllib.parse.unquote(u.password)
+    if not host or not auth:
+        die("hysteria2: в ссылке нет адреса или пароля")
+    port = _url_port(u, "hysteria2")
+    tls = {"serverName": get("sni") or host, "alpn": (get("alpn") or "h3").split(",")}
+    if get("pinSHA256"):
+        tls["pinnedPeerCertSha256"] = get("pinSHA256")
+    if get("ech"):
+        tls["echConfigList"] = get("ech")
+    if str(get("insecure") or "").lower() in ("1", "true") and not get("pinSHA256"):
+        _note_insecure()
+    ss = {"network": "hysteria", "hysteriaSettings": {"version": 2, "auth": auth},
+          "security": "tls", "tlsSettings": tls}
+    if get("obfs"):
+        if get("obfs") != "salamander":
+            sys.stderr.write("UNSUPPORTED:obfs=%s\n" % get("obfs"))
+            die("hysteria2: обфускация %s не поддерживается" % get("obfs"))
+        if not get("obfs-password"):
+            die("hysteria2: для salamander нужен obfs-password")
+        ss["finalmask"] = {"udp": [{"type": "salamander", "settings": {"password": get("obfs-password")}}]}
+    if get("mport"):
+        sys.stderr.write("NOTE:порт-хоппинг (mport=%s) не переносится — только порт %d\n" % (get("mport"), port))
+    return {"protocol": "hysteria", "tag": tag_for(host),
+            "settings": {"version": 2, "address": host, "port": port}, "streamSettings": ss}
+
+
+def _ss_outbound(link):
+    """ss:// — SIP002 (метод:пароль в base64 или открыто @хост:порт) и
+    старый формат (всё в base64). Плагины (obfs, v2ray-plugin) не переносятся."""
+    body = link[5:].split("#", 1)[0]
+    body, _, query = body.partition("?")
+    body = body.rstrip("/")
+
+    def b64(text):
+        text = urllib.parse.unquote(text)
+        try:
+            return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4)).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+    if "@" in body:
+        userinfo, hostport = body.rsplit("@", 1)
+        dec = b64(userinfo)
+        cred = dec if dec and ":" in dec else urllib.parse.unquote(userinfo)
+    else:
+        dec = b64(body) or ""
+        if "@" not in dec:
+            die("ss: ссылка не разобрана")
+        cred, hostport = dec.rsplit("@", 1)
+    method, _, password = cred.partition(":")
+    host, _, port = hostport.rpartition(":")
+    host = host.strip("[]")
+    if not (method and password and host and port):
+        die("ss: нужен метод, пароль, адрес и порт")
+    port = _port_num(port, "ss")
+    if "plugin=" in query:
+        sys.stderr.write("UNSUPPORTED:ss-plugin\n")
+        die("ss: плагины (obfs, v2ray-plugin) не поддерживаются")
+    return {"protocol": "shadowsocks", "tag": tag_for(host),
+            "settings": {"servers": [{"address": host, "port": port, "method": method, "password": password}]}}
 
 
 def cmd_xray_link(link):
@@ -734,7 +1258,7 @@ def cmd_xray_link(link):
             return qs[k][0] if qs.get(k) else None
         host = u.hostname or ""
         ob = {"protocol": "vless", "tag": tag_for(host),
-              "settings": {"vnext": [{"address": host, "port": u.port or 443,
+              "settings": {"vnext": [{"address": host, "port": _url_port(u, "vless"),
                                       "users": [{"id": urllib.parse.unquote(u.username or ""),
                                                  "encryption": get("encryption") or "none",
                                                  "flow": get("flow") or ""}]}]},
@@ -751,29 +1275,35 @@ def cmd_xray_link(link):
             return str(v) if v not in (None, "") else None
         host = str(data.get("add") or "")
         ob = {"protocol": "vmess", "tag": tag_for(host),
-              "settings": {"vnext": [{"address": host, "port": int(data.get("port") or 443),
+              "settings": {"vnext": [{"address": host, "port": _port_num(data.get("port"), "vmess"),
                                       "users": [{"id": data.get("id"),
                                                  "alterId": int(data.get("aid") or 0),
                                                  "security": data.get("scy") or "auto"}]}]},
               "streamSettings": {"network": data.get("net") or "tcp",
                                  "security": data.get("tls") or "none"}}
-    elif link.startswith(("hysteria2://", "hy2://")):
+    elif link.startswith("trojan://"):
         u = urllib.parse.urlparse(link)
         qs = urllib.parse.parse_qs(u.query)
-        st = {"server": u.hostname, "port": u.port or 443,
-              "password": urllib.parse.unquote(u.username or "")}
-        if qs.get("sni"):
-            st["serverName"] = qs["sni"][0]
-        if qs.get("insecure"):
-            st["insecure"] = qs["insecure"][0] == "1"
-        if qs.get("obfs"):
-            st["obfs"] = {"type": qs["obfs"][0]}
-            if qs.get("obfs-password"):
-                st["obfs"]["password"] = qs["obfs-password"][0]
-        print(json.dumps({"protocol": "hysteria2", "tag": tag_for(u.hostname), "settings": st}))
+
+        def get(k):
+            return qs[k][0] if qs.get(k) else None
+        host = u.hostname or ""
+        # Пароль trojan — вся часть до «@»: «p:a@host» — это пароль «p:a»
+        password = urllib.parse.unquote(u.username or "")
+        if u.password is not None:
+            password += ":" + urllib.parse.unquote(u.password)
+        ob = {"protocol": "trojan", "tag": tag_for(host),
+              "settings": {"servers": [{"address": host, "port": _url_port(u, "trojan"),
+                                        "password": password}]},
+              "streamSettings": {"network": get("type") or "tcp", "security": get("security") or "tls"}}
+    elif link.startswith("ss://"):
+        print(json.dumps(_ss_outbound(link)))
+        return
+    elif link.startswith(("hysteria2://", "hy2://")):
+        print(json.dumps(_hy2_outbound(link)))
         return
     else:
-        die("поддерживаются vless://, vmess://, hysteria2://")
+        die("поддерживаются vless://, vmess://, trojan://, ss://, hysteria2://")
     apply_transport(ob["streamSettings"], ob["streamSettings"]["network"], get)
     apply_tls(ob["streamSettings"], get, host)
     print(json.dumps(ob))
@@ -799,9 +1329,11 @@ def cmd_xray_add(path):
         die("outbound %s уже есть" % ob.get("tag"), 3)
     at = next((i for i, o in enumerate(outs) if o.get("protocol") == "freedom"), len(outs))
     outs.insert(at, ob)
-    # Новая ссылка становится активным выходом, если балансировщик не включён
+    # Новая ссылка становится выходом по умолчанию, если балансировщик не
+    # включён; клиенты со своим выходом остаются на нём
     for r in conf.get("routing", {}).get("rules", []):
-        if set(r.get("inboundTag") or []) & KNOWN_IN and not r.get("balancerTag"):
+        if set(r.get("inboundTag") or []) & KNOWN_IN and not r.get("balancerTag") \
+                and r.get("ruleTag") != XRAY_CLIENT_RULE:
             r["outboundTag"] = ob["tag"]
     jsave(path, conf)
 
@@ -810,6 +1342,71 @@ def cmd_xray_del(path, *tags):
     conf = jload(path)
     conf["outbounds"] = [o for o in conf.get("outbounds", []) if o.get("tag") not in tags]
     jsave(path, conf)
+
+
+XRAY_RESTORE_KEEP = ("outbounds", "routing", "observatory")
+
+
+def _shown(v, n=40):
+    """Имя из чужого файла — для вывода в терминал и бот: без управляющих
+    символов и обратной косой (warn печатает через echo -e)."""
+    return re.sub(r"[\x00-\x1f\x7f\\]", "?", str(v))[:n]
+
+
+def cmd_xray_restore_clean(path):
+    """Конфиг Xray из бэкапа (бэкап мог прийти чужой, Xray работает от root):
+    остаются выходы, маршрутизация и observatory — то, что пишет сама Тулза.
+    Входы пересоберёт xray-prepare (SOCKS только на 127.0.0.1); api, stats,
+    reverse, log и прочие разделы, правила чужих входов и правила на
+    несуществующие выходы — убираются. Правила своего входа tun с чужим тегом
+    переводятся на tun-in: входов в конфиге уже нет, и xray-prepare их бы не
+    узнал. Кривые записи (не объект, тег — не строка) — тоже убираются, а не
+    роняют разбор всего конфига. Печатает, что убрано."""
+    conf = jload(path)
+    if not isinstance(conf, dict):
+        die("не объект JSON")
+    is_tag = lambda v: isinstance(v, str) and v != ""          # noqa: E731
+    as_list = lambda v: v if isinstance(v, list) else []       # noqa: E731
+    outs = [o for o in as_list(conf.get("outbounds"))
+            if isinstance(o, dict) and (o.get("tag") is None or is_tag(o.get("tag")))]
+    tags = {o["tag"] for o in outs if is_tag(o.get("tag"))}
+    if not any(is_tag(o.get("tag")) and o.get("protocol") not in SKIP_PROTO for o in outs):
+        die("нет выходов")
+    inbounds = [i for i in as_list(conf.get("inbounds")) if isinstance(i, dict)]
+    tun_tags = {i["tag"] for i in inbounds if i.get("protocol") == "tun" and is_tag(i.get("tag"))}
+    known = KNOWN_IN | tun_tags
+    routing = conf.get("routing") if isinstance(conf.get("routing"), dict) else {}
+    balancers = [b for b in as_list(routing.get("balancers")) if isinstance(b, dict) and is_tag(b.get("tag"))]
+    btags = {b["tag"] for b in balancers}
+    rules, dropped_rules = [], 0
+    for r in as_list(routing.get("rules")):
+        inb = r.get("inboundTag") if isinstance(r, dict) else None
+        ot = r.get("outboundTag") if isinstance(r, dict) else None
+        bt = r.get("balancerTag") if isinstance(r, dict) else None
+        if (not isinstance(r, dict)
+                or (inb and not (isinstance(inb, list) and all(is_tag(t) for t in inb) and set(inb) & known))
+                or (ot and not (is_tag(ot) and ot in tags))
+                or (bt and not (is_tag(bt) and bt in btags))):
+            dropped_rules += 1
+            continue
+        if inb:
+            r["inboundTag"] = list(dict.fromkeys("tun-in" if t in tun_tags else t for t in inb))
+        rules.append(r)
+    clean = {"inbounds": [], "outbounds": outs,
+             "routing": {"domainStrategy": routing.get("domainStrategy") if is_tag(routing.get("domainStrategy"))
+                         else "AsIs", "rules": rules}}
+    if balancers:
+        clean["routing"]["balancers"] = balancers
+    if isinstance(conf.get("observatory"), dict):
+        clean["observatory"] = conf["observatory"]
+    foreign = [_shown(i.get("tag") or i.get("protocol") or "?") for i in inbounds
+               if not (is_tag(i.get("tag")) and i["tag"] in KNOWN_IN) and i.get("protocol") != "tun"]
+    gone = ["входы: " + ", ".join(foreign)] if foreign else []
+    gone += sorted(_shown(k) for k in conf if k not in XRAY_RESTORE_KEEP + ("inbounds",))
+    if dropped_rules:
+        gone.append("правил: %d" % dropped_rules)
+    jsave(path, clean)
+    print("; ".join(gone))
 
 
 def cmd_xray_tags(path):
@@ -863,8 +1460,7 @@ def cmd_xray_balancer(path, strategy):
     tags = proxy_tags(conf)
     routing = conf.setdefault("routing", {})
     rules = routing.setdefault("rules", [])
-    rule = next((r for r in rules if r.get("balancerTag") == "balancer"), None) \
-        or next((r for r in rules if set(r.get("inboundTag") or []) & KNOWN_IN), None)
+    rule = next((r for r in rules if r.get("balancerTag") == "balancer"), None) or _xray_main_rule(rules)
     if strategy == "off":
         routing.pop("balancers", None)
         conf.pop("observatory", None)
@@ -922,12 +1518,51 @@ def cmd_xray_ru(path, mode):
     jsave(path, conf)
 
 
-def cmd_xray_prepare(path, mode):
+XRAY_CLIENT_RULE = "client-out"
+
+
+def _xray_main_rule(rules):
+    """Правило, ведущее весь вход туннеля в выход по умолчанию или балансировщик."""
+    return next((r for r in rules if set(r.get("inboundTag") or []) & KNOWN_IN
+                 and r.get("ruleTag") != XRAY_CLIENT_RULE), None)
+
+
+def cmd_xray_main(path, tag):
+    """Выход по умолчанию для клиентов без своего выхода; балансировщик выключается."""
+    conf = jload(path)
+    if tag not in proxy_tags(conf):
+        die("выхода %s нет" % tag, 2)
+    routing = conf.setdefault("routing", {})
+    rules = routing.setdefault("rules", [])
+    routing.pop("balancers", None)
+    conf.pop("observatory", None)
+    rule = _xray_main_rule(rules)
+    if rule is None:
+        rule = {"type": "field", "inboundTag": ["socks-in"]}
+        rules.append(rule)
+    rule.pop("balancerTag", None)
+    rule["outboundTag"] = tag
+    jsave(path, conf)
+
+
+def cmd_xray_main_get(path):
+    rule = _xray_main_rule(jload(path).get("routing", {}).get("rules", []))
+    print("balancer" if rule and rule.get("balancerTag") else (rule or {}).get("outboundTag", ""))
+
+
+def cmd_xray_prepare(path, mode, peers=""):
     """Привести конфиг к режиму входа: native (inbound tun в самом Xray) или
     tun2socks (только SOCKS на 127.0.0.1:10808, xray0 поднимает tun2socks).
     Заодно чинит висячие ссылки на удалённые outbounds и балансировщик —
-    с ними Xray отвергает конфиг целиком."""
+    с ними Xray отвергает конфиг целиком.
+
+    peers — список клиентов Xray («IP» или «IP|выход»): клиентам со своим
+    выходом — правила по адресу (source) перед общим правилом. Только для
+    native: inbound tun видит адрес клиента (перед xray0 нет NAT), а через
+    tun2socks все соединения приходят с 127.0.0.1."""
     conf = jload(path)
+    conf.setdefault("routing", {})["rules"] = [r for r in conf["routing"].get("rules") or []
+                                               if r.get("ruleTag") != XRAY_CLIENT_RULE]
     inb = [i for i in conf.get("inbounds") or []
            if not (i.get("tag") == "xray0" and i.get("protocol") == "dokodemo-door")]
     socks = next((i for i in inb if i.get("tag") == "socks-in"), None)
@@ -938,13 +1573,19 @@ def cmd_xray_prepare(path, mode):
     socks["listen"] = "127.0.0.1"
     socks["port"] = socks.get("port") or 10808
     tun = next((i for i in inb if i.get("protocol") == "tun"), None)
+    # Тег входа tun — всегда свой: с чужим («tun» из правленного руками или
+    # восстановленного конфига) общее правило переставало узнаваться, и
+    # каждый проход дописывал новое, а старое продолжало вести в прежний выход
+    known = set(KNOWN_IN)
+    if tun is not None and tun.get("tag"):
+        known.add(tun["tag"])
     if mode == "native":
         if tun is None:
             tun = {"protocol": "tun", "tag": "tun-in",
                    "settings": {"mtu": 1200, "stack": "gvisor", "address": ["172.16.250.1/30"]},
                    "sniffing": SNIFF}
             inb.insert(0, tun)
-        tun["tag"] = tun.get("tag") or "tun-in"
+        tun["tag"] = "tun-in"
         want = tun["tag"]
     else:
         inb = [i for i in inb if i.get("protocol") != "tun"]
@@ -957,7 +1598,7 @@ def cmd_xray_prepare(path, mode):
     touched = False
     for r in rules:
         tags = r.get("inboundTag")
-        if isinstance(tags, list) and any(t in KNOWN_IN for t in tags):
+        if isinstance(tags, list) and any(t in known for t in tags):
             r["inboundTag"] = [want]
             touched = True
     ptags = proxy_tags(conf)
@@ -990,7 +1631,19 @@ def cmd_xray_prepare(path, mode):
                 r["outboundTag"] = ptags[0]
             else:
                 r.pop("outboundTag", None)
-    routing["rules"] = [r for r in rules if r.get("outboundTag") or r.get("balancerTag")]
+    rules = [r for r in rules if r.get("outboundTag") or r.get("balancerTag")]
+    lst = _peers_list(peers) if peers and mode == "native" else None
+    if lst:
+        by_tag = {}
+        for ip, tag in lst.items():
+            if tag in existing and tag in ptags:
+                by_tag.setdefault(tag, []).append(ip)
+        main = _xray_main_rule(rules)
+        at = rules.index(main) if main in rules else len(rules)
+        rules[at:at] = [{"type": "field", "ruleTag": XRAY_CLIENT_RULE, "inboundTag": [want],
+                         "source": sorted(ips, key=lambda x: [int(p) for p in x.split(".")] if x.count(".") == 3 else [0]),
+                         "outboundTag": tag} for tag, ips in by_tag.items()]
+    routing["rules"] = rules
     jsave(path, conf)
 
 
@@ -1162,8 +1815,9 @@ def _first_ip(value):
     return value.split(",")[0].split("/")[0].strip()
 
 
-def cmd_clients_json(conf, dump, client_dir, warp, xray, exits):
-    """Клиенты awg0 со статистикой `awg show dump` и туннелями — для бота."""
+def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
+    """Клиенты awg0 со статистикой `awg show dump`, туннелями и трафиком за
+    месяц и по лимиту — для бота."""
     _, peers = split_peers(read(conf))
     stats = {}
     try:
@@ -1173,6 +1827,10 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits):
                 stats[f[0]] = f
     except OSError:
         pass
+    traffic = Traffic(db) if db else None
+    if traffic:
+        traffic.apply({k: (int(f[5]), int(f[6])) for k, f in stats.items() if f[5].isdigit() and f[6].isdigit()})
+    today = time.strftime("%Y-%m-%d")
     now = int(time.time())
     tunnels = {"warp": _peers_list(warp), "xray": _peers_list(xray), "exit": _peers_list(exits)}
     rows = []
@@ -1201,6 +1859,13 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits):
             "rx": int(s[5]) if s[5].isdigit() else 0, "tx": int(s[6]) if s[6].isdigit() else 0,
             "endpoint": "" if s[2] in ("", "(none)") else s[2], "file": path,
         }
+        limit, period = parse_limit(peer_meta(b, "limit"))
+        by = peer_meta(b, "blocked_by")
+        row.update(limit=limit or None, period=period or None,
+                   blocked_by=(by or "expire") if orig else None,
+                   used=traffic.used(pub, period) if traffic and limit else None,
+                   month=traffic.raw_used(pub, "month") if traffic else None,
+                   today=sum((traffic.d["days"].get(today) or {}).get(pub) or [0, 0]) if traffic else None)
         for t, lst in tunnels.items():
             if lst is None:
                 row[t] = None
@@ -1208,6 +1873,8 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits):
                 row[t] = (lst[ip] or "shared") if ip in lst else "off"
             else:
                 row[t] = ip in lst
+        # Свой выход Xray клиента (пусто — выход по умолчанию)
+        row["xray_out"] = (tunnels["xray"] or {}).get(ip) or ""
         rows.append(row)
     print(json.dumps(rows, ensure_ascii=False))
 
@@ -1510,10 +2177,11 @@ def cmd_mod_compat_patch(src):
     print("patched")
 
 
-def cmd_changelog_json(current):
+def cmd_changelog_json(current, available=None):
     """CHANGELOG.md из stdin → разделы для экрана «Обновление»: новее
     установленной версии (сверху самая новая, не больше десяти), а если
-    новее нет — раздел текущей. Заголовок раздела: «## v1.1.1 — дата (бот 3.1.0)»."""
+    новее нет — раздел текущей. Заголовок раздела: «## v1.1.1 — дата (бот 3.1.0)».
+    available — версия к обновлению по свежему кэшу проверки (пусто — новее нет)."""
     sections, cur = [], None
     for line in sys.stdin.read().replace("\r", "").split("\n"):
         m = CL_HEAD.match(line)
@@ -1531,7 +2199,10 @@ def cmd_changelog_json(current):
     newer = sorted((s for s in sections if _ver_tuple(s["version"]) > now),
                    key=lambda s: _ver_tuple(s["version"]), reverse=True)[:10]
     shown = newer or [s for s in sections if _ver_tuple(s["version"]) == now][:1]
-    print(json.dumps({"current": current, "newer": bool(newer), "sections": shown}, ensure_ascii=False))
+    out = {"current": current, "newer": bool(newer), "sections": shown}
+    if available is not None:
+        out["available"] = available
+    print(json.dumps(out, ensure_ascii=False))
 
 
 def cmd_safe_untar(archive, dest):
@@ -1564,6 +2235,18 @@ def cmd_safe_untar(archive, dest):
         die("в архиве нет файлов")
 
 
+def cmd_web_hash():
+    """Пароль веб-панели (stdin) → scrypt-хеш в формате awgbot.web.hash_password."""
+    import base64
+    import hashlib
+    pw = sys.stdin.read()
+    if not pw:
+        die("пустой пароль")
+    salt = os.urandom(16)
+    dk = hashlib.scrypt(pw.encode(), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
+    print("scrypt$%d$%d$%d$%s$%s" % (2 ** 14, 8, 1, base64.b64encode(salt).decode(), base64.b64encode(dk).decode()))
+
+
 COMMANDS = {
     "peers": cmd_peers, "meta-set": cmd_meta_set, "peer-del": cmd_peer_del,
     "peer-rename": cmd_peer_rename, "peers-clear": cmd_peers_clear,
@@ -1571,15 +2254,20 @@ COMMANDS = {
     "i-replace": cmd_i_replace,
     "expire-set": cmd_expire_set, "expire-clear": cmd_expire_clear,
     "expire-check": cmd_expire_check,
+    "traffic-tick": cmd_traffic_tick, "traffic-daily": cmd_traffic_daily, "traffic-now": cmd_traffic_now,
+    "traffic-rows": cmd_traffic_rows, "traffic-report": cmd_traffic_report,
+    "limit-set": cmd_limit_set, "limit-reset": cmd_limit_reset, "size-parse": cmd_size_parse,
+    "web-hash": cmd_web_hash,
     "net-of": cmd_net_of, "pick-net": cmd_pick_net, "net-overlaps": cmd_net_overlaps,
     "allowed-except": cmd_allowed_except,
     "rand-key": cmd_rand_key, "phobos-link": cmd_phobos_link, "exit-conf-fix": cmd_exit_conf_fix,
     "conf-hooks": cmd_conf_hooks, "mod-compat-patch": cmd_mod_compat_patch,
     "xray-link": cmd_xray_link, "xray-default": cmd_xray_default, "xray-add": cmd_xray_add,
-    "xray-del": cmd_xray_del, "xray-tags": cmd_xray_tags, "xray-probe": cmd_xray_probe,
+    "xray-del": cmd_xray_del, "xray-tags": cmd_xray_tags, "xray-restore-clean": cmd_xray_restore_clean, "xray-probe": cmd_xray_probe,
     "xray-probe-tag": cmd_xray_probe_tag, "xray-tun-probe": cmd_xray_tun_probe,
     "xray-test-copy": cmd_xray_test_copy,
     "xray-balancer": cmd_xray_balancer, "xray-balancer-get": cmd_xray_balancer_get,
+    "xray-main": cmd_xray_main, "xray-main-get": cmd_xray_main_get,
     "xray-ru": cmd_xray_ru, "xray-prepare": cmd_xray_prepare,
     "pcap-analyze": cmd_pcap_analyze, "safe-untar": cmd_safe_untar,
     "cert-find": cmd_cert_find, "changelog-json": cmd_changelog_json,
@@ -1589,7 +2277,7 @@ COMMANDS = {
     "tg-targets": cmd_tg_targets,
 }
 
-if __name__ == "__main__":
+def main():
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         die("команда: " + ", ".join(sorted(COMMANDS)))
     # Байты не-UTF-8 из конфига (surrogateescape в read) печатаем как «?», а не падаем
@@ -1600,3 +2288,7 @@ if __name__ == "__main__":
         die("неверные аргументы %s: %s" % (sys.argv[1], e))
     except (OSError, ValueError) as e:
         die("%s: %s" % (sys.argv[1], e))
+
+
+if __name__ == "__main__":
+    main()

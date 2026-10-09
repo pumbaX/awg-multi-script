@@ -18,9 +18,10 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from aiogram.types import BotCommand, CallbackQuery, ChatMemberUpdated, ErrorEvent, Message
 
-from . import __version__, access, admins, api, ask, icons, jobs, monitor, net, store, ui, webapp
+from . import __version__, access, admins, alerts, api, ask, icons, jobs, monitor, net, store, ui, webapp
 from .config import load_config
-from .sections import backup, botself, clients, diag, main as main_menu, server, system, tunnels, wgobf
+from .sections import (antiscan, backup, botself, clients, diag, main as main_menu, server, system, tunnels,
+                       webpanel, wgobf)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("awgbot")
@@ -78,7 +79,8 @@ def build(session: BaseSession | None = None) -> tuple[Bot, Dispatcher]:
     dp.my_chat_member.register(_leave_groups)
     dp.errors.register(_on_error)
     dp.include_routers(main_menu.router, ask.router, server.router, clients.router, diag.router,
-                       backup.router, tunnels.router, botself.router, system.router, wgobf.router, fallback)
+                       backup.router, tunnels.router, botself.router, system.router, wgobf.router,
+                       webpanel.router, antiscan.router, fallback)
     return bot, dp
 
 
@@ -112,6 +114,7 @@ async def main() -> None:
             await bot.set_my_commands([BotCommand(command="start", description="Главное меню")])
         await restore(bot)
         tasks.append(asyncio.create_task(monitor.loop(bot), name="monitor"))
+        tasks.append(asyncio.create_task(alerts.loop(bot), name="alerts"))
         try:
             await webapp.SERVER.start(bot)
         except Exception:                                   # noqa: BLE001

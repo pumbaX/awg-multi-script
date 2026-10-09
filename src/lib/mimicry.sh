@@ -4,8 +4,8 @@
 # Цепочка I1-I5 — клиентская: у каждого устройства своя, сервер её не видит.
 # Поэтому у выданного клиента профиль мимикрии можно сменить, не трогая сервер.
 
-# Пулы доменов. Свой домен пользователя всегда лучше встроенного: пул одинаков
-# у всех, кто пользуется скриптом. Проверяются на доступность перед выдачей.
+# Пулы доменов — по региону сервера: российские сайты для сервера в РФ,
+# мировые — для остальных. Проверяются на доступность перед выдачей.
 CPS_DOMAINS=(
   yastatic.net mc.yandex.ru avatars.mds.yandex.net ok.ru st.mycdn.me vk.ru
   kinopoisk.ru hh.ru 2gis.ru lenta.ru mos.ru citilink.ru
@@ -181,6 +181,12 @@ choose_cps_budget() {
   case "$c" in 1) CPS_BUDGET=1500 ;; 2) CPS_BUDGET=3000 ;; *) CPS_BUDGET=$CPS_HARD_LIMIT ;; esac
 }
 
+# Регион для пула доменов: при создании сервера — выбранный в мастере
+# (конфига ещё нет), потом — из конфига.
+mimicry_region() {
+  if server_exists; then server_region; else echo "${S_REGION:-world}"; fi
+}
+
 # Один домен на всю цепочку: настоящий клиент за одно рукопожатие ходит на
 # один хост. Результат — CPS_DOMAIN (пусто = генератор возьмёт свой).
 choose_cps_domain() {
@@ -193,12 +199,13 @@ choose_cps_domain() {
   else
     echo ""
     hdr "Домен мимикрии (один на все I1-I5)"
-    echo -e "  ${G}1${N} Ввести свой ${C}(рекомендуется)${N}"
-    echo -e "  ${G}2${N} Из встроенного пула"
-    echo -e "  ${D}  Свой — живой сайт, куда ходят с устройства клиента.${N}"
+    echo -e "  ${G}1${N} Автоматически ${C}(рекомендуется)${N}"
+    echo -e "  ${D}    доступный сайт из пула: $([[ "$(mimicry_region)" == ru ]] && echo "российские" || echo "мировые") — по региону сервера${N}"
+    echo -e "  ${G}2${N} Ввести свой"
+    echo -e "  ${D}    живой сайт, куда ходят с устройства клиента${N}"
     [[ "$MIMICRY" == *quic ]] && echo -e "  ${Y}  Для QUIC сайт должен отдавать HTTP/3.${N}"
     read_choice c "${C}  Выбор [1-2] (Enter = 1): ${N}" 1 2 1
-    [[ "$c" == 2 ]] && ask_own=0
+    [[ "$c" == 1 ]] && ask_own=0
   fi
   if (( ask_own )); then
     while true; do
@@ -220,9 +227,10 @@ mimicry_pool_domain() {
   local kind pool=()
   case "$MIMICRY" in
     quic|curl_quic) kind=quic; pool=("${QUIC_DOMAINS[@]}")
-                    [[ "$(server_region)" == ru ]] && pool+=("${QUIC_DOMAINS_RU[@]}") ;;
+                    [[ "$(mimicry_region)" == ru ]] && pool+=("${QUIC_DOMAINS_RU[@]}") ;;
     sip) kind=sip; pool=("${SIP_DOMAINS[@]}") ;;
-    *) kind=tls; pool=("${CPS_DOMAINS[@]}") ;;
+    *) kind=tls
+       if [[ "$(mimicry_region)" == ru ]]; then pool=("${CPS_DOMAINS[@]}"); else pool=("${TLS_DOMAINS[@]}"); fi ;;
   esac
   info "Проверяю доступность доменов пула..."
   scan_domains "$kind" "${pool[@]}"

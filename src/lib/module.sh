@@ -79,6 +79,31 @@ mod_stale() {
   (( newest > 0 && kt > 0 && newest > kt ))
 }
 
+# Ядра, в которые сервер может загрузиться (работающее и новее), без
+# собранного модуля — после перезагрузки в такое ядро awg0 не поднимется.
+# Так бывает, когда apt поставил новое ядро, а DKMS не смог собрать под него
+# модуль (Ubuntu 7.0.0-38) или заголовков к нему нет. Строки «ядро» или
+# «ядро нет-заголовков»; пусто — всё в порядке.
+kernel_gap() {
+  local k running
+  command -v dkms &>/dev/null && [[ -d "$MOD_SRC_DIR" ]] || return 0
+  running=$(uname -r)
+  for k in $(installed_kernels); do
+    [[ "$(printf '%s\n%s\n' "$running" "$k" | sort -V | head -1)" == "$running" ]] || continue
+    mod_built_for "$k" && continue
+    [[ "$k" == "$running" ]] && mod_loaded && continue
+    if [[ -d "/lib/modules/$k/build" ]]; then echo "$k"; else echo "$k нет-заголовков"; fi
+  done
+}
+
+# Одной строкой для сводок: «6.8.0-150» или «6.8.0-150 (нет заголовков)».
+# others — без работающего ядра (о нём говорит reboot_reason).
+kernel_gap_line() {  # [others]
+  local skip=""
+  [[ "${1:-}" == others ]] && skip=$(uname -r)
+  kernel_gap | awk -v r="$skip" 'r == "" || $1 != r' | sed 's/ нет-заголовков$/ (нет заголовков)/' | paste -sd, - | sed 's/,/, /g'
+}
+
 # Почему нужна перезагрузка (сервера или модуля). Пусто — не нужна.
 reboot_reason() {
   local running newest
@@ -98,37 +123,51 @@ reboot_reason() {
   fi
 }
 
+# Чего не хватает для версии $1 (3.0 | 3.1) — по надёжным признакам:
+# components — awg не установлен; tools — amneziawg-tools не знают её ключа
+# (они сами разбирают конфиг); module — модуль на диске собран из тега без неё;
+# check — признаков «нет» нет, решает проба (proto_supported).
+proto_why() {  # версия
+  local key=HeaderProtectionKey fam
+  [[ "$1" == 3.1 ]] && key=RandomTrailers
+  command -v awg &>/dev/null || { echo components; return 0; }
+  grep -qa "$key" "$(command -v awg)" || { echo tools; return 0; }
+  fam=$(tag_family "$(mod_tag)")
+  if [[ -n "$fam" ]] && [[ "$fam" == 2.0 || ( "$1" == 3.1 && "$fam" == 3.0 ) ]]; then echo module; return 0; fi
+  echo check
+}
+
 # Умеют ли компоненты версию протокола $1 (3.0 | 3.1).
 # 0 — да, 1 — точно нет, 2 — подтвердить не удалось.
 # «Нет» говорим только по надёжным признакам: tools не знают ключа (они сами
 # разбирают конфиг) или модуль на диске собран из тега без поддержки.
 _PROTO_PROBE=()
 proto_supported() {
-  local proto="$1" key val fam rc dev tmp
+  local proto="$1" key val rc dev tmp
   [[ -n "${_PROTO_PROBE[${proto//./}]:-}" ]] && return "${_PROTO_PROBE[${proto//./}]}"
   case "$proto" in
     3.1) key=RandomTrailers; val=on ;;
     *)   key=HeaderProtectionKey; val="" ;;
   esac
   rc=2
-  if ! command -v awg &>/dev/null || ! grep -qa "$key" "$(command -v awg)"; then
+  if [[ "$(proto_why "$proto")" != check ]]; then
     rc=1
+  elif awg showconf "$AWG_IF" 2>/dev/null | grep -q "^$key"; then
+    rc=0
   else
-    fam=$(tag_family "$(mod_tag)")
-    if [[ -n "$fam" ]] && [[ "$fam" == 2.0 || ( "$proto" == 3.1 && "$fam" == 3.0 ) ]]; then
-      rc=1
-    elif awg showconf "$AWG_IF" 2>/dev/null | grep -q "^$key"; then
-      rc=0
-    else
-      dev="awgprb$$"
-      if ip link add dev "$dev" type amneziawg 2>/dev/null; then
-        tmp=$(mktemp)
-        [[ -n "$val" ]] || val=$(awg genkey)
-        printf '[Interface]\nPrivateKey = %s\n%s = %s\n' "$(awg genkey)" "$key" "$val" > "$tmp"
-        awg setconf "$dev" "$tmp" &>/dev/null && rc=0
-        rm -f "$tmp"
-        ip link del dev "$dev" &>/dev/null || true
-      fi
+    # Проба, прерванная раньше (тайм-аут бота, kill), оставляла интерфейс
+    for dev in $(ip -o link show type amneziawg 2>/dev/null | awk -F': ' '{sub(/@.*/, "", $2); print $2}'); do
+      [[ "$dev" =~ ^awgprb([0-9]+)$ ]] && ! kill -0 "${BASH_REMATCH[1]}" 2>/dev/null \
+        && ip link del dev "$dev" &>/dev/null
+    done
+    dev="awgprb$BASHPID"
+    if ip link add dev "$dev" type amneziawg 2>/dev/null; then
+      tmp=$(mktemp)
+      [[ -n "$val" ]] || val=$(awg genkey)
+      printf '[Interface]\nPrivateKey = %s\n%s = %s\n' "$(awg genkey)" "$key" "$val" > "$tmp"
+      awg setconf "$dev" "$tmp" &>/dev/null && rc=0
+      rm -f "$tmp"
+      ip link del dev "$dev" &>/dev/null || true
     fi
   fi
   _PROTO_PROBE[${proto//./}]=$rc
@@ -190,12 +229,19 @@ tools_update_available() {
 
 # Строка состояния для шапки меню.
 components_summary() {
-  local tag upd reason
+  local tag upd reason gap
   command -v awg &>/dev/null || { echo -e "${R}не установлены${N} ${D}— Сервер → Установить компоненты${N}"; return; }
   tag=$(mod_tag)
   reason=$(reboot_reason)
   upd=$(mod_update_available)
-  if [[ -n "$reason" ]]; then
+  # Работающее ядро без модуля — это reboot_reason; но и оно не должно
+  # прятать более новое ядро без модуля (раньше — проверка по префиксу)
+  gap=$(kernel_gap_line others)
+  if [[ -n "$gap" ]]; then
+    echo -e "${R}${tag:-?} ▲ ядро $gap без модуля AWG${N} ${D}— после перезагрузки VPN не поднимется:${N}"
+    echo -e "               ${D}Сервер → Модуль ядра → 5) Пересобрать${N}"
+    [[ -n "$reason" ]] && echo -e "               ${Y}▲ ${reason}${N}"
+  elif [[ -n "$reason" ]]; then
     echo -e "${Y}${tag:-?} ▲ ${reason}${N}"
   elif [[ -n "$upd" ]]; then
     echo -e "${W}${tag}${N} ${G}⬆ есть $upd${N} ${D}— Сервер → Модуль ядра${N}"
@@ -236,6 +282,7 @@ components_report() {
 
   for k in $(installed_kernels); do
     s="${R}✗ не собран${N}"
+    [[ -n "$(kernel_gap | awk -v k="$k" '$1 == k')" ]] && s="${R}✗ не собран — пункт 5${N}"
     mod_built_for "$k" && s="${G}✓ собран${N}"
     [[ -d "/lib/modules/$k/build" ]] || s+=" ${D}(нет заголовков)${N}"
     [[ "$k" == "$running" ]] && s+=" ${D}← работает${N}"
@@ -441,7 +488,7 @@ mod_reload() {
 
   cmd="for u in $units; do systemctl stop \"\$u\"; done
 for i in $ifaces; do ip link show \"\$i\" >/dev/null 2>&1 && { awg-quick down \"\$i\" 2>/dev/null || ip link del \"\$i\"; }; done
-rmmod $MOD_NAME || exit 3
+rmmod $MOD_NAME || { for u in $units; do systemctl start \"\$u\"; done; exit 3; }
 modprobe $MOD_NAME || exit 4
 for u in $units; do systemctl start \"\$u\"; done
 exit 0"
@@ -458,7 +505,7 @@ exit 0"
   mod_log "перезагрузка модуля rc=$rc: $(tr '\n' ';' <<< "$out")"
   case $rc in
     0) _PROTO_PROBE=(); ok "Модуль перезагружен, в памяти новая сборка" ;;
-    3) err "rmmod не выгрузил модуль — его держит ещё какой-то интерфейс"
+    3) err "rmmod не выгрузил модуль — его держит ещё какой-то интерфейс; туннели подняты на прежней сборке"
        info "Проверь: ip -all netns exec ip link show type amneziawg"
        info "Надёжно — перезагрузка сервера: новая сборка уже на диске"
        return 1 ;;
@@ -486,6 +533,12 @@ mod_update_flow() {
   if mod_loaded; then mod_reload || true; else modprobe "$MOD_NAME" 2>/dev/null || true; fi
 }
 
+# Модуль и tools разом: для 3.1 нужны оба — бот и панель предлагают одну кнопку.
+components_update_flow() {
+  mod_update_flow || return 1
+  tools_update_flow
+}
+
 tools_update_flow() {  # [force]
   local tag
   components_deps || return 1
@@ -496,8 +549,22 @@ tools_update_flow() {  # [force]
   tools_install_tag "$tag"
 }
 
+# Сборка под все ядра. Ядрам, в которые сервер может загрузиться, сначала
+# ставятся недостающие заголовки — иначе их сборка молча пропускается.
 mod_rebuild_all() {
-  components_deps && run_step "Сборка DKMS под все ядра" _mod_dkms_install_all
+  local k _
+  components_deps || return 1
+  while read -r k _; do
+    [[ -n "$k" && ! -d "/lib/modules/$k/build" ]] || continue
+    run_step "Заголовки ядра $k" ensure_headers "$k" || warn "Заголовков для $k в репозитории нет"
+  done < <(kernel_gap)
+  run_step "Сборка DKMS под все ядра" _mod_dkms_install_all || return 1
+  if [[ -n "$(kernel_gap)" ]]; then
+    warn "Модуль не собран под: $(kernel_gap_line) — после перезагрузки в это ядро awg0 не поднимется"
+    info "Журнал сборки: $MOD_LOG и /var/lib/dkms/$MOD_NAME/$MOD_DKMS_VER/build/make.log"
+    return 1
+  fi
+  ok "Модуль собран под все ядра"
 }
 
 mod_backups() { ls -1t "$MOD_BACKUP_DIR"/src-*.tar.gz 2>/dev/null || true; }
@@ -556,7 +623,7 @@ do_components_menu() {
     echo -e "  ${C}2)${N} Выбрать версию модуля из списка"
     echo -e "  ${C}3)${N} Обновить amneziawg-tools ${D}${tupd:+до $tupd}${N}"
     echo -e "  ${C}4)${N} Перезагрузить модуль ${D}— без ребута${N}"
-    echo -e "  ${C}5)${N} Пересобрать под все установленные ядра"
+    echo -e "  $([[ -n "$(kernel_gap)" ]] && echo "${Y}" || echo "${C}")5)${N} Пересобрать под все установленные ядра"
     echo -e "  ${C}6)${N} Откат модуля из резервной копии"
     echo -e "  ${C}7)${N} Проверить обновления сейчас"
     echo -e "  ${W}0)${N} ← Назад"

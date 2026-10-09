@@ -8,12 +8,13 @@ BOT_VENV_PY="$BOT_DIR/venv/bin/python"
 
 # Любой след бота, а не только маркер: после частичного удаления его
 # остатки тоже надо уметь добить.
-bot_installed() { [[ -f /usr/local/bin/awg-bot.py || -d "$BOT_DIR" || -f "/etc/systemd/system/$BOT_UNIT" ]]; }
-
-bot_version() {
-  sed -n "s/^__version__[[:space:]]*=[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" \
-    "$BOT_DIR/awgbot/__init__.py" 2>/dev/null | head -1
+# Код в $BOT_DIR ставит и веб-панель (--web-only) — при ней это ещё не бот
+bot_installed() {
+  [[ -f /usr/local/bin/awg-bot.py || -f "/etc/systemd/system/$BOT_UNIT" ]] && return 0
+  [[ -d "$BOT_DIR" ]] && ! web_installed
 }
+
+bot_version() { _bot_src_version "$BOT_DIR"; }
 
 # ── Прокси до Telegram ────────────────────────────────────
 # Значение ключа из конфига бота (кавычки и пробелы по краям снимаются).
@@ -62,6 +63,7 @@ webapp_port() {
 
 webapp_fw() {
   local p
+  [[ -f "/etc/systemd/system/$BOT_UNIT" ]] || return 0
   p=$(webapp_port)
   [[ "$p" == off ]] || ufw_allow "$p/tcp" awg-webapp
   return 0
@@ -267,15 +269,33 @@ bot_restart() {
 # ── Установка / удаление ──────────────────────────────────
 # Код бота из распакованного архива рядом: при проверке правок на GitHub
 # ещё старая версия.
+# Версия кода бота в каталоге с awgbot/ (как __version__ у установленного).
+_bot_src_version() {
+  sed -n "s/^__version__[[:space:]]*=[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" \
+    "$1/awgbot/__init__.py" 2>/dev/null | head -1
+}
+
+# Локальный код бота из распакованного архива Тулзы: рядом с awg2, в
+# текущем каталоге, в /opt, /root и /home/*. Из нескольких — самая новая
+# версия бота (дата файла после распаковки ни о чём не говорит), при
+# равных — найденная раньше. Только каталоги, которые может менять лишь
+# root (root_only_tree): установщик и код бота из них запускаются от root,
+# а из бота и панели — ещё и без вопроса. Иначе любой пользователь сервера
+# подложил бы ~/awg-toolza-x с версией побольше и получил root.
 _bot_local_src() {
-  local d best="" ts best_ts=0
-  d=$(dirname "$(readlink -f "$0")")
-  [[ -d "$d/awg_bot/awgbot" && -f "$d/awg_bot/run.py" ]] && { echo "$d/awg_bot"; return 0; }
-  for d in /opt/awg-toolza-*/ /root/awg-toolza-*/ /opt/awg-toolza/; do
-    d="${d%/}"
-    [[ -f "$d/awg_bot/run.py" ]] || continue
-    ts=$(stat -c %Y "$d/awg_bot/run.py")
-    (( ts >= best_ts )) && { best="$d/awg_bot"; best_ts=$ts; }
+  local d best="" bv="" v
+  for d in "$(dirname "$(readlink -f "$0")")" "$PWD" /opt/awg-toolza-*/ /root/awg-toolza-*/ \
+           /home/*/awg-toolza-*/ /opt/awg-toolza/; do
+    # Дальше — только настоящий путь: проверенный каталог-ссылку подменили
+    # бы между проверкой и запуском установщика
+    [[ "$d" != *$'\n'* ]] && d=$(readlink -f -- "$d" 2>/dev/null) || continue
+    [[ -n "$d" && "$d" != *$'\n'* && -d "$d/awg_bot/awgbot" && -f "$d/awg_bot/run.py" ]] || continue
+    root_only_tree "$d/awg_bot" || continue
+    [[ ! -e "$d/awg-bot-install.sh" ]] || root_only_path "$d/awg-bot-install.sh" || continue
+    v=$(_bot_src_version "$d/awg_bot")
+    if [[ -z "$best" ]] || [[ "$v" != "$bv" && "$(printf '%s\n%s\n' "$bv" "$v" | sort -V | tail -1)" == "$v" ]]; then
+      best="$d/awg_bot"; bv="$v"
+    fi
   done
   [[ -n "$best" ]] && echo "$best"
 }
@@ -283,8 +303,13 @@ _bot_local_src() {
 bot_install() {
   local src installer
   src=$(_bot_local_src || true)
-  mktmp installer || return 1
-  if [[ -n "$src" ]] && ask_yes "  Найден локальный код бота ($src). Ставить из него? [Y/n]: " y; then
+  # Установщик — в своём каталоге (700): рядом с ним он ищет awg_bot/, и в
+  # общем /tmp его мог подложить любой пользователь
+  mktmp installer -d || return 1
+  installer+="/awg-bot-install.sh"
+  local lv iv
+  lv=$(_bot_src_version "$src"); iv=$(bot_version)
+  if [[ -n "$src" ]] && ask_yes "  Найден локальный код бота $(shown "${lv:-?}") ($(shown "$src"))${iv:+, установлен $iv}. Ставить из него? [Y/n]: " y; then
     if [[ -f "${src%/awg_bot}/awg-bot-install.sh" ]]; then
       bash "${src%/awg_bot}/awg-bot-install.sh" --src "$src"
       return
@@ -312,10 +337,17 @@ bot_uninstall() {
     cp -a "$BOT_CONF" "$saved" || saved=""
   fi
   systemctl disable --now "$BOT_UNIT" &>/dev/null || true
-  for p in "${BOT_ARTIFACTS[@]}"; do rm -rf "$p"; done
+  local arts=("${BOT_ARTIFACTS[@]}")
+  # Код, venv и заметки нужны веб-панели — с ней остаются
+  if web_installed; then
+    arts=(); for p in "${BOT_ARTIFACTS[@]}"; do [[ "$p" == "$BOT_DIR" || "$p" == /var/lib/awg-bot ]] || arts+=("$p"); done
+    info "Код бота остаётся — на нём работает веб-панель"
+    rm -f "$BOT_ADMINS"           # приглашённые админы — бота, а не панели
+  fi
+  for p in "${arts[@]}"; do rm -rf "$p"; done
   systemctl daemon-reload
   systemctl reset-failed "$BOT_UNIT" &>/dev/null || true
-  for p in "${BOT_ARTIFACTS[@]}"; do [[ -e "$p" ]] && left+=("$p"); done
+  for p in "${arts[@]}"; do [[ -e "$p" ]] && left+=("$p"); done
   if (( ${#left[@]} )); then warn "Не удалось удалить: ${left[*]}"; else ok "Бот удалён"; fi
   [[ -n "$saved" ]] && info "Конфиг с токеном сохранён: $saved"
   log_info "бот удалён"

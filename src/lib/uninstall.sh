@@ -58,8 +58,23 @@ _tools_files() {
        /usr/lib/systemd/system/awg-quick@.service /usr/lib/systemd/system/awg-quick.target
 }
 
+# Распакованные архивы Тулзы (с awg2.sh и awg_bot): из них «Установить бота»
+# берёт локальный код, поэтому после полного удаления о них спрашиваем.
+# Только свои (root_only_path) и без перевода строки в имени: список
+# читается построчно, и «awg-toolza-x\nroot» дал бы rm -rf root —
+# относительный путь от текущего каталога.
+toolza_unpacked() {
+  local d
+  for d in /root/awg-toolza-*/ /home/*/awg-toolza-*/; do
+    d="${d%/}"
+    [[ "$d" != *$'\n'* && -d "$d" && -f "$d/awg2.sh" && -d "$d/awg_bot" ]] || continue
+    root_only_path "$d" && echo "$d"
+  done
+  return 0
+}
+
 do_uninstall() {
-  local del_bot=n del_wgobf=n del_self=n opts
+  local del_bot=n del_wgobf=n del_web=n del_self=n del_src=n opts src=() d
   hdr "Удаление AWG Toolza"
   warn "Будет удалено:"
   echo -e "  ${R}—${N} сервер awg0, его клиенты и автозапуск"
@@ -68,17 +83,30 @@ do_uninstall() {
   echo -e "  ${R}—${N} таймер сроков клиентов, правила UFW с меткой AmneziaWG"
   bot_installed && echo -e "  ${R}—${N} Telegram-бот ${D}(спрошу отдельно)${N}"
   wgobf_installed && echo -e "  ${R}—${N} WG + обфускатор ${D}(спрошу отдельно)${N}"
+  web_installed && echo -e "  ${R}—${N} веб-панель ${D}(спрошу отдельно)${N}"
   echo -e "  ${R}—${N} сам скрипт $SCRIPT_PATH ${D}(спрошу отдельно)${N}"
   echo -e "  ${D}Перед удалением делается полный бэкап в $BACKUP_DIR — он остаётся.${N}"
   read_confirm "${R}  Подтверди удаление (введи yes): ${N}" || return 0
   bot_installed && read_yesno del_bot "  Удалить и Telegram-бота? [Y/n]: " y
   wgobf_installed && read_yesno del_wgobf "  Удалить и WG + обфускатор? [Y/n]: " y
+  web_installed && read_yesno del_web "  Удалить и веб-панель? [Y/n]: " y
   read_yesno del_self "  Удалить сам скрипт awg2? [Y/n]: " y
+  mapfile -t src < <(toolza_unpacked)
+  if (( ${#src[@]} )); then
+    echo -e "  ${D}Распакованные архивы Тулзы — из них ставится бот «из локального кода»:${N}"
+    for d in "${src[@]}"; do printf "  ${D}  %s${N}\n" "$(shown "$d")"; done
+    read_yesno del_src "  Удалить и их? [y/N]: " n
+  fi
   opts=()
   [[ "$del_bot" == y ]] && opts+=(bot)
   [[ "$del_wgobf" == y ]] && opts+=(wgobf)
+  [[ "$del_web" == y ]] && opts+=(web)
   [[ "$del_self" == y ]] && opts+=(self)
   uninstall_all "${opts[@]}"
+  if [[ "$del_src" == y ]]; then
+    for d in "${src[@]}"; do [[ "$d" == /* ]] && rm -rf -- "$d"; done
+    ok "Распакованные архивы удалены: ${#src[@]}"
+  fi
   (( UNINSTALLED_SELF )) && exit 0
   return 0
 }
@@ -86,10 +114,16 @@ do_uninstall() {
 # uninstall_all [bot] [wgobf] [self] — без вопросов; полный бэкап делается всегда.
 UNINSTALLED_SELF=0
 uninstall_all() {
-  local v o del_bot=n del_wgobf=n del_self=n
+  local v o del_bot=n del_wgobf=n del_web=n del_self=n
   for o in "$@"; do
-    case "$o" in bot) del_bot=y ;; wgobf) del_wgobf=y ;; self) del_self=y ;; esac
+    case "$o" in bot) del_bot=y ;; wgobf) del_wgobf=y ;; web) del_web=y ;; self) del_self=y ;; esac
   done
+  # Веб-панель работает через awg2: без него она осталась бы открытым входом,
+  # который ничего не может, и убрать её было бы уже нечем
+  if [[ "$del_self" == y && "$del_web" != y ]] && web_installed; then
+    del_web=y
+    info "Без awg2 веб-панель не работает — удаляю и её"
+  fi
 
   server_exists && do_backup
   awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
@@ -119,11 +153,19 @@ uninstall_all() {
   ufw_delete_matching AmneziaWG
   if [[ "$del_wgobf" == y ]]; then wgobf_remove quiet
   elif wgobf_installed; then info "WG + обфускатор оставлен и продолжит работать сам"; fi
+  if [[ "$del_web" == y ]] && web_installed; then web_remove quiet
+  elif web_installed; then info "Веб-панель оставлена — сервера AWG в ней больше нет"; fi
+  # Антисканер работает через свой скрипт и без awg2, но управлять им без
+  # awg2 нечем — уходит вместе со скриптом, иначе остаётся защищать сервер
+  if [[ "$del_self" == y ]]; then antiscan_remove
+  elif antiscan_on; then info "Антисканер оставлен и продолжит работать"; fi
   if [[ "$del_bot" == y ]]; then
     bot_uninstall quiet
-    # Сертификат нужен только Mini App бота
-    [[ -f "$CERT_STATE" || -d "$CERT_DIR" ]] && cert_remove &>/dev/null
-    rm -rf "$ACME_DIR" "$ACME_HOME"
+    # Сертификат — для Mini App бота и веб-панели
+    if ! web_installed; then
+      [[ -f "$CERT_STATE" || -d "$CERT_DIR" ]] && cert_remove &>/dev/null
+      rm -rf "$ACME_DIR" "$ACME_HOME"
+    fi
   fi
   log_info "полное удаление"
   if [[ "$del_self" != y ]]; then

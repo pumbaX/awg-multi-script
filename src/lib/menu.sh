@@ -6,7 +6,7 @@ show_header() {
   [[ "$UPDATE_CHANNEL" == beta ]] && ch=" ${Y}[beta]${N}"
   upd=$(update_available || true)
   echo -e "${B}${LINE}${N}"
-  echo -e "  ${W}AWG Toolza $VERSION${N}$ch${upd:+   ${G}⬆ есть $upd${N} ${D}— Обновление${N}}"
+  echo -e "  ${W}AWG Toolza $VERSION_SHOW${N}$ch${upd:+   ${G}⬆ есть $upd${N} ${D}— Обновление${N}}"
   echo -e "  ${C}TG: @awgToolza${N}"
   echo -e "${B}${LINE}${N}"
   why=$(os_supported) || echo -e "  ${Y}▲ $why${N}"
@@ -39,8 +39,9 @@ do_server_menu() {
     echo -e "  ${C}6)${N} Проверить и починить"
     echo -e "  ${C}7)${N} Endpoint ${D}— ${ep:-IP сервера}${N}"
     echo -e "  ${Y}8)${N} Сбросить сервер"
+    echo -e "  ${C}9)${N} Антисканер ${D}— $(antiscan_on && echo "включён" || echo "сети сканеров РКН")${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-8]: ${N}" 0 8 0
+    read_choice c "${C}  Выбор [0-9]: ${N}" 0 9 0
     case "$c" in
       1) do_install || true ;;
       2) do_create_server || true ;;
@@ -50,6 +51,7 @@ do_server_menu() {
       6) do_repair || true ;;
       7) do_endpoint_menu || true ;;
       8) do_reset_server || true ;;
+      9) do_antiscan_menu || true; continue ;;
       0) return 0 ;;
     esac
     pause
@@ -100,8 +102,9 @@ main_menu() {
     echo -e "  ${R}7)${N} Удаление        ${D}— очистка${N}"
     echo -e "  ${M}8)${N} Обновление      ${D}— $(update_channel_label)${N}"
     echo -e "  ${C}9)${N} WG + обфускатор ${D}— $(wgobf_installed && echo "установлен" || echo "как Phobos")${N}"
+    echo -e "  ${C}w)${N} Веб-панель      ${D}— $(web_installed && { web_active && echo "работает" || echo "остановлена"; } || echo "в браузере")${N}"
     echo -e "  ${W}0)${N} Выход"
-    read_choice c "${C}  Выбор [0-9]: ${N}" 0 9
+    read_choice c "${C}  Выбор [0-9, w]: ${N}" 0 9 "" "w"
     case "$c" in
       1) do_server_menu ;;
       2) _need_server && { do_clients_menu || true; } ;;
@@ -112,6 +115,7 @@ main_menu() {
       7) do_danger_menu ;;
       8) do_update_menu ;;
       9) do_wgobf_menu ;;
+      w) do_web_menu ;;
       0) echo -e "\n  ${G}В путь!${N} ${D}t.me/awgToolza${N}\n"; return 0 ;;
     esac
   done

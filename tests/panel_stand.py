@@ -37,7 +37,12 @@ with open(os.path.join(BIN, "curl"), "w") as f:
 # wg умеет ключи (клиенты WG + обфускатор), wg-quick — strip
 with open(os.path.join(BIN, "wg"), "w") as f:
     f.write('#!/usr/bin/env bash\necho "wg $*" >> "$CALLS"\ncase "$1" in\n'
-            '  genkey|genpsk) head -c 32 /dev/urandom | base64 ;;\n  pubkey) sha256sum | head -c 43; echo "=" ;;\nesac\nexit 0\n')
+            '  genkey|genpsk) head -c 32 /dev/urandom | base64 ;;\n  pubkey) sha256sum | head -c 43; echo "=" ;;\n'
+            # Рукопожатие «-30» — 30 с назад от момента вызова: клиент в сети, сколько бы ни шёл сценарий
+            '  show) [[ -f "$WG_DUMP" ]] || exit 0\n'
+            '        dump() { awk -v now="$(date +%s)" \'BEGIN {FS = OFS = "\\t"} NR > 1 && $5 ~ /^-[0-9]+$/ {$5 = now + $5} {print}\' "$WG_DUMP"; }\n'
+            '        [[ "${3:-}" == dump ]] && dump\n'
+            '        [[ "${3:-}" == transfer ]] && dump | awk -F\'\\t\' \'NR > 1 {print $1 "\\t" $6 "\\t" $7}\' ;;\nesac\nexit 0\n')
 with open(os.path.join(BIN, "wg-quick"), "w") as f:
     f.write('#!/usr/bin/env bash\necho "wg-quick $*" >> "$CALLS"\n[[ "$1" == strip ]] && printf "[Interface]\\nPrivateKey = x\\n"\nexit 0\n')
 for tool in ("wg", "wg-quick"):
@@ -66,6 +71,20 @@ if PROFILE != "none":
         f.write(f"PRIV\tPUB\t51820\toff\n"
                 f"PUBALICE=\t(none)\t5.6.7.8:4242\t10.23.45.2/32\t{now - 20}\t12345678\t987654\toff\n"
                 f"PUBBOB=\t(none)\t(none)\t10.23.45.3/32\t{now - 7200}\t1024\t2048\toff\n")
+    # Трафик за две недели: alice — каждый день, bob — через день
+    db = {"v": 1, "saved": now, "ifindex": "", "last": {"PUBALICE=": [12345678, 987654], "PUBBOB=": [1024, 2048]},
+          "total": {}, "reset": {}, "warned": {}, "days": {}}
+    for i in range(14):
+        day = time.strftime("%Y-%m-%d", time.localtime(now - 86400 * i))
+        db["days"][day] = {"PUBALICE=": [(i % 5 + 1) * 300 * 2**20, (i % 3 + 1) * 40 * 2**20]}
+        if i % 2:
+            db["days"][day]["PUBBOB="] = [50 * 2**20, 10 * 2**20]
+    os.makedirs(os.path.join(ROOT, "var/lib/awg2"), exist_ok=True)
+    with open(os.path.join(ROOT, "var/lib/awg2/traffic.json"), "w") as f:
+        json.dump(db, f)
+    # Страна сервера уже известна (Cloudflare trace) — в шапке флаг Нидерландов
+    with open(os.path.join(ROOT, "var/lib/awg2/country"), "w") as f:
+        f.write(f"NL {now}\n")
     # Работают exit-ноды: нода n1 поднята, маршруты — «все клиенты»
     with open(os.path.join(AWG_DIR, "awg-exit-n1.conf"), "w") as f:
         f.write("[Interface]\nPrivateKey = X\nTable = off\n\n[Peer]\nEndpoint = 1.2.3.4:51820\n")
@@ -81,8 +100,13 @@ if PROFILE != "none":
         f.write("PORT=41000\nENDPOINT=203.0.113.10\nMASKING=STUN\nALLOW_CLEAN=1\nNET=10.66.66.0/24\nKEY=s3cretObfKey\n"
                 "SERVER_PUB=SRVPUBKEYxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=\nWG_PORT=51900\nMTU=1380\nDNS=1.1.1.1, 1.0.0.1\n")
     os.makedirs(os.path.join(ROOT, "etc/wireguard"), exist_ok=True)
+    # Клиент обфускатора ob1 — в сети: на обзоре своя схема wgobf0 → напрямую
     with open(os.path.join(ROOT, "etc/wireguard/wgobf0.conf"), "w") as f:
-        f.write("[Interface]\nPrivateKey = X\nAddress = 10.66.66.1/24\nListenPort = 51900\n")
+        f.write("[Interface]\nPrivateKey = X\nAddress = 10.66.66.1/24\nListenPort = 51900\n\n"
+                "[Peer]\n# client=ob1\nPublicKey = OBPUB=\nAllowedIPs = 10.66.66.2/32\n")
+    with open(WG_DUMP, "w") as f:
+        f.write(f"SRVPRIV=\tSRVPUB=\t51900\toff\nOBPUB=\t(none)\t127.0.0.1:40000\t10.66.66.2/32\t-30"
+                f"\t3145728\t1048576\t25\n")
     with open(ACTIVE, "a") as f:
         f.write("awg-wgobf.service\n")
     with open(LINKS, "a") as f:
@@ -109,6 +133,26 @@ from aiogram.types import Chat, Message, MessageEntity, Sticker, StickerSet, Use
 
 from awgbot import access, admins, icons, store, webapp  # noqa: E402
 from awgbot.config import load_config  # noqa: E402
+
+async def keep_handshakes():
+    """Клиенты «в сети» — пока рукопожатие моложе 3 минут. Под нагрузкой тест доходит
+    до шагов про «в сети» позже — рукопожатия держатся свежими, как на живом сервере."""
+    ages = {"PUBALICE=": 20, "PUBBOB=": 7200, "OBPUB=": 30}
+    while True:
+        await asyncio.sleep(20)
+        now = int(time.time())
+        for path in (AWG_DUMP, WG_DUMP):
+            try:
+                with open(path) as f:
+                    rows = [ln.split("\t") for ln in f.read().split("\n")]
+            except OSError:
+                continue
+            for r in rows:
+                if len(r) > 4 and r[0] in ages:
+                    r[4] = str(now - ages[r[0]])
+            with open(path + ".new", "w") as f:
+                f.write("\n".join("\t".join(r) for r in rows))
+            os.replace(path + ".new", path)
 
 
 class Session(BaseSession):
@@ -154,8 +198,7 @@ async def main():
         admins.add(333, 111, "helper")
     await webapp.SERVER.start(Bot(TOKEN, session=Session()))
     print("READY", PORT, init_data(111), webapp.SERVER.error or "-", ROOT, flush=True)
-    while True:
-        await asyncio.sleep(3600)
+    await keep_handshakes()
 
 
 asyncio.run(main())

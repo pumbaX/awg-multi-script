@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -66,7 +67,7 @@ def sort_rows(rows: list[dict], mode: str) -> list[dict]:
 
 def seen(c: dict) -> str:
     if c.get("blocked"):
-        return "заблокирован: срок истёк"
+        return "заблокирован: исчерпан лимит трафика" if c.get("blocked_by") == "traffic" else "заблокирован: срок истёк"
     if c.get("online"):
         return f"онлайн ({ui.fmt_dur(c.get('ago'))} назад)"
     if c.get("handshake"):
@@ -116,12 +117,13 @@ async def list_screen(target: ui.Target, page: int = 0) -> None:
     rows: list[dict] = sort_rows(good, mode)
     online = sum(1 for c in rows if c.get("online"))
     blocked = sum(1 for c in rows if c.get("blocked"))
+    expired = sum(1 for c in rows if expired_block(c))
     pages = max(1, (len(rows) + PAGE - 1) // PAGE)
     page = min(max(page, 0), pages - 1)
     text = (f"<b>👥 Клиенты: {len(rows)}</b> · 🟢 {online} онлайн"
             + (f" · 🚫 {blocked} заблок." if blocked else "")
             + ("\n\nКлиентов пока нет." if not rows else
-               f"\nСортировка: {SORTS.get(mode, mode)}\n\n🟢 онлайн · ⚪️ офлайн · 🚫 срок истёк · 🔔 мониторинг")
+               f"\nСортировка: {SORTS.get(mode, mode)}\n\n🟢 онлайн · ⚪️ офлайн · 🚫 заблокирован · 🔔 мониторинг")
             + odd_note(odd))
     notes = store.notes()
     buttons: list[ui.Button] = []
@@ -147,7 +149,7 @@ async def list_screen(target: ui.Target, page: int = 0) -> None:
         ("📊 Трафик", act.data("activity")) if rows else None,
         ("📦 Экспорт zip", act.data("export")) if rows else None,
         ("🗑 Удалить…", act.data("dsel")) if rows else None,
-        ("🧹 Истёкшие", act.data("purge")) if blocked else None,
+        ("🧹 Истёкшие", act.data("purge")) if expired else None,
         ui.back()))
 
 
@@ -155,6 +157,9 @@ async def list_screen(target: ui.Target, page: int = 0) -> None:
 async def _sort(cb: CallbackQuery, state: FSMContext, mode: str) -> None:
     store.set_setting("clients_sort", mode if mode in SORTS else "activity")
     await list_screen(cb)
+
+
+ACTIVITY_MAX = 3600          # текст одной страницы «Трафика»: с шапкой — в лимит Telegram
 
 
 @act("activity")
@@ -167,11 +172,29 @@ async def _activity(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     for c in sorted(rows, key=lambda x: (not x.get("online"), -(x.get("handshake") or 0))):
         lines.append(f"{icon(c)} <b>{esc(c['name'])}</b> <code>{c['ip']}</code>\n"
                      f"    {seen(c)} · ↓{ui.fmt_bytes(c.get('rx'))} ↑{ui.fmt_bytes(c.get('tx'))}"
+                     + (f" · месяц {ui.fmt_bytes(c['month'])}" if c.get("month") else "")
+                     + (f"\n    📶 {limit_text(c)}" if c.get("limit") else "")
                      + (f"\n    ⏳ {ui.fmt_expire(c['expires'])}" if c.get("expires") and not c.get("blocked") else ""))
-    text = "<b>📊 Активность и трафик</b>\n\n" + "\n".join(lines)
-    if len(text) > ui.TEXT_MAX:
-        text = text[:ui.TEXT_MAX - 20].rsplit("\n", 1)[0] + "\n…"
-    await ui.render(cb, text, ui.kb(("🔄 Обновить", act.data("activity")), ui.back("cl")))
+    # Страницы — по объёму текста, а не по числу клиентов: у кого лимит и срок,
+    # тот длиннее. Срез одним сообщением прятал всех после ~50-го
+    pages: list[list[str]] = [[]]
+    size = 0
+    for line in lines:
+        if pages[-1] and size + len(line) > ACTIVITY_MAX:
+            pages.append([])
+            size = 0
+        pages[-1].append(line)
+        size += len(line) + 1
+    page = min(int(arg) if arg.isdigit() else 0, len(pages) - 1)
+    text = ("<b>📊 Активность и трафик</b>"
+            + (f" · стр. {page + 1} из {len(pages)}" if len(pages) > 1 else "") + "\n\n" + "\n".join(pages[page]))
+    nav: list[ui.Button] = []
+    if page > 0:
+        nav.append((f"◀️ Стр. {page}", act.data("activity", str(page - 1))))
+    if page < len(pages) - 1:
+        nav.append((f"Стр. {page + 2} ▶️", act.data("activity", str(page + 1))))
+    await ui.render(cb, text, ui.kb(("🔄 Обновить", act.data("activity", str(page))),
+                                    ("📈 По дням", act.data("tsrv")), nav, ui.back("cl")))
 
 
 @act("export")
@@ -185,6 +208,12 @@ async def _export(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
                                          caption="📦 Все конфиги клиентов")
 
 
+def expired_block(c: dict) -> bool:
+    """Заблокирован сроком: такие и удаляет «Истёкшие». Заблокированные за
+    трафик остаются — они разблокируются сами в новом месяце."""
+    return bool(c.get("blocked")) and c.get("blocked_by") != "traffic"
+
+
 @act("purge")
 async def _purge(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     await ui.confirm(cb, "Удалить всех клиентов с истёкшим сроком? Их конфиги перестанут существовать.",
@@ -193,12 +222,12 @@ async def _purge(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
 
 @act("purgeok")
 async def _purge_ok(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
-    gone = [c["name"] for c in await clients() or [] if c.get("blocked")]
+    gone = [c["name"] for c in await clients() or [] if expired_block(c)]
     r = await api.call("clients", "purge-blocked")
     if r.ok:
         for n in gone:
             store.drop_note(n)
-    await ui.result(cb, r, "Удаление заблокированных", "cl")
+    await ui.result(cb, r, "Удаление клиентов с истёкшим сроком", "cl")
 
 
 # ── Карточка ──────────────────────────────────────────────
@@ -217,7 +246,16 @@ async def active_route() -> dict:
     if kind == "exits":
         e = await api.data("exits", "status", default={}) or {}
         route.update(mode=e.get("mode") or "all", nodes=[n["name"] for n in e.get("nodes") or []])
+    elif kind == "xray":
+        x = await api.data("xray", "status", default={}) or {}
+        route.update(tags=list(x.get("tags") or []), main=x.get("main") or "", per_client=bool(x.get("per_client")))
     return route
+
+
+def xray_main(route: dict) -> str:
+    """«выход по умолчанию: nl» / «балансировщик»."""
+    m = route.get("main") or ""
+    return "балансировщик" if m == "balancer" else m
 
 
 def exit_of(c: dict, route: dict) -> str:
@@ -232,6 +270,8 @@ def route_of(c: dict, route: dict) -> str:
     kind = route.get("kind")
     if not kind:
         return "напрямую"
+    if kind == "xray" and c.get("xray") is not False and c.get("xray_out"):
+        return f"через Xray, выход {c['xray_out']}"
     if kind in ("warp", "xray"):
         on = c.get(kind) is not False
         return f"через {TUNNEL_NAMES[kind]}" if on else f"напрямую ({TUNNEL_NAMES[kind]} — для других)"
@@ -241,18 +281,33 @@ def route_of(c: dict, route: dict) -> str:
     return {"off": "напрямую (exit-ноды — для других)", "shared": "exit-ноды, общий выход"}.get(ex, f"exit-нода {ex}")
 
 
+PERIOD = {"month": "за месяц", "total": "всего"}
+
+
+def limit_text(c: dict) -> str:
+    """«12.3 ГБ из 50.0 ГБ за месяц (25%)» или пусто."""
+    if not c.get("limit"):
+        return ""
+    used, lim = int(c.get("used") or 0), int(c["limit"])
+    return (f"{ui.fmt_bytes(used)} из {ui.fmt_bytes(lim)} {PERIOD.get(c.get('period') or '', '')}"
+            f" ({min(999, used * 100 // max(lim, 1))}%)")
+
+
 def card_text(c: dict, route: dict) -> str:
     name = c["name"]
     note = store.strip_tag(store.note(name))
+    month = c.get("month")
     return "\n".join(filter(None, [
         f"<b>👤 {esc(name)}</b>",
         "",
         f"IP: <code>{c['ip']}</code>",
         f"Статус: {icon(c)} {seen(c)}",
-        f"Трафик: ↓{ui.fmt_bytes(c.get('rx'))} ↑{ui.fmt_bytes(c.get('tx'))}",
+        f"Трафик: ↓{ui.fmt_bytes(c.get('rx'))} ↑{ui.fmt_bytes(c.get('tx'))}"
+        + (f" · за месяц {ui.fmt_bytes(month)}, сегодня {ui.fmt_bytes(c.get('today'))}" if month is not None else ""),
+        f"Лимит: {limit_text(c)}" if c.get("limit") else "",
         f"Адрес клиента: <code>{esc(c['endpoint'].rsplit(':', 1)[0])}</code>" if c.get("endpoint") else "",
         f"Срок: {ui.fmt_expire(c.get('expires'))}",
-        f"Мимикрия: {esc(c.get('mimicry') or 'none')}",
+        f"Мимикрия: {esc(c['mimicry']) if c.get('mimicry') not in (None, '', 'none') else 'без I1-I5'}",
         f"Маршрут: {route_of(c, route)}",
         f"Заметка: {esc(note)}" if note else "",
         f"Мониторинг: {'🔔 вкл' if store.monitored(name) else '🔕 выкл'}",
@@ -260,16 +315,17 @@ def card_text(c: dict, route: dict) -> str:
 
 
 async def card(target: ui.Target, name: str) -> None:
-    c = await client(name)
+    c, route = await asyncio.gather(client(name), active_route())
     if c is None:
         await ui.render(target, f"Клиента <b>{esc(name)}</b> нет.", ui.kb(ui.back("cl")))
         return
-    route = await active_route()
     mon = store.monitored(name)
     await ui.render(target, card_text(c, route), ui.kb(
         ("📄 Конфиг и QR", act.data("conf", name)),
         ("✏️ Переименовать", act.data("ren", name)),
         ("⏳ Срок действия", act.data("exp", name)),
+        ("📶 Лимит трафика", act.data("lim", name)),
+        ("📊 Трафик по дням", act.data("tday", name)),
         ("🎭 Мимикрия", act.data("mim", name)),
         ("🌐 Маршрут", act.data("tun", name)) if route["kind"] in ("warp", "xray", "exits") else None,
         ("📝 Заметка", act.data("note", name)),
@@ -331,8 +387,8 @@ async def _pick_screen(target: ui.Target, state: FSMContext, page: int = 0) -> N
     await ui.render(target, "<b>🗑 Удалить клиентов</b>\nОтметь, кого удалить. Их конфиги перестанут работать.\n\n"
                             + (f"Отмечено: {len(sel)}" if sel else "Никто не отмечен.") + odd_note(odd),
                     ui.kb(ui.paged(buttons, page, lambda p: act.data("dsp", str(p))),
-                          ("☑️ Отметить всех", act.data("dsa", "all")) if len(sel) < len(rows) else None,
-                          ("⬜️ Снять все", act.data("dsa", "none")) if sel else None,
+                          ("☑️ Отметить всех", act.data("dsa", f"{page}|all")) if len(sel) < len(rows) else None,
+                          ("⬜️ Снять все", act.data("dsa", f"{page}|none")) if sel else None,
                           (f"🗑 Удалить: {len(sel)}", act.data("dsgo")) if sel else None,
                           ui.back("cl")))
 
@@ -361,10 +417,11 @@ async def _dsel_toggle(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
 
 
 @act("dsa")
-async def _dsel_all(cb: CallbackQuery, state: FSMContext, what: str) -> None:
+async def _dsel_all(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    page, _, what = arg.rpartition("|")         # страница — та же, что была открыта
     rows, _ = usable(await clients() or [])
     await state.update_data(del_sel=[c["name"] for c in rows] if what == "all" else [])
-    await _pick_screen(cb, state)
+    await _pick_screen(cb, state, int(page) if page.isdigit() else 0)
 
 
 @act("dsgo")
@@ -463,7 +520,7 @@ async def _exp(cb: CallbackQuery, state: FSMContext, name: str) -> None:
 async def _ex(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     name, _, v = arg.partition("|")
     if v == "date":
-        await ask.ask(cb, state, "cl_exdate", "Дата окончания: <code>ГГГГ-ММ-ДД ЧЧ:ММ</code>",
+        await ask.ask(cb, state, "cl_exdate", "Дата окончания: <code>ГГГГ-ММ-ДД ЧЧ:ММ</code> (время сервера)",
                       act.data("exp", name), name=name)
         return
     r = await (api.call("client", "unexpire", name) if v == "none" else api.call("client", "expire", name, v))
@@ -482,17 +539,143 @@ def parse_date(text: str) -> int | None:
     return None
 
 
+def future_date(text: str) -> tuple[int, str]:
+    """Дата окончания из ввода и что с ней не так (пусто — годится). Пример —
+    через месяц от сегодня: зашитая дата сама когда-нибудь станет прошлым."""
+    ts = parse_date(text)
+    example = time.strftime("%Y-%m-%d 23:59", time.localtime(time.time() + 30 * 86400))
+    if not ts:
+        return 0, f"Формат даты: ГГГГ-ММ-ДД ЧЧ:ММ, например {example} (время сервера)"
+    if ts <= time.time() + 60:
+        return 0, f"Эта дата уже прошла: на сервере сейчас {ui.fmt_time(int(time.time()))}. Например {example}"
+    return ts, ""
+
+
 @ask.on("cl_exdate")
 async def _exdate(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
-    ts = parse_date(ask.text_of(msg))
-    if not ts or ts <= time.time() + 60:
-        await ask.retry(msg, state, ctx, "Нужна дата в будущем, например 2026-12-31 23:59")
+    ts, why = future_date(ask.text_of(msg))
+    if why:
+        await ask.retry(msg, state, ctx, why)
         return
     r = await api.call("client", "expire", ctx["name"], ts)
     if not r.ok:
         await ask.retry(msg, state, ctx, r.message)
         return
     await card(msg, ctx["name"])
+
+
+# ── Лимит трафика ─────────────────────────────────────────
+LIMITS = ["10G", "50G", "100G", "300G"]
+
+
+@act("lim")
+async def _lim(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    c = await client(name)
+    if c is None:
+        await card(cb, name)
+        return
+    # Выбранный период помнится для этого клиента: другому он не достаётся
+    chosen, _, p = ((await state.get_data()).get("lim_period") or "").rpartition("|")
+    period = p if chosen == name and p in PERIOD else c.get("period") or "month"
+    other = "total" if period == "month" else "month"
+    await ui.render(cb, f"<b>📶 Лимит трафика: {esc(name)}</b>\n"
+                        f"Сейчас: {limit_text(c) or 'без лимита'}\n"
+                        f"За этот месяц: {ui.fmt_bytes(c.get('month'))}\n\n"
+                        "Исчерпал лимит — клиент блокируется, как истёкший. «В месяц» — счётчик "
+                        "обнуляется 1-го числа, и клиент разблокируется сам; «всего» — считается с "
+                        "момента установки, без сброса.\n\n"
+                        f"Период для новых значений: <b>{PERIOD[period]}</b>",
+                    ui.kb([(f"📶 {v[:-1]} ГБ", act.data("ls", f"{name}|{v}|{period}")) for v in LIMITS],
+                          ("✏️ Свой размер…", act.data("ls", f"{name}|ask|{period}")),
+                          (f"🔁 {'Всего' if other == 'total' else 'В месяц'}", act.data("lp", f"{name}|{other}")),
+                          ("🔄 Обнулить", act.data("lr", name)) if c.get("limit") else None,
+                          ("♾ Снять лимит", act.data("ls", f"{name}|off|{period}")) if c.get("limit") else None,
+                          ui.back(act.data("v", name))))
+
+
+@act("lp")
+async def _lim_period(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    name, _, period = arg.partition("|")
+    await state.update_data(lim_period=f"{name}|{period if period in PERIOD else 'month'}")
+    await _lim(cb, state, name)
+
+
+@act("ls")
+async def _lim_set(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    name, v, period = (arg.split("|") + ["", ""])[:3]
+    if v == "ask":
+        await ask.ask(cb, state, "cl_limit", "Лимит: <code>50G</code>, <code>500M</code>, <code>1.5T</code> "
+                                             "(число без буквы — гигабайты)",
+                      act.data("lim", name), name=name, period=period)
+        return
+    r = await api.call("client", "limit", name, v, period if period in PERIOD else "month")
+    await state.update_data(lim_period="")
+    if not r.ok:
+        await ui.render(cb, ui.fail(r, "Лимит трафика"), ui.kb(ui.back(act.data("lim", name))))
+        return
+    await card(cb, name)
+
+
+@ask.on("cl_limit")
+async def _lim_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
+    v = ask.text_of(msg).replace(" ", "").upper().replace("ГБ", "G").replace("МБ", "M").replace("ТБ", "T")
+    r = await api.call("client", "limit", ctx["name"], v, ctx.get("period") or "month")
+    if not r.ok:
+        await ask.retry(msg, state, ctx, r.message)
+        return
+    await state.update_data(lim_period="")
+    await card(msg, ctx["name"])
+
+
+@act("lr")
+async def _lim_reset(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    r = await api.call("client", "limit-reset", name)
+    if not r.ok:
+        await ui.render(cb, ui.fail(r, "Счётчик лимита"), ui.kb(ui.back(act.data("lim", name))))
+        return
+    await cb.answer("Счётчик обнулён")
+    await card(cb, name)
+
+
+# ── Трафик по дням ────────────────────────────────────────
+def bars(d: dict, days: int = 14) -> str:
+    """Столбики по дням моноширинным блоком: «02.10 ▇▇▇▇▇▇ 1.2 ГБ»."""
+    rows = list(zip(d.get("days") or [], d.get("rx") or [], d.get("tx") or []))[-days:]
+    top = max([a + b for _, a, b in rows] + [1])
+    out = []
+    for day, a, b in rows:
+        n = round(14 * (a + b) / top) if a + b else 0
+        out.append(f"{day[8:]}.{day[5:7]} {'▇' * n or '·':<14} {ui.fmt_bytes(a + b) if a + b else '—'}")
+    return "<pre>" + esc("\n".join(out)) + "</pre>"
+
+
+@act("tday")
+async def _tday(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    r = await api.call("traffic", "daily", name, 30)
+    if not r.ok or not isinstance(r.data, dict):
+        await ui.render(cb, ui.fail(r, "Трафик по дням"), ui.kb(ui.back(act.data("v", name))))
+        return
+    d = r.data
+    week = sum(d["rx"][-7:]) + sum(d["tx"][-7:])
+    await ui.render(cb, f"<b>📊 {esc(name)}: трафик по дням</b>\n"
+                        f"За 7 дней: {ui.fmt_bytes(week)} · за 30 дней: {ui.fmt_bytes(d.get('total'))}\n"
+                        f"{bars(d)}\n<i>Приём и отдача вместе; учёт — с установки v1.2.0.</i>",
+                    ui.kb(ui.back(act.data("v", name))))
+
+
+@act("tsrv")
+async def _tsrv(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    r = await api.call("traffic", "daily", "all", 30)
+    if not r.ok or not isinstance(r.data, dict):
+        await ui.render(cb, ui.fail(r, "Трафик по дням"), ui.kb(ui.back("cl")))
+        return
+    d = r.data
+    top = "\n".join(f"{i}. {esc(c['name'])} — {ui.fmt_bytes(c['rx'] + c['tx'])}"
+                    for i, c in enumerate((d.get("clients") or [])[:10], 1))
+    await ui.render(cb, "<b>📊 Трафик сервера по дням</b>\n"
+                        f"За 30 дней: {ui.fmt_bytes(d.get('total'))}\n{bars(d)}\n"
+                        + (f"<b>Больше всех за 30 дней</b>\n{top}" if top else "Трафика пока нет."),
+                    ui.kb(ui.back("cl")))
 
 
 # ── Мимикрия ──────────────────────────────────────────────
@@ -524,10 +707,12 @@ async def mimicry_screen(target: ui.Target, title: str, pick: str, back_to: str,
 @act("lvl")
 async def _lvl(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     pick, _, rest = arg.partition("|")
+    # «Назад» — к выбору профиля: у клиента (ms) — его мимикрия, у нового (nm) — шаг мастера
+    back_to = act.data("mim", rest.partition("|")[0]) if pick == "ms" else act.data("nmb")
     await ui.render(cb, "<b>Уровень мимикрии</b>\n• Цепочка I1-I5 — полная\n"
                         "• Только I1 — один пакет: Keenetic читает только его\nWireSock не читает I1-I5 вовсе.",
                     ui.kb([(label, act.data(pick, f"{rest}:{lvl}")) for label, lvl in LEVELS],
-                          ui.back("cl")))
+                          ui.back(back_to)))
 
 
 @act("mim")
@@ -575,6 +760,16 @@ async def _tun(cb: CallbackQuery, state: FSMContext, name: str) -> None:
         buttons += [opt(f"Нода {n}", n, cur == n) for n in route.get("nodes") or []]
         note = ("\nВыбор для одного клиента переводит маршруты в режим «выбранные клиенты»: "
                 "остальные остаются на общем выходе." if route.get("mode") != "peers" else "")
+    elif kind == "xray" and len(route.get("tags") or []) >= 2:
+        # Свой выход клиенту: кнопка — номер выхода в списке (тег в 64 байта не всегда влезет)
+        on, out = c.get("xray") is not False, c.get("xray_out") or ""
+        buttons = [opt("По умолчанию", "on", on and not out)]
+        buttons += [opt(t, f"x{i}", on and out == t) for i, t in enumerate(route["tags"])]
+        buttons.append(opt("Напрямую", "off", not on))
+        note = (f"\nВыход Xray по умолчанию — {esc(xray_main(route))}; клиенту можно закрепить свой."
+                if route.get("per_client") else
+                "\n⚠️ Свой выход клиенту — только с inbound tun в самом Xray: обнови Xray "
+                "(Туннели → Xray → Установить / обновить).")
     else:
         on = c.get(kind) is not False
         buttons = [opt(f"Через {TUNNEL_NAMES[kind]}", "on", on), opt("Напрямую", "off", not on)]
@@ -588,6 +783,15 @@ async def _route_set(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     kind, name, value = (arg.split("|") + ["", "", ""])[:3]
     if kind == "exits":
         r = await api.call("exits", "client", name, value)
+    elif kind == "xray" and (value.startswith("x") or value == "on"):
+        tags = (await active_route()).get("tags") or []
+        i = int(value[1:]) if value[1:].isdigit() else -1
+        if value != "on" and not 0 <= i < len(tags):
+            await _tun(cb, state, name)
+            return
+        await cb.answer("Перенастраиваю Xray…")
+        r = await (api.call("xray", "client", name, tags[i] if value != "on" else "default") if len(tags) >= 2
+                   else api.call("tunnels", "client", kind, name, value))
     else:
         r = await api.call("tunnels", "client", kind, name, value)
     if not r.ok:
@@ -637,16 +841,16 @@ async def _new_expire(cb: CallbackQuery, state: FSMContext, v: str) -> None:
         await list_screen(cb)
         return
     if v == "date":
-        await ask.ask(cb, state, "cl_nedate", "Дата окончания: <code>ГГГГ-ММ-ДД ЧЧ:ММ</code>", "cl")
+        await ask.ask(cb, state, "cl_nedate", "Дата окончания: <code>ГГГГ-ММ-ДД ЧЧ:ММ</code> (время сервера)", "cl")
         return
     await _new_mimicry(cb, state, "" if v == "none" else v)
 
 
 @ask.on("cl_nedate")
 async def _new_date(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
-    ts = parse_date(ask.text_of(msg))
-    if not ts or ts <= time.time() + 60:
-        await ask.retry(msg, state, ctx, "Нужна дата в будущем, например 2026-12-31 23:59")
+    ts, why = future_date(ask.text_of(msg))
+    if why:
+        await ask.retry(msg, state, ctx, why)
         return
     await _new_mimicry(msg, state, str(ts))
 
@@ -660,6 +864,16 @@ async def _new_mimicry(target: ui.Target, state: FSMContext, expire: str) -> Non
         await mimicry_screen(target, f"Мимикрия: {new['name']}", "nm", "cl")
     else:
         await _create(target, state, "server")
+
+
+@act("nmb")
+async def _new_mim_back(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    """Возврат с «Уровня мимикрии» к выбору профиля нового клиента."""
+    name = ((await state.get_data()).get("newcl") or {}).get("name")
+    if not name:
+        await list_screen(cb)
+        return
+    await mimicry_screen(cb, f"Мимикрия: {name}", "nm", "cl")
 
 
 @act("nm")
@@ -752,15 +966,16 @@ async def _bulk_count_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> N
 
 @act("bnames")
 async def _bulk_names(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
-    await ask.ask(cb, state, "cl_bnames", "<b>➕ Несколько клиентов</b>\nИмена через запятую, например "
+    await ask.ask(cb, state, "cl_bnames", "<b>➕ Несколько клиентов</b>\nИмена через запятую или пробел, например "
                                           "<code>anna, boris, vera</code>", act.data("bulk"))
 
 
 @ask.on("cl_bnames")
 async def _bulk_names_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
-    names = [n for n in ask.text_of(msg).replace(" ", "").split(",") if n]
+    # Разделитель — запятая, пробел или перевод строки: «anna boris» — два имени, а не «annaboris»
+    names = [n for n in re.split(r"[\s,]+", ask.text_of(msg)) if n]
     if not names or not all(NAME_RE.match(n) for n in names):
-        await ask.retry(msg, state, ctx, "Имена: латиница, цифры, _ и -, до 32 символов, через запятую")
+        await ask.retry(msg, state, ctx, "Имена: латиница, цифры, _ и -, до 32 символов, через запятую или пробел")
         return
     await _bulk_expire_screen(msg, state, ",".join(names))
 
@@ -780,16 +995,16 @@ async def _bulk_expire(cb: CallbackQuery, state: FSMContext, v: str) -> None:
         await list_screen(cb)
         return
     if v == "date":
-        await ask.ask(cb, state, "cl_bedate", "Дата окончания: <code>ГГГГ-ММ-ДД ЧЧ:ММ</code>", "cl")
+        await ask.ask(cb, state, "cl_bedate", "Дата окончания: <code>ГГГГ-ММ-ДД ЧЧ:ММ</code> (время сервера)", "cl")
         return
     await _bulk_create(cb, state, "" if v == "none" else v)
 
 
 @ask.on("cl_bedate")
 async def _bulk_date(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
-    ts = parse_date(ask.text_of(msg))
-    if not ts or ts <= time.time() + 60:
-        await ask.retry(msg, state, ctx, "Нужна дата в будущем, например 2026-12-31 23:59")
+    ts, why = future_date(ask.text_of(msg))
+    if why:
+        await ask.retry(msg, state, ctx, why)
         return
     await _bulk_create(msg, state, str(ts))
 
@@ -805,9 +1020,25 @@ async def _bulk_create(target: ui.Target, state: FSMContext, expire: str) -> Non
     created = list(r.data or [])
     for n in created:               # заметка от удалённого тёзки не наследуется
         store.drop_note(n)
-    shown = ", ".join(created[:30]) + (f" и ещё {len(created) - 30}" if len(created) > 30 else "")
-    await ui.render(target, f"✅ <b>Создано клиентов: {len(created)}</b>\n{esc(shown)}\n\n"
-                            "Конфиги — архивом ниже.",
+    # Как в awg2: «N из M» и его предупреждения (подсеть заполнена — стоп, клиент
+    # не создан). Не созданные из списка имён — поимённо: занятые awg2 пропускает
+    def few(names: list[str]) -> str:
+        return ", ".join(names[:30]) + (f" и ещё {len(names) - 30}" if len(names) > 30 else "")
+
+    warns = [ln.strip()[1:].strip() for ln in r.log.splitlines() if ln.strip().startswith("▲")]
+    skipped = [w.split()[1] for w in warns if w.startswith("Пропущено:") and len(w.split()) > 1]
+    skipped = [n for n in dict.fromkeys(skipped) if n not in created]       # повтор в списке — не пропуск
+    warns = [w for w in warns if not w.startswith("Пропущено:")][-10:]
+    if ":" in spec:
+        asked, missed = int(spec.split(":")[1]), []
+    else:
+        want = list(dict.fromkeys(spec.split(",")))
+        asked, missed = len(want), [n for n in want if n not in created and n not in skipped]
+    notes = ([f"▲ Имя уже занято: {esc(few(skipped))}"] if skipped else []) \
+        + ([f"▲ Не созданы: {esc(few(missed))}"] if missed else []) + [f"▲ {esc(w)}" for w in warns]
+    await ui.render(target, f"✅ <b>Создано клиентов: {len(created)} из {asked}</b>\n{esc(few(created))}"
+                            + ("\n\n" + "\n".join(notes) if notes else "")
+                            + "\n\nКонфиги — архивом ниже.",
                     ui.kb(ui.Row(("👥 Клиенты", "cl"), ui.HOME)))
     files = [c["file"] for c in await clients() or [] if c["name"] in set(created)]
     await ui.chat_of(target).answer_document(

@@ -35,8 +35,10 @@ def _attention(d: dict) -> str:
     """То, что требует действий: только когда есть что сказать."""
     c, s = d.get("components") or {}, d.get("server") or {}
     return block(
-        "⚠️ awg0 не поднят — <i>Сервер → Проверить и починить</i>" if s.get("exists") and not s.get("up") else "",
+        "⚠️ awg0 не поднят — <i>Сервер → 🛠 Починить</i>" if s.get("exists") and not s.get("up") else "",
         f"▲ {esc(c['reboot'])}" if c.get("installed") and c.get("reboot") else "",
+        f"⚠️ Ядро {esc(c['kernel_gap'])} без модуля AWG — после перезагрузки VPN не поднимется: "
+        "<i>Сервер → Модуль ядра → Под все ядра</i>" if c.get("kernel_gap") else "",
         f"⬆️ Доступна {esc(d['update'])} — <i>Обновление</i>" if d.get("update") else "",
     )
 
@@ -44,7 +46,7 @@ def _attention(d: dict) -> str:
 def _server(d: dict) -> str:
     c, s = d.get("components") or {}, d.get("server") or {}
     if not c.get("installed"):
-        return block("❌ Компоненты не установлены", "<i>Сервер → Установить компоненты</i>")
+        return block("❌ Компоненты не установлены", "<i>Сервер → 📦 Компоненты</i>")
     module = f"🧩 модуль <code>{esc(c.get('module') or '?')}</code> " + (
         f"· ⬆️ есть {esc(c['module_update'])}" if c.get("module_update") else "✓")
     if not s.get("exists"):
@@ -62,7 +64,7 @@ def _tunnels(d: dict) -> str:
     """Работающие туннели первыми, затем настроенные и выключенные."""
     t = d.get("tunnels") or {}
     names = [("warp", "WARP"), ("xray", "Xray"), ("tun2socks", "tun2socks"),
-             ("exits", "Exit-ноды"), ("dns", "DNS")]
+             ("exits", "Exit-ноды WG"), ("dns", "DNS")]
     items = [(t[k], n) for k, n in names if t.get(k, "none") != "none"]
     if d.get("wgobf", "none") != "none":
         items.append((d["wgobf"], "WG+обф."))
@@ -85,8 +87,8 @@ def status_text(d: dict) -> str:
 
 
 def menu_kb(d: dict) -> ui.InlineKeyboardMarkup:
-    """Девять разделов awg2 в два столбца, в том же порядке; в самом низу —
-    «Поддержать» во всю ширину."""
+    """Разделы awg2 в два столбца, в том же порядке (и веб-панель — «w» в
+    меню awg2); ниже — «Обновить» и «Поддержать» во всю ширину."""
     return ui.kb(
         ("🖥 Сервер", "srv"),
         ("👥 Клиенты", "cl"),
@@ -95,9 +97,10 @@ def menu_kb(d: dict) -> ui.InlineKeyboardMarkup:
         ("🌐 Туннели и DNS", "tun"),
         ("🤖 Telegram-бот", "botm"),
         ("🗑 Удаление", "del"),
-        (f"⬆️ Есть {d['update']}" if d.get("update") else "⬆️ Обновление", "upd", "primary"),
+        (f"⬆️ Есть {d['update']}" if d.get("update") else "⬆️ Обновление", "upd"),
         ("🛡 Обфускатор", "wo"),
-        ("🔄 Обновить", "main"),
+        ("💻 Веб-панель", "web"),
+        ui.Row(("🔄 Обновить", "main")),
         ui.Row(("Поддержать 💚", SUPPORT_URL)),
     )
 

@@ -1,0 +1,51 @@
+# Проверка PR и пушей в main: awg2.sh собран из src/, линтеры, тесты.
+# Тесты идут без root и сети (песочница tests/sandbox.py); панель в Chromium
+# (tests/test_panel.py) здесь не запускается — ей нужен Playwright; test_web
+# без него проверяет веб-панель по HTTPS, а браузерную часть пропускает.
+name: Проверка
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - name: Зависимости
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck openssh-client
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q pyflakes -r awg_bot/requirements.txt
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: awg2.sh собран из src/
+        run: |
+          set -euo pipefail
+          AWG_BUILD="$(sed -n 's/^BUILD="\(.*\)"$/\1/p' awg2.sh | head -1)" ./build.sh "$RUNNER_TEMP/built.sh"
+          cmp -s "$RUNNER_TEMP/built.sh" awg2.sh \
+            || { echo "::error::awg2.sh не совпадает со сборкой src/ — пересобери: ./build.sh awg2.sh"; exit 1; }
+
+      - name: Линтеры
+        run: |
+          set -euo pipefail
+          shellcheck -s bash -S warning awg2.sh
+          pyflakes awg_bot src/py
+          node --check awg_bot/awgbot/webapp/app.js
+
+      - name: Тесты
+        run: |
+          set -euo pipefail
+          for t in test_toolza test_cps test_net test_admins test_bot test_web; do
+            echo "::group::$t"
+            python3 "tests/$t.py" awg2.sh
+            echo "::endgroup::"
+          done

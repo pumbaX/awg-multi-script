@@ -4,6 +4,11 @@
 # умеет — tun2socks поверх SOCKS-входа Xray на 127.0.0.1:10808. Дальше
 # маршрутизация одна: клиенты из peers.list → таблица 201 → xray0.
 #
+# Клиенту можно назначить свой выход: строка «IP|выход» в peers.list, в
+# конфиге Xray — правило по адресу клиента (source) перед общим. Адрес
+# клиента виден только inbound tun самого Xray — поэтому перед xray0 в этом
+# режиме нет NAT; через tun2socks все соединения приходят с 127.0.0.1.
+#
 # Три постоянных юнита, чтобы туннель переживал перезагрузку:
 #   awg-xray.service          — сам Xray;
 #   awg-xray-tun.service      — tun2socks (только если нет inbound tun);
@@ -43,13 +48,21 @@ xray_test() {
 
 # Умеет ли бинарь inbound tun. Апстримный XTLS/Xray-core долго его не имел,
 # поэтому спрашиваем сам бинарь, а не гадаем по версии.
+# Ответ запоминается и в $STATE_DIR/xray_tun до смены бинаря: проба
+# запускает сам Xray, а спрашивают её на каждом экране клиента в боте.
 _XRAY_TUN=""
 xray_tun_supported() {
-  local probe
+  local probe key cache="$STATE_DIR/xray_tun"
   if [[ -z "$_XRAY_TUN" ]]; then
-    _XRAY_TUN=0
-    mktmp probe .json || return 1
-    py xray-tun-probe "$probe" && xray_test "$probe" >/dev/null && _XRAY_TUN=1
+    key=$(stat -c '%Y:%s' "$XRAY_BIN" 2>/dev/null || true)
+    if [[ -n "$key" && "$(cut -d' ' -f1 "$cache" 2>/dev/null)" == "$key" ]]; then
+      _XRAY_TUN=$(cut -d' ' -f2 "$cache")
+    else
+      _XRAY_TUN=0
+      mktmp probe .json || return 1
+      py xray-tun-probe "$probe" && xray_test "$probe" >/dev/null && _XRAY_TUN=1
+      [[ -n "$key" ]] && mkdir -p "$STATE_DIR" && echo "$key $_XRAY_TUN" > "$cache" 2>/dev/null
+    fi
   fi
   [[ "$_XRAY_TUN" == 1 ]]
 }
@@ -101,7 +114,7 @@ xray_install() {  # [update] — без вопроса обновить уже �
 xray_add_outbound() {
   local link
   xray_installed || { err "Сначала установи Xray"; return 1; }
-  read_line link "${C}  Ссылка (vless:// vmess:// hysteria2://): ${N}"
+  read_line link "${C}  Ссылка (vless:// vmess:// trojan:// ss:// hysteria2://): ${N}"
   link="${link//[[:space:]]/}"
   [[ -n "$link" ]] || return 0
   xray_add_link "$link"
@@ -122,7 +135,7 @@ xray_add_link() {  # ссылка
   if ! why=$(xray_test "$probe"); then
     err "Этот Xray не принимает такой выход:"
     sed 's/^/      /' <<< "$why"
-    [[ "$link" =~ ^(hysteria2|hy2):// ]] && info "hysteria2 есть не во всех сборках Xray — используй vless/vmess"
+    [[ "$link" =~ ^(hysteria2|hy2):// ]] && info "Hysteria2 есть в Xray 26 и новее — обнови Xray: Установить / обновить"
     return 1
   fi
   py xray-add "$XRAY_CONF" <<< "$ob" 2>/dev/null || rc=$?
@@ -148,11 +161,109 @@ xray_del_outbound() {
   xray_del_tag "$CHOSEN"
 }
 
+# Клиенты удалённых выходов — на выход по умолчанию; печатает, сколько их.
+_xray_peers_untag() {  # тег...
+  local f="$XRAY_PEERS"
+  [[ -f "$f" ]] || { echo 0; return 0; }
+  awk -F'|' 'NR == FNR {d[$0] = 1; next} NF > 1 && ($2 in d) {c++} END {print c + 0}' \
+    <(printf '%s\n' "$@") "$f"
+  awk -F'|' 'NR == FNR {d[$0] = 1; next} NF > 1 && ($2 in d) {print $1; next} {print}' \
+    <(printf '%s\n' "$@") "$f" > "$f.tmp" && mv -f "$f.tmp" "$f"
+}
+
 xray_del_tag() {  # тег
+  local n
   xray_tags | grep -qxF "$1" || { err "Выхода $1 нет"; return 1; }
   py xray-del "$XRAY_CONF" "$1"
-  py xray-prepare "$XRAY_CONF" "$(xray_tun_supported && echo native || echo tun2socks)" || true
+  n=$(_xray_peers_untag "$1")
+  _xray_prepare
   ok "Выход $1 удалён"
+  (( ${n:-0} )) && info "Его клиенты ($n) — теперь на выходе по умолчанию"
+  xray_is_up && xray_restart
+  return 0
+}
+
+# Режим входа Xray: native — свой inbound tun, tun2socks — через SOCKS.
+xray_mode() { if xray_tun_supported; then echo native; else echo tun2socks; fi; }
+
+_xray_prepare() { py xray-prepare "$XRAY_CONF" "$(xray_mode)" "$XRAY_PEERS"; }
+
+# Выход по умолчанию — для клиентов без своего выхода. Балансировщик выключается.
+xray_main_set() {  # тег
+  xray_installed || { err "Xray не установлен"; return 1; }
+  xray_tags | grep -qxF "$1" || { err "Выхода $1 нет"; return 1; }
+  py xray-main "$XRAY_CONF" "$1" || return 1
+  ok "Выход по умолчанию: $1"
+  if xray_is_up; then info "Перезапускаю туннель"; xray_restart; fi
+  return 0
+}
+
+# Выход клиента: тег или default (выход по умолчанию / балансировщик).
+# Клиент заодно включается в Xray.
+xray_client_out() {  # имя тег|default
+  local name="$1" tag="$2" ip old new
+  xray_installed || { err "Xray не установлен"; return 1; }
+  ip=$(clients_name_ip | awk -F'|' -v n="$name" '$1 == n {print $2; exit}')
+  [[ -n "$ip" ]] || { err "Клиента $name нет"; return 1; }
+  if [[ "$tag" != default ]]; then
+    xray_tags | grep -qxF "$tag" || { err "Выхода $tag нет"; return 1; }
+    if ! xray_tun_supported; then
+      err "Свой выход клиенту — только с inbound tun в самом Xray, а эта сборка его не умеет"
+      info "Обнови Xray: Туннели → Xray → Установить / обновить"
+      return 1
+    fi
+  fi
+  peers_sync "$XRAY_PEERS"; peers_seed "$XRAY_PEERS"
+  old=$(grep -E "^${ip//./\\.}(\||$)" "$XRAY_PEERS" | head -1)
+  new="$ip"; [[ "$tag" == default ]] || new="$ip|$tag"
+  peers_add "$XRAY_PEERS" "$ip" "$new"
+  ok "$name → $([[ "$tag" == default ]] && echo "выход по умолчанию" || echo "$tag")"
+  xray_is_up || return 0
+  # Правила по адресу в конфиге Xray меняются, только если выход клиента был
+  # или стал своим; иначе хватает маршрута клиента в xray0
+  if [[ "$old" != "$new" && ( "$old" == *"|"* || "$new" == *"|"* ) ]]; then
+    _xray_prepare
+    info "Перезапускаю туннель"; xray_restart
+  else
+    _tunnel_rules_refresh "$XRAY_PEERS" "$XRAY_IF" "$XRAY_TABLE"
+  fi
+  return 0
+}
+
+# «имя|ip|выход» клиентов Xray со своим выходом.
+xray_client_outs() {
+  local name ip line
+  [[ -f "$XRAY_PEERS" ]] || return 0
+  while IFS='|' read -r name ip; do
+    line=$(grep -E "^${ip//./\\.}\|" "$XRAY_PEERS" | head -1)
+    [[ -n "$line" ]] && echo "$name|$ip|${line#*|}"
+  done < <(clients_name_ip)
+  return 0
+}
+
+xray_main_menu() {
+  local tags=() i c
+  mapfile -t tags < <(xray_tags)
+  (( ${#tags[@]} )) || { warn "Выходов нет — добавь выход ссылкой"; return 0; }
+  echo -e "  Сейчас: ${W}$(py xray-main-get "$XRAY_CONF" | sed 's/^balancer$/балансировщик/')${N}"
+  _xray_pick_tag || return 0
+  xray_main_set "$CHOSEN"
+}
+
+xray_client_menu() {
+  local tags=() i c name cur
+  xray_installed || { err "Xray не установлен"; return 1; }
+  mapfile -t tags < <(xray_tags)
+  (( ${#tags[@]} >= 2 )) || { warn "Свой выход клиенту — когда выходов хотя бы два"; return 0; }
+  _pick_client || return 0
+  name="${CHOSEN%%$'\t'*}"
+  [[ -n "$name" ]] || { warn "У клиента нет имени"; return 0; }
+  cur=$(xray_client_outs | awk -F'|' -v n="$name" '$1 == n {print $3}')
+  echo -e "  Сейчас: ${W}${cur:-выход по умолчанию}${N}"
+  echo -e "  ${C}0)${N} Выход по умолчанию ${D}($(py xray-main-get "$XRAY_CONF" | sed 's/^balancer$/балансировщик/'))${N}"
+  for i in "${!tags[@]}"; do echo -e "  ${C}$((i + 1)))${N} ${tags[$i]}"; done
+  read_choice c "${C}  Выход [0-${#tags[@]}]: ${N}" 0 "${#tags[@]}" 0
+  if (( c == 0 )); then xray_client_out "$name" default; else xray_client_out "$name" "${tags[$((c - 1))]}"; fi
 }
 
 xray_balancer() {  # стратегия
@@ -265,8 +376,10 @@ xray_ru_set() {
 
 # ── Маршрутизация (awg-xray-routing.service) ──────────────
 xray_routing_run() {
-  local i
+  local i nat=""
   if [[ "${1:-}" == stop ]]; then rt_down "$XRAY_IF" "$XRAY_TABLE"; return 0; fi
+  # Inbound tun самого Xray выбирает выход клиента по его адресу — без NAT
+  grep -qx 'tun_mode=native' "$XRAY_STATE" 2>/dev/null && nat=nonat
   for i in $(seq 1 40); do ip link show "$XRAY_IF" &>/dev/null && break; sleep 0.5; done
   ip link show "$XRAY_IF" &>/dev/null || { echo "$XRAY_IF не появился" >&2; return 1; }
   ip addr add "$XRAY_TUN_ADDR" dev "$XRAY_IF" 2>/dev/null || true
@@ -274,17 +387,21 @@ xray_routing_run() {
   # Мёртвый выход — не повод оставить клиентов без интернета: ждём до
   # минуты (при загрузке сеть поднимается не сразу), потом идём напрямую.
   for i in $(seq 1 8); do
-    socks_probe "$XRAY_SOCKS" >/dev/null && { rt_up "$XRAY_IF" "$XRAY_TABLE" "$XRAY_PEERS"; return; }
+    socks_probe "$XRAY_SOCKS" >/dev/null && { rt_up "$XRAY_IF" "$XRAY_TABLE" "$XRAY_PEERS" "" "$nat"; return; }
     sleep 5
   done
   echo "через Xray трафик не идёт — клиенты остаются на прямом маршруте" >&2
   return 1
 }
 
+_xray_emit_routing() {
+  emit_script "$XRAY_ROUTING_SCRIPT" 'xray_routing_run "$@"' XRAY_IF XRAY_TABLE XRAY_PEERS XRAY_STATE \
+    XRAY_TUN_ADDR XRAY_SOCKS socks_probe "${RT_FUNCS[@]}" xray_routing_run
+}
+
 _xray_write_units() {  # режим
   local mode="$1" after="$XRAY_UNIT"
-  emit_script "$XRAY_ROUTING_SCRIPT" 'xray_routing_run "$@"' XRAY_IF XRAY_TABLE XRAY_PEERS \
-    XRAY_TUN_ADDR XRAY_SOCKS socks_probe "${RT_FUNCS[@]}" xray_routing_run || return 1
+  _xray_emit_routing || return 1
   write_unit "$XRAY_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — Xray
@@ -356,7 +473,8 @@ xray_up() {
     info "Эта сборка Xray без inbound tun — xray0 поднимет tun2socks"
     t2s_install_bin || return 1
   fi
-  py xray-prepare "$XRAY_CONF" "$mode" || { err "Не удалось подготовить конфиг"; return 1; }
+  peers_sync "$XRAY_PEERS"; peers_seed "$XRAY_PEERS"
+  py xray-prepare "$XRAY_CONF" "$mode" "$XRAY_PEERS" || { err "Не удалось подготовить конфиг"; return 1; }
   # Прежние версии запускали Xray временными юнитами с теми же именами
   systemctl stop "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
   systemctl reset-failed "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
@@ -373,7 +491,6 @@ xray_up() {
     info "Разбор по выходам — «Диагностика»"
     return 1
   fi
-  peers_sync "$XRAY_PEERS"; peers_seed "$XRAY_PEERS"
   printf 'active\nclient_net=%s\niface=%s\ntun_dev=%s\ntun_mode=%s\n' \
     "$(server_net)" "$(uplink_iface)" "$XRAY_IF" "$mode" | write_file "$XRAY_STATE" 644
   _xray_write_units "$mode" || return 1
@@ -426,7 +543,7 @@ xray_uninstall() {
 
 # ── Статус и диагностика ──────────────────────────────────
 xray_status() {
-  local tags=() n total
+  local tags=() n total name tag
   if ! xray_installed; then echo -e "  Xray      : ${D}○ не установлен${N}"; return 0; fi
   echo -e "  Версия    : $("$XRAY_BIN" version 2>/dev/null | head -1 | awk '{print $2}')"
   if ip link show "$XRAY_IF" &>/dev/null; then
@@ -441,6 +558,10 @@ xray_status() {
   mapfile -t tags < <(xray_tags)
   echo -e "  Выходы    : ${W}${tags[*]:-нет}${N}"
   echo -e "  Балансир  : $(py xray-balancer-get "$XRAY_CONF" 2>/dev/null || echo off)"
+  (( ${#tags[@]} )) && echo -e "  По умолч. : ${W}$(py xray-main-get "$XRAY_CONF" 2>/dev/null | sed 's/^balancer$/балансировщик/')${N}"
+  xray_client_outs | while IFS='|' read -r name _ tag; do
+    echo -e "  ${D}  $name → $tag$(xray_tags | grep -qxF "$tag" || echo " (выхода нет — по умолчанию)")${N}"
+  done
   xray_ru_on && echo -e "  РФ-сайты  : ${G}напрямую${N}"
   return 0
 }
@@ -458,8 +579,11 @@ xray_bad_outbounds() {
 xray_fix() {
   local bad=()
   mapfile -t bad < <(xray_bad_outbounds)
-  (( ${#bad[@]} )) && py xray-del "$XRAY_CONF" "${bad[@]}"
-  py xray-prepare "$XRAY_CONF" "$(xray_tun_supported && echo native || echo tun2socks)"
+  if (( ${#bad[@]} )); then
+    py xray-del "$XRAY_CONF" "${bad[@]}"
+    _xray_peers_untag "${bad[@]}" >/dev/null
+  fi
+  _xray_prepare
   if xray_test >/dev/null; then ok "Конфиг принят Xray${bad[*]:+, убраны: ${bad[*]}}"
   else err "Конфиг всё ещё отвергается"; return 1; fi
 }
@@ -502,6 +626,8 @@ do_xray_menu() {
     echo -e "  ${C}2)${N} Добавить выход (ссылка)"
     echo -e "  ${C}3)${N} Удалить выход"
     echo -e "  ${C}4)${N} Балансировщик"
+    echo -e "  ${C}m)${N} Выход по умолчанию"
+    echo -e "  ${C}o)${N} Свой выход клиенту"
     echo -e "  ${C}5)${N} Включить туннель"
     echo -e "  ${C}6)${N} Выключить туннель"
     echo -e "  ${C}7)${N} Перезапустить туннель"
@@ -510,12 +636,14 @@ do_xray_menu() {
     echo -e "  ${C}r)${N} РФ-сайты напрямую $(xray_ru_on && echo -e "${G}● вкл${N}" || echo -e "${D}○ выкл${N}")"
     echo -e "  ${R}d)${N} Удалить Xray"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор: ${N}" 0 9 0 "r|d"
+    read_choice c "${C}  Выбор: ${N}" 0 9 0 "r|d|m|o"
     case "$c" in
       1) xray_install || true ;;
       2) xray_add_outbound || true ;;
       3) xray_del_outbound || true ;;
       4) xray_balancer_menu || true ;;
+      m) xray_main_menu || true ;;
+      o) xray_client_menu || true ;;
       5) xray_up || true ;;
       6) xray_down ;;
       7) xray_restart || true ;;

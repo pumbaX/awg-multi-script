@@ -44,7 +44,10 @@ client_add() {
 # Удаляет пира по ключу: из конфига, из ядра, файл клиента и списки туннелей.
 client_delete() {
   local pub="$1" name ip
-  ip=$(clients_tsv | awk -F'\t' -v k="$pub" '$2 == k {split($3, a, "/"); print a[1]; exit}')
+  # У заблокированного в AllowedIPs заглушка 127.0.0.2, настоящий адрес — в
+  # orig_ips: иначе его строки в туннелях и ip rule оставались, а адрес
+  # доставался новому клиенту — вместе с чужим туннелем и выходом Xray
+  ip=$(clients_tsv | awk -F'\t' -v k="$pub" '$2 == k {split($5 != "" ? $5 : $3, a, "/"); print a[1]; exit}')
   name=$(py peer-del "$SERVER_CONF" "$pub") || return 1
   iface_up && awg set "$AWG_IF" peer "$pub" remove 2>/dev/null
   [[ -n "$name" ]] && rm -f "$CLIENT_DIR/${name}_awg2.conf" "$CLIENT_DIR/${name}_awg3.conf"
@@ -114,7 +117,8 @@ client_expire_set() {  # имя unix-время
   expire_install
   # Заблокированному сначала вернуть адрес: expire-set правит только метку,
   # и клиент остался бы на 127.0.0.2 с новым сроком — «заблокирован» без причины.
-  if [[ -n "$(peer_meta_get "$1" orig_ips)" ]]; then
+  # Блокировку за трафик новый срок не снимает — её снимает лимит.
+  if [[ -n "$(peer_meta_get "$1" orig_ips)" && "$(peer_meta_get "$1" blocked_by)" != traffic ]]; then
     py expire-clear "$SERVER_CONF" "$1" "$EXPIRE_SUSPEND_IP" >/dev/null || return 1
     _expire_apply
   fi
@@ -125,17 +129,55 @@ client_expire_set() {  # имя unix-время
 
 # Снять срок; заблокированный клиент получает прежний адрес.
 client_expire_clear() {
+  local r
   client_exists "$1" || { err "Клиента $1 нет"; return 1; }
-  py expire-clear "$SERVER_CONF" "$1" "$EXPIRE_SUSPEND_IP" >/dev/null || return 1
+  r=$(py expire-clear "$SERVER_CONF" "$1" "$EXPIRE_SUSPEND_IP") || return 1
   _expire_apply
   ok "$1 — бессрочный"
+  [[ "$r" == traffic ]] && warn "$1 остаётся заблокирован: исчерпан лимит трафика"
+  return 0
 }
 
+# Лимит трафика: РАЗМЕР (50G, 500M) за месяц или всего; off — снять.
+# Применяется сразу: превысивший блокируется, уложившийся — разблокируется.
+client_limit_set() {  # имя размер|off [month|total]
+  local name="$1" size="$2" period="${3:-month}" v tr
+  client_exists "$name" || { err "Клиента $name нет"; return 1; }
+  [[ "$period" == month || "$period" == total ]] || { err "Период: month или total"; return 1; }
+  expire_install
+  tr=$(_traffic_snapshot) || return 1
+  v=$(py limit-set "$SERVER_CONF" "$TRAFFIC_DB" "$name" "$size" "$period" "$tr" \
+      "$(cat "/sys/class/net/$AWG_IF/ifindex" 2>/dev/null)") || { rm -f "$tr"; return 1; }
+  rm -f "$tr"
+  traffic_tick 1
+  if [[ "$size" == off ]]; then ok "$name — без лимита трафика"
+  else ok "Лимит $name: $v $([[ "$period" == month ]] && echo "в месяц" || echo "всего")"; fi
+}
+
+client_limit_reset() {  # имя
+  local tr
+  client_exists "$1" || { err "Клиента $1 нет"; return 1; }
+  tr=$(_traffic_snapshot) || return 1
+  py limit-reset "$SERVER_CONF" "$TRAFFIC_DB" "$1" "$tr" "$(cat "/sys/class/net/$AWG_IF/ifindex" 2>/dev/null)" \
+    || { rm -f "$tr"; return 1; }
+  rm -f "$tr"
+  traffic_tick 1
+  ok "Счётчик лимита $1 обнулён"
+}
+
+# «12.3 ГБ из 50.0 ГБ за месяц» для меню.
+limit_fmt() {  # метка limit (БАЙТ/период) использовано
+  local n="${1%/*}" p="${1#*/}"
+  echo "$(fmt_bytes "${2:-0}") из $(fmt_bytes "$n") $([[ "$p" == month ]] && echo "за месяц" || echo "всего")"
+}
+
+# Удалить клиентов с истёкшим сроком. Заблокированных за трафик не трогает:
+# они разблокируются сами в новом месяце или после смены лимита.
 clients_purge_blocked() {
   local pub n=0
   while IFS= read -r pub; do client_delete "$pub" && n=$((n + 1)); done \
-    < <(clients_tsv | awk -F'\t' '$5 != "" {print $2}')
-  ok "Удалено заблокированных: $n"
+    < <(clients_tsv | awk -F'\t' '$5 != "" && $8 != "traffic" {print $2}')
+  ok "Удалено с истёкшим сроком: $n"
 }
 
 # Архив всех конфигов → путь в EXPORT_PATH.
@@ -356,9 +398,13 @@ do_show_client_qr() { _pick_client_file && share_config "$CHOSEN" qr; }
 
 do_list_clients() {
   server_exists || { err "Сервер не создан"; return 1; }
-  local dump now name pub aip exp orig _ hs rx tx ep st i=0 age
+  local dump now name pub aip exp orig _ hs rx tx ep st i=0 age lim per used month today by
+  local -A tl=()
   dump=$(awg show "$AWG_IF" dump 2>/dev/null | tail -n +2)
   now=$(date +%s)
+  while IFS='|' read -r name lim per used month today by; do
+    [[ -n "$name" ]] && tl[x$name]="$lim|$per|$used|$month|$today|$by"
+  done < <(traffic_rows)
   echo ""
   hdr "Клиенты"
   while IFS='|' read -r name pub aip exp orig _; do
@@ -375,9 +421,13 @@ do_list_clients() {
     fi
     echo -e "  ${W}$i) ${name:-без имени}${N}  ${D}$aip${N}"
     echo -e "     $st  ↑ $(fmt_bytes "${tx:-0}")  ↓ $(fmt_bytes "${rx:-0}")${ep:+  ${D}${ep%:*}${N}}"
+    IFS='|' read -r lim per used month today by <<< "${tl[x$name]:-0|||0|0|}"
+    (( ${month:-0} )) && echo -e "     ${D}за месяц $(fmt_bytes "$month"), сегодня $(fmt_bytes "${today:-0}")${N}"
+    if [[ "$by" == traffic ]]; then echo -e "     ${R}заблокирован: исчерпан лимит — $(limit_fmt "$lim/$per" "$used")${N}"
+    elif [[ "${lim:-0}" != 0 ]]; then echo -e "     ${D}лимит: $(limit_fmt "$lim/$per" "$used")${N}"; fi
     if [[ -n "$exp" ]]; then
-      if [[ -n "$orig" ]]; then echo -e "     ${R}заблокирован: срок истёк $(expire_fmt "$exp")${N}"
-      else echo -e "     ${Y}срок: $(expire_fmt "$exp")${N}"; fi
+      if [[ -n "$orig" && "$by" != traffic ]]; then echo -e "     ${R}заблокирован: срок истёк $(expire_fmt "$exp")${N}"
+      elif [[ -z "$orig" ]]; then echo -e "     ${Y}срок: $(expire_fmt "$exp")${N}"; fi
     fi
   done < <(clients_psv)
   (( i )) || info "Клиентов нет"
@@ -417,7 +467,7 @@ do_clients_menu() {
     echo -e "  ${C}4)${N} Показать QR"
     echo -e "  ${C}5)${N} Переименовать"
     echo -e "  ${G}6)${N} Создать несколько"
-    echo -e "  ${C}7)${N} Срок действия"
+    echo -e "  ${C}7)${N} Сроки и лимиты трафика"
     echo -e "  ${C}8)${N} Экспорт всех (zip)"
     echo -e "  ${C}9)${N} Сменить мимикрию"
     echo -e "  ${R}10)${N} Удалить"

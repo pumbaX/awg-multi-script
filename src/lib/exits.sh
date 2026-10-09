@@ -148,6 +148,20 @@ WantedBy=multi-user.target
 EOF
 }
 
+# Список «выбранных» при переходе в них из режима «все клиенты». all —
+# действие над одним клиентом относительно «все» (exits_client, меню): в
+# списке все клиенты. Иначе («выбранные» кнопкой, exits up peers) — прежний
+# выбор, а если его нет или он пуст (после «никто», сброса сервера) — тоже
+# все: пустой список увёл бы мимо нод вообще всех. В режиме «выбранные»
+# пустой список — сознательное «никто», его не трогаем.
+_exits_seed_peers() {  # [all]
+  mkdir -p "$(dirname "$EXITS_PEERS")"
+  peers_sync "$EXITS_PEERS"
+  if [[ "$(exits_state_get mode)" == peers ]]; then peers_seed "$EXITS_PEERS"; return 0; fi
+  if [[ "${1:-}" == all ]] || ! grep -q . "$EXITS_PEERS" 2>/dev/null; then peers_all "$EXITS_PEERS"; fi
+  return 0
+}
+
 exits_reapply() { exits_is_up && systemctl restart "$EXITS_UNIT" &>/dev/null; return 0; }
 
 # ── Включение / выключение ────────────────────────────────
@@ -158,7 +172,7 @@ exits_up() {  # all|peers
   [[ -n "$(exits_up_nodes)" ]] || { err "Ни одна exit-нода не поднята — добавь или перезапусти ноду"; return 1; }
   # Список клиентов режима peers — до проверки «уже включено»: иначе при
   # переключении all → peers на ходу файла нет, и маршруты не получает никто.
-  if [[ "$mode" == peers ]]; then peers_sync "$EXITS_PEERS"; peers_seed "$EXITS_PEERS"; fi
+  if [[ "$mode" == peers ]]; then _exits_seed_peers; fi
   if exits_is_up; then exits_state_set mode "$mode"; exits_reapply; ok "Режим: $mode"; return 0; fi
   tunnel_guard exits || return 1
   exits_state_set state active mode "$mode"
@@ -320,12 +334,33 @@ exits_balance() {
 }
 
 # Клиент и exit-ноды: exits_client ИМЯ off|shared|НОДА. Переводит в выборочный режим.
+# exits_client ИМЯ|all|none off|shared|НОДА — выход клиента; all — все клиенты
+# через ноды (у кого своя нода, она остаётся), none — никто: все напрямую.
+# Режим при этом — «выбранные клиенты»; маршруты перезапускаются один раз.
+# Массовая форма — только без второго аргумента: клиент может называться
+# «all» или «none», и «exits client all off» — про него, а не про всех.
 exits_client() {
   local ip
+  if [[ ( "$1" == all || "$1" == none ) && -z "${2:-}" ]]; then
+    mkdir -p "$(dirname "$EXITS_PEERS")"
+    peers_sync "$EXITS_PEERS"
+    if [[ "$1" == all ]]; then
+      peers_all "$EXITS_PEERS"
+    else
+      : > "$EXITS_PEERS"
+    fi
+    exits_state_set mode peers
+    exits_reapply
+    ok "Через exit-ноды: $(grep -c . "$EXITS_PEERS" || true) из $(clients_name_ip | grep -c . || true)"
+    return 0
+  fi
   ip=$(clients_name_ip | awk -F'|' -v n="$1" '$1 == n {print $2; exit}')
   [[ -n "$ip" ]] || { err "Клиента $1 нет"; return 1; }
+  # Из «все клиенты» в «выбранные»: список — все клиенты (свои ноды остаются),
+  # а не то, что лежало в файле. После «никто» или сброса сервера он пуст, и
+  # «alice — напрямую» уводило мимо нод вообще всех.
   if [[ "$(exits_state_get mode)" != peers ]]; then
-    peers_seed "$EXITS_PEERS"
+    _exits_seed_peers all
     exits_state_set mode peers
   fi
   case "$2" in
@@ -336,6 +371,16 @@ exits_client() {
   esac
   exits_reapply
   ok "$1: ${2/shared/общий выход}"
+}
+
+# exits_mode all|peers — кого вести через ноды, не включая и не выключая их
+exits_mode() {
+  [[ "${1:-}" == all || "${1:-}" == peers ]] || { err "Режим: all | peers"; return 1; }
+  if [[ "$1" == peers ]]; then _exits_seed_peers; fi
+  exits_state_set mode "$1"
+  exits_reapply
+  if [[ "$1" == all ]]; then ok "Через exit-ноды — все клиенты"
+  else ok "Через exit-ноды — выбранные: $(grep -c . "$EXITS_PEERS" || true)"; fi
 }
 
 exits_toggle() {
@@ -369,7 +414,7 @@ exits_peers_menu() {
   # Выбор клиентов имеет смысл только в режиме «выборочно»
   if [[ "$(exits_state_get mode)" != peers ]]; then
     info "Сейчас через exit-ноды идут все клиенты — переключаю на выборочный режим"
-    peers_seed "$EXITS_PEERS"
+    _exits_seed_peers all
     exits_state_set mode peers
     exits_reapply
   fi
@@ -395,7 +440,7 @@ exits_peers_menu() {
     read_choice c "${C}  Номер — вкл/выкл: ${N}" 0 "${#rows[@]}" 0 "e|a|n"
     case "$c" in
       0) return 0 ;;
-      a) clients_name_ip | cut -d'|' -f2 > "$EXITS_PEERS" ;;
+      a) peers_all "$EXITS_PEERS" ;;          # свои ноды клиентов остаются
       n) : > "$EXITS_PEERS" ;;
       e) read_choice sel "${C}  Номер клиента: ${N}" 1 "${#rows[@]}"
          _exits_assign "${rows[$((sel - 1))]#*|}" "${rows[$((sel - 1))]%%|*}" ;;

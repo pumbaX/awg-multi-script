@@ -132,11 +132,19 @@ cascade_add() {
 }
 
 # cascade_rule_add udp|tcp|both ВХОД ЦЕЛЬ ВЫХОД [комментарий]
+# Порты и адрес цели правила; причина отказа — в stdout. Общая для
+# добавления и для правил из бэкапа: те раньше проверялись только по формату
+# и могли увести порт сервера во внутреннюю сеть.
+_cascade_rule_invalid() {  # вход цель выход
+  valid_port "$1" && valid_port "$3" || { echo "Порт 1-65535"; return 0; }
+  valid_ip "$2" && ! ip_is_private "$2" || { echo "Нужен публичный IPv4, например 5.6.7.8"; return 0; }
+  return 1
+}
+
 cascade_rule_add() {
   local protos=() proto in="$2" dst="$3" out="$4" comment="${5//[|$'\n\r']/ }" why added=0
   case "$1" in udp|tcp) protos=("$1") ;; both) protos=(udp tcp) ;; *) err "Протокол: udp | tcp | both"; return 1 ;; esac
-  valid_port "$in" && valid_port "$out" || { err "Порт 1-65535"; return 1; }
-  valid_ip "$dst" && ! ip_is_private "$dst" || { err "Нужен публичный IPv4, например 5.6.7.8"; return 1; }
+  if why=$(_cascade_rule_invalid "$in" "$dst" "$out"); then err "$why"; return 1; fi
   ip_forward_enable
   mkdir -p "$CASCADE_DIR"
   for proto in "${protos[@]}"; do

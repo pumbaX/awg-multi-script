@@ -31,6 +31,9 @@ SETTINGS = STATE_DIR / "settings.json"
 ICONS = STATE_DIR / "icons.json"
 
 MONITOR_TAG = "#ping"
+# Заметка и #ping клиента WG + обфускатора — под ключом «wgobf:имя»: имена у
+# него свои и могут совпадать с клиентами AWG
+WGOBF = "wgobf:"
 NOTE_MAX = 200
 
 

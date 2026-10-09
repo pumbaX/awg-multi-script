@@ -74,11 +74,13 @@ _api_status() {
   os_detect
   update_check_async || true
   upstream_refresh_async || true
+  country_refresh_async || true
   server_exists && n=$(clients_tsv | grep -c . || true)
   {
-    _kv version "$VERSION"; _kv api:n "$API_VERSION"
+    _kv version "$VERSION_SHOW"; _kv api:n "$API_VERSION"
     _kv channel "$UPDATE_CHANNEL"; _kv update "$(update_available || true)"
-    _kv host "$(hostname)"; _kv ip "$(public_ip_cached)"
+    _kv host "$(hostname)"; _kv ip "$(public_ip_cached)"; _kv country "$(server_country)"
+    _kv uptime:n "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
     _kv os "$OS_LABEL"; _kv kernel "$(uname -r)"
     _kv components.installed:b "$(_b command -v awg)"
     _kv components.module "$(mod_tag)"; _kv components.tools "$(tools_tag)"
@@ -86,6 +88,7 @@ _api_status() {
     _kv components.module_update "$(mod_update_available)"
     _kv components.tools_update "$(tools_update_available)"
     _kv components.reboot "$(reboot_reason)"
+    _kv components.kernel_gap "$(kernel_gap_line)"
     _kv server.exists:b "$(_b server_exists)"
     if server_exists; then
       _kv server.up:b "$(_b iface_up)"
@@ -118,10 +121,16 @@ _api_server() {
   shift || true
   case "$a" in
     info)
-      if server_exists; then proto_supported 3.1 || rc=$?; else rc=1; fi
+      # Поддержка 3.1 — из кэша (модуль, tools и сборка в памяти не менялись):
+      # server info зовут почти все экраны бота и панели, а проба на сервере
+      # 2.0 — это пробный интерфейс на каждый вызов. Сервера ещё нет — мастеру
+      # нужен тот же честный ответ, что и меню.
+      proto31_cached || rc=$?
       {
         _kv installed:b "$(_b command -v awg)"; _kv exists:b "$(_b server_exists)"
         _kv proto31:b "$([[ $rc == 0 ]] && echo 1 || echo 0)"
+        # Почему нет 3.1: components | tools | module | check (не прошла проба)
+        _kv proto31_why "$([[ $rc == 0 ]] || proto_why 3.1)"
         _kv reboot "$(reboot_reason)"
         if server_exists; then
           _kv up:b "$(_b iface_up)"; _kv proto "$(server_proto)"
@@ -189,6 +198,7 @@ _api_module() {
         _kv module_update "$(mod_update_available)"; _kv tools_update "$(tools_update_available)"
         _kv module_latest "$(upstream_latest mod)"; _kv tools_latest "$(upstream_latest tools)"
         _kv reboot "$(reboot_reason)"; _kv secure_boot:b "$(_b secure_boot_on)"
+        _kv kernel_gap "$(kernel_gap_line)"
         _kv backups:n "$(mod_backups | grep -c . || true)"
       } | api_obj
       components_report ;;
@@ -206,6 +216,7 @@ _api_module() {
       [[ -z "$tag" || "$tag" =~ ^v?[0-9][0-9A-Za-z._-]*$ ]] || { err "Тег вида v3.1.20260906"; return 1; }
       mod_update_flow "$tag" "$force" ;;
     tools) tools_update_flow "${1:-}" ;;
+    all) components_update_flow ;;
     reload) mod_reload ;;
     rebuild) mod_rebuild_all ;;
     backups)
@@ -214,7 +225,7 @@ _api_module() {
     rollback)
       [[ -n "${1:-}" ]] || { _api_usage "module rollback ФАЙЛ"; return; }
       mod_rollback "$1" ;;
-    *) _api_usage "module report|check|tags|update [ТЕГ] [force]|tools [force]|reload|rebuild|backups|rollback ФАЙЛ" ;;
+    *) _api_usage "module report|check|tags|update [ТЕГ] [force]|tools [force]|all|reload|rebuild|backups|rollback ФАЙЛ" ;;
   esac
 }
 
@@ -227,7 +238,7 @@ _api_clients() {
       server_exists || { echo '[]' > "$API_DATA"; return 0; }
       mktmp dump || return 1
       awg show "$AWG_IF" dump > "$dump" 2>/dev/null || true
-      py clients-json "$SERVER_CONF" "$dump" "$CLIENT_DIR" "$WARP_PEERS" "$XRAY_PEERS" "$EXITS_PEERS" > "$API_DATA" ;;
+      py clients-json "$SERVER_CONF" "$dump" "$CLIENT_DIR" "$WARP_PEERS" "$XRAY_PEERS" "$EXITS_PEERS" "$TRAFFIC_DB" > "$API_DATA" ;;
     bulk) _api_clients_bulk "$@" ;;
     del) _api_clients_del "$@" ;;
     export)
@@ -274,7 +285,7 @@ _api_client_opts() {
                 (( _O_EXPIRE > $(date +%s) + 60 )) || { err "Срок уже прошёл: $v"; return 1; }
               fi ;;
       mimicry) _O_MIM="$v" ;;
-      dns) [[ "$v" =~ ^[0-9.,[:space:]]+$ ]] || { err "dns: IPv4 через запятую"; return 1; }; _O_DNS="$v" ;;
+      dns) valid_dns_list "$v" || { err "dns: IPv4 через запятую"; return 1; }; _O_DNS="$v" ;;
       mtu) [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) || { err "mtu: 1280-1500"; return 1; }
            _O_MTU="$v" ;;
       *) err "Неизвестный параметр: ${kv%%=*}"; return 1 ;;
@@ -323,7 +334,7 @@ _api_clients_bulk() {
 
 _api_client() {
   local a="${1:-}" name="${2:-}" f
-  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire ИМЯ ..."; return; }
+  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset ИМЯ ..."; return; }
   shift 2
   case "$a" in
     add)
@@ -348,7 +359,11 @@ _api_client() {
       [[ -n "${1:-}" ]] || { _api_usage "client expire ИМЯ unix-время|+30d|+12h|дата"; return; }
       client_expire_set "$name" "$(_api_ts "$1")" ;;
     unexpire) client_expire_clear "$name" ;;
-    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire ИМЯ ..." ;;
+    limit)
+      [[ -n "${1:-}" ]] || { _api_usage "client limit ИМЯ 50G|500M|off [month|total]"; return; }
+      client_limit_set "$name" "$1" "${2:-month}" ;;
+    limit-reset) client_limit_reset "$name" ;;
+    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset ИМЯ ..." ;;
   esac
 }
 
@@ -358,6 +373,33 @@ _api_mimicry() {
     IFS='|' read -r id label hint <<< "$i"
     printf '%s\t%s\t%s\t%s\n' "$id" "$label" "$hint" "$(_profile_needs_domain "$id" && echo 1 || echo 0)"
   done | api_rows id label hint domain:b
+}
+
+# ── Трафик по дням ────────────────────────────────────────
+_api_traffic() {
+  local tr wtr name="" days=30
+  case "${1:-}" in
+    daily)
+      # Два аргумента — всегда «ИМЯ|all ДНЕЙ»: имя клиента может быть числом
+      if (( $# >= 3 )); then name="$2"; [[ "$3" =~ ^[0-9]+$ ]] && days="$3"
+      elif [[ "${2:-}" =~ ^[0-9]+$ ]]; then days="$2"
+      else name="${2:-}"; fi
+      [[ "$name" == all ]] && name=""
+      server_exists || { err "Сервер не создан"; return 1; }
+      mktmp tr || return 1
+      awg show "$AWG_IF" transfer > "$tr" 2>/dev/null || true
+      py traffic-daily "$SERVER_CONF" "$TRAFFIC_DB" "$tr" "$name" "$days" > "$API_DATA" ;;
+    now)
+      # Счётчики прямо сейчас — панель считает по ним живую скорость:
+      # клиенты awg0 и отдельно клиенты WG + обфускатора (wgobf0)
+      server_exists || { err "Сервер не создан"; return 1; }
+      mktmp tr || return 1
+      mktmp wtr || return 1
+      awg show "$AWG_IF" transfer > "$tr" 2>/dev/null || true
+      if wgobf_installed; then wg show "$WGOBF_IF" transfer > "$wtr" 2>/dev/null || true; fi
+      py traffic-now "$SERVER_CONF" "$tr" "$WGOBF_WG_CONF" "$wtr" > "$API_DATA" ;;
+    *) _api_usage "traffic daily [ИМЯ|all] [ДНЕЙ] | now" ;;
+  esac
 }
 
 # ── Диагностика ───────────────────────────────────────────
@@ -380,7 +422,7 @@ _api_backup() {
   shift || true
   case "$a" in
     create)
-      backup_create archive || return 1
+      backup_create archive "${1:-}" "${2:-}" || return 1
       { _kv path "$BACKUP_PATH"; _kv size:n "$(stat -c %s "$BACKUP_PATH")"; } | api_obj ;;
     list)
       while IFS= read -r p; do
@@ -398,7 +440,7 @@ _api_backup() {
     restore)
       [[ -n "${1:-}" ]] || { _api_usage "backup restore ПУТЬ [wgobf] [tunnels]"; return; }
       backup_restore "$@" ;;
-    *) _api_usage "backup create|list|inspect ПУТЬ|restore ПУТЬ [wgobf] [tunnels]" ;;
+    *) _api_usage "backup create [auto [ХРАНИТЬ]]|list|inspect ПУТЬ|restore ПУТЬ [wgobf] [tunnels]" ;;
   esac
 }
 
@@ -427,7 +469,7 @@ _api_tunnels() {
       done | api_rows name ip on:b ;;
     client)
       [[ -n "${3:-}" ]] || { _api_usage "tunnels client warp|xray ИМЯ|all|none [on|off]"; return; }
-      tunnel_client "$2" "$3" "${4:-on}" ;;
+      tunnel_client "$2" "$3" "${4:-}" ;;
     *) _api_usage "tunnels status|panic|clients warp|xray|client warp|xray ИМЯ|all|none [on|off]" ;;
   esac
 }
@@ -481,6 +523,9 @@ _api_xray() {
         _kv mode "$(xray_state_get tun_mode)"
         _kv tags:j "$(xray_tags | py json-list)"
         _kv balancer "$(xray_installed && py xray-balancer-get "$XRAY_CONF" 2>/dev/null || echo off)"
+        _kv main "$(xray_installed && py xray-main-get "$XRAY_CONF" 2>/dev/null)"
+        _kv per_client:b "$(xray_installed && _b xray_tun_supported || echo 0)"
+        _kv clients:j "$(xray_client_outs | py json-rows name ip out)"
         _kv ru:b "$(_b xray_ru_on)"; } | api_obj
       xray_status ;;
     install) xray_install update ;;
@@ -495,6 +540,12 @@ _api_xray() {
         || { _api_usage "xray balancer random|roundRobin|leastPing|leastLoad|off"; return; }
       xray_installed || { err "Xray не установлен"; return 1; }
       xray_balancer "$1" ;;
+    main)
+      [[ -n "${1:-}" ]] || { _api_usage "xray main ТЕГ"; return; }
+      xray_main_set "$1" ;;
+    client)
+      [[ -n "${2:-}" ]] || { _api_usage "xray client ИМЯ ТЕГ|default"; return; }
+      xray_client_out "$1" "$2" ;;
     up) xray_up ;;
     down) xray_down ;;
     restart) xray_restart ;;
@@ -505,7 +556,7 @@ _api_xray() {
     diag) xray_diagnose ;;
     fix) xray_fix ;;
     remove) xray_uninstall ;;
-    *) _api_usage "xray status|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|up|down|restart|ru on|off|ru-update|diag|fix|remove" ;;
+    *) _api_usage "xray status|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|diag|fix|remove" ;;
   esac
 }
 
@@ -544,10 +595,12 @@ _api_exits() {
     balance)
       [[ -n "${1:-}" ]] || { _api_usage "exits balance single НОДА|ecmp"; return; }
       exits_balance "$1" "${2:-}" ;;
+    mode) exits_mode "${1:-}" ;;
     client)
-      [[ -n "${2:-}" ]] || { _api_usage "exits client ИМЯ off|shared|НОДА"; return; }
-      exits_client "$1" "$2" ;;
-    *) _api_usage "exits status|add ИМЯ (stdin)|del ИМЯ|up [all|peers]|down|balance single НОДА|ecmp|client ИМЯ off|shared|НОДА" ;;
+      # all / none без второго аргумента — все клиенты; с ним — клиент с таким именем
+      [[ "${1:-}" == all || "${1:-}" == none || -n "${2:-}" ]] || { _api_usage "exits client ИМЯ off|shared|НОДА | all | none"; return; }
+      exits_client "$1" "${2:-}" ;;
+    *) _api_usage "exits status|add ИМЯ (stdin)|del ИМЯ|up [all|peers]|down|mode all|peers|balance single НОДА|ecmp|client ИМЯ off|shared|НОДА|all|none" ;;
   esac
 }
 
@@ -597,7 +650,7 @@ _api_dns() {
 }
 
 _api_wgobf() {
-  local a="${1:-}" name dir f dump now pub ip hs
+  local a="${1:-}" name dir f dump now pub ip hs rx tx
   shift || true
   case "$a" in
     status)
@@ -616,10 +669,13 @@ _api_wgobf() {
       while IFS= read -r name; do
         pub=$(awk -v t="# client=$name" '$0 == t {f = 1; next} f && /^PublicKey = / {print $3; exit}' "$WGOBF_WG_CONF")
         ip=$(awk -v t="# client=$name" '$0 == t {f = 1; next} f && /^AllowedIPs = / {print $3; exit}' "$WGOBF_WG_CONF")
-        hs=$(awk -v k="$pub" '$1 == k {print $5; exit}' <<< "$dump")
-        [[ "$hs" =~ ^[0-9]+$ ]] && (( hs > 0 )) && hs=$((now - hs)) || hs=""
-        printf '%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs"
-      done < <(wgobf_clients) | api_rows name ip ago:n ;;
+        # Рукопожатие и трафик с подъёма wgobf0 (счётчики WireGuard)
+        hs="" rx="" tx=""          # у нового клиента строки в dump нет: прошлый не тянется
+        read -r hs rx tx < <(awk -v k="$pub" '$1 == k {print $5, $6, $7; exit}' <<< "$dump") || true
+        [[ "${hs:-}" =~ ^[0-9]+$ ]] && (( hs > 0 )) && hs=$((now - hs)) || hs=""
+        [[ "${rx:-}" =~ ^[0-9]+$ ]] || rx=0; [[ "${tx:-}" =~ ^[0-9]+$ ]] || tx=0
+        printf '%s\t%s\t%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs" "$rx" "$tx"
+      done < <(wgobf_clients) | api_rows name ip ago:n rx:n tx:n ;;
     add|del|bundle)
       name="${1:-}"
       [[ -n "$name" ]] || { _api_usage "wgobf $a ИМЯ"; return; }
@@ -647,16 +703,16 @@ _api_wgobf() {
 
 # ── Обновление, бот, удаление ─────────────────────────────
 _api_update() {
-  local a="${1:-}" v
+  local a="${1:-}" v c
   shift || true
   case "$a" in
     status)
       v=$(update_available || true)
-      { _kv version "$VERSION"; _kv channel "$UPDATE_CHANNEL"; _kv repo "$UPDATE_REPO"
+      { _kv version "$VERSION_SHOW"; _kv channel "$UPDATE_CHANNEL"; _kv repo "$UPDATE_REPO"
         _kv available "$v"; } | api_obj ;;
     check)
       v=$(update_peek) || { err "Канал обновлений недоступен ($UPDATE_REPO)"; return 1; }
-      { _kv version "$VERSION"; _kv latest "$v"; _kv channel "$UPDATE_CHANNEL"
+      { _kv version "$VERSION_SHOW"; _kv latest "$v"; _kv channel "$UPDATE_CHANNEL"
         _kv newer:b "$( (( 10#$(ver_num "$v") > 10#$(ver_num "$VERSION") )) && echo 1 || echo 0)"; } | api_obj
       info "Текущая: $VERSION, в канале: $v" ;;
     install)
@@ -671,7 +727,14 @@ _api_update() {
       ok "Канал: $(update_channel_label)" ;;
     changelog)
       update_changelog_fetch || { err "Список изменений недоступен ($UPDATE_REPO)"; return 1; }
-      py changelog-json "$VERSION" <<< "$UPDATE_CHANGELOG" > "$API_DATA" ;;
+      # В CHANGELOG канала версия новее, чем помнит кэш проверки (он живёт до
+      # часа), — спросить канал сейчас: иначе «Доступна» и кнопка показали бы
+      # прошлую версию, а обновление поставило бы новую
+      v=$(grep -m1 -oE '^## v[0-9]+\.[0-9]+\.[0-9]+' <<< "$UPDATE_CHANGELOG" | cut -c4-)
+      c=$(awk '{print $1; exit}' "$UPDATE_CACHE" 2>/dev/null)
+      [[ "$c" =~ ^v?[0-9]+\.[0-9]+ ]] || c="v0.0.0"
+      if [[ -n "$v" ]] && (( 10#$(ver_num "$v") > 10#$(ver_num "$c") )); then update_peek >/dev/null || true; fi
+      py changelog-json "$VERSION" "$(update_available || true)" <<< "$UPDATE_CHANGELOG" > "$API_DATA" ;;
     *) _api_usage "update status|check|install [force]|channel stable|beta|changelog" ;;
   esac
 }
@@ -735,9 +798,77 @@ _api_cert() {
   esac
 }
 
+# ── Веб-панель ────────────────────────────────────────────
+# Пароль в ответе — только новый, сгенерированный здесь (install, password):
+# на сервере лежит лишь его хеш, прежний показать нельзя.
+_api_web_access() {
+  { _kv url "$(web_url)"; _kv user "$(web_conf_get WEB_USER)"; _kv password "${WEB_PASS_SHOWN:-}"; } | api_obj
+}
+
+_api_web() {
+  local a="${1:-status}"
+  shift || true
+  case "$a" in
+    status)
+      { _kv installed:b "$(_b web_installed)"; _kv active:b "$(_b web_active)"
+        if web_installed; then
+          _kv url "$(web_url)"; _kv user "$(web_conf_get WEB_USER)"; _kv port:n "$(web_conf_get WEB_PORT)"
+        fi
+        _kv cert:b "$(_b cert_installed)"; _kv cert_name "$(cert_get name)"; _kv cert_expires:n "$(cert_expires)"
+      } | api_obj ;;
+    install)
+      web_installed && { err "Веб-панель уже установлена — новый пароль: web password"; return 1; }
+      web_install_auto && _api_web_access ;;
+    password) web_password_new && _api_web_access ;;
+    path) web_path_new && _api_web_access ;;
+    restart|start)
+      web_installed || { err "Веб-панель не установлена"; return 1; }
+      web_restart ;;
+    stop) web_stop ;;
+    remove) web_installed || { err "Веб-панель не установлена"; return 1; }; web_remove quiet ;;
+    *) _api_usage "web status|install|password|path|restart|start|stop|remove" ;;
+  esac
+}
+
+# ── Антисканер ────────────────────────────────────────────
+_api_antiscan_lists() {  # id<TAB>подпись<TAB>включён<TAB>записей
+  local id file label min n on f
+  while IFS=$'\t' read -r id file label min; do
+    f="$ANTISCAN_DIR/lists/$id.list" n=0 on=0
+    [[ -f "$f" ]] && n=$(( $(_antiscan_parse 4 < "$f" | wc -l) + $(_antiscan_parse 6 < "$f" | wc -l) ))
+    [[ " $(_antiscan_enabled_lists) " == *" $id "* ]] && on=1
+    printf '%s\t%s\t%s\t%s\n' "$id" "$label" "$on" "$n"
+  done < <(_antiscan_lists)
+}
+
+_api_antiscan() {
+  local a="${1:-status}" e on=0
+  shift || true
+  case "$a" in
+    status)
+      read -r -a e <<< "$(_antiscan_get ENTRIES)"
+      antiscan_on && on=1
+      { _kv enabled:b "$on"; _kv active:b "$( (( on )) && _b antiscan_rules_ok || echo 0)"
+        _kv v4:n "${e[0]:-0}"; _kv v6:n "${e[1]:-0}"
+        _kv updated:n "$(_antiscan_get UPDATED)"; _kv error "$(_antiscan_get ERROR)"
+        _kv dropped:n "$( (( on )) && antiscan_dropped || echo 0)"
+        _kv lists:j "$(_api_antiscan_lists | py json-rows id name on:b entries:n)"
+        _kv top:j "$( (( on )) && antiscan_top 5 | py json-rows packets:n net org || echo '[]')"
+        _kv allow:j "$(_antiscan_allow_rows | py json-list)"
+        _kv ssh:j "$(_antiscan_ssh_peers | py json-list)"
+      } | api_obj ;;
+    on) antiscan_enable ;;
+    off) antiscan_disable ;;
+    update) antiscan_update ;;
+    lists) antiscan_lists_set "$@" ;;
+    allow) antiscan_allow "$@" ;;
+    *) _api_usage "antiscan status|on|off|update|lists scan,skipa,gov|allow add|del АДРЕС" ;;
+  esac
+}
+
 _api_uninstall() {
   local o
-  for o in "$@"; do [[ "$o" =~ ^(bot|wgobf|self)$ ]] || { _api_usage "uninstall [bot] [wgobf] [self]"; return; }; done
+  for o in "$@"; do [[ "$o" =~ ^(bot|wgobf|web|self)$ ]] || { _api_usage "uninstall [bot] [wgobf] [web] [self]"; return; }; done
   uninstall_all "$@"
 }
 
@@ -754,8 +885,9 @@ _api_log() {
     xray) unit="$XRAY_UNIT" ;;           xray-routing) unit="$XRAY_ROUTING_UNIT" ;;
     tun2socks) unit="$T2S_UNIT" ;;       exits) unit="$EXITS_UNIT" ;;
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
-    bot) unit="$BOT_UNIT" ;;
-    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot [строк]"; return ;;
+    bot) unit="$BOT_UNIT" ;;             web) file="$WEB_LOG" ;;
+    antiscan) file="$ANTISCAN_LOG" ;;
+    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan [строк]"; return ;;
   esac
   if [[ -n "$file" ]]; then
     [[ -f "$file" ]] || { info "Журнала $file нет"; return 0; }
@@ -831,17 +963,23 @@ _api_job() {
 # Команды только для чтения идут мимо очереди: сводка не должна ждать,
 # пока задача собирает модуль.
 _api_readonly() {
-  case "$*" in
-    # Пишущие подкоманды «читающих» разделов — в очередь: bot webapp port и
-    # bot proxy set правят один /etc/awg-bot.conf, параллельно потеряли бы ключ.
-    "bot proxy set"*|"bot proxy clear"*|"bot webapp port"*|"server params set"*) return 1 ;;
-    "server params"|"server params check"*) return 0 ;;
+  local a="${1:-}" b="${2:-}" c="${3:-}"
+  # Разделы, где всё — чтение (задача job start сама идёт через замок, когда запустится)
+  case "$a" in status|version|help|mimicry|log|job|diag) return 0 ;; esac
+  # Дальше — точные команды по словам, а не маски по строке: лишнее слово в
+  # конце или слово с пробелом внутри («allow add X info») чтением не станут.
+  # Пишущие подкоманды «читающих» разделов (bot proxy set, bot webapp port,
+  # server params set — правят общие файлы) сюда не попадают — в очередь.
+  [[ "$a $b" != *[[:space:]]*[[:space:]]* ]] || return 1
+  case "$a $b $c" in
+    "server params "|"server params check"|"bot proxy get"|"bot proxy check"|"bot proxy candidates"|"bot webapp get") return 0 ;;
   esac
-  case "$1 ${2:-}" in
-    "status "|"version "|"help "|"mimicry "|"log "*|"job "*|"diag "*) return 0 ;;
-    *" status"|*" info"|*" report"|*" tags"|*" backups"|*" list"|*" conf"|*" inspect") return 0 ;;
-    "clients "|"tunnels "|"tunnels clients"|"xray diag"|"cascade diag"|"wgobf clients"|\
-    "bot proxy"|"bot webapp"|"update check"|"update changelog"|"module check"|"cert "|"cert find") return 0 ;;
+  case "$a $b" in
+    "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
+    "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"tunnels "|"tunnels status"|\
+    "tunnels clients"|"warp status"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
+    "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
+    "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status") return 0 ;;
   esac
   return 1
 }
@@ -862,7 +1000,7 @@ api_dispatch() {
   local cmd="${1:-help}"
   shift || true
   case "$cmd" in
-    version) { _kv version "$VERSION"; _kv api:n "$API_VERSION"; _kv channel "$UPDATE_CHANNEL"
+    version) { _kv version "$VERSION_SHOW"; _kv api:n "$API_VERSION"; _kv channel "$UPDATE_CHANNEL"
                _kv update "$(update_available || true)"; } | api_obj ;;
     status) _api_status ;;
     server) _api_server "$@" ;;
@@ -870,6 +1008,7 @@ api_dispatch() {
     clients) _api_clients "$@" ;;
     client) _api_client "$@" ;;
     mimicry) _api_mimicry ;;
+    traffic) _api_traffic "$@" ;;
     diag) _api_diag "$@" ;;
     backup) _api_backup "$@" ;;
     tunnels) _api_tunnels "$@" ;;
@@ -883,12 +1022,14 @@ api_dispatch() {
     update) _api_update "$@" ;;
     bot) _api_bot "$@" ;;
     cert) _api_cert "$@" ;;
+    web) _api_web "$@" ;;
+    antiscan) _api_antiscan "$@" ;;
     uninstall) _api_uninstall "$@" ;;
     log) _api_log "$@" ;;
     job) _api_job "$@" ;;
     help)
-      echo "Разделы: status server module clients client mimicry diag backup tunnels warp xray t2s"
-      echo "         exits cascade dns wgobf update bot uninstall log job version"
+      echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
+      echo "         exits cascade dns wgobf update bot cert web antiscan uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
@@ -930,6 +1071,8 @@ api_main() {
     err "Не удалось поставить базовые пакеты (curl, iptables, iproute2)"; rc=1
   else
     helpers_refresh || true
+    expire_watchdog || true
+    antiscan_watchdog || true
     if _api_readonly "${API_ARGS[@]}"; then
       api_dispatch "${API_ARGS[@]}" || rc=$?
     else

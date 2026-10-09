@@ -13,7 +13,8 @@ import subprocess
 import sys
 import tempfile
 
-__all__ = ["HERE", "AWG2", "chk", "summary", "TMP", "BIN", "CALLS", "LINKS", "ACTIVE", "IPT_SAVE", "AWG_DUMP", "ROOT", "LIB",
+__all__ = ["fake_xray", "HERE", "AWG2", "chk", "summary", "TMP", "BIN", "CALLS", "LINKS", "ACTIVE", "IPT_SAVE", "AWG_DUMP", "WG_DUMP",
+           "ROOT", "LIB",
            "PRELUDE", "ENV", "bash", "run_script", "calls", "reset_calls", "kv", "OLD20", "api_wrapper", "fake_acme",
            "json", "os", "re", "shutil", "subprocess", "sys"]
 
@@ -43,6 +44,7 @@ LINKS = os.path.join(TMP, "links")          # «поднятые» интерф�
 ACTIVE = os.path.join(TMP, "active")        # «работающие» юниты systemd, по строке
 IPT_SAVE = os.path.join(TMP, "iptables-save.txt")
 AWG_DUMP = os.path.join(TMP, "awg-dump")      # вывод `awg show awg0 dump`, если файл есть
+WG_DUMP = os.path.join(TMP, "wg-dump")        # вывод `wg show wgobf0 dump` (WG + обфускатор), если файл есть
 open(LINKS, "w").close()
 open(ACTIVE, "w").close()
 open(IPT_SAVE, "w").close()
@@ -74,6 +76,7 @@ exit 0''',
   show) echo "awg $*" >> "$CALLS"
         [[ -f "$AWG_DUMP" ]] || exit 0
         [[ "${3:-}" == dump ]] && cat "$AWG_DUMP"
+        [[ "${3:-}" == transfer ]] && awk -F'\t' 'NR > 1 {print $1 "\t" $6 "\t" $7}' "$AWG_DUMP"
         [[ "${3:-}" == endpoints ]] && awk -F'\t' 'NR > 1 {print $1 "\t" $3}' "$AWG_DUMP" ;;
   *) echo "awg $*" >> "$CALLS" ;;
 esac
@@ -81,7 +84,10 @@ exit 0''',
     "awg-quick": r'''echo "awg-quick $*" >> "$CALLS"
 [[ "$1" == strip ]] && printf '[Interface]\nPrivateKey = x\n'
 exit 0''',
-    "wg": r'''echo "wg $*" >> "$CALLS"; exit 0''',
+    "wg": r'''echo "wg $*" >> "$CALLS"
+[[ "$1" == show && "${3:-}" == dump && -f "$WG_DUMP" ]] && cat "$WG_DUMP"
+[[ "$1" == show && "${3:-}" == transfer && -f "$WG_DUMP" ]] && awk -F'\t' 'NR > 1 {print $1 "\t" $6 "\t" $7}' "$WG_DUMP"
+exit 0''',
     "conntrack": r'''exit 0''',
     "ss": r'''exit 0''',
     "curl": r'''for a in "$@"; do [[ "$a" == *http_code* ]] && { echo 204; exit 0; }; done
@@ -112,7 +118,7 @@ CLIENT_DIR="{ROOT}/root"; STATE_DIR="{ROOT}/var/lib/awg2"; LOG_FILE="{ROOT}/awg.
 INSTALL_LOG="{ROOT}/install.log"; EXITS_DIR="$AWG_DIR"
 EXITS_PEERS="$EXITS_DIR/exits_peers.list"; EXITS_STATE="$EXITS_DIR/exits_state"
 for v in DNS_PERSIST_SCRIPT DNS_HEALTH_SCRIPT CASCADE_SCRIPT T2S_ROUTING_SCRIPT XRAY_ROUTING_SCRIPT \\
-         EXITS_SCRIPT EXPIRE_BIN WARP_AUTOSTART_SCRIPT WARP_HEALTH_SCRIPT WGOBF_FW USQUE_UP_HOOK; do
+         EXITS_SCRIPT EXPIRE_BIN WARP_AUTOSTART_SCRIPT WARP_HEALTH_SCRIPT WGOBF_FW USQUE_UP_HOOK ANTISCAN_SCRIPT; do
   printf -v "$v" '%s' "{ROOT}/scripts/$v"
 done
 CASCADE_DIR="{ROOT}/etc/awg-cascade"; CASCADE_RULES="$CASCADE_DIR/rules.conf"; CASCADE_LOG="{ROOT}/cascade.log"
@@ -122,24 +128,28 @@ CERT_DIR="{ROOT}/etc/awg2/cert"; CERT_FULL="$CERT_DIR/fullchain.pem"; CERT_KEY="
 CERT_STATE="{ROOT}/var/lib/awg2/cert"; ACME_DIR="{ROOT}/acme.sh"; ACME_HOME="{ROOT}/var/lib/awg2/acme"
 CERT_FIND_ROOT="{ROOT}"
 EXPIRE_STATE_DIR="{ROOT}/var/lib/awg2-expire"; EXPIRE_LOG="{ROOT}/expire.log"; BOT_CONF="{ROOT}/bot.conf"
-BOT_ADMINS="{ROOT}/admins.json"
+BOT_ADMINS="{ROOT}/admins.json"; TRAFFIC_DB="$STATE_DIR/traffic.json"
+EXPIRE_STALE=999999999      # сторож таймера в песочнице молчит; его проверка — отдельно
 BACKUP_DIR="{ROOT}/awg_backup"; MOD_BACKUP_DIR="{ROOT}/mod-backups"; UPDATE_CHANNEL_FILE="$STATE_DIR/channel"
-MOD_TAG_FILE="$STATE_DIR/module_tag"; TOOLS_TAG_FILE="$STATE_DIR/tools_tag"; UPSTREAM_CACHE="$STATE_DIR/upstream_tags"
+MOD_TAG_FILE="$STATE_DIR/module_tag"; TOOLS_TAG_FILE="$STATE_DIR/tools_tag"; UPSTREAM_CACHE="$STATE_DIR/upstream_tags"; COUNTRY_CACHE="$STATE_DIR/country"
 WARP_PEERS="{ROOT}/warp.peers"; XRAY_PEERS="{ROOT}/xray.peers"; USQUE_LOG="{ROOT}/usque.log"
 XRAY_DIR="{ROOT}/etc/xray"; XRAY_CONF="$XRAY_DIR/config.json"; XRAY_STATE="$XRAY_DIR/state"
+XRAY_BIN="{ROOT}/bin/xray"; XRAY_ASSET_DIR="{ROOT}/xray-assets"
 T2S_DIR="{ROOT}/etc/tun2socks"; T2S_CONF="$T2S_DIR/proxy.txt"
 DNS_PROXY_CONF="{ROOT}/etc/dnscrypt-proxy/dnscrypt-proxy.toml"; DNS_PROXY_STATE="{ROOT}/etc/dnscrypt-proxy/awg.state"
 DNS_PROXY_BACKUP_CONF="$DNS_PROXY_CONF.awg-backup"
 WARP_DIR="{ROOT}/etc/wgcf"; WARP_ACCOUNT="$WARP_DIR/wgcf-account.toml"; WARP_PROFILE="$WARP_DIR/wgcf-profile.conf"
 WARP_STATE="$WARP_DIR/state"; WARP_CONF="{ROOT}/etc/wireguard/warp0.conf"; WARP_BACKEND_FILE="{ROOT}/etc/awg-warp-backend"
 USQUE_DIR="{ROOT}/etc/usque"; USQUE_CONF="$USQUE_DIR/config.json"
+ANTISCAN_DIR="$STATE_DIR/antiscan"; ANTISCAN_CONF="$ANTISCAN_DIR/antiscan.conf"; ANTISCAN_ALLOW="$ANTISCAN_DIR/allow"
+ANTISCAN_LOG="{ROOT}/antiscan.log"
 write_unit() {{ mkdir -p "{ROOT}/units"; cat > "{ROOT}/units/$1"; }}
 remove_unit() {{ :; }}
 mkdir -p "$AWG_DIR" "$CLIENT_DIR" "$STATE_DIR" "{ROOT}/scripts"
 '''
 
 ENV = dict(os.environ, PATH=BIN + ":" + os.environ["PATH"], CALLS=CALLS, LINKS=LINKS, ACTIVE=ACTIVE,
-           IPT_SAVE=IPT_SAVE, AWG_DUMP=AWG_DUMP, LC_ALL="C.UTF-8")
+           IPT_SAVE=IPT_SAVE, AWG_DUMP=AWG_DUMP, WG_DUMP=WG_DUMP, LC_ALL="C.UTF-8")
 
 
 def bash(code, stdin=None):
@@ -220,6 +230,23 @@ def api_wrapper():
     with open(stub, "w") as f:
         f.write("#!/usr/bin/env bash\nexit 1\n")
     os.chmod(stub, 0o755)
+    return path
+
+
+def fake_xray(tun=True):
+    """xray-заглушка в XRAY_BIN: version и `run -test` (конфиг принят; без
+    tun=True отвергает inbound tun — как сборка без него)."""
+    d = os.path.join(ROOT, "bin")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "xray")
+    with open(path, "w") as f:
+        f.write("#!/usr/bin/env bash\n"
+                'case "$1" in\n'
+                '  version) echo "Xray 26.3.27 (stub)" ;;\n'
+                '  run) ' + ('' if tun else 'grep -q \'"protocol": "tun"\' "$4" && { echo "failed: unknown protocol tun"; exit 1; }; ')
+                + 'echo "Configuration OK." ;;\n'
+                "esac\n")
+    os.chmod(path, 0o755)
     return path
 
 

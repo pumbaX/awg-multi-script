@@ -30,11 +30,23 @@ auto_backup() {  # причина
 do_backup() { backup_create; }
 
 # Полный бэкап → каталог в BACKUP_PATH; с «archive» ещё и .tar.gz рядом (для бота).
+# «archive auto [N]» — автобэкап бота по расписанию: только архив
+# awg2_backup_<время>_auto.tar.gz, из таких хранятся N последних (по умолчанию 7).
 BACKUP_PATH=""
 backup_create() {
-  local ts dir n=0 f
-  ts=$(date +%Y%m%d_%H%M%S)
-  dir="$BACKUP_DIR/awg2_backup_$ts"
+  local ts dir n=0 f auto=0 keep=7
+  if [[ "${2:-}" == auto ]]; then
+    auto=1
+    [[ "${3:-}" =~ ^[0-9]{1,3}$ ]] && (( 10#$3 >= 1 )) && keep=$((10#$3))
+  fi
+  # Имя — по секундам: второй бэкап в ту же секунду писал бы в тот же архив
+  while :; do
+    ts=$(date +%Y%m%d_%H%M%S)
+    dir="$BACKUP_DIR/awg2_backup_$ts"
+    (( auto )) && dir+="_auto"
+    [[ -e "$dir" || -e "$dir.tar.gz" ]] || break
+    sleep 1
+  done
   mkdir -p "$dir" && chmod 700 "$BACKUP_DIR" "$dir"
   if [[ -f "$SERVER_CONF" ]]; then cp -a "$SERVER_CONF" "$dir/awg0.conf"; n=$((n + 1)); ok "Сервер: awg0.conf"
   else warn "Серверного конфига нет"; fi
@@ -71,7 +83,21 @@ backup_create() {
   chmod -R go-rwx "$dir"
   BACKUP_PATH="$dir"
   if [[ "${1:-}" == archive ]]; then
-    tar -czf "$dir.tar.gz" -C "$BACKUP_DIR" "${dir##*/}" && chmod 600 "$dir.tar.gz" && BACKUP_PATH="$dir.tar.gz"
+    # Архив не записался (кончилось место) — обрезок не оставлять: в нём
+    # приватные ключи, а среди автобэкапов он вытеснил бы целые при ротации
+    if ! (umask 077 && tar -czf "$dir.tar.gz" -C "$BACKUP_DIR" "${dir##*/}"); then
+      rm -f "$dir.tar.gz"
+      (( auto )) && rm -rf "$dir"
+      err "Архив бэкапа не записан — проверь место на диске: df -h $BACKUP_DIR"
+      return 1
+    fi
+    chmod 600 "$dir.tar.gz"
+    BACKUP_PATH="$dir.tar.gz"
+  fi
+  if (( auto )) && [[ "$BACKUP_PATH" == *.tar.gz ]]; then
+    rm -rf "$dir"
+    find "$BACKUP_DIR" -maxdepth 1 -type f -name 'awg2_backup_*_auto.tar.gz' -printf '%f\n' 2>/dev/null \
+      | sort -r | tail -n +$((keep + 1)) | while IFS= read -r f; do rm -f "${BACKUP_DIR:?}/$f"; done
   fi
   success_box "Бэкап: $BACKUP_PATH"
   log_info "бэкап: $BACKUP_PATH"
@@ -160,7 +186,11 @@ _restore_tunnels() {  # каталог бэкапа
   mktmp x -d || return 1
   py safe-untar "$arch" "$x" || { warn "Настройки туннелей не распаковались"; return 0; }
   if [[ -f "$x$XRAY_CONF" ]]; then
-    if py xray-tags "$x$XRAY_CONF" >/dev/null 2>&1; then install -D -m 600 "$x$XRAY_CONF" "$XRAY_CONF"
+    # Xray работает от root: из чужого конфига — только выходы и маршруты,
+    # входы (SOCKS на 0.0.0.0, API) и журналы Тулза пишет сама
+    if n=$(py xray-restore-clean "$x$XRAY_CONF" 2>/dev/null); then
+      install -D -m 600 "$x$XRAY_CONF" "$XRAY_CONF"
+      [[ -n "$n" ]] && warn "Из конфига Xray бэкапа убрано: $n"
     else warn "Конфиг Xray из бэкапа не разобран — пропущен"; fi
   fi
   [[ -f "$x$XRAY_PEERS" ]] && install -D -m 600 "$x$XRAY_PEERS" "$XRAY_PEERS"
@@ -173,10 +203,7 @@ _restore_tunnels() {  # каталог бэкапа
     [[ "$n" =~ ^[A-Za-z0-9_]{1,6}$ ]] || { warn "Пропущен конфиг exit-ноды: ${f##*/}"; continue; }
     py exit-conf-fix "$f" && install -m 600 "$f" "$EXITS_DIR/awg-exit-$n.conf"
   done
-  if [[ -f "$x$CASCADE_RULES" ]]; then
-    grep -E '^(udp|tcp)\|[0-9]{1,5}\|[0-9]{1,3}(\.[0-9]{1,3}){3}\|[0-9]{1,5}\|' "$x$CASCADE_RULES" \
-      | write_file "$CASCADE_RULES" 600
-  fi
+  [[ -f "$x$CASCADE_RULES" ]] && _restore_cascade_rules "$x$CASCADE_RULES"
   if [[ -f "$x$T2S_CONF" ]]; then
     n=$(head -1 "$x$T2S_CONF" | tr -d '[:space:]')
     [[ "$n" =~ ^[A-Za-z0-9._-]+:[0-9]{1,5}$ ]] && echo "$n" | write_file "$T2S_CONF" 600
@@ -191,6 +218,33 @@ _restore_tunnels() {  # каталог бэкапа
   for n in $(exits_nodes); do systemctl enable --now "awg-quick@awg-exit-$n" &>/dev/null || warn "Нода $n не поднялась"; done
   (( $(cascade_count) )) && { _cascade_persist; systemctl restart awg-cascade.service &>/dev/null; }
   ok "Настройки туннелей восстановлены; маршрутизация клиентов выключена"
+}
+
+# Правила каскада из бэкапа — с теми же проверками, что при добавлении:
+# публичный адрес цели, порты 1-65535, вход не занят AmneziaWG, обфускатором
+# или локальным сервисом. Не прошедшее — пропускается с причиной.
+_restore_cascade_rules() {  # файл правил из бэкапа
+  local p in dst out comment why seen=" " kept=()
+  # || [[ -n $p ]]: последняя строка без перевода строки (файл правили руками)
+  # иначе молча терялась
+  while IFS='|' read -r p in dst out comment || [[ -n "$p" ]]; do
+    [[ "$p" == udp || "$p" == tcp ]] || continue
+    out="${out//[$'\r']/}" comment="${comment//[$'\r']/}"
+    # Поля из чужого файла идут в warn (echo -e) — без управляющих символов и \\
+    in="${in//[$'\001'-$'\037'$'\177'\\]/?}" dst="${dst//[$'\001'-$'\037'$'\177'\\]/?}"
+    out="${out//[$'\001'-$'\037'$'\177'\\]/?}"
+    if why=$(_cascade_rule_invalid "$in" "$dst" "$out"); then
+      warn "Каскад из бэкапа: пропущено ${p^^} $in → $dst:$out — $why"; continue
+    fi
+    [[ "$seen" == *" $p|$in "* ]] && continue
+    if why=$(CASCADE_RULES=/dev/null _cascade_port_conflict "$p" "$in"); then
+      warn "Каскад из бэкапа: пропущено ${p^^} $in — $why"; continue
+    fi
+    seen+="$p|$in "
+    kept+=("$p|$in|$dst|$out|$comment")
+  done < "$1"
+  if (( ${#kept[@]} )); then printf '%s\n' "${kept[@]}" | write_file "$CASCADE_RULES" 600
+  else rm -f "$CASCADE_RULES"; fi
 }
 
 # Хуки конфига из бэкапа (PostUp и т. п.) выполняются от root при подъёме
@@ -242,6 +296,8 @@ backup_restore() {
   [[ -f "$SERVER_CONF" ]] && cp -a "$SERVER_CONF" "$SERVER_CONF.pre_restore.$(date +%s)"
   _restore_awg_files "$src"
   _restore_hooks "$SERVER_CONF" || return 1
+  # Бэкап с другого VPS: NAT — на аплинк этого сервера
+  conf_uplink_sync force || true
   client_files_sync_suffix
   ok "Сервер и клиенты: $(client_files | wc -l) кл."
   _restore_warp "$src"

@@ -7,7 +7,7 @@ from aiogram import Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
 
-from .. import api, jobs, ui
+from .. import access, api, jobs, ui
 from ..ui import esc
 from .clients import NAME_RE
 
@@ -15,13 +15,15 @@ router = Router()
 act = ui.Actions(router, "diag")
 
 LOGS = [
-    ("manager", "awg2 — действия"), ("install", "компоненты"), ("module", "сборка модуля"),
-    ("awg", "awg0 (awg-quick)"), ("expire", "сроки клиентов"), ("warp", "WARP"),
-    ("warp-health", "WARP health-check"), ("xray", "Xray"), ("xray-routing", "маршруты Xray"),
-    ("tun2socks", "tun2socks"), ("exits", "exit-ноды"), ("cascade", "каскад"),
+    ("manager", "awg2 — действия"), ("install", "Компоненты"), ("module", "Сборка модуля"),
+    ("awg", "awg0 (awg-quick)"), ("expire", "Сроки клиентов"), ("warp", "WARP"),
+    ("warp-health", "WARP health-check"), ("xray", "Xray"), ("xray-routing", "Маршруты Xray"),
+    ("tun2socks", "tun2socks"), ("exits", "Exit-ноды"), ("cascade", "Каскад"),
     ("dns", "dnscrypt-proxy"), ("dns-health", "DNS health-check"), ("wgobf", "WG + обфускатор"),
-    ("bot", "Telegram-бот"),
+    ("bot", "Telegram-бот"), ("web", "Веб-панель"), ("antiscan", "Антисканер"),
 ]
+# Журнал входов веб-панели (адреса, введённые логины) — как и сам раздел «Веб-панель»
+OWNER_LOGS = {"web"}
 
 DPI_HINT = (
     "<b>🔍 DPI со стороны клиента</b>\n\n"
@@ -80,9 +82,12 @@ async def _sniff(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
         await ui.render(cb, "Нет клиентов, которые уже подключались. Подключись с устройства и вернись сюда.",
                         ui.kb(("🔄 Обновить", act.data("sniff")), ui.back("diag")))
         return
+    # Все клиенты — по страницам: срез первых 40 молча прятал остальных
+    page = int(arg) if arg.isdigit() else 0
     await ui.render(cb, "<b>🎯 Тест мимикрии</b>\nСервер 20 секунд слушает первые пакеты клиента и "
-                        "проверяет, видны ли пакеты мимикрии и на что они похожи.\n\nКлиент:",
-                    ui.kb([(r["name"], act.data("sn", r["name"])) for r in rows[:40]], ui.back("diag")))
+                        f"проверяет, видны ли пакеты мимикрии и на что они похожи.\n\nКлиент ({len(rows)}):",
+                    ui.kb(ui.paged([(r["name"], act.data("sn", r["name"])) for r in rows], page,
+                                   lambda p: act.data("sniff", str(p))), ui.back("diag")))
 
 
 @act("sn")
@@ -99,14 +104,22 @@ async def _sniff_go(cb: CallbackQuery, state: FSMContext, name: str) -> None:
 
 @act("logs")
 async def _logs(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    owner = access.is_owner(cb.from_user.id)
     await ui.render(cb, "<b>📜 Журналы</b>\nПоследние строки журнала службы.",
-                    ui.kb([(label, act.data("log", name)) for name, label in LOGS], ui.back("diag")))
+                    ui.kb([(label, act.data("log", name)) for name, label in LOGS
+                           if owner or name not in OWNER_LOGS], ui.back("diag")))
 
 
 @act("log")
-async def _log(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+async def _log(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    # Журнал открывают и из других разделов: «diag:log:имя|куда» — «Назад» туда,
+    # откуда пришли (данные колбэка того экрана); без «|куда» — в «Журналы»
+    name, _, back_to = arg.partition("|")
+    if name in OWNER_LOGS and not access.is_owner(cb.from_user.id):
+        await cb.answer("Журнал веб-панели — только владельцу", show_alert=True)
+        return
     r = await api.call("log", name, 80)
     label = dict(LOGS).get(name, name)
     body = (ui.pre(r.log, 3600) or "<i>пусто</i>") if r.ok else ui.fail(r)
     await ui.render(cb, f"<b>📜 {esc(label)}</b>\n{body}",
-                    ui.kb(("🔄 Обновить", act.data("log", name)), ui.back(act.data("logs"))))
+                    ui.kb(("🔄 Обновить", act.data("log", arg)), ui.back(back_to or act.data("logs"))))

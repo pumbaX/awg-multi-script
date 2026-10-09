@@ -28,13 +28,26 @@ MOD_LOG="/var/log/awg-mod-update.log"
 MOD_FALLBACK_TAG="v3.1.20260906"
 TOOLS_FALLBACK_TAG="v3.1.20260812"
 UPSTREAM_CACHE="$STATE_DIR/upstream_tags"
+COUNTRY_CACHE="$STATE_DIR/country"     # «NL 1791500000»: страна сервера (флаг в шапке панели)
 UPSTREAM_TTL=21600
 
 # ── Обновление скрипта ────────────────────────────────────
 UPDATE_REPO_STABLE="pumbaX/awg-multi-script"
 UPDATE_REPO_BETA="genaRijoff/awg-multi-script"
 UPDATE_CHANNEL_FILE="$STATE_DIR/channel"
-UPDATE_CHECK_TTL=21600
+# Проверка версии в канале (4 КБ файла): бета выходит по нескольку раз в день —
+# раз в 6 часов уведомление бота о новой версии запаздывало на полдня
+UPDATE_CHECK_TTL=3600 UPDATE_CHECK_TTL_BETA=1200
+# Подпись сборок: awg2.sh.sig рядом с awg2.sh (ssh-keygen -Y sign, ставит
+# GitHub Actions). Ключ релизов вшит сюда — подменить сборку на зеркале
+# или по пути без закрытого ключа нельзя. Сборки старше UPDATE_SIG_SINCE
+# выходили без подписи.
+UPDATE_SIG_NS="awg-toolza"
+UPDATE_SIGNER="awg-toolza-release"
+UPDATE_SIG_SINCE="v1.2.0"
+UPDATE_SIGNERS=(
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMSoLr9/XltV/DHvw8sMTsKqMkxxGQRezmGJgBKczeAk"   # awg-toolza-release, 2026-10
+)
 
 # ── Бэкапы ────────────────────────────────────────────────
 # В домашнем каталоге того, кто запустил sudo: так было всегда, и уже
@@ -128,11 +141,10 @@ EXITS_SCRIPT="/usr/local/bin/awg2-exits-routing.sh"
 
 # ── Срок действия клиентов ────────────────────────────────
 EXPIRE_BIN="/usr/local/bin/awg2-expire-check"
-EXPIRE_SERVICE="/etc/systemd/system/awg2-expire.service"
-EXPIRE_TIMER="/etc/systemd/system/awg2-expire.timer"
 EXPIRE_STATE_DIR="/var/lib/awg2-expire"
 EXPIRE_LOG="/var/log/awg2-expire.log"
 EXPIRE_SUSPEND_IP="127.0.0.2/32"
+TRAFFIC_DB="$STATE_DIR/traffic.json"          # трафик клиентов по дням (таймер сроков)
 
 # ── WG + обфускатор ───────────────────────────────────────
 WGOBF_VERSION="v1.6"
@@ -156,6 +168,11 @@ BOT_CONF="/etc/awg-bot.conf"
 BOT_ADMINS="/var/lib/awg-bot/admins.json"   # приглашённые админы (ведёт бот)
 BOT_DIR="/opt/awg-bot"
 BOT_UNIT="awg-bot.service"
+# Веб-панель (awgbot.web): конфиг с хешем пароля, журнал входов, самоподписанный сертификат
+WEB_CONF="/etc/awg-web.conf"
+WEB_UNIT="awg-web.service"
+WEB_LOG="/var/log/awg-web.log"
+WEB_DIR="/etc/awg-web"
 BOT_PROXY_SCHEMES="http https socks4 socks5 socks5h iface"
 WEBAPP_PORT_DEFAULT=8443                    # Mini App бота (WEBAPP_PORT в BOT_CONF)
 
@@ -169,6 +186,20 @@ ACME_HOME="/var/lib/awg2/acme"              # аккаунт и сертифик
 CERT_SERVICE="awg2-cert.service"
 CERT_TIMER="awg2-cert.timer"
 CERT_TAG="awg2-cert"
+
+# ── Антисканер (сети сканеров РКН и госорганов — DROP новых входящих) ──
+ANTISCAN_DIR="$STATE_DIR/antiscan"          # списки, исключения, состояние
+ANTISCAN_CONF="$ANTISCAN_DIR/antiscan.conf" # ON, LISTS, UPDATED, ERROR, ENTRIES, ADDRS
+ANTISCAN_ALLOW="$ANTISCAN_DIR/allow"        # исключения: адрес или подсеть в строке
+ANTISCAN_SCRIPT="/usr/local/bin/awg2-antiscan"
+ANTISCAN_LOG="/var/log/awg2-antiscan.log"
+ANTISCAN_SET="awg2-antiscan" ANTISCAN_SET6="awg2-antiscan6" ANTISCAN_TAG="awg2-antiscan"
+ANTISCAN_UNIT="awg2-antiscan.service" ANTISCAN_TIMER="awg2-antiscan-update.timer"
+ANTISCAN_SRC="https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public"
+# Предел охвата одного списка. Настоящие: ~310 тыс. адресов IPv4 (самая широкая
+# запись /19) и ~20 сетей /32 IPv6. Подменённый источник с тысячами /12 прошёл бы
+# проверку записей, но закрыл бы почти весь IPv4 — такой список не принимается
+ANTISCAN_MAX4=16777216 ANTISCAN_MAX6=4096   # 2^24 адресов IPv4; 2^12 сетей /32 IPv6 (записи /32 и шире)
 
 # Интерфейсы, которые поднимает сам awg2: их адрес не может быть Endpoint
 # клиента, и маршрут через них — не аплинк сервера.

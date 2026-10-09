@@ -102,7 +102,8 @@ async def _render_update(target: ui.Target, d: dict, latest: str, checked: bool 
         text += "\nОбновлений нет."
     text += "\n\n<i>♻️ Переустановить — заново из текущего канала, даже без новой версии</i>"
     await ui.render(target, text, ui.kb(
-        ("⬆️ Обновить", upd.data("go"), "success") if latest else None,
+        ("⬆️ Обновить", upd.data("go")) if latest else None,
+        ("📋 Что нового", upd.data("notes")),
         ("🔎 Проверить", upd.data("check")),
         ("♻️ Переустановить", upd.data("force")),
         ("🔀 На стабильный" if beta else "🧪 Бета-канал", upd.data("ch", "stable" if beta else "beta")),
@@ -118,6 +119,42 @@ async def _check(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
         return
     d = r.data
     await _render_update(cb, d, d.get("latest") if d.get("newer") else "", checked=True)
+
+
+NOTES_MAX = 3600                    # сообщение Telegram — до 4096 символов
+
+
+@upd("notes")
+async def _notes(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    """Что нового: разделы CHANGELOG новее установленной (нет новее — текущей)."""
+    await ui.render(cb, "⏳ Загружаю список изменений…")
+    r = await api.call("update", "changelog", timeout=60)
+    if not r.ok or not isinstance(r.data, dict):
+        await ui.render(cb, ui.fail(r, "Что нового"), ui.kb(ui.back("upd")))
+        return
+    d = r.data
+    parts = []
+    for sec in d.get("sections") or []:
+        head = ui.changelog_headline(str(sec.get("body") or ""))
+        parts.append(f"🔹 <b>{esc(str(sec.get('version') or ''))}</b>"
+                     + (f" · {esc(str(sec.get('title') or ''))}" if sec.get("title") else "")
+                     + (f"\n<i>{esc(head)}</i>" if head else "")
+                     + "\n" + ui.changelog_html(str(sec.get("body") or "")))
+    text = "<b>📋 Что нового</b>" + ("" if d.get("newer") else " — в установленной версии")
+    for p in parts:
+        room = NOTES_MAX - len(text) - 2
+        if len(p) <= room:
+            text += "\n\n" + p
+            continue
+        # Не влезает — по строкам (каждая — законченный HTML), остальное — ссылкой
+        cut = ""
+        for ln in p.split("\n"):
+            if len(cut) + len(ln) + 1 > room - 60:
+                break
+            cut += ("\n" if cut else "") + ln
+        text += ("\n\n" + cut if cut else "") + "\n\n<i>…остальное — в CHANGELOG.md на GitHub</i>"
+        break
+    await ui.render(cb, text, ui.kb(("⬆️ Обновить", upd.data("go")) if d.get("newer") else None, ui.back("upd")))
 
 
 AFTER_UPDATE = [("⬆️ Обновить бота", "botm:update")]

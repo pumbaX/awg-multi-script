@@ -69,21 +69,11 @@ def _page(text: str) -> bool:
     return text.startswith("◀️ Стр") or text.endswith("▶️")
 
 
-# Цвет кнопки (Bot API: style) — по эмодзи в начале подписи, чтобы разделы
-# не расставляли его вручную: удаление и сброс — красные, создание и
-# включение — зелёные, выбранный вариант и главное действие — синие.
+# Цвет кнопки (Bot API: style): зелёная — только «Поддержать 💚», остальные
+# обычные — красные, синие и зелёные разделы и действия рябили в глазах.
 # Третий элемент кнопки задаёт цвет явно ("" — обычная).
-DANGER = ("🗑", "💣", "⚠️", "🚨", "🧹", "🧯", "🚫", "❌")
-SUCCESS = ("➕", "✅", "✨", "▶️", "💚")
-PRIMARY = ("🔘", "📄")
-
-
 def style_of(text: str) -> str:
-    if text.startswith(DANGER):
-        return "danger"
-    if text.startswith(SUCCESS) or text.endswith("💚"):
-        return "success"
-    return "primary" if text.startswith(PRIMARY) else ""
+    return "success" if text.endswith("💚") else ""
 
 
 def _button(text: str, data: str, style: str | None = None) -> InlineKeyboardButton:
@@ -159,6 +149,53 @@ def back(to: str = "main", text: str = "◀️ Назад") -> Button:
 HOME: Button = ("🏠 Главное меню", "main")
 
 
+# ── CHANGELOG ─────────────────────────────────────────────
+# Раздел версии (update changelog): первая жирная строка — суть релиза в одну
+# фразу, её и показывают уведомление и «Что нового».
+def _md_plain(text: str) -> str:
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    return re.sub(r"\*\*|`", "", text).strip()
+
+
+def changelog_headline(body: str, limit: int = 160) -> str:
+    m = re.search(r"^\*\*(.+?)\*\*\s*$", body or "", re.M | re.S)
+    line = " ".join(_md_plain(m.group(1)).split()) if m else ""
+    return line if len(line) <= limit else line[:limit - 1].rstrip() + "…"
+
+
+def changelog_html(body: str) -> str:
+    """Тело раздела CHANGELOG → HTML Telegram: подзаголовки — жирным,
+    пункты — «•», перенос строки внутри пункта склеивается."""
+    out: list[str] = []
+    in_head = False                         # жирный абзац-суть: он уже в заголовке
+    for raw in (body or "").split("\n"):
+        line = raw.rstrip()
+        if in_head or (not out and line.startswith("**")):
+            in_head = not line.endswith("**") or line == "**"
+            continue
+        if not line.strip() or re.fullmatch(r"\s*-{3,}\s*", line):
+            continue
+        if raw.startswith("  ") and out and not line.strip().startswith(("- ", "* ")):
+            out[-1] += " " + line.strip()
+            continue
+        line = line.strip()
+        if line.startswith("#"):
+            out.append("\n<b>" + esc(_md_plain(line.lstrip("# "))) + "</b>")
+        elif line.startswith(("- ", "* ")):
+            out.append("• " + line[2:])
+        else:
+            out.append(line)
+    html_lines = []
+    for line in out:
+        if line.startswith("\n<b>"):
+            html_lines.append(line)
+            continue
+        t = esc(re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line))
+        t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+        html_lines.append(re.sub(r"`([^`]+)`", r"<code>\1</code>", t))
+    return "\n".join(html_lines).strip()
+
+
 # ── Текст ─────────────────────────────────────────────────
 def pre(text: str, limit: int = 3000, tail: bool = True) -> str:
     """Моноширинный блок. Длинный текст режется: по умолчанию остаётся
@@ -207,7 +244,7 @@ def clip(text: str, limit: int = TEXT_MAX) -> str:
 def fmt_bytes(n: int | None) -> str:
     n = int(n or 0)
     for unit in ("Б", "КБ", "МБ", "ГБ"):
-        if n < 1024:
+        if n < (1024 if unit == "Б" else 1023.95):      # иначе «1024.0 КБ»
             return f"{n} {unit}" if unit == "Б" else f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} ТБ"
@@ -331,7 +368,9 @@ async def render(target: Target, text: str, markup: InlineKeyboardMarkup | None 
         with contextlib.suppress(TelegramBadRequest):   # колбэк старше 15 минут
             await target.answer()
         if not isinstance(msg, Message):
-            return None
+            # Сообщение старше 48 часов (InaccessibleMessage) не правится — отвечаем новым,
+            # иначе кнопка вчерашнего меню или уведомления молча ничего не делает
+            return await show_new(bot, msg.chat.id, text, markup) if msg is not None else None
         try:
             out = await msg.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
         except TelegramBadRequest as e:
