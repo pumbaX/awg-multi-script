@@ -131,7 +131,10 @@ def setup(app: web.Application, user_of: UserOf) -> None:
         def deco(fn: Callable[[web.Request, dict, dict], Any]):  # type: ignore[no-untyped-def]
             async def handler(request: web.Request) -> web.StreamResponse:
                 user = user_of(request)
-                return await fn(request, user, await _body(request))
+                try:
+                    return await fn(request, user, await _body(request))
+                except share.PersistenceError as e:
+                    return web.json_response({"error": str(e)}, status=503)
             app.router.add_post(path, handler)
             return fn
         return deco

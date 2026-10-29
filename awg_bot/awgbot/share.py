@@ -63,13 +63,34 @@ def _digest(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+class PersistenceError(RuntimeError):
+    """Состояние ссылок не удалось прочитать, сохранить или заблокировать."""
+
+    def __init__(self) -> None:
+        super().__init__("Ошибка хранилища ссылок. Попробуйте позже.")
+
+
+def _save(data: dict) -> None:
+    try:
+        if not store.save(_file(), data):
+            raise PersistenceError()
+    except OSError as e:
+        raise PersistenceError() from e
+
+
 class _Lock:
     """Бот и веб-панель — два процесса с одним файлом ссылок."""
 
     def __enter__(self) -> "_Lock":
-        _file().parent.mkdir(parents=True, exist_ok=True)
-        self.f = open(str(_file()) + ".lock", "a")
-        fcntl.flock(self.f, fcntl.LOCK_EX)
+        self.f = None
+        try:
+            _file().parent.mkdir(parents=True, exist_ok=True)
+            self.f = open(str(_file()) + ".lock", "a")
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        except OSError as e:
+            if self.f is not None:
+                self.f.close()
+            raise PersistenceError() from e
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -77,7 +98,14 @@ class _Lock:
 
 
 def _load(now: float) -> dict[str, dict]:
-    data = store.load(_file())
+    try:
+        data = json.loads(_file().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeError, json.JSONDecodeError) as e:
+        raise PersistenceError() from e
+    if not isinstance(data, dict):
+        raise PersistenceError()
     return {k: v for k, v in data.items() if isinstance(v, dict) and float(v.get("exp") or 0) > now}
 
 
@@ -94,7 +122,7 @@ def create(name: str, pub: str, by: str, now: float | None = None) -> tuple[str,
         while len(data) >= MAX_ACTIVE:
             data.pop(min(data, key=lambda k: data[k].get("made", 0)))
         data[key] = {"name": name, "pub": pub, "exp": exp, "made": int(now), "by": by[:64], "opens": 0}
-        store.save(_file(), data)
+        _save(data)
     log.info("Ссылка на конфиг %s создана (%s), до %s", name, by, time.strftime("%H:%M:%S", time.localtime(exp)))
     return token, key[:12], exp
 
@@ -106,10 +134,12 @@ def revoke(rid: str) -> bool:
     with _Lock():
         data = _load(time.time())
         hit = [k for k in data if k.startswith(rid)]
-        for k in hit:
-            log.info("Ссылка на конфиг %s отозвана", data[k].get("name"))
-            data.pop(k)
-        store.save(_file(), data)
+        if not hit:
+            return False
+        removed = [data.pop(k) for k in hit]
+        _save(data)
+        for rec in removed:
+            log.info("Ссылка на конфиг %s отозвана", rec.get("name"))
     return bool(hit)
 
 
@@ -124,7 +154,7 @@ def _lookup(token: str, count: bool = False) -> dict | None:
             return None
         if count:
             rec["opens"] = int(rec.get("opens") or 0) + 1
-            store.save(_file(), data)
+            _save(data)
     return dict(rec)
 
 
@@ -271,7 +301,8 @@ JS = r"""(function () {
   document.getElementById("show").onclick = function () {
     var b = this; b.disabled = true;
     fetch("/s/" + token + "/data", { method: "POST", credentials: "omit", headers: { "Content-Type": "application/json" }, body: "{}" })
-      .then(function (r) { if (!r.ok) throw new Error(r.status === 429 ? "Слишком много попыток — подождите" : "Ссылка недействительна или истекла"); return r.json(); })
+      .then(function (r) { if (!r.ok) throw new Error(r.status >= 500 ? "Ошибка хранилища ссылок. Попробуйте позже." :
+        r.status === 429 ? "Слишком много попыток — подождите" : "Ссылка недействительна или истекла"); return r.json(); })
       .then(function (d) {
         text = d.text; document.getElementById("text").textContent = d.text;
         document.getElementById("fname").textContent = d.file;
@@ -311,7 +342,10 @@ async def page(request: web.Request) -> web.Response:
     ip = _ip(request)
     if _limited(ip):
         return _resp("Слишком много попыток — подождите", 429, "text/plain")
-    rec = _lookup(token)
+    try:
+        rec = _lookup(token)
+    except PersistenceError as e:
+        return _resp(str(e), 503, "text/plain")
     if rec is None:
         _fail(ip)
         return _resp(GONE.replace("{top}", TOP), 404)
@@ -329,7 +363,10 @@ async def _payload(request: web.Request) -> tuple[str, str] | web.Response:
     ip = _ip(request)
     if _limited(ip):
         return _resp('{"error": "слишком много попыток"}', 429, "application/json")
-    rec = _lookup(token, count=True)
+    try:
+        rec = _lookup(token, count=True)
+    except PersistenceError as e:
+        return _resp(json.dumps({"error": str(e)}), 503, "application/json")
     got = await _client(rec) if rec else None
     if got is None:
         _fail(ip)
