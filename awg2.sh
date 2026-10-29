@@ -12861,9 +12861,10 @@ _api_readonly() {
 
 _api_lock() {
   local wait="${API_LOCK_WAIT:-20}" holder
-  mkdir -p "$STATE_DIR"
-  exec 8>>"$API_LOCK" || return 0
+  mkdir -p "$STATE_DIR" || { err "Не удалось создать каталог блокировки API"; return 73; }
+  exec 8>>"$API_LOCK" || { err "Не удалось открыть файл блокировки API"; return 73; }
   if ! flock -w "$wait" 8; then
+    exec 8>&-
     holder=$(cat "$API_LOCK.info" 2>/dev/null)
     err "Идёт другая операция${holder:+ ($holder)} — повтори, когда она закончится"
     return 75
@@ -17815,5 +17816,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=c546e2082e250ae3
+_BUILD_SUM=f3f62fac4a79f64c
 main "$@"

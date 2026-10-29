@@ -44,7 +44,7 @@ jobs:
       - name: Тесты
         run: |
           set -euo pipefail
-          for t in test_toolza test_meta_menu test_regress_f2f3 test_amnezia test_cps test_net test_admins test_bot test_web; do
+          for t in test_toolza test_meta_menu test_regress_f2f3 test_amnezia test_cps test_net test_admins test_bot test_web test_api_lock; do
             echo "::group::$t"
             python3 "tests/$t.py" awg2.sh
             echo "::endgroup::"
