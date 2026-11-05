@@ -674,7 +674,7 @@ async def run():
     with open(os.path.join(ROOT, "xray.peers")) as f:
         peers = f.read().split()
     with open(os.path.join(ROOT, "etc/xray/config.json")) as f:
-        own = [r for r in json.load(f)["routing"]["rules"] if r.get("ruleTag") == "client-out"]
+        own = [r for r in json.load(f)["routing"]["rules"] if str(r.get("ruleTag")).startswith("client-out")]
     chk("в списке «IP|выход», в конфиге Xray — правило по адресу",
         "10.23.45.2|nl" in peers and own and own[0]["source"] == ["10.23.45.2"] and own[0]["outboundTag"] == "nl",
         [peers, own])

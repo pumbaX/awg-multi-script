@@ -60,7 +60,7 @@ READS = {("job", "status"), ("job", "list"), ("log",), ("module", "report"), ("m
          ("module", "check"), ("update", "check"), ("update", "changelog"), ("cert", "find"),
          ("diag", "status"), ("diag", "sniff-list"), ("tunnels", "clients"), ("wgobf", "clients"),
          ("xray", "diag"), ("cascade", "list"), ("module", "backups"), ("backup", "inspect"),
-         ("bot", "proxy", "get"), ("bot", "webapp", "get"), ("server", "params"), ("web", "status"),
+         ("bot", "proxy", "get"), ("bot", "proxy", "candidates"), ("bot", "webapp", "get"), ("server", "params"), ("web", "status"),
          ("traffic", "now"), ("warp", "probe"), ("antiscan", "status"), ("vkblock", "status"), ("amnezia", "status"), ("amnezia", "scan")}         # обзор панели спрашивает раз в 3 с — не запись, кэш не сбрасывает
 
 

@@ -195,7 +195,8 @@ async def _warp_import(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
 async def _warp_import_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     data = await ask.file_of(msg)
     text = data.decode(errors="replace") if data else ask.text_of(msg)
-    if "[Interface]" not in text or "[Peer]" not in text:
+    # Заголовки проверяет и чинит awg2 («Interface]» без скобки — частая потеря при копировании)
+    if "PrivateKey" not in text or "PublicKey" not in text:
         await ask.retry(msg, state, ctx, "Это не похоже на wgcf-profile.conf")
         return
     await ui.render(msg, "⏳ Импортирую профиль…")

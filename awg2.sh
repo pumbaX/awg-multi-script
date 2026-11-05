@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.52"
+VERSION="v1.2.53"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -5281,6 +5281,16 @@ warp_license_set() {  # ключ
   return 0
 }
 
+# Профиль со stdin в виде, который разбирает warp_wg_bringup: без \r и
+# пробелов по краям строк, «Ключ = значение» (генераторы пишут и «Ключ=значение»),
+# заголовки секций со скобками — при копировании с телефона «[» в начале
+# текста теряется, и профиль «Interface]» отвергался целиком.
+warp_profile_clean() {
+  tr -d '\r' | sed -E -e 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+    -e 's/^\[?[Ii]nterface\]?$/[Interface]/; s/^\[?[Pp]eer\]?$/[Peer]/' \
+    -e 's/^([A-Za-z0-9]+)[[:space:]]*=[[:space:]]*/\1 = /'
+}
+
 # Импорт готового wgcf-profile.conf (регистрация с сервера не проходит).
 warp_import() {
   local content k
@@ -5288,7 +5298,7 @@ warp_import() {
   echo -e "  Зарегистрируй профиль там, где Cloudflare доступен (например, shell.cloud.google.com):"
   echo -e "  ${G}curl -fsSL -o wgcf https://github.com/ViRb3/wgcf/releases/download/v2.2.30/wgcf_2.2.30_linux_amd64 && chmod +x wgcf && ./wgcf register --accept-tos && ./wgcf generate && cat wgcf-profile.conf${N}"
   echo -e "  Вставь вывод целиком, затем Enter и Ctrl+D:"
-  content=$(cat)
+  content=$(warp_profile_clean)
   for k in '^\[Interface\]' '^PrivateKey' '^Address' '^\[Peer\]' '^PublicKey' '^Endpoint'; do
     grep -q "$k" <<< "$content" || { err "Не похоже на wgcf-profile.conf: нет ${k//[\\^]/}"; return 1; }
   done
@@ -6561,7 +6571,7 @@ xray_port_owners() {
 
 # ── Установка ─────────────────────────────────────────────
 xray_install() {  # [update] — без вопроса обновить уже установленный
-  local asset base tmp want rc
+  local asset base tmp want rc why prev=""
   if xray_installed; then
     info "Установлен: $("$XRAY_BIN" version 2>/dev/null | head -1)"
     [[ "${1:-}" == update ]] || ask_yes "  Обновить до последней версии? [y/N]: " n || return 0
@@ -6585,12 +6595,26 @@ xray_install() {  # [update] — без вопроса обновить уже �
   unzip -qo "$tmp/x.zip" xray -d "$tmp" || { err "Архив не распаковался"; return 1; }
   unzip -qo "$tmp/x.zip" geoip.dat geosite.dat -d "$XRAY_ASSET_DIR" 2>/dev/null || true
   "$tmp/xray" version &>/dev/null || { err "Скачанный xray не запускается"; return 1; }
+  [[ -x "$XRAY_BIN" ]] && cp -p "$XRAY_BIN" "$tmp/xray.prev" && prev="$tmp/xray.prev"
   install -m 755 "$tmp/xray" "$XRAY_BIN"
   ok "Xray: $("$XRAY_BIN" version 2>/dev/null | head -1)"
   _XRAY_TUN=""
   mkdir -p "$XRAY_DIR" && chmod 700 "$XRAY_DIR"
   [[ -f "$XRAY_CONF" ]] || py xray-default "$XRAY_CONF"
+  # Новые версии Xray строже к конфигу — то, что писали прежние версии Тулзы,
+  # приводится к ним заранее
+  py xray-compat "$XRAY_CONF"
   if xray_is_up; then
+    # Конфиг, который новый Xray не примет, уронил бы работающий туннель:
+    # проверяем до перезапуска и в этом случае возвращаем прежний бинарь
+    if [[ -n "$prev" ]] && ! why=$(xray_test); then
+      err "Новый Xray не принимает конфиг:"
+      sed 's/^/      /' <<< "$why"
+      install -m 755 "$prev" "$XRAY_BIN"
+      _XRAY_TUN=""
+      warn "Вернул прежний Xray: $("$XRAY_BIN" version 2>/dev/null | head -1) — туннель работает на нём"
+      return 1
+    fi
     info "Перезапускаю туннель на новой версии"
     xray_restart
   fi
@@ -9943,7 +9967,7 @@ helpers_refresh() {
   [[ -f "$XRAY_ROUTING_SCRIPT" ]] && _xray_emit_routing
   # Xray 26.7+ без имени у входа tun поднимает utunN вместо xray0 — имя в
   # готовый конфиг сразу, а не при следующем «Включить»
-  [[ -f "$XRAY_CONF" ]] && py xray-tun-name "$XRAY_CONF"
+  [[ -f "$XRAY_CONF" ]] && py xray-compat "$XRAY_CONF"
   # Xray прежних версий жил во временных юнитах и перезагрузку не переживал
   [[ -f "$XRAY_STATE" && ! -f "/etc/systemd/system/$XRAY_UNIT" ]] && ! xray_is_up && rm -f "$XRAY_STATE"
   wgobf_installed && _wgobf_write_service_files
@@ -10141,9 +10165,11 @@ do_webapp_menu() {
   done
 }
 
-# Выходы этого сервера, годные боту, строки «url|описание».
+# Выходы этого сервера, годные боту, строки «url|описание — ответ Telegram».
+# Проверки идут разом: по очереди мёртвые exit-ноды (до 8 с каждая) растягивали
+# поиск на полминуты, и казалось, что он завис.
 _bot_proxy_candidates() {
-  local list=() dev line url
+  local list=() dev line url i dir
   [[ -n "$(xray_port_owners)" ]] && list+=("socks5://$XRAY_SOCKS|SOCKS-вход Xray")
   url=$(t2s_proxy)
   [[ -n "$url" ]] && list+=("socks5://$url|прокси tun2socks")
@@ -10156,10 +10182,18 @@ _bot_proxy_candidates() {
       tun0) list+=("iface://$dev|TUN tun2socks") ;;
     esac
   done
-  for line in ${list[@]+"${list[@]}"}; do
-    if bot_proxy_probe "${line%%|*}"; then echo "$line — Telegram отвечает"
-    else echo "$line — Telegram НЕ отвечает"; fi
+  (( ${#list[@]} )) || return 0
+  # Не mktmp: зовут внутри <(...), где ловушка EXIT не убирает файлы
+  dir=$(mktemp -d /tmp/awg2.XXXXXX) || return 1
+  for i in "${!list[@]}"; do
+    { bot_proxy_probe "${list[$i]%%|*}" && : > "$dir/$i"; } &
   done
+  wait
+  for i in "${!list[@]}"; do
+    if [[ -e "$dir/$i" ]]; then echo "${list[$i]} — Telegram отвечает"
+    else echo "${list[$i]} — Telegram НЕ отвечает"; fi
+  done
+  rm -rf "$dir"
 }
 
 bot_proxy_menu() {
@@ -15593,7 +15627,7 @@ if __name__ == "__main__":
 '
 # CPS_GENERATOR_END v2
 
-_PY_HELPER_SUM=e95b111fc5b23e38
+_PY_HELPER_SUM=d130c5dfeee66f35
 IFS= read -r -d '' _PY_HELPER <<'__AWG2_PY_HELPER__' || true
 """Встроенный помощник awg2: разбор и атомарная правка конфигов, JSON Xray,
 расчёты подсетей, разбор pcap. Вызывается как `py <команда> [аргументы]`.
@@ -17168,7 +17202,7 @@ def cmd_xray_add(path):
     # включён; клиенты со своим выходом остаются на нём
     for r in conf.get("routing", {}).get("rules", []):
         if set(r.get("inboundTag") or []) & KNOWN_IN and not r.get("balancerTag") \
-                and r.get("ruleTag") != XRAY_CLIENT_RULE:
+                and not own_rule(r, XRAY_CLIENT_RULE):
             r["outboundTag"] = ob["tag"]
     jsave(path, conf)
 
@@ -17240,6 +17274,7 @@ def cmd_xray_restore_clean(path):
     gone += sorted(_shown(k) for k in conf if k not in XRAY_RESTORE_KEEP + ("inbounds",))
     if dropped_rules:
         gone.append("правил: %d" % dropped_rules)
+    xray_rule_tags_unique(clean)
     jsave(path, clean)
     print("; ".join(gone))
 
@@ -17308,9 +17343,10 @@ def xray_tun_named(tun):
     return True
 
 
-def cmd_xray_tun_name(path):
-    """Имя xray0 у входа tun в готовом конфиге — при обновлении awg2: служба,
-    перезапущенная на новом Xray (сбой, перезагрузка), иначе подняла бы utunN."""
+def cmd_xray_compat(path):
+    """Готовый конфиг — под новые версии Xray; зовётся при обновлении awg2 и
+    самого Xray: служба, перезапущенная на новом Xray (сбой, перезагрузка),
+    иначе подняла бы utunN или не запустилась из-за повторов ruleTag."""
     try:
         conf = jload(path)
     except Exception:
@@ -17319,7 +17355,7 @@ def cmd_xray_tun_name(path):
         return
     changed = [xray_tun_named(i) for i in conf.get("inbounds") or []
                if isinstance(i, dict) and i.get("protocol") == "tun"]
-    if any(changed):
+    if xray_rule_tags_unique(conf) or any(changed):
         jsave(path, conf)
 
 
@@ -17370,13 +17406,64 @@ def cmd_xray_balancer_get(path):
     print(b[0].get("strategy", {}).get("type", "random") if b else "off")
 
 
+XRAY_CLIENT_RULE = "client-out"
+XRAY_RU_RULE = "ru-direct"
+
+
+def own_rule(r, base):
+    """Правило Тулзы этого вида: ruleTag «base» или «base-…» (суффиксы — см.
+    xray_rule_tags_unique)."""
+    t = r.get("ruleTag") if isinstance(r, dict) else None
+    return isinstance(t, str) and (t == base or t.startswith(base + "-"))
+
+
+def xray_rule_tags_unique(conf):
+    """С Xray 26.9 повтор ruleTag отвергает весь конфиг («duplicate ruleTag»);
+    раньше это проверялось только при добавлении правил через API. Прежние
+    версии Тулзы ставили один тег на оба правила «РФ напрямую» и на все
+    правила клиентов со своим выходом. Свои правила получают номера, чужие
+    повторы — суффикс «-2», «-3»… True — что-то пришлось переименовать."""
+    routing = conf.get("routing")
+    rules = routing.get("rules") if isinstance(routing, dict) else None
+    if not isinstance(rules, list):
+        return False
+    rules = [r for r in rules if isinstance(r, dict)]
+    changed, n = False, 0
+    for r in rules:
+        if own_rule(r, XRAY_CLIENT_RULE):
+            n += 1
+            want = "%s-%d" % (XRAY_CLIENT_RULE, n)
+        elif r.get("ruleTag") == XRAY_RU_RULE and r.get("ip"):
+            want = XRAY_RU_RULE + "-ip"
+        else:
+            continue
+        if r["ruleTag"] != want:
+            r["ruleTag"] = want
+            changed = True
+    taken = {r["ruleTag"] for r in rules if isinstance(r.get("ruleTag"), str)}
+    seen = set()
+    for r in rules:
+        t = r.get("ruleTag")
+        if not isinstance(t, str) or not t:
+            continue
+        if t in seen:
+            i = 2
+            while "%s-%d" % (t, i) in taken:
+                i += 1
+            t = r["ruleTag"] = "%s-%d" % (t, i)
+            taken.add(t)
+            changed = True
+        seen.add(t)
+    return changed
+
+
 def cmd_xray_ru(path, mode):
     """РФ-сайты напрямую: .ru/.su/.рф, «только из РФ» и РФ-IP идут в direct.
     Правила встают над первым правилом, ведущим в туннель, — блокировки выше
     остаются выше."""
     conf = jload(path)
     routing = conf.setdefault("routing", {})
-    rules = [r for r in routing.get("rules", []) if r.get("ruleTag") != "ru-direct"]
+    rules = [r for r in routing.get("rules", []) if not own_rule(r, XRAY_RU_RULE)]
     if mode == "on":
         outs = conf.setdefault("outbounds", [])
         if not any(o.get("tag") == "direct" for o in outs):
@@ -17386,23 +17473,20 @@ def cmd_xray_ru(path, mode):
                    if r.get("balancerTag") or r.get("outboundTag") in proxy
                    or r.get("outboundTag") == "proxy"), len(rules))
         rules[at:at] = [
-            {"type": "field", "ruleTag": "ru-direct", "outboundTag": "direct",
+            {"type": "field", "ruleTag": XRAY_RU_RULE, "outboundTag": "direct",
              "domain": ["domain:ru", "domain:su", "domain:xn--p1ai",
                         "ext:geosite_RU.dat:ru-available-only-inside"]},
-            {"type": "field", "ruleTag": "ru-direct", "outboundTag": "direct",
+            {"type": "field", "ruleTag": XRAY_RU_RULE + "-ip", "outboundTag": "direct",
              "ip": ["ext:geoip_RU.dat:ru"]},
         ]
     routing["rules"] = rules
     jsave(path, conf)
 
 
-XRAY_CLIENT_RULE = "client-out"
-
-
 def _xray_main_rule(rules):
     """Правило, ведущее весь вход туннеля в выход по умолчанию или балансировщик."""
     return next((r for r in rules if set(r.get("inboundTag") or []) & KNOWN_IN
-                 and r.get("ruleTag") != XRAY_CLIENT_RULE), None)
+                 and not own_rule(r, XRAY_CLIENT_RULE)), None)
 
 
 def cmd_xray_main(path, tag):
@@ -17440,7 +17524,7 @@ def cmd_xray_prepare(path, mode, peers=""):
     tun2socks все соединения приходят с 127.0.0.1."""
     conf = jload(path)
     routing = conf.setdefault("routing", {})
-    routing["rules"] = [r for r in routing.get("rules") or [] if r.get("ruleTag") != XRAY_CLIENT_RULE]
+    routing["rules"] = [r for r in routing.get("rules") or [] if not own_rule(r, XRAY_CLIENT_RULE)]
     inb = [i for i in conf.get("inbounds") or []
            if not (i.get("tag") == "xray0" and i.get("protocol") == "dokodemo-door")]
     socks = next((i for i in inb if i.get("tag") == "socks-in"), None)
@@ -17523,10 +17607,11 @@ def cmd_xray_prepare(path, mode, peers=""):
                 by_tag.setdefault(tag, []).append(ip)
         main = _xray_main_rule(rules)
         at = rules.index(main) if main in rules else len(rules)
-        rules[at:at] = [{"type": "field", "ruleTag": XRAY_CLIENT_RULE, "inboundTag": [want],
+        rules[at:at] = [{"type": "field", "ruleTag": "%s-%d" % (XRAY_CLIENT_RULE, n), "inboundTag": [want],
                          "source": sorted(ips, key=lambda x: [int(p) for p in x.split(".")] if x.count(".") == 3 else [0]),
-                         "outboundTag": tag} for tag, ips in by_tag.items()]
+                         "outboundTag": tag} for n, (tag, ips) in enumerate(by_tag.items(), 1)]
     routing["rules"] = rules
+    xray_rule_tags_unique(conf)
     jsave(path, conf)
 
 
@@ -18513,7 +18598,7 @@ COMMANDS = {
     "conf-hooks": cmd_conf_hooks, "mod-compat-patch": cmd_mod_compat_patch,
     "xray-link": cmd_xray_link, "xray-default": cmd_xray_default, "xray-add": cmd_xray_add,
     "xray-del": cmd_xray_del, "xray-tags": cmd_xray_tags, "xray-outs": cmd_xray_outs, "xray-restore-clean": cmd_xray_restore_clean, "xray-probe": cmd_xray_probe,
-    "xray-probe-tag": cmd_xray_probe_tag, "xray-tun-probe": cmd_xray_tun_probe, "xray-tun-name": cmd_xray_tun_name,
+    "xray-probe-tag": cmd_xray_probe_tag, "xray-tun-probe": cmd_xray_tun_probe, "xray-compat": cmd_xray_compat,
     "xray-test-copy": cmd_xray_test_copy,
     "xray-balancer": cmd_xray_balancer, "xray-balancer-get": cmd_xray_balancer_get,
     "xray-main": cmd_xray_main, "xray-main-get": cmd_xray_main_get,
@@ -18543,5 +18628,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=ea2817b78ad15235
+_BUILD_SUM=7a1dfcced6957c2e
 main "$@"

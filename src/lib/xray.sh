@@ -75,7 +75,7 @@ xray_port_owners() {
 
 # ── Установка ─────────────────────────────────────────────
 xray_install() {  # [update] — без вопроса обновить уже установленный
-  local asset base tmp want rc
+  local asset base tmp want rc why prev=""
   if xray_installed; then
     info "Установлен: $("$XRAY_BIN" version 2>/dev/null | head -1)"
     [[ "${1:-}" == update ]] || ask_yes "  Обновить до последней версии? [y/N]: " n || return 0
@@ -99,12 +99,26 @@ xray_install() {  # [update] — без вопроса обновить уже �
   unzip -qo "$tmp/x.zip" xray -d "$tmp" || { err "Архив не распаковался"; return 1; }
   unzip -qo "$tmp/x.zip" geoip.dat geosite.dat -d "$XRAY_ASSET_DIR" 2>/dev/null || true
   "$tmp/xray" version &>/dev/null || { err "Скачанный xray не запускается"; return 1; }
+  [[ -x "$XRAY_BIN" ]] && cp -p "$XRAY_BIN" "$tmp/xray.prev" && prev="$tmp/xray.prev"
   install -m 755 "$tmp/xray" "$XRAY_BIN"
   ok "Xray: $("$XRAY_BIN" version 2>/dev/null | head -1)"
   _XRAY_TUN=""
   mkdir -p "$XRAY_DIR" && chmod 700 "$XRAY_DIR"
   [[ -f "$XRAY_CONF" ]] || py xray-default "$XRAY_CONF"
+  # Новые версии Xray строже к конфигу — то, что писали прежние версии Тулзы,
+  # приводится к ним заранее
+  py xray-compat "$XRAY_CONF"
   if xray_is_up; then
+    # Конфиг, который новый Xray не примет, уронил бы работающий туннель:
+    # проверяем до перезапуска и в этом случае возвращаем прежний бинарь
+    if [[ -n "$prev" ]] && ! why=$(xray_test); then
+      err "Новый Xray не принимает конфиг:"
+      sed 's/^/      /' <<< "$why"
+      install -m 755 "$prev" "$XRAY_BIN"
+      _XRAY_TUN=""
+      warn "Вернул прежний Xray: $("$XRAY_BIN" version 2>/dev/null | head -1) — туннель работает на нём"
+      return 1
+    fi
     info "Перезапускаю туннель на новой версии"
     xray_restart
   fi

@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import time
+import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sandbox import *  # noqa: E402,F401,F403
@@ -282,7 +283,7 @@ rules = xc.get("routing", {}).get("rules", [])
 chk("Xray: два выхода, балансировщик, РФ напрямую",
     len([o for o in xc.get("outbounds", []) if o["protocol"] == "vless"]) == 2
     and xc["routing"]["balancers"][0]["strategy"]["type"] == "leastPing"
-    and sum(1 for r in rules if r.get("ruleTag") == "ru-direct") == 2
+    and [r.get("ruleTag") for r in rules if str(r.get("ruleTag")).startswith("ru-direct")] == ["ru-direct", "ru-direct-ip"]
     and rules[-1].get("balancerTag") == "balancer"
     and all(i.get("protocol") != "tun" for i in xc["inbounds"]), err or out[:300])
 rc, out, _ = bash(f'py xray-del "{XC}" proxy_two_example_com; py xray-prepare "{XC}" native; cat "{XC}"')
@@ -309,6 +310,11 @@ if os.environ.get("XRAY_STUB_OLD") and any(o.get("protocol") == "hysteria" for o
     print("infra/conf: unknown config id: hysteria"); sys.exit(23)
 if "allowInsecure" in json.dumps(c):
     print("The feature allowInsecure has been removed"); sys.exit(23)
+# С Xray 26.9 повтор ruleTag отвергает конфиг при запуске
+tags = [r.get("ruleTag") for r in (c.get("routing") or {}).get("rules") or [] if r.get("ruleTag")]
+dup = next((t for t in tags if tags.count(t) > 1), None)
+if dup:
+    print("Failed to start: main: failed to create server > app/router: duplicate ruleTag " + dup); sys.exit(23)
 # Проверка с inbound tun создаёт устройство: занятое имя — отказ, как у Xray
 busy = open(os.environ["LINKS"]).read().split()
 for ib in c.get("inbounds", []):
@@ -439,10 +445,39 @@ chk("свой выход клиенту — строка «IP|выход», ос
     rc == 0 and f"{IP1}|{XT[1]}" in out.split() and IP2 in out.split(), out)
 rc, out, _ = bash(XRAY_ENV + '_xray_prepare; python3 -c "import json,sys; print(json.dumps(json.load(open(sys.argv[1]))[\'routing\'][\'rules\']))" "$XRAY_CONF"')
 rules = json.loads(out.strip().splitlines()[-1]) if rc == 0 and out.strip() else []
-own = [r for r in rules if r.get("ruleTag") == "client-out"]
+own = [r for r in rules if str(r.get("ruleTag")).startswith("client-out")]
 chk("в конфиге Xray — правило по адресу клиента перед общим",
     own and own[0]["source"] == [IP1] and own[0]["outboundTag"] == XT[1] and own[0]["inboundTag"] == ["tun-in"]
-    and rules.index(own[0]) < next(i for i, r in enumerate(rules) if r.get("ruleTag") != "client-out" and r.get("inboundTag")), rules)
+    and rules.index(own[0]) < next(i for i, r in enumerate(rules) if r not in own and r.get("inboundTag")), rules)
+rc, out, _ = bash(XRAY_ENV + f"xray_client_out {C2} {XT[0]} >/dev/null && _xray_prepare && xray_test && echo TEST-OK; "
+                  'python3 -c "import json,sys; print(json.dumps(json.load(open(sys.argv[1]))[\'routing\'][\'rules\']))" "$XRAY_CONF"')
+rules = json.loads(out.strip().splitlines()[-1]) if out.strip() else []
+own = [r.get("ruleTag") for r in rules if str(r.get("ruleTag")).startswith("client-out")]
+chk("два клиента на разных выходах — у правил разные ruleTag, Xray 26.9+ конфиг принимает",
+    "TEST-OK" in out and own == ["client-out-1", "client-out-2"], out)
+rc, out, _ = bash(XRAY_ENV + f"xray_client_out {C2} default >/dev/null && _xray_prepare")
+
+# Обновление Xray при работающем туннеле: конфиг, который новый бинарь не
+# принимает, туннель не роняет — возвращается прежний бинарь
+XUP = os.path.join(TMP, "xray-up")
+os.makedirs(XUP, exist_ok=True)
+for ver, test in (("26.99.1", 'echo "Failed to start: main: unknown new thing"; exit 23'), ("26.99.2", "exit 0")):
+    with open(os.path.join(XUP, "xray"), "w") as f:
+        f.write('#!/usr/bin/env bash\n[[ "$1" == version ]] && { echo "Xray %s (Xray, Penetrates Everything.)"; exit 0; }\n%s\n' % (ver, test))
+    os.chmod(os.path.join(XUP, "xray"), 0o755)
+    with zipfile.ZipFile(os.path.join(XUP, ver + ".zip"), "w") as z:
+        z.write(os.path.join(XUP, "xray"), "xray")
+XUP_ENV = (XRAY_ENV + f'cp "{XRAY_STUB}" "{XUP}/bin"; XRAY_BIN="{XUP}/bin"; XRAY_ASSET_DIR="{XUP}/assets"; mkdir -p "$XRAY_ASSET_DIR"; '
+           'xray_is_up() { return 0; }; xray_restart() { echo RESTARTED; }; ')
+rc, out, _ = bash(XUP_ENV + f'gh_fetch() {{ [[ "$1" == *.dgst ]] && return 1; cp "{XUP}/26.99.1.zip" "$2"; }}; '
+                  'xray_install update; echo rc=$?; "$XRAY_BIN" version')
+chk("обновление Xray: новый не принял конфиг — прежний бинарь на месте, туннель не перезапускался",
+    "rc=1" in out and "unknown new thing" in out and "Вернул прежний Xray: Xray 26.3.27" in out
+    and "RESTARTED" not in out and out.strip().splitlines()[-1].startswith("Xray 26.3.27"), out)
+rc, out, _ = bash(XUP_ENV + f'gh_fetch() {{ [[ "$1" == *.dgst ]] && return 1; cp "{XUP}/26.99.2.zip" "$2"; }}; '
+                  'xray_install update; echo rc=$?; "$XRAY_BIN" version')
+chk("обновление Xray: новый принял конфиг — туннель перезапускается на нём",
+    "RESTARTED" in out and out.strip().splitlines()[-1].startswith("Xray 26.99.2"), out)
 rc, out, _ = bash(XRAY_ENV + f"tunnel_client xray all >/dev/null; tunnel_client xray {C1} on >/dev/null; cat \"$XRAY_PEERS\"")
 chk("«все клиенты» и включение клиента свой выход не сбрасывают", f"{IP1}|{XT[1]}" in out.split(), out)
 rc, out, _ = bash(XRAY_ENV + f"xray_main_set {XT[1]} && py xray-main-get \"$XRAY_CONF\"")
@@ -649,6 +684,29 @@ rc, out, _ = bash(f'WARP_CONF="{TMP}/warp0.conf"; warp_awg_params')
 chk("WARP: параметры AmneziaWG из профиля — все и без \\r, ключи и адреса не попадают",
     out.splitlines() == ["Jc = 4", "Jmin = 40", "Jmax = 70", "S1 = 0", "S2 = 0", "H1 = 1", "H2 = 2", "H3 = 3", "H4 = 4",
                          "I1 = <b 0xc2000000011419fa>"], out)
+# Прокси до Telegram: выходы проверяются разом — мёртвые exit-ноды по 8 с
+# каждая растягивали поиск на полминуты
+rc, out, _ = bash('xray_port_owners() { echo "xray (pid 1)"; }; t2s_proxy() { echo 127.0.0.1:1081; }; '
+                  'bot_proxy_probe() { sleep 2; [[ "$1" == *10808 ]]; }; s=$SECONDS; api_main bot proxy candidates; echo "took=$((SECONDS - s))"')
+cand = json.loads(out.strip().splitlines()[-2]) if rc == 0 else {}
+chk("прокси до Telegram: выходы проверяются разом, порядок и ответы на месте",
+    [(r["url"], r["ok"]) for r in cand.get("data") or []] == [("socks5://127.0.0.1:10808", True), ("socks5://127.0.0.1:1081", False)]
+    and int(out.strip().splitlines()[-1].split("=")[1]) < 4, out)
+
+# Профиль, скопированный с телефона: «[» в начале потерялась, \r, «Ключ=значение»,
+# лишние ключи генератора — импорт чинит разметку, warp0 поднимается из него
+WIMP = os.path.join(TMP, "warp-import.conf")
+with open(WIMP, "w") as f:
+    f.write("Interface]\r\nPrivateKey=PRIVKEYTEST=\r\nAddress = 172.16.0.2, 2606:4700::2\r\n  MTU = 1280\r\nS3 = 0\r\nJc = 4\r\n"
+            "I1 = <b 0xc40000000101>\r\nRandomTrailers = on\r\n\r\npeer\r\nPublicKey = PUBKEYTEST=\r\nEndpoint = 192.0.2.1:1074\r\n")
+rc, out, err = bash(f'_warp_deps() {{ return 0; }}; mkdir -p "$(dirname "$WARP_CONF")"; warp_import < "{WIMP}" && '
+                    'cat "$WARP_CONF" && echo "@@" && warp_awg_params && echo "@@" && awk -F" = " "/^PrivateKey/{{print \\$2}}" "$WARP_CONF"')
+chk("импорт WARP: «Interface]» без скобки, \\r и «Ключ=значение» — профиль принят и разобран",
+    rc == 0 and "[Interface]" in out and "[Peer]" in out and "\r" not in out
+    and out.split("@@")[1].split() == ["S3", "=", "0", "Jc", "=", "4", "I1", "=", "<b", "0xc40000000101>"]
+    and out.split("@@")[2].strip() == "PRIVKEYTEST=", [out, err])
+rm_warp = 'rm -f "$WARP_CONF" "$WARP_PROFILE" "$WARP_ACCOUNT"'
+bash(rm_warp)
 rc, out, _ = bash('mkdir -p "$(dirname "$WARP_STATE")"; touch "$WARP_STATE"; warp_failed && echo F; '
                   'echo warp0 >> "$LINKS"; warp_failed || echo U; sed -i "/^warp0$/d" "$LINKS"; '
                   'rm -f "$WARP_STATE"; warp_failed || echo OFF')
@@ -2327,19 +2385,36 @@ had_xcf = open(XCF).read() if os.path.exists(XCF) else None
 with open(XCF, "w") as f:
     json.dump({"inbounds": [{"protocol": "socks", "tag": "socks-in", "port": 10808},
                             {"protocol": "tun", "tag": "tun-in", "settings": {"mtu": 1200}}],
-               "outbounds": [{"protocol": "vless", "tag": "A"}], "routing": {"rules": []}}, f)
+               "outbounds": [{"protocol": "vless", "tag": "A"}, {"protocol": "vless", "tag": "B"}],
+               "routing": {"rules": [
+                   {"ruleTag": "ru-direct", "domain": ["domain:ru"], "outboundTag": "direct"},
+                   {"ruleTag": "ru-direct", "ip": ["ext:geoip_RU.dat:ru"], "outboundTag": "direct"},
+                   {"ruleTag": "client-out", "inboundTag": ["tun-in"], "source": ["10.0.0.2"], "outboundTag": "A"},
+                   {"ruleTag": "client-out", "inboundTag": ["tun-in"], "source": ["10.0.0.3"], "outboundTag": "B"},
+                   {"ruleTag": "mine", "domain": ["a.example"], "outboundTag": "A"},
+                   {"ruleTag": "mine", "domain": ["b.example"], "outboundTag": "B"},
+                   {"ruleTag": "mine-2", "domain": ["c.example"], "outboundTag": "B"},
+                   {"inboundTag": ["tun-in"], "outboundTag": "A"}]}}, f)
 rc, out, _ = bash('server_exists() { return 1; }; cascade_count() { echo 0; }; wgobf_installed() { return 1; }; '
                   'MOD_SRC_DIR=/nonexistent; echo old > "$STATE_DIR/version"; helpers_refresh')
 xcf = json.load(open(XCF))
 chk("обновление awg2: у входа tun готового конфига Xray — имя xray0, остальное на месте",
     xcf["inbounds"][1]["settings"] == {"mtu": 1200, "name": "xray0"} and xcf["inbounds"][0] == {"protocol": "socks", "tag": "socks-in", "port": 10808},
     xcf)
+chk("обновление awg2: повторы ruleTag (Xray 26.9+ их не принимает) — разные теги, правила на месте",
+    [r.get("ruleTag") for r in xcf["routing"]["rules"]]
+    == ["ru-direct", "ru-direct-ip", "client-out-1", "client-out-2", "mine", "mine-3", "mine-2", None]
+    and [r.get("outboundTag") for r in xcf["routing"]["rules"]] == ["direct", "direct", "A", "B", "A", "B", "B", "A"],
+    xcf["routing"])
+os.utime(XCF, (1, 1))
+rc, out, err = bash(f'py xray-compat "{XCF}"; echo rc=$?')
+chk("xray-compat: исправленный конфиг повторно не переписывается", "rc=0" in out and os.stat(XCF).st_mtime == 1, [out, err])
 for body in ('{"inbounds": [{"protocol": "socks", "tag": "socks-in"}]}', "не json {", '{"inbounds": [{"protocol": "tun", "settings": {"name": "xray0"}}]}'):
     with open(XCF, "w") as f:
         f.write(body)
     os.utime(XCF, (1, 1))
-    rc, out, err = bash(f'py xray-tun-name "{XCF}"; echo rc=$?')
-    chk(f"xray-tun-name: без tun, не JSON или уже xray0 — файл не трогает ({body[:24]})",
+    rc, out, err = bash(f'py xray-compat "{XCF}"; echo rc=$?')
+    chk(f"xray-compat: без tun, не JSON или уже xray0 — файл не трогает ({body[:24]})",
         "rc=0" in out and open(XCF).read() == body and os.stat(XCF).st_mtime == 1, [out, err])
 if had_xcf is None:
     os.remove(XCF)

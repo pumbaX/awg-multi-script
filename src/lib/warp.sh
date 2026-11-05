@@ -104,6 +104,16 @@ warp_license_set() {  # ключ
   return 0
 }
 
+# Профиль со stdin в виде, который разбирает warp_wg_bringup: без \r и
+# пробелов по краям строк, «Ключ = значение» (генераторы пишут и «Ключ=значение»),
+# заголовки секций со скобками — при копировании с телефона «[» в начале
+# текста теряется, и профиль «Interface]» отвергался целиком.
+warp_profile_clean() {
+  tr -d '\r' | sed -E -e 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+    -e 's/^\[?[Ii]nterface\]?$/[Interface]/; s/^\[?[Pp]eer\]?$/[Peer]/' \
+    -e 's/^([A-Za-z0-9]+)[[:space:]]*=[[:space:]]*/\1 = /'
+}
+
 # Импорт готового wgcf-profile.conf (регистрация с сервера не проходит).
 warp_import() {
   local content k
@@ -111,7 +121,7 @@ warp_import() {
   echo -e "  Зарегистрируй профиль там, где Cloudflare доступен (например, shell.cloud.google.com):"
   echo -e "  ${G}curl -fsSL -o wgcf https://github.com/ViRb3/wgcf/releases/download/v2.2.30/wgcf_2.2.30_linux_amd64 && chmod +x wgcf && ./wgcf register --accept-tos && ./wgcf generate && cat wgcf-profile.conf${N}"
   echo -e "  Вставь вывод целиком, затем Enter и Ctrl+D:"
-  content=$(cat)
+  content=$(warp_profile_clean)
   for k in '^\[Interface\]' '^PrivateKey' '^Address' '^\[Peer\]' '^PublicKey' '^Endpoint'; do
     grep -q "$k" <<< "$content" || { err "Не похоже на wgcf-profile.conf: нет ${k//[\\^]/}"; return 1; }
   done

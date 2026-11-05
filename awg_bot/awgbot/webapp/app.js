@@ -3996,7 +3996,7 @@ route(/^\/tunnels\/warp\/import$/, async (ctx) => {
     h("label", {}, "wgcf-profile.conf"), fileField(ta), ta,
     btn("📥 Импортировать", (b) => {
       const text = ta.value.trim();
-      if (!text.includes("[Interface]") || !text.includes("[Peer]")) return fail(new Error("Это не похоже на wgcf-profile.conf"));
+      if (!text.includes("PrivateKey") || !text.includes("PublicKey")) return fail(new Error("Это не похоже на wgcf-profile.conf"));
       return busy(b, async () => {
         const r = await callR(["warp", "import"], { stdin: text + "\n" });
         haptic(); toast("✅ " + outcome(r.log, "Профиль импортирован"), 3500); back();
@@ -4939,8 +4939,9 @@ route(/^\/bot\/proxy$/, async (ctx) => {
     h("div", { class: "card" }, kv("Сейчас", h("span", { class: "mono" }, d.proxy || "нет — напрямую")),
       h("div", { class: "muted small" }, "Нужен, если Telegram у хостера заблокирован: SOCKS5/HTTP-прокси или туннель этого сервера.")),
     btn("🔎 Найти на сервере", (b) => busy(b, async () => {
-      toast("Ищу прокси и туннели, проверяю Telegram через каждый…", 6000);
-      const rows = (await call("bot", "proxy", "candidates")) || [];
+      // Пока идёт поиск (до ~10 с) — на экране, а не во всплывашке, которая гаснет раньше
+      cands.replaceChildren(h("div", { class: "card small muted" }, "⏳ Ищу прокси и туннели, проверяю Telegram через каждый…"));
+      const rows = await call("bot", "proxy", "candidates").catch((e) => { cands.replaceChildren(); throw e; }) || [];
       cands.replaceChildren(rows.length ? h("div", { class: "card list" }, rows.map((r) =>
         h("div", { class: "item", onclick: (ev) => apply(null, r.url) },
           h("div", { class: "dot " + (r.ok ? "on" : "bad") }),

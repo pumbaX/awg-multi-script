@@ -1571,7 +1571,7 @@ def cmd_xray_add(path):
     # включён; клиенты со своим выходом остаются на нём
     for r in conf.get("routing", {}).get("rules", []):
         if set(r.get("inboundTag") or []) & KNOWN_IN and not r.get("balancerTag") \
-                and r.get("ruleTag") != XRAY_CLIENT_RULE:
+                and not own_rule(r, XRAY_CLIENT_RULE):
             r["outboundTag"] = ob["tag"]
     jsave(path, conf)
 
@@ -1643,6 +1643,7 @@ def cmd_xray_restore_clean(path):
     gone += sorted(_shown(k) for k in conf if k not in XRAY_RESTORE_KEEP + ("inbounds",))
     if dropped_rules:
         gone.append("правил: %d" % dropped_rules)
+    xray_rule_tags_unique(clean)
     jsave(path, clean)
     print("; ".join(gone))
 
@@ -1711,9 +1712,10 @@ def xray_tun_named(tun):
     return True
 
 
-def cmd_xray_tun_name(path):
-    """Имя xray0 у входа tun в готовом конфиге — при обновлении awg2: служба,
-    перезапущенная на новом Xray (сбой, перезагрузка), иначе подняла бы utunN."""
+def cmd_xray_compat(path):
+    """Готовый конфиг — под новые версии Xray; зовётся при обновлении awg2 и
+    самого Xray: служба, перезапущенная на новом Xray (сбой, перезагрузка),
+    иначе подняла бы utunN или не запустилась из-за повторов ruleTag."""
     try:
         conf = jload(path)
     except Exception:
@@ -1722,7 +1724,7 @@ def cmd_xray_tun_name(path):
         return
     changed = [xray_tun_named(i) for i in conf.get("inbounds") or []
                if isinstance(i, dict) and i.get("protocol") == "tun"]
-    if any(changed):
+    if xray_rule_tags_unique(conf) or any(changed):
         jsave(path, conf)
 
 
@@ -1773,13 +1775,64 @@ def cmd_xray_balancer_get(path):
     print(b[0].get("strategy", {}).get("type", "random") if b else "off")
 
 
+XRAY_CLIENT_RULE = "client-out"
+XRAY_RU_RULE = "ru-direct"
+
+
+def own_rule(r, base):
+    """Правило Тулзы этого вида: ruleTag «base» или «base-…» (суффиксы — см.
+    xray_rule_tags_unique)."""
+    t = r.get("ruleTag") if isinstance(r, dict) else None
+    return isinstance(t, str) and (t == base or t.startswith(base + "-"))
+
+
+def xray_rule_tags_unique(conf):
+    """С Xray 26.9 повтор ruleTag отвергает весь конфиг («duplicate ruleTag»);
+    раньше это проверялось только при добавлении правил через API. Прежние
+    версии Тулзы ставили один тег на оба правила «РФ напрямую» и на все
+    правила клиентов со своим выходом. Свои правила получают номера, чужие
+    повторы — суффикс «-2», «-3»… True — что-то пришлось переименовать."""
+    routing = conf.get("routing")
+    rules = routing.get("rules") if isinstance(routing, dict) else None
+    if not isinstance(rules, list):
+        return False
+    rules = [r for r in rules if isinstance(r, dict)]
+    changed, n = False, 0
+    for r in rules:
+        if own_rule(r, XRAY_CLIENT_RULE):
+            n += 1
+            want = "%s-%d" % (XRAY_CLIENT_RULE, n)
+        elif r.get("ruleTag") == XRAY_RU_RULE and r.get("ip"):
+            want = XRAY_RU_RULE + "-ip"
+        else:
+            continue
+        if r["ruleTag"] != want:
+            r["ruleTag"] = want
+            changed = True
+    taken = {r["ruleTag"] for r in rules if isinstance(r.get("ruleTag"), str)}
+    seen = set()
+    for r in rules:
+        t = r.get("ruleTag")
+        if not isinstance(t, str) or not t:
+            continue
+        if t in seen:
+            i = 2
+            while "%s-%d" % (t, i) in taken:
+                i += 1
+            t = r["ruleTag"] = "%s-%d" % (t, i)
+            taken.add(t)
+            changed = True
+        seen.add(t)
+    return changed
+
+
 def cmd_xray_ru(path, mode):
     """РФ-сайты напрямую: .ru/.su/.рф, «только из РФ» и РФ-IP идут в direct.
     Правила встают над первым правилом, ведущим в туннель, — блокировки выше
     остаются выше."""
     conf = jload(path)
     routing = conf.setdefault("routing", {})
-    rules = [r for r in routing.get("rules", []) if r.get("ruleTag") != "ru-direct"]
+    rules = [r for r in routing.get("rules", []) if not own_rule(r, XRAY_RU_RULE)]
     if mode == "on":
         outs = conf.setdefault("outbounds", [])
         if not any(o.get("tag") == "direct" for o in outs):
@@ -1789,23 +1842,20 @@ def cmd_xray_ru(path, mode):
                    if r.get("balancerTag") or r.get("outboundTag") in proxy
                    or r.get("outboundTag") == "proxy"), len(rules))
         rules[at:at] = [
-            {"type": "field", "ruleTag": "ru-direct", "outboundTag": "direct",
+            {"type": "field", "ruleTag": XRAY_RU_RULE, "outboundTag": "direct",
              "domain": ["domain:ru", "domain:su", "domain:xn--p1ai",
                         "ext:geosite_RU.dat:ru-available-only-inside"]},
-            {"type": "field", "ruleTag": "ru-direct", "outboundTag": "direct",
+            {"type": "field", "ruleTag": XRAY_RU_RULE + "-ip", "outboundTag": "direct",
              "ip": ["ext:geoip_RU.dat:ru"]},
         ]
     routing["rules"] = rules
     jsave(path, conf)
 
 
-XRAY_CLIENT_RULE = "client-out"
-
-
 def _xray_main_rule(rules):
     """Правило, ведущее весь вход туннеля в выход по умолчанию или балансировщик."""
     return next((r for r in rules if set(r.get("inboundTag") or []) & KNOWN_IN
-                 and r.get("ruleTag") != XRAY_CLIENT_RULE), None)
+                 and not own_rule(r, XRAY_CLIENT_RULE)), None)
 
 
 def cmd_xray_main(path, tag):
@@ -1843,7 +1893,7 @@ def cmd_xray_prepare(path, mode, peers=""):
     tun2socks все соединения приходят с 127.0.0.1."""
     conf = jload(path)
     routing = conf.setdefault("routing", {})
-    routing["rules"] = [r for r in routing.get("rules") or [] if r.get("ruleTag") != XRAY_CLIENT_RULE]
+    routing["rules"] = [r for r in routing.get("rules") or [] if not own_rule(r, XRAY_CLIENT_RULE)]
     inb = [i for i in conf.get("inbounds") or []
            if not (i.get("tag") == "xray0" and i.get("protocol") == "dokodemo-door")]
     socks = next((i for i in inb if i.get("tag") == "socks-in"), None)
@@ -1926,10 +1976,11 @@ def cmd_xray_prepare(path, mode, peers=""):
                 by_tag.setdefault(tag, []).append(ip)
         main = _xray_main_rule(rules)
         at = rules.index(main) if main in rules else len(rules)
-        rules[at:at] = [{"type": "field", "ruleTag": XRAY_CLIENT_RULE, "inboundTag": [want],
+        rules[at:at] = [{"type": "field", "ruleTag": "%s-%d" % (XRAY_CLIENT_RULE, n), "inboundTag": [want],
                          "source": sorted(ips, key=lambda x: [int(p) for p in x.split(".")] if x.count(".") == 3 else [0]),
-                         "outboundTag": tag} for tag, ips in by_tag.items()]
+                         "outboundTag": tag} for n, (tag, ips) in enumerate(by_tag.items(), 1)]
     routing["rules"] = rules
+    xray_rule_tags_unique(conf)
     jsave(path, conf)
 
 
@@ -2916,7 +2967,7 @@ COMMANDS = {
     "conf-hooks": cmd_conf_hooks, "mod-compat-patch": cmd_mod_compat_patch,
     "xray-link": cmd_xray_link, "xray-default": cmd_xray_default, "xray-add": cmd_xray_add,
     "xray-del": cmd_xray_del, "xray-tags": cmd_xray_tags, "xray-outs": cmd_xray_outs, "xray-restore-clean": cmd_xray_restore_clean, "xray-probe": cmd_xray_probe,
-    "xray-probe-tag": cmd_xray_probe_tag, "xray-tun-probe": cmd_xray_tun_probe, "xray-tun-name": cmd_xray_tun_name,
+    "xray-probe-tag": cmd_xray_probe_tag, "xray-tun-probe": cmd_xray_tun_probe, "xray-compat": cmd_xray_compat,
     "xray-test-copy": cmd_xray_test_copy,
     "xray-balancer": cmd_xray_balancer, "xray-balancer-get": cmd_xray_balancer_get,
     "xray-main": cmd_xray_main, "xray-main-get": cmd_xray_main_get,

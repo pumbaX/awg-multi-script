@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20%2F%203.1-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-v1.2.52-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-v1.2.53-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -610,6 +610,6 @@ python3 tests/test_regress_f2f3.py && python3 tests/test_amnezia.py
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v1.2.52** · MIT License
+**AWG Toolza v1.2.53** · MIT License
 
 </div>

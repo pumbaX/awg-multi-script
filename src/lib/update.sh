@@ -306,7 +306,7 @@ helpers_refresh() {
   [[ -f "$XRAY_ROUTING_SCRIPT" ]] && _xray_emit_routing
   # Xray 26.7+ без имени у входа tun поднимает utunN вместо xray0 — имя в
   # готовый конфиг сразу, а не при следующем «Включить»
-  [[ -f "$XRAY_CONF" ]] && py xray-tun-name "$XRAY_CONF"
+  [[ -f "$XRAY_CONF" ]] && py xray-compat "$XRAY_CONF"
   # Xray прежних версий жил во временных юнитах и перезагрузку не переживал
   [[ -f "$XRAY_STATE" && ! -f "/etc/systemd/system/$XRAY_UNIT" ]] && ! xray_is_up && rm -f "$XRAY_STATE"
   wgobf_installed && _wgobf_write_service_files

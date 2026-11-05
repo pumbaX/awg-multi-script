@@ -161,9 +161,11 @@ do_webapp_menu() {
   done
 }
 
-# Выходы этого сервера, годные боту, строки «url|описание».
+# Выходы этого сервера, годные боту, строки «url|описание — ответ Telegram».
+# Проверки идут разом: по очереди мёртвые exit-ноды (до 8 с каждая) растягивали
+# поиск на полминуты, и казалось, что он завис.
 _bot_proxy_candidates() {
-  local list=() dev line url
+  local list=() dev line url i dir
   [[ -n "$(xray_port_owners)" ]] && list+=("socks5://$XRAY_SOCKS|SOCKS-вход Xray")
   url=$(t2s_proxy)
   [[ -n "$url" ]] && list+=("socks5://$url|прокси tun2socks")
@@ -176,10 +178,18 @@ _bot_proxy_candidates() {
       tun0) list+=("iface://$dev|TUN tun2socks") ;;
     esac
   done
-  for line in ${list[@]+"${list[@]}"}; do
-    if bot_proxy_probe "${line%%|*}"; then echo "$line — Telegram отвечает"
-    else echo "$line — Telegram НЕ отвечает"; fi
+  (( ${#list[@]} )) || return 0
+  # Не mktmp: зовут внутри <(...), где ловушка EXIT не убирает файлы
+  dir=$(mktemp -d /tmp/awg2.XXXXXX) || return 1
+  for i in "${!list[@]}"; do
+    { bot_proxy_probe "${list[$i]%%|*}" && : > "$dir/$i"; } &
   done
+  wait
+  for i in "${!list[@]}"; do
+    if [[ -e "$dir/$i" ]]; then echo "${list[$i]} — Telegram отвечает"
+    else echo "${list[$i]} — Telegram НЕ отвечает"; fi
+  done
+  rm -rf "$dir"
 }
 
 bot_proxy_menu() {
