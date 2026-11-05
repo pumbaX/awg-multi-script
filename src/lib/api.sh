@@ -85,6 +85,7 @@ _api_status() {
     _kv version "$VERSION_SHOW"; _kv api:n "$API_VERSION"
     _kv channel "$UPDATE_CHANNEL"; _kv update "$(update_available || true)"
     _kv host "$(hostname)"; _kv ip "$(public_ip_cached)"; _kv country "$(server_country)"
+    _kv country_auto "$(country_auto)"; _kv country_manual:b "$(_b country_is_manual)"; _kv country_votes "$(country_votes)"
     _kv uptime:n "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
     _kv os "$OS_LABEL"; _kv kernel "$(uname -r)"
     _kv components.installed:b "$(_b command -v awg)"
@@ -108,6 +109,7 @@ _api_status() {
         | awk -v now="$(date +%s)" '$2 > 0 && now - $2 < 180' | wc -l)"
     fi
     _kv tunnels.warp "$(_api_tun warp_is_up "$WARP_CONF" "$USQUE_CONF")"
+    _kv tunnels.warp_failed:b "$(_b warp_failed)"
     _kv tunnels.xray "$(_api_tun xray_is_up "$XRAY_CONF")"
     _kv tunnels.tun2socks "$(_api_tun t2s_is_up "$T2S_CONF")"
     _kv tunnels.exits "$(_api_tun exits_is_up "$EXITS_DIR"/awg-exit-*.conf)"
@@ -513,7 +515,7 @@ _api_warp() {
         # Для карточки: интерфейс, адрес Cloudflare, рукопожатие (wg) и счётчики
         _kv iface "$WARP_IF"
         _kv endpoint "$([[ "$be" == wg ]] && sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$WARP_CONF" 2>/dev/null | head -1)"
-        _kv hs:n "$(if [[ "$be" == wg ]]; then _n awk 'NR == 1 {print $2}' < <(wg show "$WARP_IF" latest-handshakes 2>/dev/null); else echo 0; fi)"
+        _kv hs:n "$(if [[ "$be" == wg ]]; then _n awk 'NR == 1 {print $2}' < <("$(warp_tool)" show "$WARP_IF" latest-handshakes 2>/dev/null); else echo 0; fi)"
         _kv rx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/rx_bytes")"
         _kv tx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/tx_bytes")"; } | api_obj
       warp_status ;;
@@ -521,6 +523,15 @@ _api_warp() {
     up) warp_up ;;
     down) warp_down ;;
     restart) warp_down quiet; warp_up ;;
+    # Для уведомлений бота: отвечает ли поднятый warp0. С health-check
+    # проверяет он сам — тогда без пинга, кроме «probe ping» (бот ждёт конца
+    # сбоя); failover — клиентов увёл health-check
+    probe)
+      local h=0
+      unit_active awg-warp-healthcheck.timer && h=1
+      { _kv up:b "$(_b warp_is_up)"; _kv health:b "$h"
+        _kv failover:b "$(_b test -f "$WARP_STATE.failed")"
+        if { (( ! h )) || [[ "${1:-}" == ping ]]; } && warp_is_up; then _kv ok:b "$(_b warp_ping)"; fi; } | api_obj ;;
     health)
       case "${1:-}" in
         on) warp_health_on ;; off) warp_health_off; ok "Health-check выключен" ;;
@@ -540,7 +551,7 @@ _api_warp() {
       [[ "${1:-}" =~ ^(wg|usque)$ ]] || { _api_usage "warp backend wg|usque"; return; }
       warp_set_backend "$1" ;;
     remove) warp_uninstall ;;
-    *) _api_usage "warp status|install|up|down|restart|health on|off|license КЛЮЧ|import (stdin)|endpoint [СТРАНА]|backend wg|usque|remove" ;;
+    *) _api_usage "warp status|install|up|down|restart|probe [ping]|health on|off|license КЛЮЧ|import (stdin)|endpoint [СТРАНА]|backend wg|usque|remove" ;;
   esac
 }
 
@@ -685,15 +696,18 @@ _api_dns() {
 }
 
 _api_wgobf() {
-  local a="${1:-}" name dir f dump now pub ip hs rx tx
+  local a="${1:-}" name dir f dump now pub ip hs rx tx u=""
   shift || true
   case "$a" in
     status)
+      wgobf_installed && u=$(ufw_port_state "$(wgobf_get PORT)/udp")
       { _kv installed:b "$(_b wgobf_installed)"; _kv running:b "$(_b wgobf_running)"
         _kv version "$WGOBF_VERSION"
         if wgobf_installed; then
           _kv endpoint "$(wgobf_get ENDPOINT):$(wgobf_get PORT)"; _kv masking "$(wgobf_get MASKING)"
           _kv clean:b "$(wgobf_get ALLOW_CLEAN)"; _kv clients:n "$(wgobf_clients | grep -c . || true)"
+          # off — UFW выключен; closed — включён, а порт обфускатора не открыт
+          _kv ufw "$u"
           # Выход для всех и новых клиентов и туннели на выбор: none | off | up,
           # свои выходы Xray (если Xray их умеет) и exit-ноды
           _kv route "$(r=$(wgobf_get ROUTE); echo "${r:-direct}")"
@@ -703,7 +717,7 @@ _api_wgobf() {
           _kv exits "$(if [[ -z "$(exits_nodes)" ]]; then echo none; elif exits_is_up; then echo up; else echo off; fi)"
           _kv exit_nodes:j "$(exits_nodes | py json-list)"
         fi; } | api_obj
-      wgobf_installed && wgobf_status
+      wgobf_installed && wgobf_status "$u"
       return 0 ;;
     install) wgobf_install_opts "$@" ;;
     clients)
@@ -720,6 +734,10 @@ _api_wgobf() {
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs" "$rx" "$tx" "$(wgobf_route_of "${ip%/32}")"
       done < <(wgobf_clients) | api_rows name ip ago:n rx:n tx:n route ;;
     route) wgobf_route_set "${1:-}" "${2:-}" ;;
+    rename)
+      [[ -n "${1:-}" && -n "${2:-}" ]] || { _api_usage "wgobf rename СТАРОЕ НОВОЕ"; return; }
+      wgobf_installed || { err "WG + обфускатор не установлен"; return 1; }
+      wgobf_rename_client "$1" "$2" ;;
     add|del|bundle)
       name="${1:-}"
       [[ -n "$name" ]] || { _api_usage "wgobf $a ИМЯ"; return; }
@@ -741,7 +759,7 @@ _api_wgobf() {
     clean) wgobf_set_clean "${1:-}" ;;
     rotate-key) wgobf_rotate_key ;;
     remove) wgobf_remove quiet ;;
-    *) _api_usage "wgobf status|install [ключ=значение...]|clients|add|del|bundle ИМЯ|route ИМЯ|all direct|warp|xray[:выход]|exits[:нода]|restart|masking STUN|NONE|clean 0|1|rotate-key|remove" ;;
+    *) _api_usage "wgobf status|install [ключ=значение...]|clients|add|del|bundle ИМЯ|rename СТАРОЕ НОВОЕ|route ИМЯ|all direct|warp|xray[:выход]|exits[:нода]|restart|masking STUN|NONE|clean 0|1|rotate-key|remove" ;;
   esac
 }
 
@@ -914,7 +932,41 @@ _api_antiscan() {
   esac
 }
 
+# ── VK и Max мимо VPN ─────────────────────────────────────
+_api_vkblock() {
+  local a="${1:-status}" e on=0
+  shift || true
+  case "$a" in
+    status)
+      read -r -a e <<< "$(_vkblock_get ENTRIES)"
+      vkblock_on && on=1
+      { _kv enabled:b "$on"; _kv active:b "$( (( on )) && _b vkblock_rules_ok || echo 0)"
+        _kv v4:n "${e[0]:-0}"; _kv v6:n "${e[1]:-0}"
+        _kv updated:n "$(_vkblock_get UPDATED)"; _kv error "$(_vkblock_get ERROR)"
+        _kv dropped:n "$( (( on )) && vkblock_dropped || echo 0)"
+      } | api_obj ;;
+    on) vkblock_enable ;;
+    off) vkblock_disable ;;
+    update) vkblock_update ;;
+    *) _api_usage "vkblock status|on|off|update" ;;
+  esac
+}
+
 # ── Перенос из Amnezia (Docker) ───────────────────────────
+# Страна сервера (флаг в шапке панели): вручную или снова по геосервисам;
+# refresh — спросить геосервисы сейчас, не дожидаясь суток
+_api_country() {
+  local a="${1:-}"
+  case "$a" in
+    set) [[ -n "${2:-}" ]] || { _api_usage "country set КОД|auto"; return; }
+         country_set "$2" ;;
+    refresh) country_refresh
+             { _kv country "$(server_country)"; _kv country_auto "$(country_auto)"; _kv votes "$(country_votes)"; } | api_obj
+             info "По геосервисам: $(country_auto || true) ($(country_votes || true))" ;;
+    *) _api_usage "country set КОД|auto | refresh" ;;
+  esac
+}
+
 _api_amnezia() {
   local a="${1:-status}" c running=0
   case "$a" in
@@ -951,8 +1003,8 @@ _api_log() {
     tun2socks) unit="$T2S_UNIT" ;;       exits) unit="$EXITS_UNIT" ;;
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
     bot) unit="$BOT_UNIT" ;;             web) file="$WEB_LOG" ;;
-    antiscan) file="$ANTISCAN_LOG" ;;
-    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan [строк]"; return ;;
+    antiscan) file="$ANTISCAN_LOG" ;;   vkblock) file="$VKBLOCK_LOG" ;;
+    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan|vkblock [строк]"; return ;;
   esac
   if [[ -n "$file" ]]; then
     [[ -f "$file" ]] || { info "Журнала $file нет"; return 0; }
@@ -1042,19 +1094,22 @@ _api_readonly() {
   case "$a $b" in
     "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
     "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"tunnels "|"tunnels status"|\
-    "tunnels clients"|"warp status"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
+    "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
     "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
-    "amnezia scan") return 0 ;;
+    "amnezia scan"|"vkblock "|"vkblock status") return 0 ;;
   esac
   return 1
 }
 
+# Блокировку не взять (нет каталога, файла или ждали дольше wait) — отказ:
+# без неё две меняющие команды пошли бы одновременно
 _api_lock() {
   local wait="${API_LOCK_WAIT:-20}" holder
-  mkdir -p "$STATE_DIR"
-  exec 8>>"$API_LOCK" || return 0
+  mkdir -p "$STATE_DIR" || { err "Не удалось создать каталог блокировки API"; return 73; }
+  exec 8>>"$API_LOCK" || { err "Не удалось открыть файл блокировки API"; return 73; }
   if ! flock -w "$wait" 8; then
+    exec 8>&-
     holder=$(cat "$API_LOCK.info" 2>/dev/null)
     err "Идёт другая операция${holder:+ ($holder)} — повтори, когда она закончится"
     return 75
@@ -1090,13 +1145,15 @@ api_dispatch() {
     cert) _api_cert "$@" ;;
     web) _api_web "$@" ;;
     antiscan) _api_antiscan "$@" ;;
+    vkblock) _api_vkblock "$@" ;;
     amnezia) _api_amnezia "$@" ;;
+    country) _api_country "$@" ;;
     uninstall) _api_uninstall "$@" ;;
     log) _api_log "$@" ;;
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade dns wgobf update bot cert web antiscan amnezia uninstall log job version"
+      echo "         exits cascade dns wgobf update bot cert web antiscan vkblock amnezia country uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
@@ -1140,6 +1197,7 @@ api_main() {
     helpers_refresh || true
     expire_watchdog || true
     antiscan_watchdog || true
+    vkblock_watchdog || true
     if _api_readonly "${API_ARGS[@]}"; then
       api_dispatch "${API_ARGS[@]}" || rc=$?
     else

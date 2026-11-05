@@ -40,8 +40,9 @@ do_server_menu() {
     echo -e "  ${Y}8)${N} Сбросить сервер"
     echo -e "  ${C}9)${N} Антисканер ${D}— $(antiscan_on && echo "включён" || echo "сети сканеров РКН")${N}"
     echo -e "  ${C}10)${N} Перенос из Amnezia ${D}— сервер из Docker-контейнера, клиенты без перевыдачи${N}"
+    echo -e "  ${C}11)${N} VK и Max мимо VPN ${D}— $(vkblock_on && echo "включено" || echo "клиенты VPN не ходят в сети VK")${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-10]: ${N}" 0 10 0
+    read_choice c "${C}  Выбор [0-11]: ${N}" 0 11 0
     case "$c" in
       1) do_install || true ;;
       2) do_create_server || true ;;
@@ -53,6 +54,7 @@ do_server_menu() {
       8) do_reset_server || true ;;
       9) do_antiscan_menu || true; continue ;;
       10) do_amnezia_menu || true ;;
+      11) do_vkblock_menu || true; continue ;;
       0) return 0 ;;
     esac
     pause

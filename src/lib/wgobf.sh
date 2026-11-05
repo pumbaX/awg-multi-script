@@ -667,6 +667,28 @@ wgobf_delete_client() {
   log_info "wgobf: удалён клиент $name"
 }
 
+# Имя — только комментарий над пиром: ключи, адрес и выход не меняются, wgobf0
+# не перезапускается. Комплект переезжает в каталог с новым именем.
+wgobf_rename_client() {  # старое новое
+  local old="$1" new="$2" bak
+  wgobf_clients | grep -qxF "$old" || { err "Клиента $old нет"; return 1; }
+  [[ "$new" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || { err "Имя: латиница, цифры, _ и -, до 32 символов"; return 1; }
+  [[ "$new" != all ]] || { err "Имя all занято: так в команде выхода зовутся все клиенты"; return 1; }
+  [[ "$new" == "$old" ]] && return 0
+  wgobf_clients | grep -qxF "$new" && { err "Клиент $new уже есть"; return 1; }
+  [[ -e "$WGOBF_CLIENTS/$new" ]] && { err "Каталог $WGOBF_CLIENTS/$new уже есть"; return 1; }
+  mktmp bak || return 1
+  cp -a "$WGOBF_WG_CONF" "$bak"
+  awk -v o="# client=$old" -v n="# client=$new" '$0 == o {print n; next} {print}' "$bak" \
+    | write_file "$WGOBF_WG_CONF" 600 || { cp -a "$bak" "$WGOBF_WG_CONF"; return 1; }
+  if [[ -d "$WGOBF_CLIENTS/$old" ]]; then
+    mv "$WGOBF_CLIENTS/$old" "$WGOBF_CLIENTS/$new" \
+      && wgobf_write_bundle "$new" || warn "Комплект $new не пересобран — «Комплект клиента» соберёт его заново"
+  fi
+  log_info "wgobf: клиент переименован: $old → $new"
+  ok "Переименован: $old → $new"
+}
+
 wgobf_list_clients() {
   local names=() dump now i name pub ip hs
   mapfile -t names < <(wgobf_clients)
@@ -736,9 +758,9 @@ wgobf_install() {
     done
   fi
   while true; do
-    read_line port "${C}  UDP-порт обфускатора (Enter — случайный): ${N}"
+    read_line port "${C}  UDP-порт обфускатора: 443 или 1024-65535 (Enter — случайный): ${N}"
     [[ -z "$port" ]] && break
-    valid_port "$port" && (( port >= 1024 )) || { warn "Порт 1024-65535"; continue; }
+    awg_port_ok "$port" || { warn "Порт — 443 или 1024-65535"; continue; }
     udp_port_busy "$port" && { warn "UDP $port занят (сокет, AWG или каскад)"; continue; }
     break
   done
@@ -770,7 +792,7 @@ wgobf_install_opts() {
   for kv in "$@"; do
     k="${kv%%=*}"; v="${kv#*=}"
     case "$k" in
-      port) valid_port "$v" && (( v >= 1024 )) || { err "port: 1024-65535"; return 1; }
+      port) awg_port_ok "$v" || { err "port: 443 или 1024-65535"; return 1; }
             udp_port_busy "$v" && { err "UDP $v занят"; return 1; }; port="$v" ;;
       masking) [[ "$v" =~ ^(STUN|NONE)$ ]] || { err "masking: STUN | NONE"; return 1; }; mask="$v" ;;
       clean) [[ "$v" =~ ^[01]$ ]] || { err "clean: 0 | 1"; return 1; }; clean="$v" ;;
@@ -810,7 +832,8 @@ EOF
     _wgobf_teardown keep
     return 1
   fi
-  ufw_allow "$port/udp" "$WGOBF_TAG"
+  ufw_open "$port/udp" "$WGOBF_TAG"
+  ufw_forward_accept
   web_vpn_changed
   ok "WG + обфускатор запущен: вход $ep:$port/udp, подсеть $net"
   log_info "wgobf: установлен (порт $port, wg $wg_port, сеть $net, маскировка $mask)"
@@ -890,13 +913,14 @@ wgobf_restore() {
   port=$(wgobf_get PORT)
   udp_listening "$port" && warn "UDP $port сейчас занят — обфускатор может не подняться"
   wgobf_restart || { err "WG + обфускатор восстановлен, но не запустился"; return 1; }
-  ufw_allow "$port/udp" "$WGOBF_TAG"
+  ufw_open "$port/udp" "$WGOBF_TAG"
+  ufw_forward_accept
   ok "WG + обфускатор восстановлен"
 }
 
 # ── Меню ──────────────────────────────────────────────────
-wgobf_status() {
-  local s
+wgobf_status() {  # [состояние порта в UFW — если уже узнано]
+  local s u="${1:-}"
   if ip link show "$WGOBF_IF" &>/dev/null; then s="${G}● поднят${N}"; else s="${R}○ лежит${N}"; fi
   echo -e "  $WGOBF_IF         : $s"
   if unit_active "$WGOBF_UNIT"; then s="${G}● работает${N}"; else s="${R}○ не работает${N}"; fi
@@ -906,6 +930,11 @@ wgobf_status() {
   echo -e "  Без обфускатора: $([[ "$(wgobf_get ALLOW_CLEAN)" == 1 ]] && echo -e "${Y}да${N}" || echo нет)"
   echo -e "  Подсеть        : $(wgobf_get NET), MTU $(wgobf_get MTU), WireGuard на $(wgobf_get WG_PORT) ${D}(снаружи закрыт)${N}"
   echo -e "  Клиентов       : $(wgobf_clients | grep -c . || true)"
+  [[ -n "$u" ]] || u=$(ufw_port_state "$(wgobf_get PORT)/udp")
+  case "$u" in
+    open) echo -e "  UFW            : ${G}● порт открыт${N}" ;;
+    closed) echo -e "  UFW            : ${R}▲ порт $(wgobf_get PORT)/udp закрыт${N} ${D}— Сервер → Проверить и починить${N}" ;;
+  esac
 }
 
 wgobf_settings() {
@@ -961,13 +990,14 @@ do_wgobf_menu() {
     echo -e "  ${C}2)${N} Список"
     echo -e "  ${C}3)${N} Комплект клиента"
     echo -e "  ${C}4)${N} Удалить клиента"
-    echo -e "  ${C}5)${N} Статус и журнал"
-    echo -e "  ${C}6)${N} Перезапустить"
-    echo -e "  ${C}7)${N} Настройки"
-    echo -e "  ${C}8)${N} Выход клиентов ${D}— $(_wgobf_route_label "$(wgobf_get ROUTE)")${N}"
-    echo -e "  ${R}9)${N} Удалить WG + обфускатор"
+    echo -e "  ${C}5)${N} Переименовать клиента"
+    echo -e "  ${C}6)${N} Статус и журнал"
+    echo -e "  ${C}7)${N} Перезапустить"
+    echo -e "  ${C}8)${N} Настройки"
+    echo -e "  ${C}9)${N} Выход клиентов ${D}— $(_wgobf_route_label "$(wgobf_get ROUTE)")${N}"
+    echo -e "  ${R}10)${N} Удалить WG + обфускатор"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-9]: ${N}" 0 9 0
+    read_choice c "${C}  Выбор [0-10]: ${N}" 0 10 0
     case "$c" in
       1) read_line name "${C}  Имя клиента: ${N}"
          name="${name// /}"
@@ -976,11 +1006,13 @@ do_wgobf_menu() {
       3) _wgobf_pick_client && { wgobf_show_bundle "$CHOSEN" || true; } ;;
       4) _wgobf_pick_client && read_confirm "${R}  Удалить клиента $CHOSEN? (введи yes): ${N}" \
            && { wgobf_delete_client "$CHOSEN" || true; } ;;
-      5) wgobf_status; journalctl -u "$WGOBF_UNIT" -n 12 --no-pager 2>/dev/null | sed 's/^/  /' || true ;;
-      6) wgobf_restart && ok "Перезапущено" || true ;;
-      7) wgobf_settings || true ;;
-      8) wgobf_route_menu || true ;;
-      9) wgobf_remove || true ;;
+      5) _wgobf_pick_client && read_line name "${C}  Новое имя для $CHOSEN: ${N}" && name="${name// /}" \
+           && [[ -n "$name" ]] && { wgobf_rename_client "$CHOSEN" "$name" || true; } ;;
+      6) wgobf_status; journalctl -u "$WGOBF_UNIT" -n 12 --no-pager 2>/dev/null | sed 's/^/  /' || true ;;
+      7) wgobf_restart && ok "Перезапущено" || true ;;
+      8) wgobf_settings || true ;;
+      9) wgobf_route_menu || true ;;
+      10) wgobf_remove || true ;;
       0) return 0 ;;
     esac
     pause
@@ -993,14 +1025,16 @@ wgobf_cli() {
   wgobf_installed || { err "WG + обфускатор не установлен"; return 1; }
   case "$cmd" in
     add|del|bundle) [[ -n "$name" ]] || { err "Использование: awg2 --wgobf $cmd ИМЯ"; return 1; } ;;
+    rename) [[ -n "$name" && -n "${3:-}" ]] || { err "Использование: awg2 --wgobf rename СТАРОЕ НОВОЕ"; return 1; } ;;
   esac
   case "$cmd" in
     add) wgobf_add_client "$name" ;;
     del) wgobf_delete_client "$name" ;;
+    rename) wgobf_rename_client "$name" "${3:-}" ;;
     bundle) wgobf_clients | grep -qxF "$name" || { err "Клиента $name нет"; return 1; }
             wgobf_write_bundle "$name" && ok "$WGOBF_CLIENTS/$name" ;;
     rotate-key) wgobf_rotate_key ;;
     restart) wgobf_restart && ok "Перезапущено" ;;
-    *) err "Команда: add ИМЯ | del ИМЯ | bundle ИМЯ | rotate-key | restart"; return 1 ;;
+    *) err "Команда: add ИМЯ | del ИМЯ | rename СТАРОЕ НОВОЕ | bundle ИМЯ | rotate-key | restart"; return 1 ;;
   esac
 }

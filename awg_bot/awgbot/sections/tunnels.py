@@ -119,7 +119,7 @@ async def warp_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> No
     conf = d.get("configured")
     hints = [f"📦 — {'переустановить' if conf else 'установить'} и зарегистрировать (бэкенд {esc(d.get('backend') or '?')})"]
     if conf:
-        hints.append("✅ Health-check — сам перезапускает WARP, если тот перестал отвечать")
+        hints.append("✅ Health-check — WARP не отвечает: клиенты напрямую, а WARP он вернёт сам")
     if wg:
         hints.append("📥 Импорт — свой wgcf-profile.conf, если регистрация отсюда не проходит")
     await ui.render(cb, "<b>☁️ WARP (Cloudflare)</b>\n" + ui.pre(r.log, 1500, tail=False)
@@ -146,6 +146,11 @@ async def _warp_install(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
 @warp("up")
 async def _warp_up(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     await jobs.start(cb, "Включение WARP", "warp", "up", back_to="warp")
+
+
+@warp("restart")
+async def _warp_restart(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    await jobs.start(cb, "Перезапуск WARP", "warp", "restart", back_to="warp")
 
 
 @warp("down")
@@ -181,7 +186,9 @@ async def _warp_import(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     await ask.ask(cb, state, "warp_import",
                   "Зарегистрируй профиль там, где Cloudflare доступен (например, shell.cloud.google.com):\n"
                   "<code>./wgcf register --accept-tos &amp;&amp; ./wgcf generate</code>\n\n"
-                  "Пришли <code>wgcf-profile.conf</code> файлом или текстом.", "warp")
+                  "Пришли <code>wgcf-profile.conf</code> файлом или текстом.\n"
+                  "<i>Подойдёт и профиль с параметрами AmneziaWG (Jc, Jmin, Jmax): с российских серверов "
+                  "чистый WireGuard к Cloudflare часто режут, а с ними WARP поднимается через AmneziaWG.</i>", "warp")
 
 
 @ask.on("warp_import")

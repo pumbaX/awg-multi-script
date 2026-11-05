@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.43"
+VERSION="v1.2.52"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -399,7 +399,8 @@ MOD_LOG="/var/log/awg-mod-update.log"
 MOD_FALLBACK_TAG="v3.1.20260906"
 TOOLS_FALLBACK_TAG="v3.1.20260812"
 UPSTREAM_CACHE="$STATE_DIR/upstream_tags"
-COUNTRY_CACHE="$STATE_DIR/country"     # «NL 1791500000»: страна сервера (флаг в шапке панели)
+COUNTRY_CACHE="$STATE_DIR/country"     # «NL 1791500000 2 NL=4,DE=1»: страна сервера по геосервисам (флаг в шапке панели)
+COUNTRY_MANUAL="$STATE_DIR/country_manual"   # страна, выбранная вручную, — главнее геосервисов
 UPSTREAM_TTL=21600
 
 # ── Обновление скрипта ────────────────────────────────────
@@ -451,6 +452,8 @@ WARP_BACKEND_FILE="/etc/awg-warp-backend"
 WARP_AUTOSTART_SCRIPT="$WARP_DIR/warp-autostart.sh"
 WARP_HEALTH_SCRIPT="/usr/local/bin/awg-warp-healthcheck.sh"
 WARP_HEALTH_LOG="/var/log/awg-warp-health.log"
+WARP_HEALTH_FAILS="/tmp/awg-warp-fails"     # провалов подряд
+WARP_HEALTH_RETRY="/tmp/awg-warp-retry"     # попыток вернуть WARP после отказа
 WARPSCOUT_BIN="/usr/local/bin/warpscout"
 WARPSCOUT_DIR="/etc/warpscout"
 WARPSCOUT_ACCOUNT="$WARPSCOUT_DIR/warpscout-account.json"
@@ -481,6 +484,7 @@ CASCADE_TAG="awg-cascade"
 CASCADE_SCRIPT="/usr/local/bin/awg-cascade-apply.sh"
 CASCADE_LOG="/var/log/awg-cascade.log"
 CASCADE_UFW_BACKUP="$CASCADE_DIR/ufw-backup/ufw.default.original"
+UFW_DEFAULTS="/etc/default/ufw"   # политики UFW (DEFAULT_FORWARD_POLICY)
 
 XRAY_DIR="/etc/xray"
 XRAY_CONF="$XRAY_DIR/config.json"
@@ -577,6 +581,18 @@ ANTISCAN_SRC="https://raw.githubusercontent.com/shadow-netlab/traffic-guard-list
 # запись /19) и ~20 сетей /32 IPv6. Подменённый источник с тысячами /12 прошёл бы
 # проверку записей, но закрыл бы почти весь IPv4 — такой список не принимается
 ANTISCAN_MAX4=16777216 ANTISCAN_MAX6=4096   # 2^24 адресов IPv4; 2^12 сетей /32 IPv6 (записи /32 и шире)
+
+# ── VK и Max мимо VPN (сети VK — DROP трафика клиентов VPN) ──
+VKBLOCK_DIR="$STATE_DIR/vkblock"            # список и состояние
+VKBLOCK_CONF="$VKBLOCK_DIR/vkblock.conf"    # ON, UPDATED, ERROR, ENTRIES
+VKBLOCK_SCRIPT="/usr/local/bin/awg2-vkblock"
+VKBLOCK_LOG="/var/log/awg2-vkblock.log"
+VKBLOCK_SET="awg2-vk" VKBLOCK_SET6="awg2-vk6" VKBLOCK_TAG="awg2-vkblock"
+VKBLOCK_UNIT="awg2-vkblock.service" VKBLOCK_TIMER="awg2-vkblock-update.timer"
+VKBLOCK_SRC="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist-vk.txt"
+# Настоящий список: ~200 записей, ~300 тыс. адресов IPv4 и три сети /29 IPv6.
+# Короче минимума — оборван, шире предела — подменён: прежний не заменяют
+VKBLOCK_MIN=50 VKBLOCK_MAX4=4194304 VKBLOCK_MAX6=4096   # 2^22 адресов IPv4; 2^12 сетей /32 IPv6
 
 # Интерфейсы, которые поднимает сам awg2: их адрес не может быть Endpoint
 # клиента, и маршрут через них — не аплинк сервера.
@@ -794,11 +810,39 @@ ipt_del_grep() {
 }
 
 # ── UFW ───────────────────────────────────────────────────
-ufw_active() { command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qiE '^Status:[[:space:]]*active'; }
+# LC_ALL=C: ufw переводит вывод («Состояние: активен») — на русской локали
+# Тулза считала бы его выключенным и не открывала бы ни один порт.
+ufw_active() { command -v ufw &>/dev/null && LC_ALL=C ufw status 2>/dev/null | grep -qiE '^Status:[[:space:]]*active'; }
 
 ufw_allow() {  # порт/протокол комментарий
   ufw_active || return 0
-  ufw allow "$1" comment "$2" >/dev/null 2>&1
+  LC_ALL=C ufw allow "$1" comment "$2" >/dev/null 2>&1
+}
+
+# Порт в UFW одним вызовом ufw (он на Python — каждый вызов ~0,1-0,3 с):
+# off — UFW нет или выключен, open — разрешающее правило на порт есть, closed — нет
+ufw_port_state() {  # порт/протокол, как пишет ufw status: 51820/udp
+  local out
+  command -v ufw &>/dev/null && out=$(LC_ALL=C ufw status 2>/dev/null) \
+    && grep -qiE '^Status:[[:space:]]*active' <<< "$out" || { echo off; return 0; }
+  if grep -qE "^$1[[:space:]]+ALLOW" <<< "$out"; then echo open; else echo closed; fi
+}
+
+# Открыть порт службы с сообщением; UFW выключен — молча ничего.
+ufw_open() {  # порт/протокол комментарий
+  ufw_active || return 0
+  ufw_allow "$1" "$2" && ok "UFW: открыт $1"
+}
+
+# Политика FORWARD в UFW: DROP оставит клиентов VPN без интернета, если
+# правил ACCEPT туннеля в цепочке не окажется (ufw с MANAGE_BUILTINS=yes,
+# iptables -F) — для серверов с VPN ставим ACCEPT, как делает сам wg-quick.
+ufw_forward_accept() {
+  ufw_active || return 0
+  grep -q '^DEFAULT_FORWARD_POLICY="DROP"' "$UFW_DEFAULTS" 2>/dev/null || return 0
+  sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' "$UFW_DEFAULTS" || return 1
+  LC_ALL=C ufw reload &>/dev/null || true
+  info "UFW: DEFAULT_FORWARD_POLICY=ACCEPT (нужно для выхода клиентов в интернет)"
 }
 
 # Снять правила UFW с комментарием ровно $1. ufw_delete_matching ищет подстроку —
@@ -807,12 +851,12 @@ ufw_delete_comment() {
   command -v ufw &>/dev/null || return 0
   local n guard=0
   while (( guard++ < 64 )); do
-    n=$(ufw status numbered 2>/dev/null | awk -v c="$1" '{
+    n=$(LC_ALL=C ufw status numbered 2>/dev/null | awk -v c="$1" '{
           s = $0; sub(/[ \t]+$/, "", s); i = index(s, "# ")
           if (i && substr(s, i + 2) == c && match(s, /^\[ *[0-9]+ *\]/)) {
             n = substr(s, 2, RLENGTH - 2); gsub(/ /, "", n); print n; exit } }')
     [[ -n "$n" ]] || break
-    ufw --force delete "$n" >/dev/null 2>&1 || break
+    LC_ALL=C ufw --force delete "$n" >/dev/null 2>&1 || break
   done
 }
 
@@ -821,9 +865,9 @@ ufw_delete_matching() {
   command -v ufw &>/dev/null || return 0
   local n guard=0
   while (( guard++ < 64 )); do
-    n=$(ufw status numbered 2>/dev/null | grep -F -- "$1" | head -1 | grep -oE '^\[ *[0-9]+ *\]' | tr -d '[] ')
+    n=$(LC_ALL=C ufw status numbered 2>/dev/null | grep -F -- "$1" | head -1 | grep -oE '^\[ *[0-9]+ *\]' | tr -d '[] ')
     [[ -n "$n" ]] || break
-    ufw --force delete "$n" >/dev/null 2>&1 || break
+    LC_ALL=C ufw --force delete "$n" >/dev/null 2>&1 || break
   done
 }
 
@@ -860,6 +904,9 @@ valid_cidr() {
 # Без ведущих нулей: «0080» и «/08» — не восьмеричные числа и не ошибка
 # арифметики, а отказ; иначе такое значение легло бы в конфиги как есть.
 valid_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 )); }
+# Порт AWG и обфускатора: 1024-65535 или 443 — там, где ждут QUIC (HTTP/3).
+# Остальные ниже 1024 — системные: 53 перехватывает DNS Тулзы, 123 — NTP и т.п.
+awg_port_ok() { valid_port "$1" && (( $1 >= 1024 || $1 == 443 )); }
 
 # Имя хоста (не IP): метки из букв, цифр и дефисов, минимум одна точка.
 valid_domain() {
@@ -916,31 +963,139 @@ public_ip_cached() {
   echo "$_PUBLIC_IP"
 }
 
-# Страна сервера — флаг в шапке панели. Код страны IP сервера по геобазе
-# Cloudflare (cdn-cgi/trace, строка «loc=»): без ключей и своих баз. В кэше
-# на сутки (не узнали — повтор через час), обновляется в фоне: статус сеть не ждёт.
-server_country() { awk 'NR == 1 && $1 ~ /^[A-Z][A-Z]$/ {print $1}' "$COUNTRY_CACHE" 2>/dev/null || true; }
+# Страна сервера — флаг в шапке панели. Одному геосервису верить нельзя: по
+# адресам хостеров базы расходятся (сервер в Нидерландах «оказывается» в
+# Германии, у другого сервиса страна вовсе не определилась). Поэтому спрашиваем
+# несколько независимых сервисов разом и берём страну, на которой сошлись
+# большинство; при равенстве — тот, кто выше в списке. Все отвечают про один и
+# тот же адрес сервера (Cloudflare — про адрес, с которого пришёл запрос).
+# В кэше на сутки (не узнали — повтор через час), обновляется в фоне: статус
+# сеть не ждёт. Формат кэша: «КОД время версия голоса» — «NL 1791500000 2 NL=4,DE=1».
+#
+# «имя|URL с {IP}|URL без адреса» (пусто — без адреса не спрашиваем)
+COUNTRY_SOURCES=(
+  "cloudflare|https://cloudflare.com/cdn-cgi/trace|https://cloudflare.com/cdn-cgi/trace"
+  "ipinfo|https://ipinfo.io/{IP}/country|https://ipinfo.io/country"
+  "ipapi|https://ipapi.co/{IP}/country/|https://ipapi.co/country/"
+  "countryis|https://api.country.is/{IP}|https://api.country.is/"
+  "geojs|https://get.geojs.io/v1/ip/country/{IP}.json|https://get.geojs.io/v1/ip/country.json"
+  "ipwhois|https://ipwho.is/{IP}?fields=country_code|"
+  "ifconfig|https://ifconfig.co/country-iso|https://ifconfig.co/country-iso"
+)
+
+# Страна по геосервисам (кэш) и выбранная вручную. Флаг — по ручной, если она есть:
+# геобазы бывают дружно неправы (сервер в Вене, а адрес «нидерландский»).
+country_auto() { awk 'NR == 1 && $1 ~ /^[A-Z][A-Z]$/ {print $1}' "$COUNTRY_CACHE" 2>/dev/null || true; }
+country_manual() { awk 'NR == 1 && $1 ~ /^[A-Z][A-Z]$/ {print $1}' "$COUNTRY_MANUAL" 2>/dev/null || true; }
+country_is_manual() { [[ -n "$(country_manual)" ]]; }
+server_country() {
+  local c
+  c=$(country_manual)
+  [[ -n "$c" ]] && { echo "$c"; return 0; }
+  country_auto
+}
+# Голоса последней проверки: «NL=4,DE=1» (или пусто)
+country_votes() {
+  local v
+  v=$(awk 'NR == 1 {print $4}' "$COUNTRY_CACHE" 2>/dev/null)
+  [[ "$v" =~ ^[A-Z]{2}=[0-9]+(,[A-Z]{2}=[0-9]+)*$ ]] && echo "$v"
+  return 0
+}
+
+# Страна вручную: код из двух латинских букв или auto — снова по геосервисам.
+country_set() {  # КОД|auto
+  local c="${1^^}" a
+  if [[ "$c" == AUTO ]]; then
+    rm -f "$COUNTRY_MANUAL"
+    a=$(country_auto)
+    log_info "страна сервера: снова по геосервисам (${a:-не определена})"
+    ok "Страна сервера — по геосервисам: ${a:-пока не определена}"
+    return 0
+  fi
+  [[ "$c" =~ ^[A-Z]{2}$ ]] || { err "Код страны — две латинские буквы (AT, NL, DE) или auto"; return 1; }
+  printf '%s\n' "$c" | write_file "$COUNTRY_MANUAL" 644 || return 1
+  log_info "страна сервера: $c (вручную)"
+  ok "Страна сервера: $c (вручную)"
+}
+
+# Тело ответа сервиса → двухбуквенный код страны или пусто. Понимает «loc=NL»
+# (Cloudflare), простой текст «NL» и JSON с полем country / country_code.
+# Ошибки сервисов («Too many requests», страница HTML), XX, EU и прочие
+# «не страна» отбрасываются.
+country_parse() {
+  local body c
+  body=$(head -c 4000 | tr -d '\r')
+  c=$(sed -n 's/^loc=\([A-Za-z][A-Za-z]\)$/\1/p; s/.*"country[_a-z]*"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]\)".*/\1/p' <<< "$body" | head -1)
+  [[ -n "$c" ]] || c=$(tr -d '[:space:]' <<< "$body")
+  c=${c^^}
+  [[ "$c" == UK ]] && c=GB
+  [[ "$c" =~ ^[A-Z]{2}$ && ! "$c" =~ ^(XX|ZZ|EU|AP|AA|QM|QZ)$ ]] && echo "$c"
+  return 0
+}
+
+# Голосование: коды по одному в строке, по порядку источников → «КОД<tab>голосов»
+# победителя. Побеждает страна с наибольшим числом голосов; при равенстве — та,
+# что встретилась раньше (выше в списке источников). Нет ни одного кода — пусто.
+country_vote() {
+  awk '{ n[$1]++; if (!($1 in first)) first[$1] = NR }
+       END { best = ""
+             for (c in n) if (best == "" || n[c] > n[best] || (n[c] == n[best] && first[c] < first[best])) best = c
+             if (best != "") printf "%s\t%d\n", best, n[best] }'
+}
 
 country_refresh() {
-  local loc="" ts
+  local ip="" src name u1 u2 url d i=0 body code winner cnt ts prev tally
+  local -a codes=() pids=()
   command -v curl &>/dev/null || return 0
-  loc=$(curl -s --max-time 6 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^loc=//p' | head -1 || true)
-  ts=$(date +%s)
-  if ! [[ "$loc" =~ ^[A-Z]{2}$ && "$loc" != XX ]]; then
-    # Не ответили: прежняя страна остаётся (флаг не пропадает на час из-за одного сбоя),
-    # метка сдвинута так, чтобы повтор был через час, а не через сутки
-    loc=$(server_country); ts=$(( ts - 86400 + 3600 ))
-    [[ -n "$loc" ]] || { loc="-"; ts=$(date +%s); }
+  ip=$(public_ip_cached 2>/dev/null || true)
+  valid_ip "$ip" && ! ip_is_private "$ip" || ip=""
+  d=$(mktemp -d /tmp/awg2.country.XXXXXX) || return 0
+  # Все сервисы — одновременно: ждём самого медленного, а не сумму
+  for src in "${COUNTRY_SOURCES[@]}"; do
+    IFS='|' read -r name u1 u2 <<< "$src"
+    if [[ -n "$ip" ]]; then url="${u1//\{IP\}/$ip}"; else url="$u2"; fi
+    [[ -n "$url" ]] || continue
+    ( curl -4 -fsS --max-time 6 -A awg2-toolza "$url" 2>/dev/null | head -c 4000 > "$d/$(printf '%02d' "$i").$name" ) &
+    pids+=("$!"); i=$((i + 1))
+  done
+  # Только свои запросы: чужие фоновые задачи (обновление кэшей) не ждём
+  (( ${#pids[@]} )) && wait "${pids[@]}" 2>/dev/null
+  # Ответы — по порядку источников (имена файлов начинаются с номера)
+  for body in "$d"/*; do
+    [[ -f "$body" ]] || continue
+    code=$(country_parse < "$body")
+    [[ -n "$code" ]] && codes+=("$code")
+  done
+  [[ "$d" == /tmp/awg2.country.* ]] && rm -rf "$d"
+  ts=$(date +%s); prev=$(country_auto); winner=""
+  if (( ${#codes[@]} )); then
+    IFS=$'\t' read -r winner cnt < <(printf '%s\n' "${codes[@]}" | country_vote)
+    tally=$(printf '%s\n' "${codes[@]}" | sort | uniq -c | sort -k1,1nr -k2 | awk '{printf "%s%s=%s", s, $2, $1; s=","}')
+    # Два и больше ответа, а двух одинаковых нет: «большинства» нет — прежняя
+    # страна не перебивается случайным ответом одного сервиса
+    if (( ${#codes[@]} > 1 && cnt < 2 )) && [[ -n "$prev" ]]; then winner=""; fi
   fi
-  printf '%s %s\n' "$loc" "$ts" | write_file "$COUNTRY_CACHE" 644
+  if [[ "$winner" =~ ^[A-Z]{2}$ ]]; then
+    # Кто за кого — в журнал (при смене страны) и в кэш: видно, если сервисы расходятся
+    [[ "$winner" == "$prev" ]] || log_info "страна сервера: $winner (голоса: $tally)"
+    printf '%s %s 2 %s\n' "$winner" "$ts" "$tally" | write_file "$COUNTRY_CACHE" 644
+    return 0
+  fi
+  # Не ответили (или не сошлись): прежняя страна остаётся (флаг не пропадает на
+  # час из-за одного сбоя), метка сдвинута так, чтобы повтор был через час
+  winner="$prev"; ts=$(( ts - 86400 + 3600 ))
+  [[ -n "$winner" ]] || { winner="-"; ts=$(date +%s); }
+  printf '%s %s 2\n' "$winner" "$ts" | write_file "$COUNTRY_CACHE" 644
 }
 
 country_refresh_async() {
-  local cc="" ts=0 ttl=86400
+  local cc="" ts=0 ver="" ttl=86400
   [[ -n "${AWG_NO_UPDATE_CHECK:-}" ]] && return 0
-  read -r cc ts 2>/dev/null < "$COUNTRY_CACHE" || true
+  read -r cc ts ver _ 2>/dev/null < "$COUNTRY_CACHE" || true
   [[ "$ts" =~ ^[0-9]+$ ]] || ts=0
   [[ "$cc" =~ ^[A-Z]{2}$ ]] || ttl=3600
+  # Кэш прежнего формата (один сервис, без голосования) — пересчитать сразу
+  [[ "$ver" == 2 ]] || ttl=0
   (( $(date +%s) - ts < ttl )) && return 0
   ( country_refresh ) </dev/null >/dev/null 2>&1 3>&- 4>&- 8>&- &
   disown 2>/dev/null || true
@@ -2239,6 +2394,7 @@ choose_mimicry() {
     echo -e "  ${D}  Для одного I1 самый достоверный — QUIC (1).${N}"
   fi
   echo -e "  ${D}  На высоком порту естественны STUN, WebRTC, RTP; DNS/NTP/SSDP — нет.${N}"
+  echo -e "  ${D}  На порту 443 — QUIC (1) с одним I1.${N}"
   read_choice c "${C}  Выбор [0-9] (Enter = $def): ${N}" 0 9 "$def"
   (( c == 0 )) && return 1
   MIMICRY="${MIMICRY_PROFILES[$((c - 1))]}"
@@ -2714,14 +2870,8 @@ server_write() {
 server_start_new() {
   awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   awg_up_diag || return 1
-  if ufw_active; then
-    ufw_allow "$S_PORT/udp" AmneziaWG && ok "UFW: открыт $S_PORT/udp"
-    if grep -q '^DEFAULT_FORWARD_POLICY="DROP"' /etc/default/ufw 2>/dev/null; then
-      sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-      ufw reload &>/dev/null || true
-      info "UFW: DEFAULT_FORWARD_POLICY=ACCEPT (нужно для выхода клиентов в интернет)"
-    fi
-  fi
+  ufw_open "$S_PORT/udp" AmneziaWG
+  ufw_forward_accept
   setup_autostart
   expire_install
   web_vpn_changed
@@ -2870,14 +3020,14 @@ _choose_net() {
 _choose_port() {
   local v
   while true; do
-    read_line v "${C}  UDP-порт [Enter = случайный]: ${N}"
+    read_line v "${C}  UDP-порт: 443 или 1024-65535 [Enter = случайный]: ${N}"
     v="${v// /}"
     if [[ -z "$v" ]]; then S_PORT=$(random_free_udp_port) || return 1; return 0; fi
-    if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1024 && v <= 65535 )); then
+    if awg_port_ok "$v"; then
       udp_port_busy "$v" && { warn "Порт $v занят"; continue; }
       S_PORT=$v; return 0
     fi
-    warn "Порт — число 1024-65535"
+    warn "Порт — 443 или число 1024-65535"
   done
 }
 
@@ -2944,7 +3094,7 @@ server_create_opts() {
       region) [[ "$v" =~ ^(world|ru)$ ]] || { err "region: world | ru"; return 1; }; S_REGION="$v" ;;
       dns) valid_dns_list "$v" || { err "dns: IPv4 через запятую"; return 1; }; S_DNS="$v" ;;
       mtu) [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) || { err "mtu: 1280-1500"; return 1; }; MTU="$v" ;;
-      port) valid_port "$v" && (( v >= 1024 )) || { err "port: 1024-65535"; return 1; }
+      port) awg_port_ok "$v" || { err "port: 443 или 1024-65535"; return 1; }
             udp_port_busy "$v" && { err "UDP $v занят"; return 1; }; S_PORT="$v" ;;
       net) valid_cidr "$v" && [[ "${v#*/}" == 24 ]] || { err "net: сеть /24"; return 1; }
            v="${v%.*}.0/24"
@@ -3045,6 +3195,33 @@ REPAIR_ISSUES=0 REPAIR_FIXED=0
 _issue() { REPAIR_ISSUES=$((REPAIR_ISSUES + 1)); warn "$1"; }
 _fixed() { REPAIR_FIXED=$((REPAIR_FIXED + 1)); ok "$1"; }
 
+# Файрвол: при включённом UFW порты awg0 и обфускатора открыты (UFW могли
+# включить уже после установки, или на русской локали Тулза его не видела),
+# политика FORWARD не режет клиентов; правила wgobf0 на месте — их сносит
+# ufw с MANAGE_BUILTINS=yes или iptables -F, и обфускатор остаётся без NAT.
+_repair_firewall() {
+  local p st on=0 what tag
+  for what in AWG обфускатора; do
+    if [[ "$what" == AWG ]]; then server_exists || continue; p=$(server_port); tag=AmneziaWG
+    else wgobf_installed || continue; p=$(wgobf_get PORT); tag="$WGOBF_TAG"; fi
+    st=$(ufw_port_state "$p/udp")
+    case "$st" in
+      open) on=1; ok "UFW: порт $what $p/udp открыт" ;;
+      closed) on=1; _issue "UFW включён, а порт $what $p/udp закрыт"
+              ufw_allow "$p/udp" "$tag" && _fixed "UFW: открыт $p/udp" ;;
+    esac
+  done
+  if (( on )) && grep -q '^DEFAULT_FORWARD_POLICY="DROP"' "$UFW_DEFAULTS" 2>/dev/null; then
+    _issue "UFW: политика FORWARD — DROP, клиенты VPN без правил туннеля останутся без интернета"
+    ufw_forward_accept >/dev/null && _fixed "UFW: DEFAULT_FORWARD_POLICY=ACCEPT"
+  fi
+  if wgobf_installed && ip link show "$WGOBF_IF" &>/dev/null \
+     && ! iptables -C FORWARD -i "$WGOBF_IF" -j ACCEPT -m comment --comment "$WGOBF_TAG" 2>/dev/null; then
+    _issue "Нет правил файрвола $WGOBF_IF (NAT, FORWARD) — обфускатор без выхода в интернет"
+    wgobf_fw_run up && _fixed "Правила $WGOBF_IF восстановлены"
+  fi
+}
+
 do_repair() {
   local bad conf_n live_n dev net perm rc old
   REPAIR_ISSUES=0 REPAIR_FIXED=0
@@ -3069,6 +3246,7 @@ do_repair() {
   if grep -qs "^$MOD_NAME" "$MODULES_LOAD_FILE"; then ok "Автозагрузка модуля"
   else _issue "Нет автозагрузки модуля"; mod_autoload && _fixed "Автозагрузка настроена"; fi
 
+  _repair_firewall
   server_exists || { err "Сервер не создан"; return 1; }
   if [[ -z "$(conf_marker AWG_OBF_LEVEL)" ]]; then
     # Бот по этой метке решает, сколько пакетов I1-I5 выдать клиенту
@@ -4834,6 +5012,9 @@ rt_down() {  # устройство таблица
 
 # ── Состояние и взаимоисключение ──────────────────────────
 warp_is_up()  { ip link show "$WARP_IF" &>/dev/null; }
+# WARP включён, а туннеля нет: health-check увёл клиентов напрямую или warp0
+# не поднялся после перезагрузки. Выключенный руками — не сбой (состояния нет).
+warp_failed() { [[ -f "$WARP_STATE" ]] && ! warp_is_up; }
 xray_is_up()  { ip link show "$XRAY_IF" &>/dev/null || unit_active "$XRAY_UNIT"; }
 t2s_is_up()   { unit_active "$T2S_UNIT"; }
 exits_is_up() { unit_active "$EXITS_UNIT"; }
@@ -5116,13 +5297,26 @@ warp_import() {
   printf '%s\n' "$content" | write_file "$WARP_PROFILE" 600
   install -m 600 "$WARP_PROFILE" "$WARP_CONF"
   [[ -f "$WARP_ACCOUNT" ]] || printf '# импортирован готовый профиль\nimported = true\n' | write_file "$WARP_ACCOUNT" 600
+  [[ -n "$(warp_awg_params)" ]] && info "В профиле параметры AmneziaWG — WARP поднимется через AmneziaWG"
   ok "Профиль импортирован — включай туннель"
 }
+
+# Параметры AmneziaWG из профиля WARP (Jc, Jmin, Jmax, S1-S4, H1-H4, I1-I5),
+# строками «Ключ = значение». Их несут готовые профили «WARP для России»:
+# с российских серверов чистый WireGuard к Cloudflare режут, а с мусорными
+# пакетами AmneziaWG рукопожатие проходит.
+warp_awg_params() {
+  sed -nE 's/^[[:space:]]*(Jc|Jmin|Jmax|S[1-4]|H[1-4]|I[1-5])[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1 = \2/p' \
+    "$WARP_CONF" 2>/dev/null
+}
+
+# wg или awg — чем говорить с warp0: из профиля с параметрами AWG он amneziawg
+warp_tool() { if ip -d link show "$WARP_IF" 2>/dev/null | grep -q amneziawg; then echo awg; else echo wg; fi; }
 
 # Поднимает warp0 из профиля и уводит в него клиентов. Работает и в
 # скрипте автозапуска, поэтому без вывода в интерфейс пользователя.
 warp_wg_bringup() {
-  local priv pub ep mtu addr a tmp
+  local priv pub ep mtu addr a tmp obf kind=wireguard tool=wg
   [[ -f "$WARP_CONF" && -f "$SERVER_CONF" ]] || return 1
   ip link show "$WARP_IF" &>/dev/null && return 0
   priv=$(awk -F' = ' '/^PrivateKey/{print $2; exit}' "$WARP_CONF")
@@ -5134,23 +5328,28 @@ warp_wg_bringup() {
     [[ "$a" == *.* ]] && addr="$a"
   done
   [[ -n "$priv" && -n "$pub" && -n "$ep" && -n "${addr:-}" ]] || { echo "профиль WARP не разобран" >&2; return 1; }
-  ip link add dev "$WARP_IF" type wireguard || return 1
+  # Профиль с параметрами AmneziaWG — через AmneziaWG: wg их не знает и отверг бы
+  obf=$(warp_awg_params)
+  if [[ -n "$obf" ]] && command -v awg >/dev/null; then kind=amneziawg; tool=awg; else obf=""; fi
+  ip link add dev "$WARP_IF" type "$kind" || return 1
   # Временный файл — в /etc/wireguard: пакетный wg на Ubuntu 26.04 не читает
   # из /tmp (AppArmor), а /etc/wireguard — каталог root:700.
   tmp="/etc/wireguard/.warp0.$$"
-  printf '[Interface]\nPrivateKey = %s\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 0.0.0.0/0\nEndpoint = %s\n' \
-    "$priv" "$pub" "$ep" > "$tmp"
+  printf '[Interface]\nPrivateKey = %s\n%s\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 0.0.0.0/0\nEndpoint = %s\n' \
+    "$priv" "$obf" "$pub" "$ep" > "$tmp"
   chmod 600 "$tmp"
-  if ! wg setconf "$WARP_IF" "$tmp"; then rm -f "$tmp"; ip link del "$WARP_IF"; return 1; fi
+  if ! "$tool" setconf "$WARP_IF" "$tmp"; then rm -f "$tmp"; ip link del "$WARP_IF"; return 1; fi
   rm -f "$tmp"
   ip -4 addr add "$addr" dev "$WARP_IF"
   ip link set mtu "${mtu:-1280}" up dev "$WARP_IF" || { ip link del "$WARP_IF"; return 1; }
+  # Health-check возвращает WARP без клиентов: маршруты — только после ответа Cloudflare
+  [[ -n "${WARP_NO_RT:-}" ]] && return 0
   rt_up "$WARP_IF" "$WARP_TABLE" "$WARP_PEERS" "${addr%/*}"
 }
 
 _warp_autostart_install() {
   emit_script "$WARP_AUTOSTART_SCRIPT" 'warp_wg_bringup' \
-    WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_wg_bringup || return 1
+    WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_awg_params warp_wg_bringup || return 1
   write_unit awg-warp.service <<EOF
 [Unit]
 Description=AWG Toolza — WARP для клиентов AWG
@@ -5261,8 +5460,9 @@ warp_usque_install() { _usque_install_bin && _usque_register && _usque_write; }
 
 # ── Включение / выключение ────────────────────────────────
 warp_up() {
-  local be i
+  local be i had=""
   server_exists || { err "Сначала создай сервер"; return 1; }
+  [[ -f "$WARP_STATE" ]] && had=1
   tunnel_guard warp || return 1
   warp_is_up && { info "WARP уже включён"; return 0; }
   be=$(warp_backend)
@@ -5284,7 +5484,14 @@ warp_up() {
     (( i == 3 )) && {
       err "Через WARP трафик не идёт — выключаю, клиенты остаются напрямую"
       [[ "$be" == wg ]] && info "Попробуй найти рабочий endpoint (warpscout) или импортировать профиль"
-      warp_down quiet
+      [[ "$be" == wg && -z "$(warp_awg_params)" ]] && info "С российских серверов чистый WireGuard к Cloudflare часто режут — помогает профиль с параметрами AmneziaWG (Jc, Jmin, Jmax)"
+      # WARP упал раньше, а health-check включён — он и дальше пробует вернуть его сам
+      if [[ -n "$had" ]] && unit_active awg-warp-healthcheck.timer; then
+        warp_failover
+        info "Health-check продолжит пробовать сам и вернёт WARP, когда Cloudflare ответит"
+      else
+        warp_down quiet
+      fi
       return 1
     }
     sleep 2
@@ -5309,28 +5516,83 @@ warp_down() {
 }
 
 # ── Health-check ──────────────────────────────────────────
-# Три провала подряд — клиенты возвращаются на прямой маршрут.
-warp_health_run() {
-  local f=/tmp/awg-warp-fails n
-  ip link show "$WARP_IF" &>/dev/null || exit 0
-  command -v ping >/dev/null || exit 0
-  if ping -c1 -W3 -I "$WARP_IF" 1.1.1.1 &>/dev/null; then echo 0 > "$f"; exit 0; fi
-  n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 ))
-  echo "$n" > "$f"
-  echo "$(date '+%F %T') FAIL $n/3" >> "$WARP_HEALTH_LOG"
-  (( n >= 3 )) || exit 0
+# Раз в минуту — пинг 1.1.1.1 через warp0. Три провала подряд — клиенты WARP
+# уходят напрямую (warp_failover), а WARP остаётся включённым. Дальше
+# health-check сам возвращает его, пока не вернёт или пока WARP либо
+# health-check не выключат: первые 10 попыток — раз в минуту, потом раз в
+# 5 минут (сеть хостера может лежать часами). Пробует без клиентов: warp0
+# поднимается без их маршрутов, и только ответ Cloudflare возвращает их в туннель.
+warp_ping() { ping -c3 -i0.5 -W2 -I "$WARP_IF" 1.1.1.1 &>/dev/null; }
+
+# Клиенты WARP — напрямую, WARP остаётся включённым с меткой .failed.
+warp_failover() {
   rt_down "$WARP_IF" "$WARP_TABLE"
   # usque держит warp0 сам: гасим службу, иначе warp_is_up остаётся истинным,
   # warp_up отвечает «уже включён», а хук usque при реконнекте вернёт правила.
   if [[ "$(cat "$WARP_BACKEND_FILE" 2>/dev/null)" == usque ]]; then systemctl stop awg-usque.service 2>/dev/null
   else ip link del "$WARP_IF" 2>/dev/null; fi
   echo failed > "$WARP_STATE.failed"
-  echo "$(date '+%F %T') FAILOVER: клиенты идут напрямую" >> "$WARP_HEALTH_LOG"
+}
+
+warp_health_recover() {
+  local r="$WARP_HEALTH_RETRY" n i src
+  n=$(( $(cat "$r" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$r"
+  (( n <= 10 || n % 5 == 0 )) || return 0
+  # Пока WARP лежал, включили другой туннель — ему не мешаем
+  [[ -z "$(tunnel_conflict warp)" ]] || return 0
+  if (( n == 1 || n % 60 == 0 )); then echo "$(date '+%F %T') RETRY $n: пробую вернуть WARP" >> "$WARP_HEALTH_LOG"; fi
+  if [[ "$(cat "$WARP_BACKEND_FILE" 2>/dev/null)" == usque ]]; then
+    # usque поднимает warp0 и маршруты клиентов сам, когда достучится до Cloudflare
+    systemctl start awg-usque.service 2>/dev/null || return 0
+    for i in {1..15}; do ip link show "$WARP_IF" &>/dev/null && break; sleep 1; done
+    if ! { ip link show "$WARP_IF" &>/dev/null && warp_ping; }; then warp_failover; return 0; fi
+  else
+    WARP_NO_RT=1 warp_wg_bringup 2>/dev/null || return 0
+    if ! warp_ping; then ip link del "$WARP_IF" 2>/dev/null; return 0; fi
+    src=$(ip -4 -o addr show dev "$WARP_IF" 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}')
+    rt_up "$WARP_IF" "$WARP_TABLE" "$WARP_PEERS" "$src" || { warp_failover; return 0; }
+  fi
+  rm -f "$WARP_STATE.failed" "$r"
+  echo 0 > "$WARP_HEALTH_FAILS"
+  echo "$(date '+%F %T') RECOVERED: WARP снова работает, клиенты WARP — в туннеле (попытка $n)" >> "$WARP_HEALTH_LOG"
+}
+
+warp_health_run() {
+  local f="$WARP_HEALTH_FAILS" n src
+  command -v ping >/dev/null || exit 0
+  if ! ip link show "$WARP_IF" &>/dev/null; then
+    # WARP включён, а туннеля нет: health-check увёл клиентов или warp0 не поднялся при загрузке
+    [[ -f "$WARP_STATE" ]] && warp_health_recover
+    exit 0
+  fi
+  if warp_ping; then
+    echo 0 > "$f"
+    # Попытку вернуть WARP прервали между подъёмом warp0 и маршрутами — доставить маршруты
+    if [[ -f "$WARP_STATE" ]] && ! ip route show table "$WARP_TABLE" 2>/dev/null | grep -q '^default'; then
+      src=$(ip -4 -o addr show dev "$WARP_IF" 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}')
+      rt_up "$WARP_IF" "$WARP_TABLE" "$WARP_PEERS" "$src"
+    fi
+    exit 0
+  fi
+  n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$f"
+  echo "$(date '+%F %T') FAIL $n/3" >> "$WARP_HEALTH_LOG"
+  (( n >= 3 )) || exit 0
+  warp_failover
+  rm -f "$WARP_HEALTH_RETRY"
+  echo "$(date '+%F %T') FAILOVER: клиенты идут напрямую, WARP вернётся сам" >> "$WARP_HEALTH_LOG"
+}
+
+_warp_health_emit() {
+  emit_script "$WARP_HEALTH_SCRIPT" 'warp_health_run' WARP_IF WARP_TABLE WARP_STATE WARP_CONF WARP_PEERS \
+    WARP_BACKEND_FILE WARP_HEALTH_LOG WARP_HEALTH_FAILS WARP_HEALTH_RETRY XRAY_IF XRAY_UNIT T2S_UNIT EXITS_UNIT "${RT_FUNCS[@]}" \
+    unit_active warp_is_up xray_is_up t2s_is_up exits_is_up tunnel_conflict \
+    warp_awg_params warp_wg_bringup warp_ping warp_failover warp_health_recover warp_health_run
 }
 
 warp_health_on() {
-  emit_script "$WARP_HEALTH_SCRIPT" 'warp_health_run' WARP_IF WARP_TABLE WARP_STATE \
-    WARP_BACKEND_FILE WARP_HEALTH_LOG "${RT_FUNCS[@]}" warp_health_run || return 1
+  _warp_health_emit || return 1
   write_unit awg-warp-healthcheck.service <<EOF
 [Unit]
 Description=AWG Toolza — проверка WARP
@@ -5350,12 +5612,13 @@ OnUnitActiveSec=60s
 [Install]
 WantedBy=timers.target
 EOF
-  systemctl enable --now awg-warp-healthcheck.timer &>/dev/null && ok "Health-check включён (раз в минуту)"
+  systemctl enable --now awg-warp-healthcheck.timer &>/dev/null \
+    && ok "Health-check включён: раз в минуту; WARP не отвечает — клиенты напрямую, WARP вернётся сам"
 }
 
 warp_health_off() {
   remove_unit awg-warp-healthcheck.timer awg-warp-healthcheck.service
-  rm -f "$WARP_HEALTH_SCRIPT" /tmp/awg-warp-fails
+  rm -f "$WARP_HEALTH_SCRIPT" "$WARP_HEALTH_FAILS" "$WARP_HEALTH_RETRY"
 }
 
 # ── warpscout: поиск рабочего endpoint ────────────────────
@@ -5388,8 +5651,8 @@ warp_endpoint_set() {  # ip:порт
   [[ "$1" =~ ^[0-9.]+:[0-9]+$ ]] || { err "Ни один endpoint не прошёл проверку — UDP к Cloudflare, похоже, режут"; return 1; }
   sed -i "s|^Endpoint = .*|Endpoint = $1|" "$WARP_CONF" "$WARP_PROFILE" 2>/dev/null
   if warp_is_up; then
-    pub=$(wg show "$WARP_IF" peers | head -1)
-    [[ -n "$pub" ]] && wg set "$WARP_IF" peer "$pub" endpoint "$1"
+    pub=$("$(warp_tool)" show "$WARP_IF" peers | head -1)
+    [[ -n "$pub" ]] && "$(warp_tool)" set "$WARP_IF" peer "$pub" endpoint "$1"
   fi
   ok "Endpoint: $1"
 }
@@ -6142,7 +6405,7 @@ cascade_uninstall() {
   # Прежние версии меняли политику FORWARD в UFW. Если AWG-сервера нет,
   # вернуть её было бы некому — возвращаем здесь.
   if [[ -f "$CASCADE_UFW_BACKUP" ]] && ! server_exists; then
-    cp -a "$CASCADE_UFW_BACKUP" /etc/default/ufw
+    cp -a "$CASCADE_UFW_BACKUP" "$UFW_DEFAULTS"
     ufw_active && ufw reload &>/dev/null
   fi
   rm -rf "$CASCADE_DIR"
@@ -8225,6 +8488,28 @@ wgobf_delete_client() {
   log_info "wgobf: удалён клиент $name"
 }
 
+# Имя — только комментарий над пиром: ключи, адрес и выход не меняются, wgobf0
+# не перезапускается. Комплект переезжает в каталог с новым именем.
+wgobf_rename_client() {  # старое новое
+  local old="$1" new="$2" bak
+  wgobf_clients | grep -qxF "$old" || { err "Клиента $old нет"; return 1; }
+  [[ "$new" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || { err "Имя: латиница, цифры, _ и -, до 32 символов"; return 1; }
+  [[ "$new" != all ]] || { err "Имя all занято: так в команде выхода зовутся все клиенты"; return 1; }
+  [[ "$new" == "$old" ]] && return 0
+  wgobf_clients | grep -qxF "$new" && { err "Клиент $new уже есть"; return 1; }
+  [[ -e "$WGOBF_CLIENTS/$new" ]] && { err "Каталог $WGOBF_CLIENTS/$new уже есть"; return 1; }
+  mktmp bak || return 1
+  cp -a "$WGOBF_WG_CONF" "$bak"
+  awk -v o="# client=$old" -v n="# client=$new" '$0 == o {print n; next} {print}' "$bak" \
+    | write_file "$WGOBF_WG_CONF" 600 || { cp -a "$bak" "$WGOBF_WG_CONF"; return 1; }
+  if [[ -d "$WGOBF_CLIENTS/$old" ]]; then
+    mv "$WGOBF_CLIENTS/$old" "$WGOBF_CLIENTS/$new" \
+      && wgobf_write_bundle "$new" || warn "Комплект $new не пересобран — «Комплект клиента» соберёт его заново"
+  fi
+  log_info "wgobf: клиент переименован: $old → $new"
+  ok "Переименован: $old → $new"
+}
+
 wgobf_list_clients() {
   local names=() dump now i name pub ip hs
   mapfile -t names < <(wgobf_clients)
@@ -8294,9 +8579,9 @@ wgobf_install() {
     done
   fi
   while true; do
-    read_line port "${C}  UDP-порт обфускатора (Enter — случайный): ${N}"
+    read_line port "${C}  UDP-порт обфускатора: 443 или 1024-65535 (Enter — случайный): ${N}"
     [[ -z "$port" ]] && break
-    valid_port "$port" && (( port >= 1024 )) || { warn "Порт 1024-65535"; continue; }
+    awg_port_ok "$port" || { warn "Порт — 443 или 1024-65535"; continue; }
     udp_port_busy "$port" && { warn "UDP $port занят (сокет, AWG или каскад)"; continue; }
     break
   done
@@ -8328,7 +8613,7 @@ wgobf_install_opts() {
   for kv in "$@"; do
     k="${kv%%=*}"; v="${kv#*=}"
     case "$k" in
-      port) valid_port "$v" && (( v >= 1024 )) || { err "port: 1024-65535"; return 1; }
+      port) awg_port_ok "$v" || { err "port: 443 или 1024-65535"; return 1; }
             udp_port_busy "$v" && { err "UDP $v занят"; return 1; }; port="$v" ;;
       masking) [[ "$v" =~ ^(STUN|NONE)$ ]] || { err "masking: STUN | NONE"; return 1; }; mask="$v" ;;
       clean) [[ "$v" =~ ^[01]$ ]] || { err "clean: 0 | 1"; return 1; }; clean="$v" ;;
@@ -8368,7 +8653,8 @@ EOF
     _wgobf_teardown keep
     return 1
   fi
-  ufw_allow "$port/udp" "$WGOBF_TAG"
+  ufw_open "$port/udp" "$WGOBF_TAG"
+  ufw_forward_accept
   web_vpn_changed
   ok "WG + обфускатор запущен: вход $ep:$port/udp, подсеть $net"
   log_info "wgobf: установлен (порт $port, wg $wg_port, сеть $net, маскировка $mask)"
@@ -8448,13 +8734,14 @@ wgobf_restore() {
   port=$(wgobf_get PORT)
   udp_listening "$port" && warn "UDP $port сейчас занят — обфускатор может не подняться"
   wgobf_restart || { err "WG + обфускатор восстановлен, но не запустился"; return 1; }
-  ufw_allow "$port/udp" "$WGOBF_TAG"
+  ufw_open "$port/udp" "$WGOBF_TAG"
+  ufw_forward_accept
   ok "WG + обфускатор восстановлен"
 }
 
 # ── Меню ──────────────────────────────────────────────────
-wgobf_status() {
-  local s
+wgobf_status() {  # [состояние порта в UFW — если уже узнано]
+  local s u="${1:-}"
   if ip link show "$WGOBF_IF" &>/dev/null; then s="${G}● поднят${N}"; else s="${R}○ лежит${N}"; fi
   echo -e "  $WGOBF_IF         : $s"
   if unit_active "$WGOBF_UNIT"; then s="${G}● работает${N}"; else s="${R}○ не работает${N}"; fi
@@ -8464,6 +8751,11 @@ wgobf_status() {
   echo -e "  Без обфускатора: $([[ "$(wgobf_get ALLOW_CLEAN)" == 1 ]] && echo -e "${Y}да${N}" || echo нет)"
   echo -e "  Подсеть        : $(wgobf_get NET), MTU $(wgobf_get MTU), WireGuard на $(wgobf_get WG_PORT) ${D}(снаружи закрыт)${N}"
   echo -e "  Клиентов       : $(wgobf_clients | grep -c . || true)"
+  [[ -n "$u" ]] || u=$(ufw_port_state "$(wgobf_get PORT)/udp")
+  case "$u" in
+    open) echo -e "  UFW            : ${G}● порт открыт${N}" ;;
+    closed) echo -e "  UFW            : ${R}▲ порт $(wgobf_get PORT)/udp закрыт${N} ${D}— Сервер → Проверить и починить${N}" ;;
+  esac
 }
 
 wgobf_settings() {
@@ -8519,13 +8811,14 @@ do_wgobf_menu() {
     echo -e "  ${C}2)${N} Список"
     echo -e "  ${C}3)${N} Комплект клиента"
     echo -e "  ${C}4)${N} Удалить клиента"
-    echo -e "  ${C}5)${N} Статус и журнал"
-    echo -e "  ${C}6)${N} Перезапустить"
-    echo -e "  ${C}7)${N} Настройки"
-    echo -e "  ${C}8)${N} Выход клиентов ${D}— $(_wgobf_route_label "$(wgobf_get ROUTE)")${N}"
-    echo -e "  ${R}9)${N} Удалить WG + обфускатор"
+    echo -e "  ${C}5)${N} Переименовать клиента"
+    echo -e "  ${C}6)${N} Статус и журнал"
+    echo -e "  ${C}7)${N} Перезапустить"
+    echo -e "  ${C}8)${N} Настройки"
+    echo -e "  ${C}9)${N} Выход клиентов ${D}— $(_wgobf_route_label "$(wgobf_get ROUTE)")${N}"
+    echo -e "  ${R}10)${N} Удалить WG + обфускатор"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-9]: ${N}" 0 9 0
+    read_choice c "${C}  Выбор [0-10]: ${N}" 0 10 0
     case "$c" in
       1) read_line name "${C}  Имя клиента: ${N}"
          name="${name// /}"
@@ -8534,11 +8827,13 @@ do_wgobf_menu() {
       3) _wgobf_pick_client && { wgobf_show_bundle "$CHOSEN" || true; } ;;
       4) _wgobf_pick_client && read_confirm "${R}  Удалить клиента $CHOSEN? (введи yes): ${N}" \
            && { wgobf_delete_client "$CHOSEN" || true; } ;;
-      5) wgobf_status; journalctl -u "$WGOBF_UNIT" -n 12 --no-pager 2>/dev/null | sed 's/^/  /' || true ;;
-      6) wgobf_restart && ok "Перезапущено" || true ;;
-      7) wgobf_settings || true ;;
-      8) wgobf_route_menu || true ;;
-      9) wgobf_remove || true ;;
+      5) _wgobf_pick_client && read_line name "${C}  Новое имя для $CHOSEN: ${N}" && name="${name// /}" \
+           && [[ -n "$name" ]] && { wgobf_rename_client "$CHOSEN" "$name" || true; } ;;
+      6) wgobf_status; journalctl -u "$WGOBF_UNIT" -n 12 --no-pager 2>/dev/null | sed 's/^/  /' || true ;;
+      7) wgobf_restart && ok "Перезапущено" || true ;;
+      8) wgobf_settings || true ;;
+      9) wgobf_route_menu || true ;;
+      10) wgobf_remove || true ;;
       0) return 0 ;;
     esac
     pause
@@ -8551,15 +8846,17 @@ wgobf_cli() {
   wgobf_installed || { err "WG + обфускатор не установлен"; return 1; }
   case "$cmd" in
     add|del|bundle) [[ -n "$name" ]] || { err "Использование: awg2 --wgobf $cmd ИМЯ"; return 1; } ;;
+    rename) [[ -n "$name" && -n "${3:-}" ]] || { err "Использование: awg2 --wgobf rename СТАРОЕ НОВОЕ"; return 1; } ;;
   esac
   case "$cmd" in
     add) wgobf_add_client "$name" ;;
     del) wgobf_delete_client "$name" ;;
+    rename) wgobf_rename_client "$name" "${3:-}" ;;
     bundle) wgobf_clients | grep -qxF "$name" || { err "Клиента $name нет"; return 1; }
             wgobf_write_bundle "$name" && ok "$WGOBF_CLIENTS/$name" ;;
     rotate-key) wgobf_rotate_key ;;
     restart) wgobf_restart && ok "Перезапущено" ;;
-    *) err "Команда: add ИМЯ | del ИМЯ | bundle ИМЯ | rotate-key | restart"; return 1 ;;
+    *) err "Команда: add ИМЯ | del ИМЯ | rename СТАРОЕ НОВОЕ | bundle ИМЯ | rotate-key | restart"; return 1 ;;
   esac
 }
 
@@ -9623,11 +9920,10 @@ helpers_refresh() {
   _mod_src_patch "$MOD_SRC_DIR"
   if [[ -f "$WARP_AUTOSTART_SCRIPT" ]]; then
     emit_script "$WARP_AUTOSTART_SCRIPT" 'warp_wg_bringup' \
-      WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_wg_bringup
+      WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_awg_params warp_wg_bringup
   fi
   if [[ -f "$WARP_HEALTH_SCRIPT" ]]; then
-    emit_script "$WARP_HEALTH_SCRIPT" 'warp_health_run' WARP_IF WARP_TABLE WARP_STATE \
-      WARP_BACKEND_FILE WARP_HEALTH_LOG "${RT_FUNCS[@]}" warp_health_run
+    _warp_health_emit
   fi
   [[ -f "$USQUE_UP_HOOK" ]] && _usque_write &>/dev/null
   if [[ -f "$DNS_PROXY_STATE" ]]; then
@@ -9642,8 +9938,12 @@ helpers_refresh() {
     T2S_IF T2S_TABLE T2S_ADDR "${RT_FUNCS[@]}" t2s_routing_run
   [[ -f "$EXITS_SCRIPT" ]] && _exits_write_unit
   antiscan_on && _antiscan_emit &>/dev/null
+  vkblock_on && _vkblock_emit &>/dev/null
   # Маршруты Xray: с v1.2.0 перед inbound tun нет NAT (свой выход клиенту)
   [[ -f "$XRAY_ROUTING_SCRIPT" ]] && _xray_emit_routing
+  # Xray 26.7+ без имени у входа tun поднимает utunN вместо xray0 — имя в
+  # готовый конфиг сразу, а не при следующем «Включить»
+  [[ -f "$XRAY_CONF" ]] && py xray-tun-name "$XRAY_CONF"
   # Xray прежних версий жил во временных юнитах и перезагрузку не переживал
   [[ -f "$XRAY_STATE" && ! -f "/etc/systemd/system/$XRAY_UNIT" ]] && ! xray_is_up && rm -f "$XRAY_STATE"
   wgobf_installed && _wgobf_write_service_files
@@ -11304,6 +11604,340 @@ antiscan_remove() {
   rm -rf "$ANTISCAN_DIR" "$ANTISCAN_SCRIPT" "$ANTISCAN_LOG"
 }
 
+# ═════ vkblock ═════
+# VK и Max мимо VPN: трафик клиентов VPN в сети VK (ВКонтакте, Max,
+# Одноклассники и другие сервисы VK) на сервере отбрасывается. Приложения VK
+# на телефоне с VPN не видят адрес сервера и не могут сдать его как VPN.
+# Сервисы VK через VPN у клиентов не откроются — их пускают мимо туннеля.
+#
+# Список — публичный (C24Be/AS_Network_List, blacklist-vk.txt). Проверка та
+# же, что у антисканера (_antiscan_parse): частные и служебные сети и слишком
+# широкие подсети отбрасываются, оборванный или раздутый ответ прежний список
+# не заменяет.
+#
+# Как устроено: наборы ipset hash:net и DROP в mangle PREROUTING — раньше
+# FORWARD, где PostUp сервера ставит свой ACCEPT первым (см. dns.sh). Ловит
+# всех, чей трафик сервер пересылает: awg0, обфускатор, контейнеры Amnezia,
+# клиентов, идущих через WARP, Xray или каскад. Пакеты к адресам самого
+# сервера не трогаются (addrtype LOCAL) — сервер в сети VK остаётся
+# доступным; свой трафик сервера (OUTPUT) — тоже.
+#
+# Служба awg2-vkblock.service ставит наборы и правило при загрузке (раньше
+# UFW и netfilter-persistent), таймер раз в час возвращает правило, если его
+# сбросили, и раз в сутки обновляет список. Без сети — на сохранённом списке.
+
+_vkblock_get() {  # КЛЮЧ — значение из vkblock.conf (файл не исполняется)
+  sed -n "s/^$1=//p" "$VKBLOCK_CONF" 2>/dev/null | tail -1
+}
+
+_vkblock_set() {  # КЛЮЧ ЗНАЧЕНИЕ
+  local v="${2//[$'\n\r']/ }"
+  mkdir -p "$VKBLOCK_DIR" && chmod 700 "$VKBLOCK_DIR"
+  { grep -v "^$1=" "$VKBLOCK_CONF" 2>/dev/null; printf '%s=%s\n' "$1" "$v"; } | write_file "$VKBLOCK_CONF" 600
+}
+
+_vkblock_log() { mkdir -p "$(dirname "$VKBLOCK_LOG")"; echo "[$(date '+%F %T')] $*" >> "$VKBLOCK_LOG"; }
+
+_vkblock_fail() { _vkblock_set ERROR "$1"; _vkblock_log "$1"; return 1; }
+
+vkblock_on() { [[ "$(_vkblock_get ON)" == 1 ]]; }
+
+# Скачать список. Оборванный, пустой или слишком широкий ответ прежний не
+# заменяет; ошибка — в ERROR, время удачного обновления — в UPDATED.
+_vkblock_fetch() {
+  local tmp n s4 s6 keep="оставлен прежний список"
+  mkdir -p "$VKBLOCK_DIR" && chmod 700 "$VKBLOCK_DIR"
+  [[ -s "$VKBLOCK_DIR/vk.list" ]] || keep="список не принят"
+  tmp=$(mktemp "$VKBLOCK_DIR/.dl.XXXXXX") || return 1
+  if ! curl -fsS --proto '=https' --max-time 40 --max-filesize 2000000 -o "$tmp" "$VKBLOCK_SRC" 2>/dev/null; then
+    rm -f "$tmp"; _vkblock_fail "список не скачался"; return 1
+  fi
+  read -r n s4 s6 < <({ _antiscan_parse 4 < "$tmp"; _antiscan_parse 6 < "$tmp"; } | _antiscan_span)
+  if (( n < VKBLOCK_MIN || n > 20000 )); then
+    rm -f "$tmp"; _vkblock_fail "в ответе $n записей — $keep"; return 1
+  fi
+  if (( s4 > VKBLOCK_MAX4 || s6 > VKBLOCK_MAX6 )); then
+    rm -f "$tmp"; _vkblock_fail "слишком широкий охват (IPv4 $s4 адресов, IPv6 $s6 сетей /32) — $keep"; return 1
+  fi
+  chmod 600 "$tmp" && mv -f "$tmp" "$VKBLOCK_DIR/vk.list" || return 1
+  _vkblock_set ERROR ""
+  _vkblock_set UPDATED "$(date +%s)"
+}
+
+_vkblock_rule() {  # набор → VKBLOCK_RULE
+  VKBLOCK_RULE=(-m set --match-set "$1" dst -m addrtype ! --dst-type LOCAL -m comment --comment "$VKBLOCK_TAG" -j DROP)
+}
+
+_vkblock_rule_up() {  # iptables|ip6tables набор
+  _vkblock_rule "$2"
+  "$1" -t mangle -C PREROUTING "${VKBLOCK_RULE[@]}" 2>/dev/null || "$1" -t mangle -I PREROUTING 1 "${VKBLOCK_RULE[@]}"
+}
+
+_vkblock_rule_down() {  # iptables|ip6tables набор
+  local guard=0
+  command -v "$1" &>/dev/null || return 0
+  _vkblock_rule "$2"
+  while (( guard++ < 32 )) && "$1" -t mangle -D PREROUTING "${VKBLOCK_RULE[@]}" 2>/dev/null; do :; done
+  return 0
+}
+
+# Правила на месте: у каждого набора — своё правило
+vkblock_rules_ok() {
+  ipset list -n "$VKBLOCK_SET" &>/dev/null || return 1
+  _vkblock_rule "$VKBLOCK_SET"
+  iptables -t mangle -C PREROUTING "${VKBLOCK_RULE[@]}" 2>/dev/null || return 1
+  ipset list -n "$VKBLOCK_SET6" &>/dev/null || return 0
+  _vkblock_rule "$VKBLOCK_SET6"
+  ip6tables -t mangle -C PREROUTING "${VKBLOCK_RULE[@]}" 2>/dev/null
+}
+
+# Собрать наборы из сохранённого списка и поставить правила.
+_vkblock_apply() {
+  local d n4 n6=0 rc=0
+  # Выключили, пока качался список (выключение ждёт замок не дольше 20 с), —
+  # правило обратно не ставить
+  [[ "$(_vkblock_get ON)" == 1 ]] || { vkblock_down; return 0; }
+  [[ -s "$VKBLOCK_DIR/vk.list" ]] || { _vkblock_log "нечего применять: список ещё не скачан"; return 3; }
+  d=$(mktemp -d "$VKBLOCK_DIR/.apply.XXXXXX") || return 1
+  _antiscan_parse 4 < "$VKBLOCK_DIR/vk.list" | sort -u > "$d/v4"
+  _antiscan_parse 6 < "$VKBLOCK_DIR/vk.list" | sort -u > "$d/v6"
+  : > "$d/none"
+  if ! n4=$(_antiscan_load "$VKBLOCK_SET" inet "$d/v4" "$d/none"); then
+    _vkblock_log "ipset: набор IPv4 не загрузился"; rc=5
+  elif ! _vkblock_rule_up iptables "$VKBLOCK_SET"; then
+    _vkblock_log "iptables: правило не поставилось"; rc=5
+  else
+    if [[ -s "$d/v6" ]] && command -v ip6tables &>/dev/null \
+        && n6=$(_antiscan_load "$VKBLOCK_SET6" inet6 "$d/v6" "$d/none") \
+        && _vkblock_rule_up ip6tables "$VKBLOCK_SET6"; then
+      :
+    else
+      n6=0
+      _vkblock_rule_down ip6tables "$VKBLOCK_SET6"
+      ipset destroy "$VKBLOCK_SET6" 2>/dev/null || true
+    fi
+    _vkblock_set ENTRIES "$n4 $n6"
+    _vkblock_log "применено: IPv4 $n4, IPv6 $n6"
+  fi
+  rm -rf "$d"
+  return "$rc"
+}
+
+vkblock_down() {
+  local s
+  _vkblock_rule_down iptables "$VKBLOCK_SET"
+  _vkblock_rule_down ip6tables "$VKBLOCK_SET6"
+  command -v ipset &>/dev/null || return 0
+  # и временные наборы замены — остаются, если загрузку прервали
+  for s in "$VKBLOCK_SET" "$VKBLOCK_SET6" "$VKBLOCK_SET-new" "$VKBLOCK_SET6-new"; do
+    ipset destroy "$s" 2>/dev/null || true
+  done
+  return 0
+}
+
+# Точка входа службы и таймера (и awg2): apply | update | heal | off.
+vkblock_run() {
+  local mode="${1:-heal}" rc=0 upd
+  mkdir -p "$VKBLOCK_DIR" && chmod 700 "$VKBLOCK_DIR"
+  exec 9>"$VKBLOCK_DIR/.lock"
+  flock -w 180 9 || { _vkblock_log "$mode: занято другой операцией"; return 75; }
+  if [[ "$mode" == off || "$(_vkblock_get ON)" != 1 ]]; then
+    vkblock_down
+    return 0
+  fi
+  case "$mode" in
+    update) _vkblock_fetch || true; _vkblock_apply || rc=$? ;;
+    apply) _vkblock_apply || rc=$? ;;
+    heal)
+      touch "$VKBLOCK_DIR/heal"
+      upd=$(_vkblock_get UPDATED)
+      if (( $(date +%s) - ${upd:-0} > 86400 )); then
+        _vkblock_fetch || true
+        _vkblock_apply || rc=$?
+      elif ! vkblock_rules_ok; then
+        _vkblock_log "правило пропало — применяю заново"
+        _vkblock_apply || rc=$?
+      fi ;;
+    *) echo "использование: ${0##*/} apply|update|heal|off" >&2; return 2 ;;
+  esac
+  return "$rc"
+}
+
+# ── Установка ─────────────────────────────────────────────
+_vkblock_emit() {
+  emit_script "$VKBLOCK_SCRIPT" 'vkblock_run "$@"' \
+    VKBLOCK_DIR VKBLOCK_CONF VKBLOCK_LOG VKBLOCK_SET VKBLOCK_SET6 VKBLOCK_TAG VKBLOCK_SRC \
+    VKBLOCK_MIN VKBLOCK_MAX4 VKBLOCK_MAX6 \
+    write_file _vkblock_get _vkblock_set _vkblock_log _vkblock_fail _antiscan_parse _antiscan_span _antiscan_load \
+    _vkblock_fetch _vkblock_rule _vkblock_rule_up _vkblock_rule_down vkblock_rules_ok _vkblock_apply vkblock_down \
+    vkblock_run || return 1
+  # Раньше UFW и netfilter-persistent: восстановление iptables-persistent найдёт набор
+  write_unit "$VKBLOCK_UNIT" <<EOF
+[Unit]
+Description=AWG Toolza — VK и Max мимо VPN: клиенты не ходят через сервер в сети VK
+DefaultDependencies=no
+Wants=network-pre.target local-fs.target
+After=local-fs.target systemd-modules-load.service
+Before=network-pre.target ufw.service netfilter-persistent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$VKBLOCK_SCRIPT apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  write_unit "${VKBLOCK_TIMER%.timer}.service" <<EOF
+[Unit]
+Description=AWG Toolza — VK и Max мимо VPN: правило на месте, список раз в сутки
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$VKBLOCK_SCRIPT heal
+EOF
+  write_unit "$VKBLOCK_TIMER" <<'EOF'
+[Unit]
+Description=AWG Toolza — VK и Max мимо VPN: проверка раз в час
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=3600
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+vkblock_enable() {
+  local rc=0
+  need_cmds ipset:ipset flock:util-linux || return 1
+  _vkblock_set ON 1
+  _vkblock_emit || { err "Не удалось записать службу"; return 1; }
+  info "Скачиваю и проверяю список сетей VK..."
+  "$VKBLOCK_SCRIPT" update || rc=$?
+  if (( rc )); then
+    _vkblock_set ON 0
+    "$VKBLOCK_SCRIPT" off &>/dev/null || true
+    case $rc in
+      3) err "Список сетей VK не получен: $(_vkblock_get ERROR)" ;;
+      75) err "Занято другой операцией — повтори через минуту" ;;
+      *) err "Не удалось применить правило (код $rc) — журнал: $VKBLOCK_LOG" ;;
+    esac
+    return 1
+  fi
+  systemctl enable "$VKBLOCK_UNIT" &>/dev/null || true
+  systemctl enable --now "$VKBLOCK_TIMER" &>/dev/null || true
+  log_info "VK и Max мимо VPN: включено"
+  ok "VK и Max мимо VPN включено: $(vkblock_summary)"
+  [[ -n "$(_vkblock_get ERROR)" ]] && warn "$(_vkblock_get ERROR)"
+  return 0
+}
+
+vkblock_disable() {
+  local held=0
+  _vkblock_set ON 0
+  remove_unit "$VKBLOCK_TIMER" "${VKBLOCK_TIMER%.timer}.service" "$VKBLOCK_UNIT"
+  # Замок прохода таймера: проход, уже увидевший ON=1, иначе поставил бы правило
+  # обратно после нас. Не дольше 20 с — качающий проход сам увидит ON=0 перед применением
+  mkdir -p "$VKBLOCK_DIR" && chmod 700 "$VKBLOCK_DIR"
+  exec 9>"$VKBLOCK_DIR/.lock"
+  flock -w 20 9 && held=1
+  vkblock_down
+  (( held )) || _vkblock_log "выключение: замок занят дольше 20 с — снято без него"
+  exec 9>&-
+  log_info "VK и Max мимо VPN: выключено"
+  ok "VK и Max снова идут через VPN — правило и наборы сняты"
+}
+
+vkblock_update() {
+  vkblock_on || { err "VK и Max мимо VPN — выключено"; return 1; }
+  _vkblock_emit || return 1
+  "$VKBLOCK_SCRIPT" update || { err "Не удалось применить список — журнал: $VKBLOCK_LOG"; return 1; }
+  if [[ -n "$(_vkblock_get ERROR)" ]]; then warn "$(_vkblock_get ERROR)"; fi
+  ok "Список обновлён: $(vkblock_summary)"
+}
+
+# Отброшено пакетов в сети VK с установки правила (перезагрузка сбрасывает)
+vkblock_dropped() {
+  { iptables-save -c -t mangle 2>/dev/null; ip6tables-save -c -t mangle 2>/dev/null; } \
+    | awk -v tag="$VKBLOCK_TAG" 'index($0, "--comment " tag) && /^\[/ {
+        split(substr($1, 2), c, ":"); n += c[1] } END { printf "%.0f\n", n }'
+}
+
+vkblock_summary() {
+  local e
+  read -r -a e <<< "$(_vkblock_get ENTRIES)"
+  echo "подсетей IPv4 ${e[0]:-0}, IPv6 ${e[1]:-0}"
+}
+
+# ── Меню ──────────────────────────────────────────────────
+_vkblock_show() {
+  local upd err
+  hdr "VK и Max мимо VPN"
+  echo -e "  ${D}Клиенты VPN не ходят через сервер в сети VK: ВКонтакте, Max, Одноклассники."
+  echo -e "  Приложения VK не видят адрес сервера и не могут сдать его как VPN. Сервисы VK"
+  echo -e "  у клиентов через VPN не откроются — их пускают мимо туннеля.${N}"
+  echo ""
+  if vkblock_on; then
+    if vkblock_rules_ok; then echo -e "  Состояние : ${G}● включено${N} — $(vkblock_summary)"
+    else echo -e "  Состояние : ${Y}▲ включено, правило не на месте${N} — вернёт таймер или «Обновить список»"; fi
+    echo -e "  Отбито    : ${W}$(vkblock_dropped)${N} ${D}пакетов в сети VK (сбрасывается при перезагрузке)${N}"
+  else
+    echo -e "  Состояние : ${D}○ выключено${N}"
+  fi
+  upd=$(_vkblock_get UPDATED)
+  [[ -n "$upd" ]] && echo -e "  Список    : обновлён $(date -d "@$upd" '+%d.%m.%Y %H:%M' 2>/dev/null)"
+  err=$(_vkblock_get ERROR)
+  [[ -n "$err" ]] && echo -e "  ${Y}▲ $err${N}"
+  return 0
+}
+
+do_vkblock_menu() {
+  local c
+  while true; do
+    echo ""
+    _vkblock_show
+    echo ""
+    if vkblock_on; then echo -e "  ${C}1)${N} Выключить"; else echo -e "  ${C}1)${N} Включить"; fi
+    echo -e "  ${C}2)${N} Обновить список сейчас"
+    echo -e "  ${W}0)${N} ← Назад"
+    read_choice c "${C}  Выбор [0-2]: ${N}" 0 2 0
+    case "$c" in
+      1) if vkblock_on; then vkblock_disable
+         else
+           echo -e "  ${Y}ВКонтакте, Max и другие сервисы VK у клиентов через VPN перестанут открываться —"
+           echo -e "  в приложении VPN их надо пустить мимо туннеля.${N}"
+           ask_yes "  Включить? [y/N]: " n && { vkblock_enable || true; }
+         fi ;;
+      2) vkblock_update || true ;;
+      0) return 0 ;;
+    esac
+    pause
+  done
+}
+
+# Таймер молчит дольше трёх часов (сброшен, заглох) — перезапустить
+vkblock_watchdog() {
+  local age
+  vkblock_on || return 0
+  [[ -f "$VKBLOCK_DIR/heal" ]] || return 0
+  age=$(( $(date +%s) - $(stat -c %Y "$VKBLOCK_DIR/heal" 2>/dev/null || echo 0) ))
+  (( age < 10800 )) && return 0
+  touch "$VKBLOCK_DIR/heal"
+  timer_heal "$VKBLOCK_TIMER"
+  systemctl start --no-block "${VKBLOCK_TIMER%.timer}.service" &>/dev/null || true
+}
+
+vkblock_remove() {
+  remove_unit "$VKBLOCK_TIMER" "${VKBLOCK_TIMER%.timer}.service" "$VKBLOCK_UNIT"
+  vkblock_down
+  rm -rf "$VKBLOCK_DIR" "$VKBLOCK_SCRIPT" "$VKBLOCK_LOG"
+}
+
 # ═════ uninstall ═════
 # Очистка клиентов и полное удаление.
 
@@ -11463,10 +12097,13 @@ uninstall_all() {
   if [[ "$del_wgobf" == y ]]; then wgobf_remove quiet
   elif wgobf_installed; then info "WG + обфускатор оставлен и продолжит работать сам"; fi
   if web_installed; then info "Веб-панель оставлена — сервера AWG в ней больше нет"; web_vpn_changed; fi
-  # Антисканер работает через свой скрипт и без awg2, но управлять им без
-  # awg2 нечем — уходит вместе со скриптом, иначе остаётся защищать сервер
-  if [[ "$del_self" == y ]]; then antiscan_remove
-  elif antiscan_on; then info "Антисканер оставлен и продолжит работать"; fi
+  # Антисканер и «VK и Max мимо VPN» работают через свои скрипты и без awg2,
+  # но управлять ими без awg2 нечем — уходят вместе со скриптом, иначе остаются
+  if [[ "$del_self" == y ]]; then antiscan_remove; vkblock_remove
+  else
+    if antiscan_on; then info "Антисканер оставлен и продолжит работать"; fi
+    if vkblock_on; then info "VK и Max мимо VPN оставлено и продолжит работать"; fi
+  fi
   if [[ "$del_bot" == y ]]; then
     bot_uninstall quiet
     # Сертификат — для Mini App бота и веб-панели
@@ -11724,8 +12361,9 @@ do_server_menu() {
     echo -e "  ${Y}8)${N} Сбросить сервер"
     echo -e "  ${C}9)${N} Антисканер ${D}— $(antiscan_on && echo "включён" || echo "сети сканеров РКН")${N}"
     echo -e "  ${C}10)${N} Перенос из Amnezia ${D}— сервер из Docker-контейнера, клиенты без перевыдачи${N}"
+    echo -e "  ${C}11)${N} VK и Max мимо VPN ${D}— $(vkblock_on && echo "включено" || echo "клиенты VPN не ходят в сети VK")${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-10]: ${N}" 0 10 0
+    read_choice c "${C}  Выбор [0-11]: ${N}" 0 11 0
     case "$c" in
       1) do_install || true ;;
       2) do_create_server || true ;;
@@ -11737,6 +12375,7 @@ do_server_menu() {
       8) do_reset_server || true ;;
       9) do_antiscan_menu || true; continue ;;
       10) do_amnezia_menu || true ;;
+      11) do_vkblock_menu || true; continue ;;
       0) return 0 ;;
     esac
     pause
@@ -11894,6 +12533,7 @@ _api_status() {
     _kv version "$VERSION_SHOW"; _kv api:n "$API_VERSION"
     _kv channel "$UPDATE_CHANNEL"; _kv update "$(update_available || true)"
     _kv host "$(hostname)"; _kv ip "$(public_ip_cached)"; _kv country "$(server_country)"
+    _kv country_auto "$(country_auto)"; _kv country_manual:b "$(_b country_is_manual)"; _kv country_votes "$(country_votes)"
     _kv uptime:n "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
     _kv os "$OS_LABEL"; _kv kernel "$(uname -r)"
     _kv components.installed:b "$(_b command -v awg)"
@@ -11917,6 +12557,7 @@ _api_status() {
         | awk -v now="$(date +%s)" '$2 > 0 && now - $2 < 180' | wc -l)"
     fi
     _kv tunnels.warp "$(_api_tun warp_is_up "$WARP_CONF" "$USQUE_CONF")"
+    _kv tunnels.warp_failed:b "$(_b warp_failed)"
     _kv tunnels.xray "$(_api_tun xray_is_up "$XRAY_CONF")"
     _kv tunnels.tun2socks "$(_api_tun t2s_is_up "$T2S_CONF")"
     _kv tunnels.exits "$(_api_tun exits_is_up "$EXITS_DIR"/awg-exit-*.conf)"
@@ -12322,7 +12963,7 @@ _api_warp() {
         # Для карточки: интерфейс, адрес Cloudflare, рукопожатие (wg) и счётчики
         _kv iface "$WARP_IF"
         _kv endpoint "$([[ "$be" == wg ]] && sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$WARP_CONF" 2>/dev/null | head -1)"
-        _kv hs:n "$(if [[ "$be" == wg ]]; then _n awk 'NR == 1 {print $2}' < <(wg show "$WARP_IF" latest-handshakes 2>/dev/null); else echo 0; fi)"
+        _kv hs:n "$(if [[ "$be" == wg ]]; then _n awk 'NR == 1 {print $2}' < <("$(warp_tool)" show "$WARP_IF" latest-handshakes 2>/dev/null); else echo 0; fi)"
         _kv rx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/rx_bytes")"
         _kv tx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/tx_bytes")"; } | api_obj
       warp_status ;;
@@ -12330,6 +12971,15 @@ _api_warp() {
     up) warp_up ;;
     down) warp_down ;;
     restart) warp_down quiet; warp_up ;;
+    # Для уведомлений бота: отвечает ли поднятый warp0. С health-check
+    # проверяет он сам — тогда без пинга, кроме «probe ping» (бот ждёт конца
+    # сбоя); failover — клиентов увёл health-check
+    probe)
+      local h=0
+      unit_active awg-warp-healthcheck.timer && h=1
+      { _kv up:b "$(_b warp_is_up)"; _kv health:b "$h"
+        _kv failover:b "$(_b test -f "$WARP_STATE.failed")"
+        if { (( ! h )) || [[ "${1:-}" == ping ]]; } && warp_is_up; then _kv ok:b "$(_b warp_ping)"; fi; } | api_obj ;;
     health)
       case "${1:-}" in
         on) warp_health_on ;; off) warp_health_off; ok "Health-check выключен" ;;
@@ -12349,7 +12999,7 @@ _api_warp() {
       [[ "${1:-}" =~ ^(wg|usque)$ ]] || { _api_usage "warp backend wg|usque"; return; }
       warp_set_backend "$1" ;;
     remove) warp_uninstall ;;
-    *) _api_usage "warp status|install|up|down|restart|health on|off|license КЛЮЧ|import (stdin)|endpoint [СТРАНА]|backend wg|usque|remove" ;;
+    *) _api_usage "warp status|install|up|down|restart|probe [ping]|health on|off|license КЛЮЧ|import (stdin)|endpoint [СТРАНА]|backend wg|usque|remove" ;;
   esac
 }
 
@@ -12494,15 +13144,18 @@ _api_dns() {
 }
 
 _api_wgobf() {
-  local a="${1:-}" name dir f dump now pub ip hs rx tx
+  local a="${1:-}" name dir f dump now pub ip hs rx tx u=""
   shift || true
   case "$a" in
     status)
+      wgobf_installed && u=$(ufw_port_state "$(wgobf_get PORT)/udp")
       { _kv installed:b "$(_b wgobf_installed)"; _kv running:b "$(_b wgobf_running)"
         _kv version "$WGOBF_VERSION"
         if wgobf_installed; then
           _kv endpoint "$(wgobf_get ENDPOINT):$(wgobf_get PORT)"; _kv masking "$(wgobf_get MASKING)"
           _kv clean:b "$(wgobf_get ALLOW_CLEAN)"; _kv clients:n "$(wgobf_clients | grep -c . || true)"
+          # off — UFW выключен; closed — включён, а порт обфускатора не открыт
+          _kv ufw "$u"
           # Выход для всех и новых клиентов и туннели на выбор: none | off | up,
           # свои выходы Xray (если Xray их умеет) и exit-ноды
           _kv route "$(r=$(wgobf_get ROUTE); echo "${r:-direct}")"
@@ -12512,7 +13165,7 @@ _api_wgobf() {
           _kv exits "$(if [[ -z "$(exits_nodes)" ]]; then echo none; elif exits_is_up; then echo up; else echo off; fi)"
           _kv exit_nodes:j "$(exits_nodes | py json-list)"
         fi; } | api_obj
-      wgobf_installed && wgobf_status
+      wgobf_installed && wgobf_status "$u"
       return 0 ;;
     install) wgobf_install_opts "$@" ;;
     clients)
@@ -12529,6 +13182,10 @@ _api_wgobf() {
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs" "$rx" "$tx" "$(wgobf_route_of "${ip%/32}")"
       done < <(wgobf_clients) | api_rows name ip ago:n rx:n tx:n route ;;
     route) wgobf_route_set "${1:-}" "${2:-}" ;;
+    rename)
+      [[ -n "${1:-}" && -n "${2:-}" ]] || { _api_usage "wgobf rename СТАРОЕ НОВОЕ"; return; }
+      wgobf_installed || { err "WG + обфускатор не установлен"; return 1; }
+      wgobf_rename_client "$1" "$2" ;;
     add|del|bundle)
       name="${1:-}"
       [[ -n "$name" ]] || { _api_usage "wgobf $a ИМЯ"; return; }
@@ -12550,7 +13207,7 @@ _api_wgobf() {
     clean) wgobf_set_clean "${1:-}" ;;
     rotate-key) wgobf_rotate_key ;;
     remove) wgobf_remove quiet ;;
-    *) _api_usage "wgobf status|install [ключ=значение...]|clients|add|del|bundle ИМЯ|route ИМЯ|all direct|warp|xray[:выход]|exits[:нода]|restart|masking STUN|NONE|clean 0|1|rotate-key|remove" ;;
+    *) _api_usage "wgobf status|install [ключ=значение...]|clients|add|del|bundle ИМЯ|rename СТАРОЕ НОВОЕ|route ИМЯ|all direct|warp|xray[:выход]|exits[:нода]|restart|masking STUN|NONE|clean 0|1|rotate-key|remove" ;;
   esac
 }
 
@@ -12723,7 +13380,41 @@ _api_antiscan() {
   esac
 }
 
+# ── VK и Max мимо VPN ─────────────────────────────────────
+_api_vkblock() {
+  local a="${1:-status}" e on=0
+  shift || true
+  case "$a" in
+    status)
+      read -r -a e <<< "$(_vkblock_get ENTRIES)"
+      vkblock_on && on=1
+      { _kv enabled:b "$on"; _kv active:b "$( (( on )) && _b vkblock_rules_ok || echo 0)"
+        _kv v4:n "${e[0]:-0}"; _kv v6:n "${e[1]:-0}"
+        _kv updated:n "$(_vkblock_get UPDATED)"; _kv error "$(_vkblock_get ERROR)"
+        _kv dropped:n "$( (( on )) && vkblock_dropped || echo 0)"
+      } | api_obj ;;
+    on) vkblock_enable ;;
+    off) vkblock_disable ;;
+    update) vkblock_update ;;
+    *) _api_usage "vkblock status|on|off|update" ;;
+  esac
+}
+
 # ── Перенос из Amnezia (Docker) ───────────────────────────
+# Страна сервера (флаг в шапке панели): вручную или снова по геосервисам;
+# refresh — спросить геосервисы сейчас, не дожидаясь суток
+_api_country() {
+  local a="${1:-}"
+  case "$a" in
+    set) [[ -n "${2:-}" ]] || { _api_usage "country set КОД|auto"; return; }
+         country_set "$2" ;;
+    refresh) country_refresh
+             { _kv country "$(server_country)"; _kv country_auto "$(country_auto)"; _kv votes "$(country_votes)"; } | api_obj
+             info "По геосервисам: $(country_auto || true) ($(country_votes || true))" ;;
+    *) _api_usage "country set КОД|auto | refresh" ;;
+  esac
+}
+
 _api_amnezia() {
   local a="${1:-status}" c running=0
   case "$a" in
@@ -12760,8 +13451,8 @@ _api_log() {
     tun2socks) unit="$T2S_UNIT" ;;       exits) unit="$EXITS_UNIT" ;;
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
     bot) unit="$BOT_UNIT" ;;             web) file="$WEB_LOG" ;;
-    antiscan) file="$ANTISCAN_LOG" ;;
-    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan [строк]"; return ;;
+    antiscan) file="$ANTISCAN_LOG" ;;   vkblock) file="$VKBLOCK_LOG" ;;
+    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan|vkblock [строк]"; return ;;
   esac
   if [[ -n "$file" ]]; then
     [[ -f "$file" ]] || { info "Журнала $file нет"; return 0; }
@@ -12851,19 +13542,22 @@ _api_readonly() {
   case "$a $b" in
     "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
     "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"tunnels "|"tunnels status"|\
-    "tunnels clients"|"warp status"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
+    "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
     "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
-    "amnezia scan") return 0 ;;
+    "amnezia scan"|"vkblock "|"vkblock status") return 0 ;;
   esac
   return 1
 }
 
+# Блокировку не взять (нет каталога, файла или ждали дольше wait) — отказ:
+# без неё две меняющие команды пошли бы одновременно
 _api_lock() {
   local wait="${API_LOCK_WAIT:-20}" holder
-  mkdir -p "$STATE_DIR"
-  exec 8>>"$API_LOCK" || return 0
+  mkdir -p "$STATE_DIR" || { err "Не удалось создать каталог блокировки API"; return 73; }
+  exec 8>>"$API_LOCK" || { err "Не удалось открыть файл блокировки API"; return 73; }
   if ! flock -w "$wait" 8; then
+    exec 8>&-
     holder=$(cat "$API_LOCK.info" 2>/dev/null)
     err "Идёт другая операция${holder:+ ($holder)} — повтори, когда она закончится"
     return 75
@@ -12899,13 +13593,15 @@ api_dispatch() {
     cert) _api_cert "$@" ;;
     web) _api_web "$@" ;;
     antiscan) _api_antiscan "$@" ;;
+    vkblock) _api_vkblock "$@" ;;
     amnezia) _api_amnezia "$@" ;;
+    country) _api_country "$@" ;;
     uninstall) _api_uninstall "$@" ;;
     log) _api_log "$@" ;;
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade dns wgobf update bot cert web antiscan amnezia uninstall log job version"
+      echo "         exits cascade dns wgobf update bot cert web antiscan vkblock amnezia country uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
@@ -12949,6 +13645,7 @@ api_main() {
     helpers_refresh || true
     expire_watchdog || true
     antiscan_watchdog || true
+    vkblock_watchdog || true
     if _api_readonly "${API_ARGS[@]}"; then
       api_dispatch "${API_ARGS[@]}" || rc=$?
     else
@@ -13061,7 +13758,7 @@ main() {
       xray_ru_update || exit 1
       info "Новые базы подхватятся при перезапуске туннеля Xray"
       exit 0 ;;
-    --wgobf) AUTO_MODE=1; wgobf_cli "${2:-}" "${3:-}" && exit 0 || exit 1 ;;
+    --wgobf) AUTO_MODE=1; wgobf_cli "${2:-}" "${3:-}" "${4:-}" && exit 0 || exit 1 ;;
     "") [[ "${AUTOINSTALL:-}" == 1 ]] && { AUTO_MODE=1; do_autoinstall; exit; } ;;
     *) err "Неизвестный аргумент: $1"; info "awg2 --help — список аргументов"; exit 1 ;;
   esac
@@ -14896,7 +15593,7 @@ if __name__ == "__main__":
 '
 # CPS_GENERATOR_END v2
 
-_PY_HELPER_SUM=6cbfee4c1f8ac3b7
+_PY_HELPER_SUM=e95b111fc5b23e38
 IFS= read -r -d '' _PY_HELPER <<'__AWG2_PY_HELPER__' || true
 """Встроенный помощник awg2: разбор и атомарная правка конфигов, JSON Xray,
 расчёты подсетей, разбор pcap. Вызывается как `py <команда> [аргументы]`.
@@ -16204,6 +16901,7 @@ def cmd_conf_hooks(path, mode, *allow):
 # ════════════════════════ Xray ════════════════════════
 SKIP_PROTO = ("freedom", "blackhole", "dns")
 KNOWN_IN = {"xray0", "tun-in", "tun-probe", "socks-in"}
+XRAY_IF = "xray0"                   # интерфейс входа tun — как XRAY_IF в awg2
 SNIFF = {"enabled": True, "destOverride": ["http", "tls", "quic"]}
 
 
@@ -16596,6 +17294,35 @@ def cmd_xray_test_copy(src, dst):
     jsave(dst, conf)
 
 
+def xray_tun_named(tun):
+    """Имя устройства входа tun — всегда xray0. До Xray 26.6 включительно оно
+    и было по умолчанию, с 26.7 без имени устройство называется случайно
+    (utun10…utun1024): awg2 не дожидался xray0 и выключал туннель. Поле name
+    есть во всех версиях со входом tun. True — имя пришлось поставить."""
+    st = tun.get("settings")
+    if not isinstance(st, dict):
+        st = tun["settings"] = {}
+    if st.get("name") == XRAY_IF:
+        return False
+    st["name"] = XRAY_IF
+    return True
+
+
+def cmd_xray_tun_name(path):
+    """Имя xray0 у входа tun в готовом конфиге — при обновлении awg2: служба,
+    перезапущенная на новом Xray (сбой, перезагрузка), иначе подняла бы utunN."""
+    try:
+        conf = jload(path)
+    except Exception:
+        return
+    if not isinstance(conf, dict):
+        return
+    changed = [xray_tun_named(i) for i in conf.get("inbounds") or []
+               if isinstance(i, dict) and i.get("protocol") == "tun"]
+    if any(changed):
+        jsave(path, conf)
+
+
 def cmd_xray_tun_probe(out):
     jsave(out, {"log": {"loglevel": "none"},
                 "inbounds": [{"protocol": "tun", "tag": "tun-probe",
@@ -16712,8 +17439,8 @@ def cmd_xray_prepare(path, mode, peers=""):
     native: inbound tun видит адрес клиента (перед xray0 нет NAT), а через
     tun2socks все соединения приходят с 127.0.0.1."""
     conf = jload(path)
-    conf.setdefault("routing", {})["rules"] = [r for r in conf["routing"].get("rules") or []
-                                               if r.get("ruleTag") != XRAY_CLIENT_RULE]
+    routing = conf.setdefault("routing", {})
+    routing["rules"] = [r for r in routing.get("rules") or [] if r.get("ruleTag") != XRAY_CLIENT_RULE]
     inb = [i for i in conf.get("inbounds") or []
            if not (i.get("tag") == "xray0" and i.get("protocol") == "dokodemo-door")]
     socks = next((i for i in inb if i.get("tag") == "socks-in"), None)
@@ -16737,6 +17464,7 @@ def cmd_xray_prepare(path, mode, peers=""):
                    "sniffing": SNIFF}
             inb.insert(0, tun)
         tun["tag"] = "tun-in"
+        xray_tun_named(tun)
         want = tun["tag"]
     else:
         inb = [i for i in inb if i.get("protocol") != "tun"]
@@ -17785,7 +18513,7 @@ COMMANDS = {
     "conf-hooks": cmd_conf_hooks, "mod-compat-patch": cmd_mod_compat_patch,
     "xray-link": cmd_xray_link, "xray-default": cmd_xray_default, "xray-add": cmd_xray_add,
     "xray-del": cmd_xray_del, "xray-tags": cmd_xray_tags, "xray-outs": cmd_xray_outs, "xray-restore-clean": cmd_xray_restore_clean, "xray-probe": cmd_xray_probe,
-    "xray-probe-tag": cmd_xray_probe_tag, "xray-tun-probe": cmd_xray_tun_probe,
+    "xray-probe-tag": cmd_xray_probe_tag, "xray-tun-probe": cmd_xray_tun_probe, "xray-tun-name": cmd_xray_tun_name,
     "xray-test-copy": cmd_xray_test_copy,
     "xray-balancer": cmd_xray_balancer, "xray-balancer-get": cmd_xray_balancer_get,
     "xray-main": cmd_xray_main, "xray-main-get": cmd_xray_main_get,
@@ -17815,5 +18543,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=c546e2082e250ae3
+_BUILD_SUM=ea2817b78ad15235
 main "$@"

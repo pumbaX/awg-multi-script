@@ -90,7 +90,7 @@ main() {
       xray_ru_update || exit 1
       info "Новые базы подхватятся при перезапуске туннеля Xray"
       exit 0 ;;
-    --wgobf) AUTO_MODE=1; wgobf_cli "${2:-}" "${3:-}" && exit 0 || exit 1 ;;
+    --wgobf) AUTO_MODE=1; wgobf_cli "${2:-}" "${3:-}" "${4:-}" && exit 0 || exit 1 ;;
     "") [[ "${AUTOINSTALL:-}" == 1 ]] && { AUTO_MODE=1; do_autoinstall; exit; } ;;
     *) err "Неизвестный аргумент: $1"; info "awg2 --help — список аргументов"; exit 1 ;;
   esac

@@ -210,6 +210,9 @@ rt_down() {  # устройство таблица
 
 # ── Состояние и взаимоисключение ──────────────────────────
 warp_is_up()  { ip link show "$WARP_IF" &>/dev/null; }
+# WARP включён, а туннеля нет: health-check увёл клиентов напрямую или warp0
+# не поднялся после перезагрузки. Выключенный руками — не сбой (состояния нет).
+warp_failed() { [[ -f "$WARP_STATE" ]] && ! warp_is_up; }
 xray_is_up()  { ip link show "$XRAY_IF" &>/dev/null || unit_active "$XRAY_UNIT"; }
 t2s_is_up()   { unit_active "$T2S_UNIT"; }
 exits_is_up() { unit_active "$EXITS_UNIT"; }

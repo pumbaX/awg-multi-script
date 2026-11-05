@@ -283,11 +283,10 @@ helpers_refresh() {
   _mod_src_patch "$MOD_SRC_DIR"
   if [[ -f "$WARP_AUTOSTART_SCRIPT" ]]; then
     emit_script "$WARP_AUTOSTART_SCRIPT" 'warp_wg_bringup' \
-      WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_wg_bringup
+      WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_awg_params warp_wg_bringup
   fi
   if [[ -f "$WARP_HEALTH_SCRIPT" ]]; then
-    emit_script "$WARP_HEALTH_SCRIPT" 'warp_health_run' WARP_IF WARP_TABLE WARP_STATE \
-      WARP_BACKEND_FILE WARP_HEALTH_LOG "${RT_FUNCS[@]}" warp_health_run
+    _warp_health_emit
   fi
   [[ -f "$USQUE_UP_HOOK" ]] && _usque_write &>/dev/null
   if [[ -f "$DNS_PROXY_STATE" ]]; then
@@ -302,8 +301,12 @@ helpers_refresh() {
     T2S_IF T2S_TABLE T2S_ADDR "${RT_FUNCS[@]}" t2s_routing_run
   [[ -f "$EXITS_SCRIPT" ]] && _exits_write_unit
   antiscan_on && _antiscan_emit &>/dev/null
+  vkblock_on && _vkblock_emit &>/dev/null
   # Маршруты Xray: с v1.2.0 перед inbound tun нет NAT (свой выход клиенту)
   [[ -f "$XRAY_ROUTING_SCRIPT" ]] && _xray_emit_routing
+  # Xray 26.7+ без имени у входа tun поднимает utunN вместо xray0 — имя в
+  # готовый конфиг сразу, а не при следующем «Включить»
+  [[ -f "$XRAY_CONF" ]] && py xray-tun-name "$XRAY_CONF"
   # Xray прежних версий жил во временных юнитах и перезагрузку не переживал
   [[ -f "$XRAY_STATE" && ! -f "/etc/systemd/system/$XRAY_UNIT" ]] && ! xray_is_up && rm -f "$XRAY_STATE"
   wgobf_installed && _wgobf_write_service_files

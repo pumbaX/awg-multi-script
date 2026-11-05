@@ -21,6 +21,7 @@ LOGS = [
     ("tun2socks", "tun2socks"), ("exits", "Exit-ноды"), ("cascade", "Каскад"),
     ("dns", "dnscrypt-proxy"), ("dns-health", "DNS health-check"), ("wgobf", "WG + обфускатор"),
     ("bot", "Telegram-бот"), ("web", "Веб-панель"), ("antiscan", "Антисканер"),
+    ("vkblock", "VK и Max мимо VPN"),
 ]
 # Журнал входов веб-панели (адреса, введённые логины) — как и сам раздел «Веб-панель»
 OWNER_LOGS = {"web"}

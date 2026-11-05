@@ -244,6 +244,11 @@ def clip(text: str, limit: int = TEXT_MAX) -> str:
     return cut + "…" + "".join(f"</{t}>" for t in reversed(open_tags))
 
 
+def awg_port_ok(v: str) -> bool:
+    """Порт AWG и обфускатора, как awg_port_ok в awg2: 1024-65535 или 443 (QUIC)."""
+    return bool(re.fullmatch(r"[0-9]{1,5}", v)) and (1024 <= int(v) <= 65535 or int(v) == 443)
+
+
 def fmt_bytes(n: int | None) -> str:
     n = int(n or 0)
     for unit in ("Б", "КБ", "МБ", "ГБ"):

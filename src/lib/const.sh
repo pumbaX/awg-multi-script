@@ -28,7 +28,8 @@ MOD_LOG="/var/log/awg-mod-update.log"
 MOD_FALLBACK_TAG="v3.1.20260906"
 TOOLS_FALLBACK_TAG="v3.1.20260812"
 UPSTREAM_CACHE="$STATE_DIR/upstream_tags"
-COUNTRY_CACHE="$STATE_DIR/country"     # «NL 1791500000»: страна сервера (флаг в шапке панели)
+COUNTRY_CACHE="$STATE_DIR/country"     # «NL 1791500000 2 NL=4,DE=1»: страна сервера по геосервисам (флаг в шапке панели)
+COUNTRY_MANUAL="$STATE_DIR/country_manual"   # страна, выбранная вручную, — главнее геосервисов
 UPSTREAM_TTL=21600
 
 # ── Обновление скрипта ────────────────────────────────────
@@ -80,6 +81,8 @@ WARP_BACKEND_FILE="/etc/awg-warp-backend"
 WARP_AUTOSTART_SCRIPT="$WARP_DIR/warp-autostart.sh"
 WARP_HEALTH_SCRIPT="/usr/local/bin/awg-warp-healthcheck.sh"
 WARP_HEALTH_LOG="/var/log/awg-warp-health.log"
+WARP_HEALTH_FAILS="/tmp/awg-warp-fails"     # провалов подряд
+WARP_HEALTH_RETRY="/tmp/awg-warp-retry"     # попыток вернуть WARP после отказа
 WARPSCOUT_BIN="/usr/local/bin/warpscout"
 WARPSCOUT_DIR="/etc/warpscout"
 WARPSCOUT_ACCOUNT="$WARPSCOUT_DIR/warpscout-account.json"
@@ -110,6 +113,7 @@ CASCADE_TAG="awg-cascade"
 CASCADE_SCRIPT="/usr/local/bin/awg-cascade-apply.sh"
 CASCADE_LOG="/var/log/awg-cascade.log"
 CASCADE_UFW_BACKUP="$CASCADE_DIR/ufw-backup/ufw.default.original"
+UFW_DEFAULTS="/etc/default/ufw"   # политики UFW (DEFAULT_FORWARD_POLICY)
 
 XRAY_DIR="/etc/xray"
 XRAY_CONF="$XRAY_DIR/config.json"
@@ -206,6 +210,18 @@ ANTISCAN_SRC="https://raw.githubusercontent.com/shadow-netlab/traffic-guard-list
 # запись /19) и ~20 сетей /32 IPv6. Подменённый источник с тысячами /12 прошёл бы
 # проверку записей, но закрыл бы почти весь IPv4 — такой список не принимается
 ANTISCAN_MAX4=16777216 ANTISCAN_MAX6=4096   # 2^24 адресов IPv4; 2^12 сетей /32 IPv6 (записи /32 и шире)
+
+# ── VK и Max мимо VPN (сети VK — DROP трафика клиентов VPN) ──
+VKBLOCK_DIR="$STATE_DIR/vkblock"            # список и состояние
+VKBLOCK_CONF="$VKBLOCK_DIR/vkblock.conf"    # ON, UPDATED, ERROR, ENTRIES
+VKBLOCK_SCRIPT="/usr/local/bin/awg2-vkblock"
+VKBLOCK_LOG="/var/log/awg2-vkblock.log"
+VKBLOCK_SET="awg2-vk" VKBLOCK_SET6="awg2-vk6" VKBLOCK_TAG="awg2-vkblock"
+VKBLOCK_UNIT="awg2-vkblock.service" VKBLOCK_TIMER="awg2-vkblock-update.timer"
+VKBLOCK_SRC="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist-vk.txt"
+# Настоящий список: ~200 записей, ~300 тыс. адресов IPv4 и три сети /29 IPv6.
+# Короче минимума — оборван, шире предела — подменён: прежний не заменяют
+VKBLOCK_MIN=50 VKBLOCK_MAX4=4194304 VKBLOCK_MAX6=4096   # 2^22 адресов IPv4; 2^12 сетей /32 IPv6
 
 # Интерфейсы, которые поднимает сам awg2: их адрес не может быть Endpoint
 # клиента, и маршрут через них — не аплинк сервера.

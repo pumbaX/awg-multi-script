@@ -152,6 +152,7 @@ choose_mimicry() {
     echo -e "  ${D}  Для одного I1 самый достоверный — QUIC (1).${N}"
   fi
   echo -e "  ${D}  На высоком порту естественны STUN, WebRTC, RTP; DNS/NTP/SSDP — нет.${N}"
+  echo -e "  ${D}  На порту 443 — QUIC (1) с одним I1.${N}"
   read_choice c "${C}  Выбор [0-9] (Enter = $def): ${N}" 0 9 "$def"
   (( c == 0 )) && return 1
   MIMICRY="${MIMICRY_PROFILES[$((c - 1))]}"

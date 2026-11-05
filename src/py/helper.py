@@ -1304,6 +1304,7 @@ def cmd_conf_hooks(path, mode, *allow):
 # ════════════════════════ Xray ════════════════════════
 SKIP_PROTO = ("freedom", "blackhole", "dns")
 KNOWN_IN = {"xray0", "tun-in", "tun-probe", "socks-in"}
+XRAY_IF = "xray0"                   # интерфейс входа tun — как XRAY_IF в awg2
 SNIFF = {"enabled": True, "destOverride": ["http", "tls", "quic"]}
 
 
@@ -1696,6 +1697,35 @@ def cmd_xray_test_copy(src, dst):
     jsave(dst, conf)
 
 
+def xray_tun_named(tun):
+    """Имя устройства входа tun — всегда xray0. До Xray 26.6 включительно оно
+    и было по умолчанию, с 26.7 без имени устройство называется случайно
+    (utun10…utun1024): awg2 не дожидался xray0 и выключал туннель. Поле name
+    есть во всех версиях со входом tun. True — имя пришлось поставить."""
+    st = tun.get("settings")
+    if not isinstance(st, dict):
+        st = tun["settings"] = {}
+    if st.get("name") == XRAY_IF:
+        return False
+    st["name"] = XRAY_IF
+    return True
+
+
+def cmd_xray_tun_name(path):
+    """Имя xray0 у входа tun в готовом конфиге — при обновлении awg2: служба,
+    перезапущенная на новом Xray (сбой, перезагрузка), иначе подняла бы utunN."""
+    try:
+        conf = jload(path)
+    except Exception:
+        return
+    if not isinstance(conf, dict):
+        return
+    changed = [xray_tun_named(i) for i in conf.get("inbounds") or []
+               if isinstance(i, dict) and i.get("protocol") == "tun"]
+    if any(changed):
+        jsave(path, conf)
+
+
 def cmd_xray_tun_probe(out):
     jsave(out, {"log": {"loglevel": "none"},
                 "inbounds": [{"protocol": "tun", "tag": "tun-probe",
@@ -1812,8 +1842,8 @@ def cmd_xray_prepare(path, mode, peers=""):
     native: inbound tun видит адрес клиента (перед xray0 нет NAT), а через
     tun2socks все соединения приходят с 127.0.0.1."""
     conf = jload(path)
-    conf.setdefault("routing", {})["rules"] = [r for r in conf["routing"].get("rules") or []
-                                               if r.get("ruleTag") != XRAY_CLIENT_RULE]
+    routing = conf.setdefault("routing", {})
+    routing["rules"] = [r for r in routing.get("rules") or [] if r.get("ruleTag") != XRAY_CLIENT_RULE]
     inb = [i for i in conf.get("inbounds") or []
            if not (i.get("tag") == "xray0" and i.get("protocol") == "dokodemo-door")]
     socks = next((i for i in inb if i.get("tag") == "socks-in"), None)
@@ -1837,6 +1867,7 @@ def cmd_xray_prepare(path, mode, peers=""):
                    "sniffing": SNIFF}
             inb.insert(0, tun)
         tun["tag"] = "tun-in"
+        xray_tun_named(tun)
         want = tun["tag"]
     else:
         inb = [i for i in inb if i.get("protocol") != "tun"]
@@ -2885,7 +2916,7 @@ COMMANDS = {
     "conf-hooks": cmd_conf_hooks, "mod-compat-patch": cmd_mod_compat_patch,
     "xray-link": cmd_xray_link, "xray-default": cmd_xray_default, "xray-add": cmd_xray_add,
     "xray-del": cmd_xray_del, "xray-tags": cmd_xray_tags, "xray-outs": cmd_xray_outs, "xray-restore-clean": cmd_xray_restore_clean, "xray-probe": cmd_xray_probe,
-    "xray-probe-tag": cmd_xray_probe_tag, "xray-tun-probe": cmd_xray_tun_probe,
+    "xray-probe-tag": cmd_xray_probe_tag, "xray-tun-probe": cmd_xray_tun_probe, "xray-tun-name": cmd_xray_tun_name,
     "xray-test-copy": cmd_xray_test_copy,
     "xray-balancer": cmd_xray_balancer, "xray-balancer-get": cmd_xray_balancer_get,
     "xray-main": cmd_xray_main, "xray-main-get": cmd_xray_main_get,

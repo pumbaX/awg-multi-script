@@ -67,6 +67,7 @@ async def screen(target: ui.Target) -> None:
         ("🌍 Endpoint", act.data("ep")) if exists else None,
         ("🛠 Починить", act.data("repair")),
         ("🛡 Антисканер", "as"),
+        ("🚫 VK и Max", "vk"),
         ("🐳 Перенос из Amnezia", "amz") if amz else None,
         ("♻️ Перезагрузка", act.data("reboot")),
         ("⚠️ Сбросить", act.data("reset")) if exists else None,
@@ -176,7 +177,8 @@ async def _wizard_answer(cb: CallbackQuery, state: FSMContext, arg: str) -> None
             await ask.ask(cb, state, "srv_dns", "DNS для клиентов: IPv4 через запятую", "srv")
             return
     if key == "port" and val == "ask":
-        await ask.ask(cb, state, "srv_port", "UDP-порт сервера: 1024-65535", "srv")
+        await ask.ask(cb, state, "srv_port", "UDP-порт сервера: 443 или 1024-65535\n"
+                                             "<i>443 — порт QUIC (HTTP/3): трафик на нём выглядит привычнее.</i>", "srv")
         return
     if key == "mtu" and val == "ask":
         await ask.ask(cb, state, "srv_mtu", "MTU: число 1280-1500", "srv")
@@ -216,10 +218,10 @@ async def _dns_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
 @ask.on("srv_port")
 async def _port_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
-    if not v.isdigit() or not 1024 <= int(v) <= 65535:
-        await ask.retry(msg, state, ctx, "Порт — число 1024-65535")
+    if not ui.awg_port_ok(v):
+        await ask.retry(msg, state, ctx, "Порт — 443 или число 1024-65535")
         return
-    await _wizard_set(msg, state, "port", v)
+    await _wizard_set(msg, state, "port", str(int(v)))
 
 
 @ask.on("srv_mtu")
@@ -283,7 +285,7 @@ async def wizard(target: ui.Target, state: FSMContext) -> None:
             return
         profiles = await api.data("mimicry", default=[])
         await ui.render(target, head + "<b>Профиль мимикрии</b>\nПять пакетов залпом естественны для DNS, "
-                                       "STUN и RTP; на высоком порту — STUN, WebRTC, RTP.\n\n" + ui.profile_hints(profiles),
+                                       "STUN и RTP; на высоком порту — STUN, WebRTC, RTP; на порту 443 — QUIC с одним I1.\n\n" + ui.profile_hints(profiles),
                         ui.kb([(p["label"], _w("mimicry", f"{p['id']}:{wiz['level']}")) for p in profiles], cancel))
     elif step == "proto":
         info = await api.data("server", "info", default={}) or {}

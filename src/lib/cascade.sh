@@ -235,7 +235,7 @@ cascade_uninstall() {
   # Прежние версии меняли политику FORWARD в UFW. Если AWG-сервера нет,
   # вернуть её было бы некому — возвращаем здесь.
   if [[ -f "$CASCADE_UFW_BACKUP" ]] && ! server_exists; then
-    cp -a "$CASCADE_UFW_BACKUP" /etc/default/ufw
+    cp -a "$CASCADE_UFW_BACKUP" "$UFW_DEFAULTS"
     ufw_active && ufw reload &>/dev/null
   fi
   rm -rf "$CASCADE_DIR"

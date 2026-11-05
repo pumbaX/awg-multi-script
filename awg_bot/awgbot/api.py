@@ -61,7 +61,7 @@ READS = {("job", "status"), ("job", "list"), ("log",), ("module", "report"), ("m
          ("diag", "status"), ("diag", "sniff-list"), ("tunnels", "clients"), ("wgobf", "clients"),
          ("xray", "diag"), ("cascade", "list"), ("module", "backups"), ("backup", "inspect"),
          ("bot", "proxy", "get"), ("bot", "webapp", "get"), ("server", "params"), ("web", "status"),
-         ("traffic", "now"), ("antiscan", "status"), ("amnezia", "status"), ("amnezia", "scan")}         # обзор панели спрашивает раз в 3 с — не запись, кэш не сбрасывает
+         ("traffic", "now"), ("warp", "probe"), ("antiscan", "status"), ("vkblock", "status"), ("amnezia", "status"), ("amnezia", "scan")}         # обзор панели спрашивает раз в 3 с — не запись, кэш не сбрасывает
 
 
 def _cacheable(key: tuple[str, ...]) -> bool:

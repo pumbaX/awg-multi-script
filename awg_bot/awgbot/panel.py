@@ -30,7 +30,7 @@ from .sections import wgobf
 # Команды awg2 api, открытые панели; первое слово — раздел
 ALLOWED = {"status", "version", "server", "module", "clients", "client", "mimicry", "diag", "backup",
            "tunnels", "warp", "xray", "t2s", "exits", "cascade", "dns", "wgobf", "update", "log", "bot",
-           "cert", "uninstall", "traffic", "antiscan", "amnezia"}
+           "cert", "uninstall", "traffic", "antiscan", "vkblock", "amnezia", "country"}
 # backup create auto — ротация автобэкапов: «auto 1» стёр бы все, кроме одного;
 # log web — журнал входов веб-панели (адреса, введённые логины), как раздел «Веб-панель» в боте
 OWNER_ONLY = (("uninstall",), ("bot", "uninstall"), ("bot", "webapp", "port"), ("cert", "issue"),
@@ -131,7 +131,10 @@ def setup(app: web.Application, user_of: UserOf) -> None:
         def deco(fn: Callable[[web.Request, dict, dict], Any]):  # type: ignore[no-untyped-def]
             async def handler(request: web.Request) -> web.StreamResponse:
                 user = user_of(request)
-                return await fn(request, user, await _body(request))
+                try:
+                    return await fn(request, user, await _body(request))
+                except share.PersistenceError as e:
+                    return web.json_response({"error": str(e)}, status=503)
             app.router.add_post(path, handler)
             return fn
         return deco
@@ -406,6 +409,14 @@ def setup(app: web.Application, user_of: UserOf) -> None:
                                   "conf": _read(files.get("phobos.conf", "")), "direct": direct,
                                   "png": base64.b64encode(png).decode() if png else None,
                                   "mon": store.monitored(store.WGOBF + body["name"])})
+
+    @route("/api/wgobf/rename")
+    async def _wgobf_rename(request: web.Request, user: dict, body: dict) -> web.Response:
+        old, new = _name(body, "old"), _name(body, "new")
+        r = await api.call("wgobf", "rename", old, new)
+        if r.ok:
+            store.rename_note(store.WGOBF + old, store.WGOBF + new)
+        return _result(r)
 
     @route("/api/wgobf/mon")
     async def _wgobf_mon(request: web.Request, user: dict, body: dict) -> web.Response:

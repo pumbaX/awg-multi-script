@@ -327,14 +327,8 @@ server_write() {
 server_start_new() {
   awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   awg_up_diag || return 1
-  if ufw_active; then
-    ufw_allow "$S_PORT/udp" AmneziaWG && ok "UFW: открыт $S_PORT/udp"
-    if grep -q '^DEFAULT_FORWARD_POLICY="DROP"' /etc/default/ufw 2>/dev/null; then
-      sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-      ufw reload &>/dev/null || true
-      info "UFW: DEFAULT_FORWARD_POLICY=ACCEPT (нужно для выхода клиентов в интернет)"
-    fi
-  fi
+  ufw_open "$S_PORT/udp" AmneziaWG
+  ufw_forward_accept
   setup_autostart
   expire_install
   web_vpn_changed
@@ -483,14 +477,14 @@ _choose_net() {
 _choose_port() {
   local v
   while true; do
-    read_line v "${C}  UDP-порт [Enter = случайный]: ${N}"
+    read_line v "${C}  UDP-порт: 443 или 1024-65535 [Enter = случайный]: ${N}"
     v="${v// /}"
     if [[ -z "$v" ]]; then S_PORT=$(random_free_udp_port) || return 1; return 0; fi
-    if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1024 && v <= 65535 )); then
+    if awg_port_ok "$v"; then
       udp_port_busy "$v" && { warn "Порт $v занят"; continue; }
       S_PORT=$v; return 0
     fi
-    warn "Порт — число 1024-65535"
+    warn "Порт — 443 или число 1024-65535"
   done
 }
 
@@ -557,7 +551,7 @@ server_create_opts() {
       region) [[ "$v" =~ ^(world|ru)$ ]] || { err "region: world | ru"; return 1; }; S_REGION="$v" ;;
       dns) valid_dns_list "$v" || { err "dns: IPv4 через запятую"; return 1; }; S_DNS="$v" ;;
       mtu) [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) || { err "mtu: 1280-1500"; return 1; }; MTU="$v" ;;
-      port) valid_port "$v" && (( v >= 1024 )) || { err "port: 1024-65535"; return 1; }
+      port) awg_port_ok "$v" || { err "port: 443 или 1024-65535"; return 1; }
             udp_port_busy "$v" && { err "UDP $v занят"; return 1; }; S_PORT="$v" ;;
       net) valid_cidr "$v" && [[ "${v#*/}" == 24 ]] || { err "net: сеть /24"; return 1; }
            v="${v%.*}.0/24"
@@ -658,6 +652,33 @@ REPAIR_ISSUES=0 REPAIR_FIXED=0
 _issue() { REPAIR_ISSUES=$((REPAIR_ISSUES + 1)); warn "$1"; }
 _fixed() { REPAIR_FIXED=$((REPAIR_FIXED + 1)); ok "$1"; }
 
+# Файрвол: при включённом UFW порты awg0 и обфускатора открыты (UFW могли
+# включить уже после установки, или на русской локали Тулза его не видела),
+# политика FORWARD не режет клиентов; правила wgobf0 на месте — их сносит
+# ufw с MANAGE_BUILTINS=yes или iptables -F, и обфускатор остаётся без NAT.
+_repair_firewall() {
+  local p st on=0 what tag
+  for what in AWG обфускатора; do
+    if [[ "$what" == AWG ]]; then server_exists || continue; p=$(server_port); tag=AmneziaWG
+    else wgobf_installed || continue; p=$(wgobf_get PORT); tag="$WGOBF_TAG"; fi
+    st=$(ufw_port_state "$p/udp")
+    case "$st" in
+      open) on=1; ok "UFW: порт $what $p/udp открыт" ;;
+      closed) on=1; _issue "UFW включён, а порт $what $p/udp закрыт"
+              ufw_allow "$p/udp" "$tag" && _fixed "UFW: открыт $p/udp" ;;
+    esac
+  done
+  if (( on )) && grep -q '^DEFAULT_FORWARD_POLICY="DROP"' "$UFW_DEFAULTS" 2>/dev/null; then
+    _issue "UFW: политика FORWARD — DROP, клиенты VPN без правил туннеля останутся без интернета"
+    ufw_forward_accept >/dev/null && _fixed "UFW: DEFAULT_FORWARD_POLICY=ACCEPT"
+  fi
+  if wgobf_installed && ip link show "$WGOBF_IF" &>/dev/null \
+     && ! iptables -C FORWARD -i "$WGOBF_IF" -j ACCEPT -m comment --comment "$WGOBF_TAG" 2>/dev/null; then
+    _issue "Нет правил файрвола $WGOBF_IF (NAT, FORWARD) — обфускатор без выхода в интернет"
+    wgobf_fw_run up && _fixed "Правила $WGOBF_IF восстановлены"
+  fi
+}
+
 do_repair() {
   local bad conf_n live_n dev net perm rc old
   REPAIR_ISSUES=0 REPAIR_FIXED=0
@@ -682,6 +703,7 @@ do_repair() {
   if grep -qs "^$MOD_NAME" "$MODULES_LOAD_FILE"; then ok "Автозагрузка модуля"
   else _issue "Нет автозагрузки модуля"; mod_autoload && _fixed "Автозагрузка настроена"; fi
 
+  _repair_firewall
   server_exists || { err "Сервер не создан"; return 1; }
   if [[ -z "$(conf_marker AWG_OBF_LEVEL)" ]]; then
     # Бот по этой метке решает, сколько пакетов I1-I5 выдать клиенту

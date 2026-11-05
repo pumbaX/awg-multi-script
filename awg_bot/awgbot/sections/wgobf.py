@@ -197,16 +197,16 @@ async def _install_opt(cb: CallbackQuery, state: FSMContext, key: str) -> None:
 
 @act("iport")
 async def _install_port(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
-    await ask.ask(cb, state, "wo_port", "UDP-порт обфускатора (1024-65535):", "wo")
+    await ask.ask(cb, state, "wo_port", "UDP-порт обфускатора: 443 или 1024-65535", "wo")
 
 
 @ask.on("wo_port")
 async def _install_port_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
-    if not v.isdigit() or not 1024 <= int(v) <= 65535:
-        await ask.retry(msg, state, ctx, "Порт — число 1024-65535")
+    if not ui.awg_port_ok(v):
+        await ask.retry(msg, state, ctx, "Порт — 443 или число 1024-65535")
         return
-    o = dict((await state.get_data()).get("wgobf") or {}, port=v)
+    o = dict((await state.get_data()).get("wgobf") or {}, port=str(int(v)))
     await state.update_data(wgobf=o)
     await _install_screen(msg, state)
 
@@ -309,8 +309,30 @@ async def _view(cb: ui.Target, state: FSMContext, name: str) -> None:
                           ("📦 Архив", act.data("zip", name)),
                           ("🔕 Выключить мониторинг" if mon else "🔔 Мониторинг", act.data("mon", name)),
                           ("🌐 Маршрут", act.data("rt", name)),
+                          ("✏️ Переименовать", act.data("ren", name)),
                           ("🗑 Удалить", act.data("del", name)),
                           ui.back(act.data("list"))))
+
+
+@act("ren")
+async def _ren(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    await ask.ask(cb, state, "wo_ren", f"Новое имя для <b>{esc(name)}</b>\n<i>латиница, цифры, _ и -, до 32</i>",
+                  act.data("v", name), old=name)
+
+
+@ask.on("wo_ren")
+async def _ren_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
+    new = ask.text_of(msg)
+    if not NAME_RE.match(new):
+        await ask.retry(msg, state, ctx, "Имя: латиница, цифры, _ и -, до 32 символов")
+        return
+    r = await api.call("wgobf", "rename", ctx["old"], new)
+    if not r.ok:
+        await ask.retry(msg, state, ctx, r.message)
+        return
+    # Мониторинг клиента записан под его именем — переезжает вместе с ним
+    store.rename_note(store.WGOBF + ctx["old"], store.WGOBF + new)
+    await _view(msg, state, new)
 
 
 @act("mon")

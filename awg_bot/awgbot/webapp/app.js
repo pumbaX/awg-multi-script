@@ -713,13 +713,82 @@ const FLAGS = {
   IL: () => `<rect width="30" height="20" fill="#fff"/><rect y="2" width="30" height="3" fill="#0038B8"/><rect y="15" width="30" height="3" fill="#0038B8"/>
     <path d="M15,6.6 18,11.8 12,11.8ZM15,13.4 12,8.2 18,8.2Z" fill="none" stroke="#0038B8" stroke-width=".9"/>`,
   AE: () => `${flagBody("h:#00732F,#fff,#000")}<rect width="8" height="20" fill="#FF0000"/>`,
+  ID: "h:#CE1126,#fff", MC: "h:#CE1126,#fff", TH: "h:#A51931,#F4F5F8,#2D2A4A,#2D2A4A,#F4F5F8,#A51931", NG: "v:#008751,#fff,#008751",
+  PE: "v:#D91023,#fff,#D91023", CO: "h:#FCD116,#FCD116,#003893,#CE1126", EC: "h:#FFDD00,#FFDD00,#034EA2,#ED1C24",
+  BO: "h:#D52B1E,#F9E300,#007934", VE: "h:#FCE300,#00247D,#CF142B", TJ: "h:#CC0000,#CC0000,#fff,#fff,#fff,#006600,#006600",
+  KE: "h:#000,#BB0000,#006600",
+  SK: () => `${flagBody("h:#fff,#0B4EA2,#EE1C25")}<path d="M6,4.5h7v6.2c0,3.3-3.5,4.8-3.5,4.8S6,14,6,10.7Z" fill="#EE1C25" stroke="#fff" stroke-width=".6"/>
+    <path d="M9.5,6v7M7.6,8h3.8M8.1,9.8h2.8" stroke="#fff" stroke-width=".9"/>`,
+  SI: () => `${flagBody("h:#fff,#0000FF,#FF0000")}<path d="M5,3.5h5v4.2c0,2.2-2.5,3.3-2.5,3.3S5,9.9,5,7.7Z" fill="#0000FF" stroke="#FF0000" stroke-width=".5"/>`,
+  HR: () => `${flagBody("h:#FF0000,#fff,#171796")}${[0, 1, 2, 3, 4].map((r) => [0, 1, 2, 3].map((c) =>
+    `<rect x="${12.5 + c * 1.25}" y="${5 + r * 1.25}" width="1.25" height="1.25" fill="${(r + c) % 2 ? "#fff" : "#FF0000"}"/>`).join("")).join("")}`,
+  CY: () => `<rect width="30" height="20" fill="#fff"/><path d="M8,8.5 13,7 19,7.2 22.5,6.2 20,9 15,10.3 9.5,10.3Z" fill="#D57800"/>
+    <path d="M11,14q4,2 8,0" stroke="#4E5B31" stroke-width="1" fill="none"/>`,
+  MT: () => `${flagBody("v:#fff,#CF142B")}<rect x="2" y="2" width="3.5" height="3.5" fill="#999" stroke="#CF142B" stroke-width=".4"/>`,
+  MK: () => `<rect width="30" height="20" fill="#D20000"/><path d="M15,10 0,0M15,10 30,0M15,10 0,20M15,10 30,20M15,10 15,0M15,10 15,20M15,10 0,10M15,10 30,10"
+    stroke="#FFE600" stroke-width="2.6"/><circle cx="15" cy="10" r="3.4" fill="#FFE600" stroke="#D20000" stroke-width=".7"/>`,
+  ME: () => `<rect width="30" height="20" fill="#D4AF37"/><rect x="1.2" y="1.2" width="27.6" height="17.6" fill="#C40308"/><circle cx="15" cy="10" r="3.2" fill="#D4AF37"/>`,
+  BA: () => `<rect width="30" height="20" fill="#002395"/><path d="M8.5,0H22V20Z" fill="#FECB00"/>${[0, 1, 2, 3, 4, 5, 6].map((k) => {
+    const t = (k + 0.5) / 7; return `<polygon points="${starPts(8.5 + 13.5 * t - 1.6, 20 * t, 1)}" fill="#fff"/>`; }).join("")}`,
+  AL: () => `<rect width="30" height="20" fill="#E41E20"/><path d="M15,4l2.5,2.5 3-1.5-1,3 2.5,1-2.5,1.5 1,3-3-1.5L15,16l-2.5-4-3,1.5 1-3-2.5-1.5 2.5-1-1-3 3,1.5Z" fill="#000"/>`,
+  XK: () => `<rect width="30" height="20" fill="#244AA5"/><path d="M10,8 14,7 19,8.5 20,11 17,14.5 13,14.5 10.5,12Z" fill="#D0A650"/>${[0, 1, 2, 3, 4, 5].map((k) =>
+    `<polygon points="${starPts(9 + 2.4 * k, 4.8 - Math.sin(Math.PI * (k + 0.5) / 6) * 1.6, 0.9)}" fill="#fff"/>`).join("")}`,
+  CN: () => `<rect width="30" height="20" fill="#EE1C25"/><polygon points="${starPts(5, 5, 3)}" fill="#FFFF00"/>${[[10, 2], [12, 4], [12, 7], [10, 9]].map(([x, y]) =>
+    `<polygon points="${starPts(x, y, 1)}" fill="#FFFF00"/>`).join("")}`,
+  HK: () => `<rect width="30" height="20" fill="#DE2910"/><polygon points="${starPts(15, 10, 5)}" fill="#fff"/>`,
+  TW: () => `<rect width="30" height="20" fill="#FE0000"/><rect width="15" height="10" fill="#000095"/><circle cx="7.5" cy="5" r="2.6" fill="#fff"/>`,
+  KR: () => `<rect width="30" height="20" fill="#fff"/><path d="M10,10a5,5 0 0 1 10,0Z" fill="#CD2E3A"/><path d="M10,10a5,5 0 0 0 10,0Z" fill="#0047A0"/>
+    ${[[2.5, 2.5], [23.5, 2.5], [2.5, 14.3], [23.5, 14.3]].map(([x, y]) => [0, 1.1, 2.2].map((d) =>
+    `<rect x="${x}" y="${y + d}" width="4" height=".7" fill="#000"/>`).join("")).join("")}`,
+  VN: () => `<rect width="30" height="20" fill="#DA251D"/><polygon points="${starPts(15, 10, 5)}" fill="#FFFF00"/>`,
+  MY: () => `${Array.from({ length: 14 }, (_, i) => `<rect y="${(i * 20 / 14).toFixed(2)}" width="30" height="${(20 / 14 + 0.1).toFixed(2)}" fill="${i % 2 ? "#fff" : "#CC0001"}"/>`).join("")}
+    <rect width="15" height="11.43" fill="#010066"/><circle cx="5.5" cy="5.7" r="3.6" fill="#FC0"/><circle cx="6.5" cy="5.7" r="3" fill="#010066"/>
+    <polygon points="${starPts(11, 5.7, 2)}" fill="#FC0"/>`,
+  PH: () => `${flagBody("h:#0038A8,#CE1126")}<path d="M0,0 17.3,10 0,20Z" fill="#fff"/><circle cx="5.5" cy="10" r="2.2" fill="#FCD116"/>`,
+  AU: () => `<rect width="30" height="20" fill="#012169"/><g transform="scale(.5)">${FLAGS.GB()}</g><polygon points="${starPts(7.5, 15, 2.2)}" fill="#fff"/>
+    ${[[22.5, 16.5], [19, 9], [22.5, 3.5], [26, 8]].map(([x, y]) => `<polygon points="${starPts(x, y, 1.1)}" fill="#fff"/>`).join("")}`,
+  NZ: () => `<rect width="30" height="20" fill="#012169"/><g transform="scale(.5)">${FLAGS.GB()}</g>
+    ${[[22.5, 16.5], [19, 9], [22.5, 3.5], [26, 8]].map(([x, y]) => `<polygon points="${starPts(x, y, 1.2)}" fill="#C8102E" stroke="#fff" stroke-width=".4"/>`).join("")}`,
+  BR: () => `<rect width="30" height="20" fill="#009C3B"/><path d="M15,2 27.5,10 15,18 2.5,10Z" fill="#FFDF00"/><circle cx="15" cy="10" r="4.4" fill="#002776"/>
+    <path d="M10.8,9.2q4.2-1.2 8.4,1.6" stroke="#fff" stroke-width=".8" fill="none"/>`,
+  MX: () => `${flagBody("v:#006847,#fff,#CE1126")}<circle cx="15" cy="10" r="2.2" fill="#8C5A2B"/>`,
+  AR: () => `${flagBody("h:#74ACDF,#fff,#74ACDF")}<circle cx="15" cy="10" r="1.8" fill="#F6B40E"/>`,
+  CL: () => `<rect width="30" height="20" fill="#fff"/><rect y="10" width="30" height="10" fill="#D52B1E"/><rect width="10" height="10" fill="#0039A6"/>
+    <polygon points="${starPts(5, 5, 2.2)}" fill="#fff"/>`,
+  ZA: () => `<rect width="30" height="20" fill="#fff"/><rect width="30" height="7.2" fill="#E03C31"/><rect y="12.8" width="30" height="7.2" fill="#001489"/>
+    <path d="M0,1.6 12.2,10 0,18.4M12.2,10H30" stroke="#007749" stroke-width="5" fill="none"/><path d="M0,3 10.2,10 0,17Z" fill="#FFB81C"/><path d="M0,4.6 8,10 0,15.4Z" fill="#000"/>`,
+  EG: () => `${flagBody("h:#CE1126,#fff,#000")}<circle cx="15" cy="10" r="1.6" fill="#C09300"/>`,
+  SA: () => `<rect width="30" height="20" fill="#006C35"/><rect x="7" y="13" width="16" height="1" fill="#fff"/>
+    <path d="M8,8h14" stroke="#fff" stroke-width="1.6" stroke-dasharray="1.2 .8"/>`,
+  QA: () => `<rect width="30" height="20" fill="#8A1538"/><path d="M0,0${Array.from({ length: 19 }, (_, i) => ` L${i % 2 ? 11.5 : 9},${(i * 20 / 18).toFixed(2)}`).join("")} L0,20Z" fill="#fff"/>`,
+  KW: () => `${flagBody("h:#007A3D,#fff,#CE1126")}<path d="M0,0 7,6.67 7,13.33 0,20Z" fill="#000"/>`,
+  IR: () => `${flagBody("h:#239F40,#fff,#DA0000")}<circle cx="15" cy="10" r="1.7" fill="none" stroke="#DA0000" stroke-width=".7"/>`,
+  PK: () => `<rect width="30" height="20" fill="#01411C"/><rect width="7.5" height="20" fill="#fff"/><circle cx="18.5" cy="10" r="5" fill="#fff"/>
+    <circle cx="20" cy="8.7" r="4.4" fill="#01411C"/><polygon points="${starPts(21.6, 7.4, 1.6)}" fill="#fff"/>`,
+  BD: () => `<rect width="30" height="20" fill="#006A4E"/><circle cx="13.5" cy="10" r="6" fill="#F42A41"/>`,
+  MA: () => `<rect width="30" height="20" fill="#C1272D"/><polygon points="${starPts(15, 10, 4.2)}" fill="none" stroke="#006233" stroke-width=".9"/>`,
+  TN: () => `<rect width="30" height="20" fill="#E70013"/><circle cx="15" cy="10" r="5" fill="#fff"/><circle cx="15" cy="10" r="3.7" fill="#E70013"/>
+    <circle cx="16" cy="10" r="3" fill="#fff"/><polygon points="${starPts(15.6, 10, 2)}" fill="#E70013"/>`,
+  DZ: () => `${flagBody("v:#006233,#fff")}<path d="M17,5.5a5,5 0 1 0 0,9a4,4 0 1 1 0,-9Z" fill="#D21034"/><polygon points="${starPts(17.2, 10, 1.8)}" fill="#D21034"/>`,
+  UZ: () => `${flagBody("h:#0099B5,#fff,#1EB53A")}<rect y="6.4" width="30" height=".6" fill="#CE1126"/><rect y="13" width="30" height=".6" fill="#CE1126"/>
+    <circle cx="5" cy="3.4" r="2.2" fill="#fff"/><circle cx="5.8" cy="3.4" r="1.9" fill="#0099B5"/>`,
+  KG: () => `<rect width="30" height="20" fill="#E8112D"/><circle cx="15" cy="10" r="5" fill="#FFEF00"/><circle cx="15" cy="10" r="3" fill="#E8112D"/>`,
+  TM: () => `<rect width="30" height="20" fill="#00843D"/><rect x="5" width="5" height="20" fill="#D22630"/><circle cx="17" cy="4" r="2" fill="#fff"/>
+    <circle cx="17.8" cy="4" r="1.7" fill="#00843D"/>`,
+  MN: () => `${flagBody("v:#C4272F,#015197,#C4272F")}<rect x="4" y="6" width="2" height="8" fill="#F9CF02"/>`,
 };
 const COUNTRY = { NL: "Нидерланды", DE: "Германия", RU: "Россия", LV: "Латвия", LT: "Литва", EE: "Эстония", AT: "Австрия", HU: "Венгрия",
   BG: "Болгария", UA: "Украина", PL: "Польша", LU: "Люксембург", AM: "Армения", ES: "Испания", RS: "Сербия", AZ: "Азербайджан",
   BY: "Беларусь", FR: "Франция", IT: "Италия", BE: "Бельгия", IE: "Ирландия", RO: "Румыния", MD: "Молдова", FI: "Финляндия",
   SE: "Швеция", DK: "Дания", NO: "Норвегия", IS: "Исландия", US: "США", GB: "Великобритания", CH: "Швейцария", JP: "Япония",
   TR: "Турция", KZ: "Казахстан", CZ: "Чехия", CA: "Канада", GE: "Грузия", SG: "Сингапур", PT: "Португалия", IN: "Индия",
-  GR: "Греция", IL: "Израиль", AE: "ОАЭ" };
+  GR: "Греция", IL: "Израиль", AE: "ОАЭ", ID: "Индонезия", MC: "Монако", TH: "Таиланд", NG: "Нигерия", PE: "Перу",
+  CO: "Колумбия", EC: "Эквадор", BO: "Боливия", VE: "Венесуэла", TJ: "Таджикистан", KE: "Кения", SK: "Словакия", SI: "Словения",
+  HR: "Хорватия", CY: "Кипр", MT: "Мальта", MK: "Северная Македония", ME: "Черногория", BA: "Босния и Герцеговина", AL: "Албания",
+  XK: "Косово", CN: "Китай", HK: "Гонконг", TW: "Тайвань", KR: "Южная Корея", VN: "Вьетнам", MY: "Малайзия", PH: "Филиппины",
+  AU: "Австралия", NZ: "Новая Зеландия", BR: "Бразилия", MX: "Мексика", AR: "Аргентина", CL: "Чили", ZA: "ЮАР", EG: "Египет",
+  SA: "Саудовская Аравия", QA: "Катар", KW: "Кувейт", IR: "Иран", PK: "Пакистан", BD: "Бангладеш", MA: "Марокко", TN: "Тунис",
+  DZ: "Алжир", UZ: "Узбекистан", KG: "Киргизия", TM: "Туркменистан", MN: "Монголия" };
 function countryName(cc) {
   if (COUNTRY[cc]) return COUNTRY[cc];
   try { if (window.Intl && Intl.DisplayNames) return new Intl.DisplayNames(["ru"], { type: "region" }).of(cc) || cc; } catch (_) { /* старый движок */ }
@@ -748,6 +817,49 @@ function flagEl(cc, w) {
   el.innerHTML = flagBody(FLAGS[cc]);
   return el;
 }
+// Страна сервера вручную: геобазы бывают дружно неправы (сервер в Вене, а адрес
+// «нидерландский»). «Автоматически» — снова по геосервисам; выбор хранит awg2,
+// поэтому он один для бота, Mini App и веб-панели
+function pickCountry() {
+  const st = S.status || {}, auto = st.country_auto || "", manual = !!st.country_manual, cur = manual ? st.country : "";
+  const votes = String(st.country_votes || "").split(",").filter(Boolean).map((v) => v.replace("=", " × ")).join(", ");
+  const codes = Object.keys(FLAGS).sort((a, b) => countryName(a).localeCompare(countryName(b), "ru"));
+  const list = h("div", { class: "cpick" });
+  const q = h("input", { type: "search", placeholder: "Поиск страны", autocomplete: "off", "aria-label": "Поиск страны" });
+  let close = null;
+  const choose = (btn, code) => busy(btn, async () => {
+    await call("country", "set", code);
+    await refreshStatus();
+    haptic(); toast(code === "auto" ? "Страна — по геосервисам" : "Страна: " + countryName(code));
+    close();
+  });
+  const item = (code, label, on, pic) => h("button", { class: "cpi" + (on ? " on" : ""), "data-cc": code,
+    onclick: (ev) => choose(ev.currentTarget, code) }, pic, h("span", {}, label), on ? icon("check") : null);
+  const draw = () => {
+    const s = q.value.trim().toLowerCase();
+    const hits = codes.filter((c) => !s || countryName(c).toLowerCase().indexOf(s) >= 0 || c.toLowerCase() === s);
+    list.replaceChildren(...[
+      s ? null : item("auto", "Автоматически — по геосервисам" + (auto ? ` (${countryName(auto)})` : ""), !manual, icon("globe")),
+      ...hits.map((c) => item(c, countryName(c), c === cur, flagEl(c, 24))),
+      hits.length ? null : h("div", { class: "muted small", style: "padding:8px 4px" }, "Ничего не нашлось")].filter(Boolean));
+  };
+  q.oninput = draw;
+  draw();
+  const box = h("div", { class: "sheet cpicker", "aria-label": "Страна сервера", "data-name": "country-pick" },
+    h("h3", {}, "Страна сервера"),
+    h("div", { class: "muted small", style: "margin:0 4px 10px" },
+      auto ? `По геосервисам: ${countryName(auto)}` + (votes ? ` (голоса: ${votes})` : "") : "Геосервисы страну пока не определили"),
+    q, list,
+    h("button", { class: "muted", onclick: (ev) => busy(ev.currentTarget, async () => {
+      const d = await call("country", "refresh") || {};
+      await refreshStatus();
+      haptic(); toast(d.country_auto ? "По геосервисам: " + countryName(d.country_auto) : "Геосервисы не ответили");
+      close();
+    }) }, icon("refresh-cw"), "Спросить геосервисы заново"),
+    h("button", { class: "muted", onclick: () => close() }, "Отмена"));
+  close = sheetOpen(box);
+}
+
 const srvState = (st) => { const s = st.server || {}; return !s.exists ? "сервер не создан" : s.up ? "awg0 работает" : "awg0 не поднят"; };
 const srvPulse = (st) => { const s = st.server || {}; return !s.exists ? "off" : s.up ? "" : "bad"; };
 
@@ -761,9 +873,14 @@ function serverInfo(anchor) {
   const fill = () => {
     const st = S.status || {}, s = st.server || {}, cc = st.country || "", hide = srvHidden(), up = uptimeParts(st.uptime);
     box.replaceChildren(
-      h("div", { class: "sih" }, flagEl(cc, 42) || h("span", { class: "cc big" }, cc || icon("globe")),
-        h("div", {}, h("h3", {}, cc ? countryName(cc) : "Страна не определена"),
-          h("div", { class: "muted small" }, h("i", { class: "pulse " + srvPulse(st) }), srvState(st)))),
+      // Страна — кнопкой: геобазы бывают неправы, её можно выбрать вручную
+      h("button", { class: "sih", "aria-label": "Страна сервера — выбрать", "data-name": "country",
+        onclick: () => { close(); pickCountry(); } },
+        flagEl(cc, 42) || h("span", { class: "cc big" }, cc || icon("globe")),
+        h("div", {}, h("h3", {}, cc ? countryName(cc) : "Страна не определена",
+          st.country_manual ? h("small", { class: "muted" }, " · вручную") : null),
+          h("div", { class: "muted small" }, h("i", { class: "pulse " + srvPulse(st) }), srvState(st))),
+        h("span", { class: "sih-go" }, icon("chevron-right"))),
       h("div", { class: "sil" },
         row("имя", hide ? "скрыто" : st.host || "—", hide ? "hid" : null),
         row("адрес", !s.exists ? "—" : hide ? "скрыт" : s.endpoint || st.ip || "—", "mono" + (hide ? " hid" : "")),
@@ -1434,6 +1551,8 @@ function enterTo(button, ...fields) {
   return button;
 }
 const validPort = (v, min = 1) => /^\d{1,5}$/.test(v) && +v >= min && +v <= 65535;
+// Порт AWG и обфускатора, как awg_port_ok в awg2: 1024-65535 или 443 — порт QUIC (HTTP/3)
+const awgPortOk = (v) => validPort(v) && (+v >= 1024 || +v === 443);
 
 // Строка меню раздела: иконка (из эмодзи в подписи), заголовок, пояснение, «›»
 function menuItem(label, sub, onclick) {
@@ -2831,9 +2950,13 @@ function shareBox(name) {
       h("div", { class: "eyebrow" }, "ссылка на конфиг · ", left), field,
       h("div", { class: "even2", style: "margin-top:8px" },
         copyBtn("Скопировать", d.url, ""),
-        !WEB && tg && tg.openTelegramLink
-          ? h("button", { onclick: () => tg.openTelegramLink("https://t.me/share/url?url=" + encodeURIComponent(d.url)) }, "✈️ Переслать")
-          : null),
+        // Открыть — в новой вкладке (в Mini App — в браузере): проверить, что видит человек.
+        // Ссылка не одноразовая — открытие её не тратит
+        h("button", { class: "btn-primary", "data-name": "share-open", onclick: () => openUrl(d.url) }, icon("external-link"), "Открыть")),
+      !WEB && tg && tg.openTelegramLink
+        ? h("button", { class: "btn-block", style: "margin-top:8px",
+          onclick: () => tg.openTelegramLink("https://t.me/share/url?url=" + encodeURIComponent(d.url)) }, "✈️ Переслать")
+        : null,
       h("button", { class: "btn-danger btn-block", onclick: (ev) => busy(ev.currentTarget, async () => {
         await post("/api/client/share/revoke", { id: d.id }); clearInterval(timer); haptic(); toast("Ссылка отозвана"); idle();
       }) }, "🚫 Отозвать"),
@@ -3132,6 +3255,7 @@ route(/^\/server$/, async (ctx) => {
       d.exists ? menuItem("🎛 Параметры AWG", "Jc, S1-S4, H1-H4 вручную", () => go("/server/params")) : null,
       menuItem("🧩 Модуль ядра", "версии, обновление, откат", () => go("/server/module")),
       menuItem("🛡 Антисканер", "сети сканеров РКН и госорганов — не до портов сервера", () => go("/server/antiscan")),
+      menuItem("🚫 VK и Max мимо VPN", "клиенты VPN не ходят через сервер в сети VK", () => go("/server/vkblock")),
       amzOn ? menuItem("🐳 Перенос из Amnezia", amz.migrated ? "сделан — вернуть или удалить контейнер"
         : "сервер из Docker-контейнера, клиенты без перевыдачи", () => go("/server/amnezia")) : null,
       menuItem(d.installed ? "📦 Компоненты" : "📦 Установить компоненты", "пакеты, модуль, amneziawg-tools",
@@ -3199,6 +3323,33 @@ route(/^\/server\/antiscan$/, async (ctx) => {
     h("div", { class: "main" }, h("div", { class: "title mono wrap" }, a)), h("div", { class: "side bad" }, icon("x"))))) : null,
     h("div", { class: "row", style: "gap:8px;margin-top:8px" }, ip, enterTo(add, ip)),
     hint("Клиенты VPN, которые подключаются из этих сетей, тоже не подключатся — для них есть исключения."));
+});
+
+// VK и Max мимо VPN: трафик клиентов VPN в сети VK сервер отбрасывает — приложения
+// VK не видят его адрес. Список качает и проверяет awg2
+route(/^\/server\/vkblock$/, async (ctx) => {
+  const d = (await call("vkblock", "status")) || {};
+  const on = !!d.enabled;
+  ctx.put(title("🚫 VK и Max мимо VPN"),
+    hint("Клиенты VPN не ходят через сервер в сети VK: ВКонтакте, Max, Одноклассники. Приложения VK не видят адрес "
+      + "сервера и не могут сдать его как VPN."),
+    h("div", { class: "card", "data-name": "vkblock-status" },
+      kv("Статус", !on ? h("span", { class: "muted" }, "○ выключено") : d.active ? h("span", { class: "ok" }, "● включено")
+        : h("span", { class: "warn" }, "▲ правило не на месте")),
+      on ? kv("Подсетей", num((d.v4 || 0) + (d.v6 || 0))) : null,
+      on ? kv("Отбито", num(d.dropped) + " пакетов") : null,
+      d.updated ? kv("Список", fmtTime(d.updated)) : null,
+      d.error ? h("div", { class: "small warn" }, "▲ " + d.error) : null),
+    h("div", { class: "actions", style: "margin-top:8px" },
+      on ? btn("⏹ Выключить", (b) => quickAsk(b, "Выключить? Правило и наборы снимаются — клиенты VPN снова пойдут "
+        + "в VK через сервер.", "VK и Max снова через VPN", ["vkblock", "off"]))
+        : btn("✅ Включить", (b) => quickAsk(b, "Включить? ВКонтакте, Max и другие сервисы VK у клиентов через VPN "
+          + "перестанут открываться — в приложении VPN их надо пустить мимо туннеля. Выключить можно здесь или в боте.",
+        "VK и Max мимо VPN включено", ["vkblock", "on"]), "btn-primary"),
+      on ? btn("🔄 Обновить список", (b) => quick(b, "Список обновлён", ["vkblock", "update"])) : null,
+      btn("📜 Журнал", () => go("/log/vkblock"))),
+    hint("Сервисы VK у клиентов через VPN не откроются — в приложении VPN их пускают мимо туннеля. Список сетей VK — "
+      + "C24Be/AS_Network_List, обновляется раз в сутки. Трафик самого сервера не трогается."));
 });
 
 // Перенос из Amnezia (Docker): сервер AWG из контейнера приложения AmneziaVPN — в awg0
@@ -3273,7 +3424,7 @@ route(/^\/server\/create$/, async (ctx) => {
   const dnsIn = h("input", { placeholder: "1.1.1.1, 8.8.8.8", inputmode: "decimal" });
   const mtu = h("input", { type: "number", min: 1280, max: 1500 });
   const net = h("input", { placeholder: "случайная 10.x.y.0/24", autocapitalize: "off", autocomplete: "off" });
-  const port = h("input", { type: "number", min: 1024, max: 65535, placeholder: "случайный" });
+  const port = h("input", { type: "number", min: 443, max: 65535, placeholder: "случайный" });
   const ep = h("input", { placeholder: "vpn.example.com", autocapitalize: "off", autocomplete: "off" });
   const first = h("input", { placeholder: "случайное", maxlength: 32, autocapitalize: "off", autocomplete: "off" });
 
@@ -3305,7 +3456,7 @@ route(/^\/server\/create$/, async (ctx) => {
       h("label", {}, `MTU — рекомендуется ${rec}`), mtu,
       h("label", {}, "Подсеть клиентов"), net,
       hint("Случайная — меньше шансов совпасть с домашней сетью клиента"),
-      h("label", {}, "UDP-порт"), port,
+      h("label", {}, "UDP-порт — 443 или 1024-65535"), port,
       h("label", {}, "Домен для конфигов (необязательно)"), ep,
       hint("С доменом сервер можно перенести без перевыдачи конфигов. A-запись должна указывать сюда"),
       h("label", {}, "Имя первого клиента"), first,
@@ -3331,8 +3482,8 @@ route(/^\/server\/create$/, async (ctx) => {
     }
     const p = port.value.trim();
     if (p) {
-      if (!validPort(p, 1024)) throw new Error("Порт — число 1024-65535");
-      a.push(`port=${p}`);
+      if (!awgPortOk(p)) throw new Error("Порт — 443 или число 1024-65535");
+      a.push(`port=${+p}`);
     }
     const e = ep.value.trim().toLowerCase();
     if (e) {
@@ -3807,7 +3958,7 @@ route(/^\/tunnels\/warp$/, async (ctx) => {
     if (v) await runJob(ctx, `WARP: бэкенд ${v}`, ["warp", "backend", v]);
   }
   ctx.put(title("☁️ WARP"), logCard(r.log),
-    conf ? switchRow("🩺 Health-check", "сам перезапускает WARP, если тот перестал отвечать", d.health,
+    conf ? switchRow("🩺 Health-check", "WARP не отвечает — клиенты напрямую, а WARP он вернёт сам", d.health,
       (on) => call("warp", "health", on ? "on" : "off")) : null,
     h("div", { class: "actions" },
       conf && !d.up ? btn("▶️ Включить", () => runJob(ctx, "Включение WARP", ["warp", "up"]), "btn-primary") : null,
@@ -3840,6 +3991,8 @@ route(/^\/tunnels\/warp\/import$/, async (ctx) => {
   ctx.put(title("📥 Профиль WARP"),
     h("div", { class: "card small" }, "Зарегистрируй профиль там, где Cloudflare доступен (например, shell.cloud.google.com):",
       h("pre", { style: "margin:8px 0 0" }, "./wgcf register --accept-tos && ./wgcf generate")),
+    hint("Подойдёт и профиль с параметрами AmneziaWG (Jc, Jmin, Jmax): с российских серверов чистый WireGuard "
+      + "к Cloudflare часто режут, а с ними WARP поднимается через AmneziaWG."),
     h("label", {}, "wgcf-profile.conf"), fileField(ta), ta,
     btn("📥 Импортировать", (b) => {
       const text = ta.value.trim();
@@ -4174,10 +4327,10 @@ route(/^\/tunnels\/dns\/manual$/, async (ctx) => {
 });
 
 // Внешняя ссылка — браузером Telegram, не внутри панели
-const extLink = (url, text) => h("a", { href: url, onclick: (ev) => {
-  ev.preventDefault();
+function openUrl(url) {
   if (tg && tg.openLink) tg.openLink(url); else window.open(url, "_blank", "noopener");
-} }, text || url);
+}
+const extLink = (url, text) => h("a", { href: url, onclick: (ev) => { ev.preventDefault(); openUrl(url); } }, text || url);
 
 // ── Диагностика ───────────────────────────────────────────
 route(/^\/diag$/, async (ctx) => {
@@ -4505,7 +4658,7 @@ const sendWgobf = (b, name, what) => busy(b, () => deliver({ what, name },
 
 function wgobfInstall(ctx, d) {
   const f = { masking: "STUN", clean: false, dns: 0 };
-  const port = h("input", { type: "number", min: 1024, max: 65535, placeholder: "случайный" });
+  const port = h("input", { type: "number", min: 443, max: 65535, placeholder: "случайный" });
   const name = h("input", { placeholder: "client1", maxlength: 32, autocapitalize: "off", autocomplete: "off" });
   const box = h("div");
   const draw = () => box.replaceChildren(
@@ -4513,7 +4666,7 @@ function wgobfInstall(ctx, d) {
     segText([["STUN", "STUN · видеозвонок"], ["NONE", "NONE · только XOR"]], f.masking, (v) => { f.masking = v; draw(); }),
     h("label", {}, "DNS клиентов"),
     segText(WGOBF_DNS.map(([l], i) => [i, l]), f.dns, (v) => { f.dns = v; draw(); }),
-    h("label", {}, "UDP-порт обфускатора"), port,
+    h("label", {}, "UDP-порт обфускатора — 443 или 1024-65535"), port,
     h("label", {}, "Имя первого клиента"), name,
     h("div", { style: "margin-top:10px" }, switchRow("Чистый WG", "пускать и обычный WireGuard без обфускатора (iOS) — его DPI видит",
       f.clean, (on) => { f.clean = on; })));
@@ -4526,10 +4679,10 @@ function wgobfInstall(ctx, d) {
     box,
     btn("📦 Установить", () => {
       const p = port.value.trim(), n = name.value.trim() || "client1";
-      if (p && !validPort(p, 1024)) return fail(new Error("Порт — число 1024-65535"));
+      if (p && !awgPortOk(p)) return fail(new Error("Порт — 443 или число 1024-65535"));
       if (!/^[A-Za-z0-9_-]{1,32}$/.test(n)) return fail(new Error("Имя: латиница, цифры, _ и -, до 32"));
       const args = ["wgobf", "install", `masking=${f.masking}`, `clean=${f.clean ? 1 : 0}`, `client=${n}`,
-        `dns=${WGOBF_DNS[f.dns][1]}`, ...(p ? [`port=${p}`] : [])];
+        `dns=${WGOBF_DNS[f.dns][1]}`, ...(p ? [`port=${+p}`] : [])];
       return runJob(ctx, "Установка WG + обфускатор", args, () =>
         btn(`📄 Комплект ${n}`, () => go(`/wgobf/client/${encodeURIComponent(n)}`), "btn-primary btn-block"));
     }, "btn-primary btn-block"));
@@ -4646,8 +4799,22 @@ route(/^\/wgobf\/client\/([^/]+)$/, async (ctx, name) => {
     d.direct ? [h("h2", {}, "Чистый WireGuard"), hint("Без обфускатора — для iOS и обычного WireGuard. DPI его видит."),
       d.png ? h("img", { class: "qr", src: "data:image/png;base64," + d.png, alt: "QR" }) : null,
       copyBtn("Скопировать конфиг", d.direct)] : null,
+    btn("✏️ Переименовать", () => go(`/wgobf/client/${encodeURIComponent(name)}/rename`), "btn-block"),
     btn("🗑 Удалить клиента", (b) => quickAsk(b, `Удалить клиента ${name}?`, "Клиент удалён", ["wgobf", "del", name],
       () => backWith((p) => (/^\/wgobf\/client\//.test(p) ? "/wgobf" : null))), "btn-danger btn-block"));
+});
+
+route(/^\/wgobf\/client\/([^/]+)\/rename$/, async (ctx, name) => {
+  const input = h("input", { value: name, maxlength: 32, autocapitalize: "off", autocomplete: "off", "data-name": "wgobf-rename-input" });
+  ctx.put(title("✏️ Новое имя"), h("label", {}, "Латиница, цифры, _ и -, до 32"), input,
+    enterTo(h("button", { class: "btn-primary btn-block", "data-name": "wgobf-rename-save", onclick: (ev) => busy(ev.currentTarget, async () => {
+      const v = input.value.trim();
+      if (!/^[A-Za-z0-9_-]{1,32}$/.test(v)) throw new Error("Имя: латиница, цифры, _ и -, до 32 символов");
+      if (v !== name) await post("/api/wgobf/rename", { old: name, new: v });
+      // Карточка со старым именем в истории заменяется новой
+      haptic(); backWith(() => "/wgobf/client/" + encodeURIComponent(v));
+    }) }, "Сохранить"), input));
+  input.focus();
 });
 
 // ── Бот ───────────────────────────────────────────────────
@@ -4728,6 +4895,7 @@ route(/^\/bot$/, async (ctx) => {
 
 const ALERT_HINTS = {
   iface: "две проверки подряд без awg0 — и когда он вернётся, с временем простоя",
+  warp: "WARP упал (клиенты идут напрямую) или не отвечает (клиенты без интернета) — и когда он снова заработает",
   reboot: "сервер загрузился заново: время работы и поднялся ли awg0",
   update: "вышла новая версия AWG Toolza — один раз на версию",
   kernel: "apt поставил ядро, под которое модуль AWG не собрался",
@@ -4969,7 +5137,8 @@ route(/^\/bot\/app$/, async (ctx) => {
 const LOGS = { manager: "awg2 — действия", install: "Компоненты", module: "Сборка модуля", awg: "awg0 (awg-quick)",
   expire: "Сроки клиентов", warp: "WARP", "warp-health": "WARP health-check", usque: "usque (WARP MASQUE)", xray: "Xray",
   "xray-routing": "Маршруты Xray", tun2socks: "tun2socks", exits: "Exit-ноды", cascade: "Каскад", dns: "dnscrypt-proxy",
-  "dns-health": "DNS health-check", wgobf: "WG + обфускатор", bot: "Telegram-бот", antiscan: "Антисканер" };
+  "dns-health": "DNS health-check", wgobf: "WG + обфускатор", bot: "Telegram-бот", antiscan: "Антисканер",
+  vkblock: "VK и Max мимо VPN" };
 
 route(/^\/log\/([a-z0-9-]+)$/, async (ctx, name) => {
   const r = await callR(["log", name, "150"]);

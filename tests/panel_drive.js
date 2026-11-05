@@ -600,6 +600,66 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click("summary"); await page.waitForSelector("details[open] pre");
     await shot("23-module");
   });
+  await step("страна сервера: окно «О сервере» → выбор вручную, поиск, «Автоматически»", async () => {
+    const sent = [];
+    const fake = async (r) => {
+      const body = r.request().postData() || "";
+      if (body.includes('"country"')) { sent.push(body); return r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data: {} }) }); }
+      return r.continue();
+    };
+    const st = async (r) => {
+      const resp = await r.fetch(), d = await resp.json();
+      Object.assign(d, { country: "NL", country_auto: "NL", country_manual: false, country_votes: "NL=4,DE=2" });
+      return r.fulfill({ response: resp, body: JSON.stringify(d) });
+    };
+    await page.route("**/api/call", fake);
+    await page.route("**/api/status", st);
+    try {
+      await nav("/", "h1");
+      await page.evaluate(() => refreshStatus());
+      await page.evaluate(() => serverInfo(null));
+      await page.waitForSelector("[data-name=server-info] [data-name=country]");
+      await page.click("[data-name=server-info] [data-name=country]");
+      await page.waitForSelector("[data-name=country-pick]");
+      const txt = await page.textContent("[data-name=country-pick]");
+      if (!txt.includes("По геосервисам: Нидерланды") || !txt.includes("NL × 4")) throw new Error("сводка геосервисов: " + txt.slice(0, 200));
+      if (!(await page.locator("[data-name=country-pick] .cpi.on[data-cc=auto]").count())) throw new Error("не отмечено «Автоматически»");
+      await page.fill("[data-name=country-pick] input", "авст");
+      const vis = await page.locator("[data-name=country-pick] .cpi").evaluateAll((els) => els.map((e) => e.dataset.cc));
+      // По русскому названию: Австралия раньше Австрии
+      if (vis.join(",") !== "AU,AT") throw new Error("поиск «авст»: " + vis.join(","));
+      await page.click("[data-name=country-pick] .cpi[data-cc=AT]");
+      await page.waitForTimeout(300);
+      if (!sent.some((b) => b.includes('"country","set","AT"'))) throw new Error("выбор не ушёл в awg2: " + sent.join(" | "));
+      if (await page.locator("[data-name=country-pick]").count()) throw new Error("окно выбора не закрылось");
+    } finally {
+      await page.unroute("**/api/call", fake);
+      await page.unroute("**/api/status", st);
+    }
+  });
+  await step("ссылка на конфиг: «Открыть» — ссылка в новой вкладке", async () => {
+    const opened = [];
+    await page.exposeFunction("__opened", (u) => opened.push(u)).catch(() => {});
+    await page.evaluate(() => { window.open = (u) => { window.__opened(u); return null; };
+      if (window.Telegram && window.Telegram.WebApp) window.Telegram.WebApp.openLink = (u) => window.__opened(u); });
+    const fake = (r) => r.fulfill({ contentType: "application/json",
+      body: JSON.stringify({ ok: true, url: "https://198.51.100.7:8443/s/test-token", id: "abc123", exp: Math.round(Date.now() / 1000) + 300 }) });
+    await page.route("**/api/client/share", fake);
+    try {
+      await nav("/client/alice/qr", "text=Ссылка на 5 минут");
+      await page.click("button:has-text('Ссылка на 5 минут')");
+      await page.waitForSelector("[data-name=share-open]");
+      await page.click("[data-name=share-open]");
+      await page.waitForTimeout(200);
+      if (opened[0] !== "https://198.51.100.7:8443/s/test-token") throw new Error("открыто: " + JSON.stringify(opened));
+    } finally {
+      await page.unroute("**/api/client/share", fake);
+    }
+  });
+  await step("порт AWG и обфускатора: 443 (QUIC) или 1024-65535", async () => {
+    const r = await page.evaluate(() => ["443", "1024", "65535", "80", "1023", "65536", "44x"].map((v) => awgPortOk(v)));
+    if (r.join(",") !== "true,true,true,false,false,false,false") throw new Error(r.join(","));
+  });
   await step("журнал", async () => { await nav("/log/manager", "pre"); });
   await step("перенос из Amnezia: пункт в «Сервере», предпросмотр клиентов, перенос задачей; перенесённый клиент — перевыпуск", async () => {
     const AMZ = { container: "amnezia-awg2", running: true, migrated: false, proto: "3.1", port: 51888, net: "10.8.1.0/24",
@@ -696,6 +756,31 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
         return e ? [e.scrollWidth - e.clientWidth, document.documentElement.scrollWidth - document.documentElement.clientWidth] : null;
       }, six);
       if (!r || r[0] > 0 || r[1] > 0) throw new Error("адрес обрезан или страница шире экрана: " + JSON.stringify(r));
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+
+  await step("VK и Max мимо VPN: выключено, «Включить» — с вопросом про сервисы VK у клиентов", async () => {
+    await nav("/server", "text=VK и Max мимо VPN");
+    await page.click("text=VK и Max мимо VPN");
+    await page.waitForSelector("[data-name=vkblock-status] >> text=○ выключено");
+    if (await page.locator("button:has-text('Обновить список')").count()) throw new Error("«Обновить список» при выключенном");
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "vkblock" && b.args[1] === "on")
+        return route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, log: "", error: "", data: null }) });
+      if (b.args && b.args[0] === "vkblock" && b.args[1] === "status")
+        return route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, log: "", error: "", data: {
+          enabled: true, active: true, v4: 204, v6: 3, dropped: 4321, updated: 1790000000, error: "" } }) });
+      return route.continue();
+    });
+    try {
+      await page.click("button:has-text('Включить')");
+      await page.waitForSelector(".toast >> text=VK и Max мимо VPN включено");
+      const asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:Включить? ВКонтакте"));
+      if (!asked.length || !/мимо туннеля/.test(asked[0])) throw new Error("включение без подтверждения: " + JSON.stringify(asked));
+      await page.waitForSelector("[data-name=vkblock-status] >> text=● включено");
+      await page.waitForSelector("[data-name=vkblock-status] >> text=4 321 пакетов");
+      await page.waitForSelector("button:has-text('Обновить список')");
     } finally { await page.unroute(/\/api\/call$/); }
   });
 
@@ -1300,6 +1385,22 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/wgobf/client/kn1", "text=Ссылка для Keenetic");
     await page.waitForSelector(".card.item:has-text('Мониторинг') .switch.on");
   });
+  await step("обфускатор: переименовать клиента — карточка под новым именем, мониторинг переехал", async () => {
+    const rename = async (from, to) => {
+      await nav("/wgobf/client/" + from, "text=Ссылка для Keenetic");
+      await page.click("button:has-text('Переименовать')");
+      await page.waitForURL(new RegExp("#/wgobf/client/" + from + "/rename$"));
+      await page.fill("[data-name=wgobf-rename-input]", to);
+      await page.click("[data-name=wgobf-rename-save]");
+      await page.waitForURL(new RegExp("#/wgobf/client/" + to + "$"));
+      await page.waitForSelector("text=Ссылка для Keenetic");
+      await page.waitForSelector(".card.item:has-text('Мониторинг') .switch.on");
+    };
+    await rename("kn1", "kn2");
+    await nav("/wgobf", "[data-name=kn2]");
+    if (await page.locator("[data-name=kn1]").count()) throw new Error("старое имя осталось в списке");
+    await rename("kn2", "kn1");
+  });
   await step("обфускатор: удалить клиента", async () => {
     await page.click("button:has-text('Удалить клиента')");
     await page.waitForURL(/#\/wgobf$/);
@@ -1400,12 +1501,13 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/bot", "text=Уведомления");
     await page.click("text=Уведомления");
     await page.waitForSelector("h1:has-text('Уведомления')");
-    if (await page.locator(".switch.on").count() !== 7) throw new Error("ждали 7 включённых уведомлений");
+    if (await page.locator(".switch.on").count() !== 8) throw new Error("ждали 8 включённых уведомлений");
+    await page.waitForSelector(".card.item:has-text('WARP упал или не отвечает и снова работает')");
     await page.waitForSelector(".card.item:has-text('Пятница: поддержать проект') >> text=только владельцу");
     await page.click(".card.item >> text=Диск заполнен");
-    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 6);
+    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 7);
     await nav("/bot/alerts", ".switch");
-    if (await page.locator(".switch.on").count() !== 6) throw new Error("выключенное уведомление не сохранилось");
+    if (await page.locator(".switch.on").count() !== 7) throw new Error("выключенное уведомление не сохранилось");
     await shot("52a-alerts");
   });
   await step("меню бота в чат", async () => {
@@ -1573,6 +1675,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       const routes = ("/ /add /backup /backup/restore /bot /bot/admins /bot/alerts /bot/app /bot/look /bot/proxy /bulk /client/alice "
         + "/client/alice/date /client/alice/limit /client/alice/mimicry /client/alice/note /client/alice/qr /client/alice/rename /client/alice/speed /clients "
         + "/diag /diag/dpi /diag/logs /diag/sniff /log/warp /server /server/amnezia /server/antiscan /server/create /server/endpoint /server/module "
+        + "/server/vkblock "
         + "/server/params /server/proto /tunnels /tunnels/cascade /tunnels/cascade/add /tunnels/dns /tunnels/dns/manual /tunnels/exits "
         + "/tunnels/exits/add /tunnels/tun2socks /tunnels/warp /tunnels/warp/clients /tunnels/warp/endpoint /tunnels/warp/import "
         + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /update /wgobf /wgobf/add /wgobf/client/ob1").split(" ");

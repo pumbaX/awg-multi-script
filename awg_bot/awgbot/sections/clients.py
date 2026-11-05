@@ -631,7 +631,11 @@ async def _share(cb: CallbackQuery, state: FSMContext, name: str) -> None:
                             "сейчас ни одна из них не работает. Включи Mini App: Бот → 📱 Mini App.",
                         ui.kb(ui.back(act.data("v", name))))
         return
-    token, rid, exp = share.create(name, c["pub"], f"tg:{cb.from_user.id}")
+    try:
+        token, rid, exp = share.create(name, c["pub"], f"tg:{cb.from_user.id}")
+    except share.PersistenceError as e:
+        await cb.answer(str(e), show_alert=True)
+        return
     await ui.render(cb, f"<b>🔗 Ссылка на конфиг {esc(name)}</b>\n<code>{esc(share.url_for(base, token))}</code>\n\n"
                         f"Действует 5 минут — до {time.strftime('%H:%M:%S', time.localtime(exp))}. По ней: QR, текст "
                         "и файл .conf.\nСсылка — это доступ к VPN: отправляй только тому, кому конфиг предназначен.",
@@ -641,7 +645,12 @@ async def _share(cb: CallbackQuery, state: FSMContext, name: str) -> None:
 @act("shx")
 async def _share_revoke(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     name, _, rid = arg.partition("|")
-    await cb.answer("Ссылка отозвана" if share.revoke(rid) else "Ссылка уже не действует")
+    try:
+        revoked = share.revoke(rid)
+    except share.PersistenceError as e:
+        await cb.answer(str(e), show_alert=True)
+        return
+    await cb.answer("Ссылка отозвана" if revoked else "Ссылка уже не действует")
     await card(cb, name)
 
 

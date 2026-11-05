@@ -139,7 +139,7 @@ INSTALL_LOG="{ROOT}/install.log"; EXITS_DIR="$AWG_DIR"
 EXITS_PEERS="$EXITS_DIR/exits_peers.list"; EXITS_STATE="$EXITS_DIR/exits_state"
 for v in DNS_PERSIST_SCRIPT DNS_HEALTH_SCRIPT CASCADE_SCRIPT T2S_ROUTING_SCRIPT XRAY_ROUTING_SCRIPT \\
          EXITS_SCRIPT EXPIRE_BIN WARP_AUTOSTART_SCRIPT WARP_HEALTH_SCRIPT WGOBF_FW USQUE_UP_HOOK ANTISCAN_SCRIPT \\
-         WEB_FW_SCRIPT; do
+         WEB_FW_SCRIPT VKBLOCK_SCRIPT; do
   printf -v "$v" '%s' "{ROOT}/scripts/$v"
 done
 CASCADE_DIR="{ROOT}/etc/awg-cascade"; CASCADE_RULES="$CASCADE_DIR/rules.conf"; CASCADE_LOG="{ROOT}/cascade.log"
@@ -152,18 +152,20 @@ EXPIRE_STATE_DIR="{ROOT}/var/lib/awg2-expire"; EXPIRE_LOG="{ROOT}/expire.log"; B
 BOT_ADMINS="{ROOT}/admins.json"; TRAFFIC_DB="$STATE_DIR/traffic.json"
 EXPIRE_STALE=999999999      # сторож таймера в песочнице молчит; его проверка — отдельно
 BACKUP_DIR="{ROOT}/awg_backup"; MOD_BACKUP_DIR="{ROOT}/mod-backups"; UPDATE_CHANNEL_FILE="$STATE_DIR/channel"
-MOD_TAG_FILE="$STATE_DIR/module_tag"; TOOLS_TAG_FILE="$STATE_DIR/tools_tag"; UPSTREAM_CACHE="$STATE_DIR/upstream_tags"; COUNTRY_CACHE="$STATE_DIR/country"
+MOD_TAG_FILE="$STATE_DIR/module_tag"; TOOLS_TAG_FILE="$STATE_DIR/tools_tag"; UPSTREAM_CACHE="$STATE_DIR/upstream_tags"; COUNTRY_CACHE="$STATE_DIR/country"; COUNTRY_MANUAL="$STATE_DIR/country_manual"
 WARP_PEERS="{ROOT}/warp.peers"; XRAY_PEERS="{ROOT}/xray.peers"; USQUE_LOG="{ROOT}/usque.log"
 XRAY_DIR="{ROOT}/etc/xray"; XRAY_CONF="$XRAY_DIR/config.json"; XRAY_STATE="$XRAY_DIR/state"
 XRAY_BIN="{ROOT}/bin/xray"; XRAY_ASSET_DIR="{ROOT}/xray-assets"
 T2S_DIR="{ROOT}/etc/tun2socks"; T2S_CONF="$T2S_DIR/proxy.txt"
 DNS_PROXY_CONF="{ROOT}/etc/dnscrypt-proxy/dnscrypt-proxy.toml"; DNS_PROXY_STATE="{ROOT}/etc/dnscrypt-proxy/awg.state"; DNS_RESOLVERS_MD="{ROOT}/var/cache/dnscrypt-proxy/public-resolvers.md"
-DNS_PROXY_BACKUP_CONF="$DNS_PROXY_CONF.awg-backup"
+DNS_PROXY_BACKUP_CONF="$DNS_PROXY_CONF.awg-backup"; UFW_DEFAULTS="{ROOT}/etc/default/ufw"
 WARP_DIR="{ROOT}/etc/wgcf"; WARP_ACCOUNT="$WARP_DIR/wgcf-account.toml"; WARP_PROFILE="$WARP_DIR/wgcf-profile.conf"
 WARP_STATE="$WARP_DIR/state"; WARP_CONF="{ROOT}/etc/wireguard/warp0.conf"; WARP_BACKEND_FILE="{ROOT}/etc/awg-warp-backend"
 USQUE_DIR="{ROOT}/etc/usque"; USQUE_CONF="$USQUE_DIR/config.json"
 ANTISCAN_DIR="$STATE_DIR/antiscan"; ANTISCAN_CONF="$ANTISCAN_DIR/antiscan.conf"; ANTISCAN_ALLOW="$ANTISCAN_DIR/allow"
 ANTISCAN_LOG="{ROOT}/antiscan.log"
+WARP_HEALTH_FAILS="{ROOT}/warp-fails"; WARP_HEALTH_RETRY="{ROOT}/warp-retry"; WARP_HEALTH_LOG="{ROOT}/warp-health.log"
+VKBLOCK_DIR="$STATE_DIR/vkblock"; VKBLOCK_CONF="$VKBLOCK_DIR/vkblock.conf"; VKBLOCK_LOG="{ROOT}/vkblock.log"
 AMNEZIA_STATE_DIR="$STATE_DIR/amnezia"
 AUTOSTART_DROPIN="{ROOT}/etc/systemd/system/awg-quick@awg0.service.d"
 # Веб-панель: стенд (web_stand.py) передаёт свои конфиг и список адресов

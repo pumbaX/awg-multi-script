@@ -540,9 +540,14 @@ async def run():
     chk("мастер: не /24 — повторный вопрос", "сеть /24" in text, text)
     text, buttons = screen(await say("10.66.1.7/24"))
     chk("мастер: после подсети — порт", "UDP-порт" in text, text)
-    await press("srv:w:port=")
+    text, _ = screen(await press("srv:w:port=ask"))
+    chk("мастер: вопрос про порт называет 443 (QUIC)", "443 или 1024-65535" in text, text)
+    text, _ = screen(await say("80"))
+    chk("мастер: порт 80 — повторный вопрос", "Порт — 443 или число 1024-65535" in text, text)
+    text, _ = screen(await say("443"))
+    chk("мастер: порт 443 принят — дальше адрес в конфигах", "Адрес в конфигах" in text, text)
     text, _ = screen(await press("srv:w:endpoint="))
-    chk("мастер: итог с подсетью", "Подсеть: 10.66.1.0/24" in text, text)
+    chk("мастер: итог с подсетью и портом 443", "Подсеть: 10.66.1.0/24" in text and "Порт: 443" in text, text)
     long_domain = "a" * 60 + ".example.com"
     await press("srv:epdom")
     text, buttons = screen(await say(long_domain))
@@ -890,6 +895,95 @@ async def run():
     await al.tick(BOT, st2)
     chk("сервер удалён, пока awg0 лежал, — без ложного «снова работает»",
         not any("снова работает" in t for t in said(mark)) and "down_sent" not in st2, [said(mark), st2])
+    # WARP: включён, а туннеля нет — две проверки подряд и кнопка «Включить»; вернулся — с простоем
+    warp = {"failed": True, "state": "off", "probe": {"up": False, "health": False, "failover": False}}
+    probes = []
+
+    async def warp_status(*args, **kw):
+        if args[:1] == ("status",):
+            return {"host": "vm1", "server": {"exists": False, "up": False},
+                    "tunnels": {"warp": warp["state"], "warp_failed": warp["failed"]}}
+        if args[:2] == ("warp", "probe"):
+            probes.append(args)
+            return dict(warp["probe"])
+        return await real_data(*args, **kw)
+    al.api.data = warp_status
+    st3 = {"boot": "boot-B"}
+
+    def warp_said(mark):
+        return [t for t in said(mark) if "WARP" in t]
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st3)
+    chk("WARP упал: первая проверка — молчит", not warp_said(mark), warp_said(mark))
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st3)
+    rep = [m for n, m in SESSION.sent[mark:] if n == "SendMessage" and "WARP упал" in (m.text or "")]
+    chk("WARP лежит две проверки — 🟠 с кнопкой «Включить WARP»", len(rep) == 1
+        and rep[0].reply_markup.inline_keyboard[0][0].callback_data == "warp:up"
+        and "Туннели → WARP → ▶️ Включить" in rep[0].text, warp_said(mark))
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st3)
+    chk("пока WARP лежит — молчит", not warp_said(mark), warp_said(mark))
+    warp.update(failed=False, state="up")
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st3)
+    chk("WARP снова работает — с простоем", any("WARP снова работает" in t and "Простой" in t for t in warp_said(mark))
+        and "warp_sent" not in st3, [warp_said(mark), st3])
+    # Выключили руками, пока лежал: это не «снова работает»
+    st4 = {"boot": "boot-B", "warp_down": 2, "warp_since": int(time.time()) - 60, "warp_sent": True}
+    warp.update(failed=False, state="off")
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st4)
+    chk("WARP выключили руками, пока лежал, — без ложного «снова работает»",
+        not warp_said(mark) and "warp_sent" not in st4, [warp_said(mark), st4])
+    # Клиентов увёл health-check (метка failover): он уже проверил трижды — сразу, и вернёт WARP сам
+    st5 = {"boot": "boot-B"}
+    warp.update(failed=True, state="off", probe={"up": False, "health": True, "failover": True})
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st5)
+    rep = [m for n, m in SESSION.sent[mark:] if n == "SendMessage" and "WARP упал" in (m.text or "")]
+    chk("health-check увёл клиентов — уведомление с первой проверки: вернёт WARP сам",
+        len(rep) == 1 and "Health-check вернёт его сам" in rep[0].text, warp_said(mark))
+    warp.update(failed=False, state="up", probe={"up": True, "health": True, "failover": False, "ok": False})
+    mark, n = len(SESSION.sent), len(probes)
+    await al.tick(BOT, st5)
+    chk("warp0 подняли, а Cloudflare молчит — не «снова работает»: пока сбой не закрыт, бот пингует и с health-check",
+        not warp_said(mark) and st5.get("warp_sent") and probes[n:] == [("warp", "probe", "ping")], [warp_said(mark), probes[n:]])
+    warp["probe"]["ok"] = True
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st5)
+    chk("health-check вернул WARP — «снова работает»", any("WARP снова работает" in t for t in warp_said(mark)), warp_said(mark))
+    # Без health-check бот проверяет поднятый WARP сам: не отвечает — клиенты без интернета
+    st6 = {"boot": "boot-B"}
+    warp.update(failed=False, state="up", probe={"up": True, "health": False, "failover": False, "ok": False})
+    mark = len(SESSION.sent)
+    n = len(probes)
+    await al.tick(BOT, st6)
+    chk("WARP поднят, но не отвечает: бот проверил сам, первая проверка — молчит",
+        len(probes) == n + 1 and not warp_said(mark), [probes[n:], warp_said(mark)])
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st6)
+    rep = [m for n_, m in SESSION.sent[mark:] if n_ == "SendMessage" and "WARP не отвечает" in (m.text or "")]
+    cbs = [b.callback_data for row in (rep[0].reply_markup.inline_keyboard if rep else []) for b in row]
+    chk("не отвечает две проверки — 🟠 «клиенты без интернета», перезапуск и health-check кнопками",
+        len(rep) == 1 and "без интернета" in rep[0].text and cbs == ["warp:restart", "warp:health:on"], [warp_said(mark), cbs])
+    warp["probe"]["ok"] = True
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st6)
+    chk("снова отвечает — «снова работает» с простоем",
+        any("WARP снова работает" in t and "Простой" in t for t in warp_said(mark)) and "warp_sent" not in st6, warp_said(mark))
+    # С health-check поднятый WARP бот не пингует: probe отвечает без ok
+    warp.update(probe={"up": True, "health": True})
+    mark, n = len(SESSION.sent), len(probes)
+    await al.tick(BOT, st6)
+    await al.tick(BOT, st6)
+    chk("с health-check бот не тревожит, пока WARP поднят, и не просит пинг",
+        not warp_said(mark) and "warp_down" not in st6 and probes[n:] == [("warp", "probe")] * 2, [warp_said(mark), st6, probes[n:]])
+    # WARP выключен — не проверяет вовсе
+    warp.update(failed=False, state="off")
+    n = len(probes)
+    await al.tick(BOT, st6)
+    chk("WARP выключен — без проверок", len(probes) == n, probes[n:])
     al.api.data = real_data
 
     CL = {"newer": True, "sections": [{"version": "v1.2.1", "title": "2026-10-08",
@@ -1324,6 +1418,23 @@ async def run():
     chk("нет ответа по обфускатору — офлайн-клиент не даёт второго «офлайн»", not again and "wgobf:clus" in st,
         [again, st])
     os.remove(WG_DUMP)
+
+    text, buttons = screen(await press("wo:v:clus"))
+    chk("карточка клиента обфускатора: кнопка «Переименовать»", ("✏️ Переименовать", "wo:ren:clus") in buttons, buttons)
+    text, _ = screen(await press("wo:ren:clus"))
+    chk("переименование обфускатора: вопрос про новое имя", "Новое имя" in text and "clus" in text, text)
+    text, _ = screen(await say("bad name"))
+    chk("переименование: недопустимое имя — повторный вопрос", "латиница" in text, text)
+    text, _ = screen(await say("clus2"))
+    with open(os.path.join(ROOT, "etc/wireguard/wgobf0.conf")) as f:
+        wgc = f.read()
+    chk("переименование обфускатора: карточка с новым именем, мониторинг переехал, комплект — в новом каталоге",
+        "clus2" in text and "# client=clus2\n" in wgc and "# client=clus\n" not in wgc
+        and store.monitored("wgobf:clus2") and not store.monitored("wgobf:clus")
+        and os.path.isfile(os.path.join(ROOT, "root/wgobf/clus2/wg.conf")), [text, wgc, store.notes()])
+    await press("wo:ren:clus2")
+    text, _ = screen(await say("clus"))
+    chk("и обратно — карточка clus", "<b>🛡 clus</b>" in text and store.monitored("wgobf:clus"), text)
 
     text, buttons = screen(await press("wo:install"))
     chk("установка обфускатора: DNS по умолчанию Cloudflare", "DNS клиентов: Cloudflare" in text, text)
@@ -1979,6 +2090,73 @@ async def run():
     no_hourglass("антисканер")
     botapi.call = real_call_
 
+    print("VK и Max мимо VPN")
+    text, buttons = screen(await press("srv"))
+    chk("в «Сервере» — кнопка «🚫 VK и Max»", ("🚫 VK и Max", "vk") in buttons, buttons)
+    VKST = {"enabled": False, "active": False, "v4": 0, "v6": 0, "updated": 0, "error": "", "dropped": 0}
+    vk_calls = []
+
+    async def vk_call(*args, **kw):
+        if args[:1] != ("vkblock",):
+            return await real_call_(*args, **kw)
+        vk_calls.append((args[1:], kw.get("timeout")))
+        if args[1] == "status":
+            return botapi.Result(True, data=json.loads(json.dumps(VKST)))
+        if args[1] == "on":
+            VKST.update(enabled=True, active=True, v4=204, v6=3, updated=1791500000, dropped=4321,
+                        error="Список сетей VK: в ответе 3 записей <b>")
+        if args[1] == "off":
+            VKST.update(enabled=False, active=False)
+        return botapi.Result(True)
+    botapi.call = vk_call
+    text, buttons = screen(await press("vk"))
+    chk("выключено: что делает и чем грозит, «Включить», журнал, назад в «Сервер»",
+        "⚪️ Выключено" in text and "Max" in text and "мимо туннеля" in text and ("✅ Включить", "vk:on") in buttons
+        and ("📜 Журнал", "diag:log:vkblock|vk") in buttons and ("◀️ Назад", "srv") in buttons
+        and not any(d == "vk:upd" for _, d in buttons), [text, buttons])
+    n = len(vk_calls)
+    text, buttons = screen(await press("vk:on"))
+    chk("включение — с подтверждением и предупреждением про сервисы VK у клиентов",
+        ("✅ Включить", "vk:onok") in buttons and ("✖️ Отмена", "vk") in buttons and "перестанут" in text
+        and not any(c[0][0] == "on" for c in vk_calls[n:]), [text, buttons])
+    text, buttons = screen(await press("vk:onok"))
+    chk("включено: долгий вызов, подсети, счётчик, ошибка экранирована, «Обновить» и «Выключить»",
+        (("on",), 180) in vk_calls and "🟢 Включено · подсетей 207" in text and "Отбито: 4 321 пакетов" in text
+        and "&lt;b&gt;" in text and ("🔄 Обновить список", "vk:upd") in buttons and ("⏹ Выключить", "vk:off") in buttons,
+        [vk_calls[-3:], text, buttons])
+    await press("vk:upd")
+    chk("обновить список — долгий вызов", (("update",), 180) in vk_calls, vk_calls[-3:])
+    text, buttons = screen(await press("vk:off"))
+    chk("выключение — с подтверждением", ("⏹ Выключить", "vk:offok") in buttons, buttons)
+    text, buttons = screen(await press("vk:offok"))
+    chk("выключено снова", (("off",), None) in vk_calls and "⚪️ Выключено" in text, [vk_calls[-3:], text])
+    text, buttons = screen(await press("diag:log:vkblock|vk"))
+    chk("журнал открывается, «Назад» — на экран VK", ("◀️ Назад", "vk") in buttons, [text, buttons])
+    no_hourglass("VK и Max")
+    botapi.call = real_call_
+
+    print("WARP: кнопки из уведомлений")
+    started, real_job_w = [], botapi.job_start
+
+    async def warp_job(*args, **kw):
+        started.append(args)
+        return botapi.Result(False, error="тест: задачу не запускаем")
+    botapi.job_start = warp_job
+    await press("warp:restart")
+    chk("«Перезапустить WARP» — задача awg2 warp restart", ("warp", "restart") in started, started)
+    botapi.job_start = real_job_w
+    health_calls = []
+
+    async def warp_health_call(*args, **kw):
+        if args[:2] == ("warp", "health"):
+            health_calls.append(args)
+            return botapi.Result(True)
+        return await real_call_(*args, **kw)
+    botapi.call = warp_health_call
+    await press("warp:health:on")
+    chk("«Включить health-check» — awg2 warp health on", ("warp", "health", "on") in health_calls, health_calls)
+    botapi.call = real_call_
+
     print("Перенос из Amnezia")
     AMZ = {"container": "amnezia-awg2", "running": True, "migrated": False, "proto": "3.1", "port": 51888,
            "net": "10.8.1.0/24", "clients": [{"name": "Petr", "orig": "Пётр <b>", "ip": "10.8.1.1"},
@@ -2062,6 +2240,11 @@ async def run():
         and ui.width(short.replace("<b>", "").replace("</b>", "")) >= 2 * (ui.width("📦 Комплект") + 4), short)
     long_text = "<b>Заголовок</b>\n" + "очень длинная строка текста экрана"
     chk("длинный текст не трогается", ui.fit(long_text, ui.kb(("📦 Комплект", "a"))) == long_text)
+
+    print("Порт AWG и обфускатора")
+    chk("ui.awg_port_ok: 443 и 1024-65535 — да; 80, 1023, 65536, мусор — нет",
+        all(ui.awg_port_ok(v) for v in ("443", "1024", "51820", "65535"))
+        and not any(ui.awg_port_ok(v) for v in ("80", "53", "1023", "0", "65536", "", "44x", "١٠٢٤", "000443000")))
 
 
 asyncio.run(run())

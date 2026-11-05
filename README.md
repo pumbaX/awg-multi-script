@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20%2F%203.1-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-v1.2.43-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-v1.2.52-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -284,6 +284,24 @@ journalctl -u awg-bot -n 50 | grep 'Запасные адреса'
 - Служба ставит правило при загрузке раньше UFW; таймер раз в час возвращает его
   на место, раз в сутки обновляет списки. `iptables-persistent` не нужен.
 - Клиенты VPN из этих сетей тоже не подключатся — для них есть исключения.
+
+---
+
+## 🚫 VK и Max мимо VPN
+
+**Сервер → VK и Max мимо VPN** (в боте и панели — там же): клиенты VPN не ходят через
+сервер в сети VK — ВКонтакте, Max, Одноклассники. Приложения VK на телефоне с VPN не
+видят адрес сервера и не могут сдать его как VPN. Сервисы VK у клиентов через VPN
+не откроются — в приложении VPN их пускают мимо туннеля.
+
+- Список — публичный [AS_Network_List](https://github.com/C24Be/AS_Network_List)
+  (`blacklist-vk.txt`), проверка — как у антисканера: частные сети и слишком широкие
+  подсети отбрасываются, оборванный ответ не заменяет прежний список.
+- `ipset` и DROP в `mangle PREROUTING` — раньше любого ACCEPT в FORWARD. Ловит всех, чей
+  трафик пересылает сервер: AWG, обфускатор, контейнеры Amnezia, клиентов через WARP,
+  Xray и каскад. Адреса самого сервера и его собственный трафик не трогаются. IPv6 — тоже.
+- Служба ставит правило при загрузке, таймер раз в час возвращает его на место, раз
+  в сутки обновляет список.
 
 ---
 
@@ -592,6 +610,6 @@ python3 tests/test_regress_f2f3.py && python3 tests/test_amnezia.py
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v1.2.43** · MIT License
+**AWG Toolza v1.2.52** · MIT License
 
 </div>
