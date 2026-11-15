@@ -90,7 +90,7 @@ EOF
     t2s_down quiet
     return 1
   fi
-  for i in $(seq 1 10); do ip rule show | grep -q "lookup $T2S_TABLE" && break; sleep 0.5; done
+  for i in $(seq 1 10); do grep -q "lookup $T2S_TABLE" <<< "$(ip rule show)" && break; sleep 0.5; done
   ok "tun2socks включён: все клиенты идут через $proxy"
 }
 

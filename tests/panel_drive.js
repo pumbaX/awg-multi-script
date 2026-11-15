@@ -30,11 +30,16 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
   page.on("console", (m) => { if (m.type() === "error" && !/telegram\.org|ERR_FAILED/.test(m.text()))
     errors.push("console: " + m.text() + ((m.location() || {}).url ? " " + m.location().url : "")); });
   const base = `https://127.0.0.1:${port}/`;
-  const shot = async (name) => { await page.waitForTimeout(500); await page.screenshot({ path: `${out}/${name}.png`, fullPage: true }); };
+  // Снимки — только когда их оставляют (AWG_PANEL_SHOTS): иначе это время впустую
+  const SHOTS = !!process.env.AWG_PANEL_SHOTS;
+  const shot = async (name) => { if (!SHOTS) return; await page.waitForTimeout(500); await page.screenshot({ path: `${out}/${name}.png`, fullPage: true }); };
+  // Сводки бот держит в кэше AWG_API_CACHE_TTL секунд: файлы поменяли мимо awg2 — ждём его
+  const CACHE_WAIT = Number(process.env.AWG_API_CACHE_TTL || 5) * 1000 + 500;
   const noNull = async () => {
     const bad = await page.evaluate(() => [...document.querySelectorAll("#app, #app *")].some((el) =>
-      [...el.childNodes].some((n) => n.nodeType === 3 && /^(null|undefined|false)$/.test(n.textContent.trim()))));
-    if (bad) throw new Error("на экране текст null/undefined");
+      [...el.childNodes].some((n) => n.nodeType === 3 && (/^(null|undefined|false)$/.test(n.textContent.trim())
+        || /\[object \w+\]/.test(n.textContent)))));
+    if (bad) throw new Error("на экране текст null/undefined/[object …]");
   };
   // Тот же адрес браузер навигацией не считает — тогда перезагружаем страницу
   const nav = async (hash, sel = "h1") => {
@@ -88,7 +93,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       : !/Страна не определена/.test(t) || !/сервер не создан/.test(t)) throw new Error("окно «О сервере»: " + t);
     // Лист снизу — снимок экрана, а не всей страницы
     await page.waitForTimeout(300);
-    await page.screenshot({ path: `${out}/01b-server-info.png` });
+    if (SHOTS) await page.screenshot({ path: `${out}/01b-server-info.png` });
     // Скрыть имя и адрес — тут же, окно остаётся открытым; и вернуть
     await page.click(`${box} button:has-text('Скрыть адрес')`);
     await page.waitForSelector(`${box} b.hid >> text=скрыто`);
@@ -226,6 +231,11 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       await page.click(".chip >> text=Мощный"); await page.waitForSelector(".chip >> text=Цепочка I1-I5");
       await page.waitForSelector("select >> nth=0");
       await shot("12-create-pro");
+      // У сервера есть IPv6 — переключатель «Клиенты — по IPv6»; включён — поля домена нет
+      await page.click(".card.item:has-text('Клиенты — по IPv6')");
+      await page.waitForSelector("text=Домен для конфигов", { state: "detached" });
+      await page.click(".card.item:has-text('Клиенты — по IPv6')");
+      await page.waitForSelector("text=Домен для конфигов");
       await page.click(".chip >> text=AmneziaVPN");
       await page.click(".chip >> text=Пакет I1 (DNS)");
       await page.fill("input[placeholder^='случайная']", "10.66.1.7/25");
@@ -338,6 +348,16 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     if (!/МБ|ГБ/.test(cap)) throw new Error("подпись дня без объёма: " + cap);
     await shot("03a-traffic");
   });
+  await step("пустые графики: уход указателя не вызывает ошибку", async () => {
+    const before = errors.length;
+    await page.evaluate(() => {
+      for (const box of [barChart([]), lineChart({ days: [], rx: [], tx: [] })]) {
+        box.querySelector("svg").dispatchEvent(new Event("pointerleave"));
+      }
+    });
+    await page.waitForTimeout(100);
+    if (errors.length !== before) throw new Error(errors.slice(before).join(" | "));
+  });
   await step("лимит трафика: готовый размер", async () => {
     await page.click(".actions button:has-text('Лимит')"); await page.waitForSelector(".sheet");
     await page.click(".sheet >> text=50 ГБ в месяц");
@@ -417,7 +437,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     if (!await p2.locator("#qr[src^='data:image/png']").count() && !await p2.locator("#noqr:not([hidden])").count()) throw new Error("ни QR, ни пояснения");
     if (!/PrivateKey/.test(await p2.textContent("#text"))) throw new Error("нет текста конфига");
     if (await p2.textContent("#fname") !== "alice.conf") throw new Error("имя файла: " + await p2.textContent("#fname"));
-    await p2.screenshot({ path: `${out}/04c-share-page.png`, fullPage: true });
+    if (SHOTS) await p2.screenshot({ path: `${out}/04c-share-page.png`, fullPage: true });
     await page.click("[data-name=share] button:has-text('Отозвать')");
     await page.waitForSelector(".toast >> text=Ссылка отозвана");
     await p2.reload();
@@ -595,6 +615,57 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/server", "text=Endpoint");
     await page.waitForSelector("text=vpn.example.com");
   });
+  await step("точки входа (каскад)", async () => {
+    await nav("/server/entries", "text=Новая точка входа");
+    await page.waitForSelector(".ecard >> text=Напрямую");
+    const nameIn = "input[placeholder='Каскад NL']", addrIn = "input[placeholder='203.0.113.5:443']", card = ".ecard[data-name='Каскад NL']";
+    await page.fill(nameIn, "Каскад NL");
+    await expectAlert("хост:порт", async () => { await page.fill(addrIn, "bad"); await page.click("button:has-text('Добавить')"); });
+    await page.fill(addrIn, "203.0.113.5:443");
+    await page.click("button:has-text('Добавить')");
+    await page.waitForSelector(`${card} >> text=работает`, { timeout: 30000 });
+    await shot("22b-entries");
+    // Вход клиенту — выбором в его карточке (прежний вид экрана сменяется свежим — ждём кнопку входа)
+    await nav("/client/alice", ".rchips button[data-v='Каскад NL']");
+    await page.click(".rchips button[data-v='Каскад NL']");
+    await page.waitForSelector(".toast >> text=Каскад NL", { timeout: 30000 });
+    await page.waitForSelector(".rchips button.on[data-v='Каскад NL']", { timeout: 15000 });
+    // Выбранным клиентам — отметкой: «Все», «Выдать», затем конфиги архивом
+    await nav("/server/entries/" + encodeURIComponent("Каскад NL") + "/clients", ".bar button:has-text('Все')");
+    await page.click(".bar button:has-text('Все')");
+    await page.waitForSelector(".ecard.sel");
+    await shot("22c-entry-clients");
+    await page.click(".bar button:has-text('Выдать')");
+    await page.waitForSelector("text=/Вход «Каскад NL»: \\d+/", { timeout: 30000 });
+    await page.waitForSelector("button:has-text('архивом')");
+    // Новый адрес проверку не проходит — выдача заперта
+    await nav("/server/entries/" + encodeURIComponent("Каскад NL"), "input[inputmode=url]");
+    await page.fill("input[inputmode=url]", "198.51.100.9:8443");
+    await page.click("button:has-text('Сохранить')");
+    await page.waitForSelector(".toast", { timeout: 30000 });
+    await nav("/server/entries", "text=Новая точка входа");
+    await page.waitForSelector(`${card} >> text=пакеты не доходят`, { timeout: 15000 });
+    await page.waitForSelector(`${card} button.locked:has-text('Выбрать')`);
+    await expectAlert("не прошёл проверку", async () => { await page.click(`${card} button:has-text('Всех сюда')`); });
+    await nav("/client/alice", ".rchips button.on[data-v='Каскад NL']");
+    await page.click(".rchips button[data-v='']");
+    await page.waitForSelector(".toast >> text=напрямую", { timeout: 30000 });
+    await page.waitForSelector(".rchips button.locked[data-v='Каскад NL']", { timeout: 15000 });
+    await expectAlert("не прошёл проверку", async () => { await page.click(".rchips button[data-v='Каскад NL']"); });
+    await nav("/server/entries", "text=Новая точка входа");
+    await page.click(`${card} button:has-text('Удалить')`);
+    await page.waitForSelector(card, { state: "detached", timeout: 30000 });
+    await nav("/client/alice", ".a-acts");
+    await page.waitForSelector(".rchips button[data-v='Каскад NL']", { state: "detached", timeout: 15000 });
+    // IPv6 этого сервера — входом в одно нажатие; после добавления кнопки нет
+    await nav("/server/entries", "button:has-text('IPv6 этого сервера')");
+    await page.click("button:has-text('IPv6 этого сервера')");
+    await page.waitForSelector(".ecard[data-name=IPv6] >> text=работает", { timeout: 30000 });
+    await page.waitForSelector(".ecard[data-name=IPv6] >> text=[2a01:4f8:c0c:1234::1]:51820");
+    if (await page.locator("button:has-text('IPv6 этого сервера')").count()) throw new Error("кнопка IPv6 осталась после добавления");
+    await page.click(".ecard[data-name=IPv6] button:has-text('Удалить')");
+    await page.waitForSelector(".ecard[data-name=IPv6]", { state: "detached", timeout: 30000 });
+  });
   await step("модуль ядра", async () => {
     await nav("/server/module", "text=Ядро");
     await page.click("summary"); await page.waitForSelector("details[open] pre");
@@ -629,9 +700,10 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       // По русскому названию: Австралия раньше Австрии
       if (vis.join(",") !== "AU,AT") throw new Error("поиск «авст»: " + vis.join(","));
       await page.click("[data-name=country-pick] .cpi[data-cc=AT]");
-      await page.waitForTimeout(300);
+      // Окно закрывается после ответа awg2 — ждём его, а не фиксированные 300 мс (под нагрузкой не успевает)
+      await page.waitForSelector("[data-name=country-pick]", { state: "detached", timeout: 5000 })
+        .catch(() => { throw new Error("окно выбора не закрылось"); });
       if (!sent.some((b) => b.includes('"country","set","AT"'))) throw new Error("выбор не ушёл в awg2: " + sent.join(" | "));
-      if (await page.locator("[data-name=country-pick]").count()) throw new Error("окно выбора не закрылось");
     } finally {
       await page.unroute("**/api/call", fake);
       await page.unroute("**/api/status", st);
@@ -784,13 +856,171 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     } finally { await page.unroute(/\/api\/call$/); }
   });
 
+
+  // ── РФ напрямую, если туннель упал, куда идёт адрес ──
+  const fake = (data) => ({ contentType: "application/json", body: JSON.stringify({ ok: true, log: "", error: "", data }) });
+  await step("РФ напрямую: карточка в «Туннелях», выключено, свои списки, «Включить» — с вопросом; включено — счётчик и действия", async () => {
+    await nav("/tunnels", ".kcard");
+    await page.click(".ktabs button[data-tab=tun]");
+    await page.click("[data-name='РФ напрямую'] .kc-n");
+    await page.waitForSelector("[data-name=rudirect-status] >> text=○ выключено");
+    if (await page.locator("button:has-text('Обновить список')").count()) throw new Error("«Обновить список» при выключенном");
+    await page.waitForSelector("input[aria-label='Всегда напрямую']");
+    await page.waitForSelector("input[aria-label='Всегда через туннель']");
+    const ST = { enabled: true, active: true, ru: 8673, mine: 1, excl: 0, updated: 1790000000, src: "ipverse", error: "",
+      packets: 12345, bytes: 2048, direct: ["bank.example"], tunnel: [], xray_ru: true };
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "on") return route.fulfill(fake(null));
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "status") return route.fulfill(fake(ST));
+      return route.continue();
+    });
+    try {
+      await page.click("button:has-text('Включить')");
+      await page.waitForSelector(".toast >> text=РФ напрямую включено");
+      const asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:") && l.includes("Включить? Клиенты в туннеле"));
+      if (!asked.length || !/адреса сервера/.test(asked[0])) throw new Error("включение без подтверждения: " + JSON.stringify(asked));
+      await page.waitForSelector("[data-name=rudirect-status] >> text=● включено");
+      await page.waitForSelector("[data-name=rudirect-status] >> text=8 673");
+      await page.waitForSelector("[data-name=rudirect-status] >> text=12 345 пакетов");
+      await page.waitForSelector("[data-name=rudirect-status] >> text=своё «РФ напрямую»");
+      await page.waitForSelector("button:has-text('Обновить список')");
+      await page.waitForSelector("button:has-text('Починить')");
+      await page.waitForSelector("[data-name=rud-direct] >> text=bank.example");
+      await shot("23c-rudirect");
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+  await step("РФ напрямую: свой адрес уходит в awg2, пробел — отказ; запись убирается с вопросом", async () => {
+    const seen = [];
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "status") return route.fulfill(fake({ enabled: true, active: true, ru: 8673,
+        direct: ["bank.example"], tunnel: [] }));
+      if (b.args && b.args[0] === "rudirect") { seen.push(b.args.join(" ")); return route.fulfill(fake(null)); }
+      return route.continue();
+    });
+    try {
+      await nav("/tunnels/rudirect", "[data-name=rud-direct]");
+      await expectAlert("Нужен один адрес", async () => {
+        await page.fill("input[aria-label='Всегда через туннель']", "77.88.8.0 /24");
+        await page.press("input[aria-label='Всегда через туннель']", "Enter");
+      });
+      await page.fill("input[aria-label='Всегда через туннель']", "77.88.8.0/24");
+      await page.press("input[aria-label='Всегда через туннель']", "Enter");
+      await page.waitForSelector(".toast >> text=Добавлено");
+      await page.click("[data-name=rud-direct] .item:has-text('bank.example')");
+      await page.waitForSelector(".toast >> text=Убрано");
+      const asked = (await page.evaluate(() => window.__log)).some((l) => l.startsWith("confirm:Убрать bank.example"));
+      if (!asked) throw new Error("убрал без вопроса");
+      if (seen.join("|") !== "rudirect add tunnel 77.88.8.0/24|rudirect del direct bank.example") throw new Error("вызовы: " + JSON.stringify(seen));
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+  await step("РФ напрямую на сервере не в России: предупреждение в вопросе при включении и в статусе", async () => {
+    const st = { enabled: false, active: false, ru: 0, direct: [], tunnel: [], abroad: "NL" };
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "status") return route.fulfill(fake(st));
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "on") { Object.assign(st, { enabled: true, active: true, ru: 8673 }); return route.fulfill(fake(null)); }
+      return route.continue();
+    });
+    try {
+      await nav("/tunnels/rudirect", "[data-name=rudirect-status]");
+      if (await page.locator("[data-name=rud-abroad]").count()) throw new Error("предупреждение у выключенного");
+      await page.click(".actions button:has-text('Включить')");
+      await page.waitForSelector("[data-name=rud-abroad] >> text=флагом в шапке");
+      const asked = (await page.evaluate(() => window.__log)).some((l) => l.startsWith("confirm:⚠️ Сервер не в России (NL)"));
+      if (!asked) throw new Error("в вопросе нет предупреждения");
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+  await step("РФ напрямую: Telegram — через туннель или напрямую, переключение уходит в awg2", async () => {
+    const seen = [], st = { enabled: true, active: true, ru: 8673, direct: [], tunnel: [], tg: false };
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "status") return route.fulfill(fake(st));
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "tg") { seen.push(b.args.join(" ")); st.tg = b.args[2] === "on"; return route.fulfill(fake(null)); }
+      return route.continue();
+    });
+    try {
+      await nav("/tunnels/rudirect", "[data-name=rud-tg]");
+      await page.waitForSelector("text=висит на «Соединение…»");
+      await page.waitForSelector("[data-name=rud-tg] button.on[data-v=off]");
+      await page.click("[data-name=rud-tg] button[data-v=on]");
+      await page.waitForSelector(".toast >> text=Telegram напрямую");
+      await page.waitForSelector("[data-name=rud-tg] button.on[data-v=on]");
+      await page.click("[data-name=rud-tg] button[data-v=off]");
+      await page.waitForSelector("[data-name=rud-tg] button.on[data-v=off]");
+      if (seen.join("|") !== "rudirect tg on|rudirect tg off") throw new Error("вызовы: " + JSON.stringify(seen));
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+  await step("если туннель упал: карточка, четыре туннеля с режимами, работающему — сразу, лежащему — с вопросом", async () => {
+    const seen = [];
+    const rows = [{ name: "warp", label: "WARP", mode: "direct", enabled: true, up: true, held: false },
+      { name: "xray", label: "Xray", mode: "block", enabled: true, up: false, held: true },
+      { name: "t2s", label: "tun2socks", mode: "direct", enabled: true, up: false, held: false },
+      { name: "exits", label: "Exit-ноды WG", mode: "direct", enabled: false, up: false, held: false }];
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "tunnels" && b.args[1] === "fail" && b.args[2] === "list") return route.fulfill(fake(rows));
+      if (b.args && b.args[0] === "tunnels" && b.args[1] === "fail") { seen.push(b.args.slice(2).join(" ")); return route.fulfill(fake(null)); }
+      return route.continue();
+    });
+    try {
+      await nav("/tunnels", ".kcard");
+      await page.click(".ktabs button[data-tab=tun]");
+      await page.click("[data-name='Если туннель упал'] .kc-n");
+      await page.waitForSelector("[data-name=fail-xray] >> text=упал — клиенты ждут его без интернета");
+      await page.waitForSelector("[data-name=fail-warp] >> text=● работает");
+      await page.waitForSelector("[data-name=fail-exits] >> text=○ выключен");
+      await page.waitForSelector("[data-name=fail-xray] button.on[data-v=block]");
+      await shot("33b-tunfail");
+      await page.click("[data-name=fail-warp] button[data-v=block]");
+      await page.waitForSelector(".toast >> text=WARP: блокировать");
+      let asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:") && l.includes("сразу останутся"));
+      if (asked.length) throw new Error("работающему — с вопросом");
+      await page.click("[data-name=fail-t2s] button[data-v=block]");
+      await page.waitForSelector(".toast >> text=tun2socks: блокировать");
+      asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:tun2socks сейчас не работает"));
+      if (!asked.length) throw new Error("лежащему — без вопроса");
+      await page.click("button:has-text('Всем напрямую')");
+      await page.waitForSelector(".toast >> text=Все туннели: напрямую");
+      if (seen.join("|") !== "set warp block|set t2s block|set all direct") throw new Error("вызовы: " + JSON.stringify(seen));
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+  await step("куда идёт адрес: из карточки клиента, адрес — итог с видом каждого IP и подсказкой", async () => {
+    await page.evaluate(() => { S.clients = null; });
+    await nav("/client/alice", "text=Куда идёт адрес");
+    await page.click("text=🧭 Куда идёт адрес →");
+    await page.waitForSelector("select[aria-label='Клиент']");
+    if (await page.inputValue("select[aria-label='Клиент']") !== "alice") throw new Error("клиент не выбран");
+    let asked = null;
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "diag" && b.args[1] === "route") {
+        asked = b.args.join(" ");
+        return route.fulfill(fake({ client: "alice", input: b.args[3], ip: "10.8.1.2", rows: [
+          { ip: "1.1.1.1", kind: "held", dev: "", note: "туннель лежит, режим «блокировать»" },
+          { ip: "77.88.8.8", kind: "rudirect", dev: "eth0", note: "напрямую с сервера — сеть России («РФ напрямую»)" }] }));
+      }
+      return route.continue();
+    });
+    try {
+      await page.fill("input[aria-label='Адрес']", "https://ya.ru/x");
+      await page.press("input[aria-label='Адрес']", "Enter");
+      await page.waitForSelector("[data-name=route-result] [data-kind=held] >> text=1.1.1.1");
+      await page.waitForSelector("[data-name=route-result] [data-kind=rudirect] >> text=сеть России");
+      await page.waitForSelector("[data-name=route-result] button:has-text('Если туннель упал')");
+      if (asked !== "diag route alice https://ya.ru/x") throw new Error("вызов: " + asked);
+      await shot("44b-diag-route");
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+
   // ── Туннели и DNS ──
   await step("туннели", async () => {
     // Экран туннелей — карточками и в «Классике»
     await nav("/tunnels", ".kcard");
     await page.click(".ktabs button[data-tab=tun]");
     const n = await page.locator(".kcard").count();
-    if (n !== 6) throw new Error("ждали 6 карточек (4 туннеля, каскад, DNS), есть " + n);
+    if (n !== 8) throw new Error("ждали 8 карточек (4 туннеля, каскад, DNS, РФ напрямую, если упал), есть " + n);
     await page.waitForSelector(".kstats >> text=Exit-ноды");
     if (await page.evaluate(() => document.documentElement.dataset.skin) !== "toolza") throw new Error("по умолчанию не «Классика»");
     await shot("30-tunnels");
@@ -818,6 +1048,35 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     if (await page.textContent(sel + " .sub") !== now) throw new Error("на сервере другое: " + await page.textContent(sel + " .sub"));
   });
   await step("Xray", async () => { await nav("/tunnels/xray", "text=Установить"); await shot("33-xray"); });
+  await step("Xray: через выход трафик не идёт — что делать, на экране Xray и на главной", async () => {
+    const R = "#app:not(.reloading) ";
+    const fake = async (r) => {
+      if ((r.request().postData() || "").includes('["xray","status"]')) return r.fulfill({ contentType: "application/json", body: JSON.stringify({
+        ok: true, rc: 0, data: { installed: true, up: true, tags: ["vl1"], main: "vl1", fail: "notraffic" },
+        log: "  Туннель   : ▲ включён, но через выход трафик не идёт — клиенты Xray не в туннеле\n" }) });
+      return r.continue();
+    };
+    const st = async (r) => {
+      const resp = await r.fetch(), d = await resp.json();
+      d.tunnels = Object.assign(d.tunnels || {}, { xray_fail: "notraffic" });
+      return r.fulfill({ response: resp, body: JSON.stringify(d) });
+    };
+    await page.route("**/api/call", fake);
+    await page.route("**/api/status", st);
+    try {
+      await nav("/tunnels/xray", R + "[data-name=xray-fail]");
+      const t = await page.textContent("[data-name=xray-fail]");
+      if (!/Через выход трафик не идёт/.test(t) || !/устареть/.test(t) || !/Диагностика/.test(t) || !/Журнал/.test(t))
+        throw new Error("предупреждение: " + t);
+      await shot("33b-xray-fail");
+      await nav("/", "h1");
+      await page.evaluate(() => refreshStatus());
+      await page.waitForSelector(R + "[data-name=alerts] >> text=Xray: через выход трафик не идёт");
+    } finally {
+      await page.unroute("**/api/call", fake);
+      await page.unroute("**/api/status", st);
+    }
+  });
   await step("tun2socks", async () => {
     await nav("/tunnels/tun2socks", "input");
     await expectAlert("IP:ПОРТ", async () => { await page.fill("input", "нет"); await page.click("text=Включить"); });
@@ -869,6 +1128,34 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/tunnels/exits", ".exmode");
     await page.click(".exmode button:has-text('Все клиенты')");
     await page.waitForSelector("[data-tunnel=on] >> text=включён · все клиенты");
+  });
+  await step("exit-ноды: порядок нод и упавшая нода", async () => {
+    const fs = require("fs"), R = "#app:not(.reloading) ", awg = `${sandboxRoot}/etc/amnezia/amneziawg`,
+      hdir = `${sandboxRoot}/run/exits-health`;
+    fs.writeFileSync(`${awg}/awg-exit-n2.conf`, "[Interface]\nPrivateKey = X\nTable = off\n\n[Peer]\nEndpoint = 1.2.3.5:51820\n");
+    fs.mkdirSync(hdir, { recursive: true });
+    fs.writeFileSync(`${hdir}/n1`, `down 3 0 ${Math.floor(Date.now() / 1000)} nonet\n`);
+    try {
+      // Сводку бот держит в кэше — нода и её здоровье появились мимо awg2
+      await page.waitForTimeout(CACHE_WAIT);
+      await nav("/tunnels/exits", R + "[data-name=ex-nodes] [data-node=n2]");
+      await page.waitForSelector("[data-node=n1] >> text=основная");
+      await page.waitForSelector("[data-node=n1] >> text=на связи, но выхода в интернет нет");
+      await page.waitForSelector("[data-node=n1] >> text=выпала из общего выхода");
+      await page.waitForSelector("[data-node=n2] >> text=запасная 1");
+      if (await page.$("[data-node=n1] button[aria-label^='Выше']")) throw new Error("у основной ноды есть ⬆");
+      await shot("36b-exit-order");
+      await page.click("[data-node=n2] button[aria-label='Выше: n2']");
+      await page.waitForSelector(".toast >> text=Порядок общего выхода: n2 → n1");
+      await page.waitForSelector(R + "[data-node=n2] >> text=основная");
+      const first = await page.$eval("[data-name=ex-nodes] .item", (e) => e.dataset.node);
+      if (first !== "n2") throw new Error("после ⬆ первой должна быть n2, а не " + first);
+      await page.click("[data-node=n1] button[aria-label='Выше: n1']");
+      await page.waitForSelector(".toast >> text=Порядок общего выхода: n1 → n2");
+    } finally {
+      fs.unlinkSync(`${awg}/awg-exit-n2.conf`);
+      fs.rmSync(`${hdir}/n1`, { force: true });
+    }
   });
   await step("каскад: добавить", async () => {
     await nav("/tunnels/cascade/add", "input");
@@ -1250,7 +1537,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
           over: document.documentElement.scrollWidth - document.documentElement.clientWidth };
       });
       if (r.lockR > r.flagL || r.flagR > r.kbarL || r.topR > width || r.over > 0) throw new Error(`шапка на ${width}px: ` + JSON.stringify(r));
-      if (width === 360) await page.screenshot({ path: `${out}/48d-beta-360.png` });
+      if (SHOTS && width === 360) await page.screenshot({ path: `${out}/48d-beta-360.png` });
     }
     // Поворот телефона / окно Telegram Desktop: название выбирает размер при отрисовке,
     // а шапку никто не вызывал — после широкого окна оно оставалось крупным и теснило флаг
@@ -1283,8 +1570,8 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     const fs = require("fs"), f = `${sandboxRoot}/reboot.txt`, R = "#app:not(.reloading) ";
     fs.writeFileSync(f, "новое ядро 6.8.0-146 — нужна перезагрузка\n");
     try {
-      // Сводку бот держит в кэше 5 с — повод появился мимо awg2
-      await page.waitForTimeout(5500);
+      // Сводку бот держит в кэше — повод появился мимо awg2
+      await page.waitForTimeout(CACHE_WAIT);
       await nav("/", R + "[data-name=alerts] >> text=новое ядро 6.8.0-146 — нужна перезагрузка");
       await shot("04-reboot-alert");
       await nav("/server", R + "[data-name=alerts] >> text=новое ядро 6.8.0-146");
@@ -1294,7 +1581,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       if (await page.$("text=новое ядро 6.8.0-146")) throw new Error("на обзоре убранное замечание вернулось");
       // Ещё более новое ядро — другой текст: замечание снова на месте
       fs.writeFileSync(f, "новое ядро 6.8.0-150 — нужна перезагрузка\n");
-      await page.waitForTimeout(5500);
+      await page.waitForTimeout(CACHE_WAIT);
       await nav("/", R + "[data-name=alerts] >> text=новое ядро 6.8.0-150 — нужна перезагрузка");
     } finally {
       fs.unlinkSync(f);
@@ -1305,17 +1592,17 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     const fs = require("fs"), f = `${sandboxRoot}/reboot.txt`, R = "#app:not(.reloading) ", t = "обновлены пакеты — нужна перезагрузка";
     fs.writeFileSync(f, t + "\n");
     try {
-      await page.waitForTimeout(5500);
+      await page.waitForTimeout(CACHE_WAIT);
       await nav("/", R + `[data-name=alerts] >> text=${t}`);
       await page.click("[data-name=alerts] .row:has-text('обновлены пакеты') button[aria-label=Убрать]");
       await page.waitForSelector(`text=${t}`, { state: "detached" });
     } finally { fs.unlinkSync(f); }
     // Перезагрузились — повод другой (в песочнице — «модуль не загружен»); потом пакеты обновились снова: текст тот же, замечание должно вернуться
-    await page.waitForTimeout(5500);
+    await page.waitForTimeout(CACHE_WAIT);
     await nav("/", R + "[data-name=routes]");
     fs.writeFileSync(f, t + "\n");
     try {
-      await page.waitForTimeout(5500);
+      await page.waitForTimeout(CACHE_WAIT);
       await nav("/", R + `[data-name=alerts] >> text=${t}`);
     } finally { fs.unlinkSync(f); await page.evaluate(() => localStorage.removeItem("awg-hidden-alerts")); }
   });
@@ -1336,8 +1623,8 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     const fs = require("fs"), warpConf = `${sandboxRoot}/etc/wireguard/warp0.conf`;
     fs.writeFileSync(warpConf, "[Interface]\nPrivateKey = P\nAddress = 172.16.0.2/32\n");
     try {
-      // Сводку обфускатора бот держит в кэше 5 с — профиль WARP появился мимо awg2
-      await page.waitForTimeout(5500);
+      // Сводку обфускатора бот держит в кэше — профиль WARP появился мимо awg2
+      await page.waitForTimeout(CACHE_WAIT);
       await nav("/wgobf", R + ".rchips button[data-v=warp]");
       await page.click(".rchips button[data-v=warp]");
       await page.waitForSelector(".toast >> text=через WARP");
@@ -1501,13 +1788,15 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/bot", "text=Уведомления");
     await page.click("text=Уведомления");
     await page.waitForSelector("h1:has-text('Уведомления')");
-    if (await page.locator(".switch.on").count() !== 8) throw new Error("ждали 8 включённых уведомлений");
+    if (await page.locator(".switch.on").count() !== 10) throw new Error("ждали 10 включённых уведомлений");
+    await page.waitForSelector(".card.item:has-text('Xray: через выход трафик не идёт и снова работает')");
+    await page.waitForSelector(".card.item:has-text('Exit-нода не отвечает и снова работает')");
     await page.waitForSelector(".card.item:has-text('WARP упал или не отвечает и снова работает')");
     await page.waitForSelector(".card.item:has-text('Пятница: поддержать проект') >> text=только владельцу");
     await page.click(".card.item >> text=Диск заполнен");
-    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 7);
+    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 9);
     await nav("/bot/alerts", ".switch");
-    if (await page.locator(".switch.on").count() !== 7) throw new Error("выключенное уведомление не сохранилось");
+    if (await page.locator(".switch.on").count() !== 9) throw new Error("выключенное уведомление не сохранилось");
     await shot("52a-alerts");
   });
   await step("меню бота в чат", async () => {
@@ -1675,7 +1964,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       const routes = ("/ /add /backup /backup/restore /bot /bot/admins /bot/alerts /bot/app /bot/look /bot/proxy /bulk /client/alice "
         + "/client/alice/date /client/alice/limit /client/alice/mimicry /client/alice/note /client/alice/qr /client/alice/rename /client/alice/speed /clients "
         + "/diag /diag/dpi /diag/logs /diag/sniff /log/warp /server /server/amnezia /server/antiscan /server/create /server/endpoint /server/module "
-        + "/server/vkblock "
+        + "/server/vkblock /server/entries /tunnels/rudirect /tunnels/fail /diag/route /diag/route/alice "
         + "/server/params /server/proto /tunnels /tunnels/cascade /tunnels/cascade/add /tunnels/dns /tunnels/dns/manual /tunnels/exits "
         + "/tunnels/exits/add /tunnels/tun2socks /tunnels/warp /tunnels/warp/clients /tunnels/warp/endpoint /tunnels/warp/import "
         + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /update /wgobf /wgobf/add /wgobf/client/ob1").split(" ");

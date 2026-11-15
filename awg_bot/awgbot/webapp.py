@@ -80,7 +80,9 @@ def check_init_data(init_data: str, token: str, now: float | None = None) -> dic
         user = json.loads(pairs.get("user") or "{}")
     except (ValueError, TypeError):
         return None
-    if (now or time.time()) - auth > MAX_AGE or not isinstance(user, dict) or not user.get("id"):
+    current = time.time() if now is None else now
+    age = current - auth
+    if age > MAX_AGE or age < -300 or not isinstance(user, dict) or not user.get("id"):
         return None
     return user
 

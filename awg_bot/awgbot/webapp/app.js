@@ -225,7 +225,7 @@ function barChart(items, { def = items.length - 1, axis = null } = {}) {
     plot.append(hit);
   });
   plot.append(svg("line", { class: "base", x1: 0, x2: W, y1: H - 0.5, y2: H - 0.5 }));
-  plot.addEventListener("pointerleave", () => show(def, false));
+  plot.addEventListener("pointerleave", () => { if (n) show(def, false); });
   if (n) show(def, false);
   box.append(cap, plot, axis || h("div", { class: "ax" }, h("span", {}), h("span", {}, `макс ${fmtBytes(max)}`), h("span", {})));
   return box;
@@ -268,7 +268,7 @@ function lineChart(d, { H = 80 } = {}) {
     hit.addEventListener("click", () => show(i, true));
     plot.append(hit);
   });
-  plot.addEventListener("pointerleave", () => show(n - 1, false));
+  plot.addEventListener("pointerleave", () => { if (n) show(n - 1, false); });
   if (n) show(n - 1, false);
   box.append(cap, h("div", { class: "plotw" }, plot, n ? dot : null), dayAxis(d, max));
   return box;
@@ -2031,10 +2031,12 @@ const alertCard = (alerts) => (alerts.length ? h("div", { class: "card warn", "d
 
 // Предупреждения сервера — те же, что были на главной
 function homeAlerts(d) {
-  const s = d.server || {}, c = d.components || {};
+  const s = d.server || {}, c = d.components || {}, t = d.tunnels || {};
   forgetAlerts(d.components, c.reboot);
   return [
     s.exists && !s.up ? ["awg0 не поднят — Сервер → Починить", "/server"] : null,
+    t.xray_fail ? [t.xray_fail === "down" ? "Xray включён, но не запущен — перезапусти его"
+      : "Xray: через выход трафик не идёт — проверь ссылку выхода", "/tunnels/xray"] : null,
     c.installed && c.reboot && !alertHidden(c.reboot) ? [c.reboot, "/server/module", !/не (собран|загружен)/.test(c.reboot)] : null,
     c.kernel_gap ? [`Ядро ${c.kernel_gap} без модуля AWG — пересобрать до перезагрузки`, "/server/module"] : null,
     d.update ? [`Доступна ${d.update} — обновить`, "/update"] : null,
@@ -2773,6 +2775,24 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
   const enc = encodeURIComponent(name);
   const chartBox = h("div");
   call("traffic", "daily", name, 30).then((t) => t && t.total && chartBox.replaceChildren(lineChart(t))).catch(() => {});
+  // Точка входа (каскад) — выбор в карточке, если входы есть или клиент на входе
+  const entryBox = h("div");
+  call("entry", "list").then((ents) => {
+    if (!ents || !(ents.some((e) => e.name) || c.entry)) return;
+    const cur = c.entry || "";
+    const at = ents.find((e) => e.name === cur);
+    entryBox.replaceChildren(h("div", { class: "card rcard" }, h("div", { class: "eyebrow" }, "вход"),
+      h("div", { class: "chips rchips" }, ents.map((e) => h("button", {
+        class: e.name === cur ? "on" : !entryUsable(e) ? "locked" : null, "data-v": e.name,
+        title: entryUsable(e) ? e.addr : ENTRY_LOCKED,
+        onclick: (ev) => (e.name === cur ? null : !entryUsable(e) ? fail(new Error(ENTRY_LOCKED)) : busy(ev.currentTarget, async () => {
+          await call("client", "entry", name, e.name || "direct");
+          haptic(); toast(`Вход ${name}: ${e.name || "напрямую"} — отправь клиенту новый конфиг или QR`, 4500);
+          S.clients = null; render();
+        })) }, e.name || "Напрямую"))),
+      h("div", { class: "muted small" }, "Endpoint в конфиге: ", h("span", { class: "mono" }, at ? at.addr : "—"), " · ",
+        linkTo("Точки входа →", "/server/entries"))));
+  }).catch(() => {});
 
   async function setExpire(btn) {
     const v = await sheet("Срок действия", [
@@ -2838,7 +2858,8 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
       const t = kind === "warp" ? "WARP" : "Xray";
       body = pick([["on", "Через " + t], ["off", "Напрямую"]], c[kind] !== false ? "on" : "off", (v) => call("tunnels", "client", kind, name, v));
     }
-    return h("div", { class: "card rcard" }, h("div", { class: "eyebrow" }, "маршрут"), body);
+    return h("div", { class: "card rcard" }, h("div", { class: "eyebrow" }, "маршрут"), body,
+      h("div", { class: "small", style: "margin-top:6px" }, linkTo("🧭 Куда идёт адрес →", `/diag/route/${enc}`)));
   }
 
   const area = (a, ...el) => h("div", { class: "a-" + a }, el);
@@ -2856,7 +2877,7 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
       c.endpoint ? kv("Адрес клиента", h("span", { class: "mono" }, c.endpoint.replace(/:\d+$/, ""))) : null,
       c.amnezia ? kv("Из Amnezia", (c.amnezia !== name ? `«${c.amnezia}» · ` : "") + "конфиг есть только у клиента")
         : kv("Мимикрия", h("span", { class: "mono" }, !c.mimicry || c.mimicry === "none" ? "без I1-I5" : c.mimicry)),
-      c.note ? kv("Заметка", c.note) : null), routeCard()),
+      c.note ? kv("Заметка", c.note) : null), routeCard(), entryBox),
     area("traf", h("div", { class: "card" },
       kv("За месяц", fmtBytes(c.month)), kv("Сегодня", fmtBytes(c.today)),
       kv("Лимит", badMeta(c, "limit") ? "метка повреждена — клиент заблокирован, задай лимит заново"
@@ -3235,7 +3256,8 @@ route(/^\/server$/, async (ctx) => {
         tag("MTU " + d.mtu), tag(d.region === "ru" ? "Россия" : "мир", "", "globe")],
       lines: [h("span", { onclick: (ev) => { ev.stopPropagation(); copy(d.endpoint); }, style: "cursor:pointer" }, d.endpoint || "", " ", icon("copy"))],
       acts: [act("refresh-cw", "Рестарт", (b) => quickAsk(b, AWG0_RESTART, "awg0 перезапущен", ["server", "restart"])),
-        act("shuffle", "Протокол", () => go("/server/proto")), act("globe", "Endpoint", () => go("/server/endpoint"))] })
+        act("shuffle", "Протокол", () => go("/server/proto")), act("globe", "Endpoint", () => go("/server/endpoint")),
+        act("map-pin", "Входы", () => go("/server/entries"))] })
       : ecard({ name: "Сервер не создан", right: pill(d.installed ? "компоненты есть" : "нет компонентов", d.installed ? "ok" : "warn"),
         lines: ["Создай сервер — те же вопросы, что в меню awg2"] }),
     d.exists ? statGrid([
@@ -3256,6 +3278,7 @@ route(/^\/server$/, async (ctx) => {
       menuItem("🧩 Модуль ядра", "версии, обновление, откат", () => go("/server/module")),
       menuItem("🛡 Антисканер", "сети сканеров РКН и госорганов — не до портов сервера", () => go("/server/antiscan")),
       menuItem("🚫 VK и Max мимо VPN", "клиенты VPN не ходят через сервер в сети VK", () => go("/server/vkblock")),
+      d.exists ? menuItem("📍 Точки входа", "клиенты через другой сервер (каскад) — свой Endpoint", () => go("/server/entries")) : null,
       amzOn ? menuItem("🐳 Перенос из Amnezia", amz.migrated ? "сделан — вернуть или удалить контейнер"
         : "сервер из Docker-контейнера, клиенты без перевыдачи", () => go("/server/amnezia")) : null,
       menuItem(d.installed ? "📦 Компоненты" : "📦 Установить компоненты", "пакеты, модуль, amneziawg-tools",
@@ -3457,8 +3480,10 @@ route(/^\/server\/create$/, async (ctx) => {
       h("label", {}, "Подсеть клиентов"), net,
       hint("Случайная — меньше шансов совпасть с домашней сетью клиента"),
       h("label", {}, "UDP-порт — 443 или 1024-65535"), port,
-      h("label", {}, "Домен для конфигов (необязательно)"), ep,
-      hint("С доменом сервер можно перенести без перевыдачи конфигов. A-запись должна указывать сюда"),
+      info.ipv6 ? switchRow("Клиенты — по IPv6", `адрес ${info.ipv6}; у кого в сети IPv6 нет — вход «напрямую» в карточке клиента`,
+        !!f.v6, (on) => { f.v6 = on; draw(); }) : null,
+      f.v6 ? null : [h("label", {}, "Домен для конфигов (необязательно)"), ep,
+        hint("С доменом сервер можно перенести без перевыдачи конфигов. A-запись должна указывать сюда")],
       h("label", {}, "Имя первого клиента"), first,
     ].flat(Infinity).filter((n) => n != null));
   }
@@ -3486,7 +3511,8 @@ route(/^\/server\/create$/, async (ctx) => {
       a.push(`port=${+p}`);
     }
     const e = ep.value.trim().toLowerCase();
-    if (e) {
+    if (f.v6 && info.ipv6) a.push("endpoint=ipv6");
+    else if (e) {
       if (!DOMAIN_RE.test(e)) throw new Error("Домен — имя вида vpn.example.com");
       a.push(`endpoint=${e}`);
     }
@@ -3647,7 +3673,148 @@ route(/^\/server\/endpoint$/, async (ctx) => {
       if (!DOMAIN_RE.test(v)) return fail(new Error("Нужно имя вида vpn.example.com"));
       return save(b, v);
     }, "btn-primary btn-block"),
-    d.domain ? btn("🔢 Вернуть публичный IP", (b) => save(b, "ip"), "btn-block") : null);
+    d.domain ? btn("🔢 Вернуть публичный IP", (b) => save(b, "ip"), "btn-block") : null,
+    h("div", { class: "muted small", style: "margin:8px 4px" }, "Клиентам через другой сервер (каскад) — ",
+      linkTo("📍 Точки входа", "/server/entries"), ": у них в конфиге адрес входа, смена Endpoint их не трогает."));
+});
+
+// Выдать вход выбранным клиентам: отметка, «Все», затем конфиги архивом
+route(/^\/server\/entries\/([^/]+)\/clients$/, async (ctx, key) => {
+  const ename = key === "-" ? "" : key;
+  const [ents] = await Promise.all([call("entry", "list"), loadClients()]);
+  const e = (ents || []).find((r) => r.name === ename);
+  const label = ename || "Напрямую";
+  if (!e) return ctx.put(title("📍 " + label), h("div", { class: "card empty" }, "Такой точки входа уже нет"));
+  if (!entryUsable(e)) {
+    return ctx.put(title("📍 " + label), h("div", { class: "card" }, h("b", {}, "🔒 Вход не прошёл проверку"),
+      h("div", { class: "muted small", style: "margin-top:6px" }, ENTRY_LOCKED)),
+    btn("🩺 Проверить", (b) => quick(b, "Вход работает", ["entry", "check", e.name]), "btn-primary btn-block"));
+  }
+  const rows = sortRows((S.clients.rows || []).filter((c) => c.name && !c.amnezia), "name");
+  const sel = new Set();
+  const list = h("div"), bar = h("div", { class: "bar" });
+  function draw() {
+    list.replaceChildren(...rows.map((c) => ecard({ cls: sel.has(c.name) ? "sel" : "", name: c.name, attrs: { "data-name": c.name },
+      onopen: () => { sel.has(c.name) ? sel.delete(c.name) : sel.add(c.name); draw(); },
+      right: h("div", { class: "check" + (sel.has(c.name) ? " on" : "") }, sel.has(c.name) ? icon("check") : null),
+      meta: [(c.entry || "") === ename ? tag("уже здесь", "accent", "map-pin") : tag(c.entry ? "вход " + c.entry : "напрямую")],
+      lines: [c.ip] })));
+    bar.replaceChildren(
+      h("button", { onclick: () => { const all = rows.every((c) => sel.has(c.name));
+        rows.forEach((c) => (all ? sel.delete(c.name) : sel.add(c.name))); draw(); } }, "Все"),
+      h("button", { class: "btn-primary", disabled: !sel.size || null, onclick: (ev) => give(ev.currentTarget) },
+        icon("map-pin"), `Выдать ${sel.size || ""}`));
+  }
+  async function give(b) {
+    const picked = rows.filter((c) => sel.has(c.name)).map((c) => c.name);
+    if (!picked.length || !await confirmTg(`Вход «${label}» — клиентам: ${picked.length}. Endpoint в их конфигах станет ${e.addr}; `
+      + "в старых конфигах прежний адрес — клиентам нужны новые.")) return;
+    await busy(b, async () => {
+      const r = await callR(["entry", "clients", e.name || "direct", picked.join(",")], { timeout: 300 });
+      const done = Array.isArray(r.data) ? r.data : picked;
+      haptic(); S.clients = null;
+      ctx.put(title("📍 " + label),
+        h("div", { class: "card" }, h("b", {}, `✅ Вход «${label}»: ${done.length}`),
+          h("div", { class: "muted small", style: "margin-top:6px" }, done.join(", ")),
+          kv("Endpoint", h("span", { class: "mono" }, e.addr))),
+        hint("В старых конфигах прежний адрес — отправь клиентам новые конфиги или QR."),
+        h("button", { class: "btn-primary btn-block", onclick: (ev) => busy(ev.currentTarget,
+          () => deliver({ what: "zip", names: done }, "Архив конфигов — в чате с ботом")) },
+        TO("📦 Конфиги архивом в чат", "📦 Скачать конфиги архивом")),
+        h("button", { class: "btn-block", onclick: () => replace("/server/entries") }, "📍 К точкам входа"));
+    });
+  }
+  ctx.put(title("📍 " + label),
+    hint(`Отметь клиентов: им выдаётся ${e.name ? "адрес входа" : "адрес сервера"} ${e.addr}, затем — новые конфиги и QR.`),
+    rows.length ? list : h("div", { class: "card empty" }, "Клиентов нет"), rows.length ? bar : null);
+  draw();
+});
+
+route(/^\/server\/entries\/([^/]+)$/, async (ctx, name) => {
+  const e = ((await call("entry", "list")) || []).find((r) => r.name === name);
+  if (!e) return ctx.put(title("📍 " + name), h("div", { class: "card empty" }, "Такой точки входа уже нет"));
+  const addr = h("input", { value: e.addr, placeholder: "203.0.113.5:443", autocapitalize: "off", autocomplete: "off", inputmode: "url" });
+  ctx.put(title("📍 " + name),
+    h("div", { class: "card" }, kv("Адрес", h("span", { class: "mono" }, e.addr)), kv("Клиентов", String(e.clients || 0))),
+    h("label", {}, "Новый адрес: хост:порт, проброшенный на этот сервер"), addr,
+    btn("💾 Сохранить", (b) => {
+      const a = addr.value.replace(/\s/g, "");
+      if (!ENTRY_ADDR_RE.test(a)) return fail(new Error("Нужен хост:порт, например 203.0.113.5:443"));
+      return quick(b, "Адрес изменён", ["entry", "set", name, a], () => back());
+    }, "btn-primary btn-block"),
+    e.clients ? hint(`Endpoint перепишется в конфигах ${e.clients} клиентов — им нужен новый конфиг или QR.`) : null);
+});
+
+// Точки входа (каскад): клиент подключается через сервер-вход — любой сервер,
+// где UDP-порт проброшен на этот. Первая строка списка — «напрямую» (имя пустое)
+const ENTRY_ADDR_RE = /^(\[[0-9a-f:.]+\]|[a-z0-9.-]+):\d{1,5}$/i;
+// Выдавать вход клиентам можно, если проверка прошла или проверить нельзя;
+// не прошёл или не проверялся — кнопки выдачи заперты (awg2 и сам проверит)
+const entryUsable = (e) => !e.name || e.check === "ok" || e.check === "unknown";
+const ENTRY_LOCKED = "Вход не прошёл проверку: через него пакеты не доходят до сервера. Проверь проброс на сервере-входе и нажми «Проверить».";
+function entryStatus(e) {
+  if (!e.name) return null;
+  const ago = Math.floor(Date.now() / 1000) - (e.checked || 0);
+  const when = !e.checked ? "" : ago < 3600 ? ` · ${Math.floor(ago / 60)} мин назад` : ago < 172800 ? ` · ${Math.floor(ago / 3600)} ч назад` : "";
+  return { ok: ["работает" + when, "ok"], fail: ["пакеты не доходят" + when, "bad"], unknown: ["проверить нельзя", "warn"] }[e.check]
+    || ["не проверялся", "warn"];
+}
+// Кнопка выдачи входа: заперта — серая, по нажатию объясняет почему
+function entryAct(e, ic, label, fn) {
+  if (entryUsable(e)) return act(ic, label, fn);
+  const b = act("lock", label, () => fail(new Error(ENTRY_LOCKED)));
+  b.classList.add("locked");
+  b.title = ENTRY_LOCKED;
+  return b;
+}
+route(/^\/server\/entries$/, async (ctx) => {
+  const [list, info] = await Promise.all([call("entry", "list"), call("server", "info").catch(() => ({}))]);
+  const rows = list || [];
+  // IPv6 этого сервера — входом в одно нажатие, если его ещё нет
+  const v6 = (info && info.ipv6) || "";
+  const v6New = !!v6 && !rows.some((e) => String(e.addr || "").startsWith(`[${v6}]`));
+  const name = h("input", { placeholder: "Каскад NL", maxlength: 24, autocomplete: "off" });
+  const addr = h("input", { placeholder: "203.0.113.5:443", autocapitalize: "off", autocomplete: "off", inputmode: "url" });
+  const label = (e) => e.name || "Напрямую";
+  const arg = (e) => e.name || "direct";
+  const card = (e) => {
+    const st = entryStatus(e);
+    return ecard({ state: !entryUsable(e) ? "bad" : e.clients ? "on" : "", name: label(e), attrs: { "data-name": e.name },
+    right: e.default ? pill("для новых", "ok") : null,
+    meta: [tag("клиентов " + (e.clients || 0), "", "users"), st ? tag(st[0], st[1], entryUsable(e) ? "circle-check" : "lock") : null],
+    lines: [h("span", { class: "mono" }, e.addr || ""), e.name ? null : "этот сервер: IP или домен из «Endpoint»",
+      entryUsable(e) ? null : "🔒 Выдать клиентам нельзя, пока вход не пройдёт проверку"],
+    acts: [
+      e.name ? act("stethoscope", "Проверить", (b) => quick(b, "Вход работает", ["entry", "check", e.name])) : null,
+      e.name ? act("pencil", "Адрес", () => go("/server/entries/" + encodeURIComponent(e.name))) : null,
+      entryAct(e, "list-checks", "Выбрать", () => go(`/server/entries/${e.name ? encodeURIComponent(e.name) : "-"}/clients`)),
+      e.default ? null : entryAct(e, "user-plus", "Для новых", (b) => quick(b, `Новые клиенты — ${e.name ? "через «" + e.name + "»" : "напрямую"}`,
+        ["entry", "default", arg(e)])),
+      entryAct(e, "users", "Всех сюда", (b) => quickAsk(b, `Перевести всех клиентов на «${label(e)}»? Endpoint перепишется во всех конфигах `
+        + `на ${e.addr} — каждому клиенту нужен новый конфиг или QR.`, "Клиенты переведены", ["entry", "all", arg(e)])),
+      e.name ? act("trash-2", "Удалить", (b) => quickAsk(b, `Удалить точку входа «${e.name}»?`
+        + (e.clients ? ` Её клиенты (${e.clients}) перейдут на «напрямую» — им нужен новый конфиг.` : ""),
+      "Точка входа удалена", ["entry", "del", e.name]), "bad") : null].filter(Boolean) });
+  };
+  ctx.put(title("📍 Точки входа"),
+    hint("Клиент подключается через сервер-вход — любой сервер, где UDP-порт проброшен на этот (каскад Тулзы, iptables, "
+      + "nginx stream). В конфиге и QR такого клиента Endpoint — адрес входа, остальное как у всех. Вход клиенту — в его "
+      + "карточке, всем новым — «Для новых»."),
+    rows.map(card),
+    v6New && rows.length <= 20 ? [h("div", { class: "card" }, h("b", {}, "🌐 У сервера есть IPv6"),
+      h("div", { class: "muted small", style: "margin-top:6px" }, h("span", { class: "mono" }, v6),
+        " — клиентов можно подключать по нему. У кого в сети IPv6 нет — оставь им «напрямую» (IPv4).")),
+    btn("🌐 IPv6 этого сервера", (b) => quick(b, "IPv6 сервера добавлен", ["entry", "add-ipv6"]), "btn-block")] : null,
+    rows.length <= 20 ? [h("h2", {}, "Новая точка входа"),
+      h("label", {}, "Название — до 24 символов"), name,
+      h("label", {}, "Адрес входа: хост:порт, проброшенный на этот сервер ([IPv6]:порт — тоже)"), addr,
+      btn("➕ Добавить", (b) => {
+        const n = name.value.trim().replace(/\s+/g, " ");
+        const a = addr.value.replace(/\s/g, "");
+        if (!n || n.length > 24 || /[|,=#]/.test(n)) return fail(new Error("Название — до 24 символов: буквы, цифры, пробел, точка, _ и -"));
+        if (!ENTRY_ADDR_RE.test(a)) return fail(new Error("Нужен хост:порт, например 203.0.113.5:443"));
+        return quick(b, "Точка входа добавлена", ["entry", "add", n, a]);
+      }, "btn-primary btn-block")] : null);
 });
 
 route(/^\/server\/module$/, async (ctx) => {
@@ -3758,7 +3925,8 @@ async function tunnelsCards(ctx) {
       const own = (X.clients || []).length, i = ifs.xray0 || {};
       iface = "xray0";
       chips = [kchip(`${outs.length} ${plural(outs.length, "выход", "выхода", "выходов")}`, outs.length ? "acc" : ""),
-        X.balancer && X.balancer !== "off" ? kchip(X.balancer, "", "scale") : null, X.ru ? kchip("РФ напрямую") : null];
+        X.balancer && X.balancer !== "off" ? kchip(X.balancer, "", "scale") : null, X.ru ? kchip("РФ напрямую") : null,
+        X.fail ? kchip(X.fail === "down" ? "не запущен" : "трафик не идёт", "bad") : null];
       kv = [["По умолчанию", X.main || "—"], ["Свой выход", own ? `у ${own} ${plural(own, "клиента", "клиентов", "клиентов")}` : "ни у кого"]];
       rx = i.rx || 0; tx = i.tx || 0;
       install = () => runJob(ctx, "Установка Xray", ["xray", "install"]);
@@ -3784,7 +3952,7 @@ async function tunnelsCards(ctx) {
       canOn = nodes.length > 0; why = !nodes.length ? "Сначала добавь ноду" : null;
     }
     const open = () => go("/tunnels/" + k);
-    const state = on ? "on" : !conf ? "none" : W.failed && k === "warp" ? "bad" : "";
+    const state = (k === "xray" && X.fail) || (W.failed && k === "warp") ? "bad" : on ? "on" : !conf ? "none" : "";
     const del = TUN_DEL[k];
     return kcard({ view, state, name: TUN_NAME[k], iface, chips, attrs: { "data-name": TUN_NAME[k], "data-tunnel": k }, onopen: open,
       right: [on && del ? klock("Работает — удалить можно после выключения") : null,
@@ -3799,11 +3967,11 @@ async function tunnelsCards(ctx) {
           del ? kact("trash-2", "Удалить", (b) => quickAsk(b, ...del), "bad", lock)
             : kact("plus", "Нода", () => go("/tunnels/exits/add"))] });
   }
-  const nodeCard = (n) => kcard({ view, state: n.up ? "on" : exitsUp ? "bad" : "", name: n.name, iface: "awg-exit-" + n.name,
+  const nodeCard = (n) => kcard({ view, state: n.health === "down" ? "bad" : n.up ? "on" : exitsUp ? "bad" : "", name: n.name, iface: "awg-exit-" + n.name,
     attrs: { "data-name": "node-" + n.name }, onopen: () => go("/tunnels/exits"),
     chips: [kchip(n.proto === "awg" ? "AWG" : "WG", n.proto === "awg" ? "acc" : ""),
       E.balancer === "ecmp" ? kchip("ECMP", "", "scale") : E.single === n.name ? kchip("основная", "ok") : null,
-      n.up ? null : kchip(exitsUp ? "лежит" : "выключена", exitsUp ? "bad" : "")],
+      n.health === "down" ? kchip("не отвечает", "bad") : n.up ? null : kchip(exitsUp ? "лежит" : "выключена", exitsUp ? "bad" : "")],
     kv: [["Сервер", masked(n.endpoint || "")], ["Рукопожатие", n.up ? agoText(n.hs) : "—"]].concat(trafficKv(n.rx || 0, n.tx || 0)),
     extra: kTraffic(n.rx || 0, n.tx || 0),
     acts: [kact("users", "Клиенты", () => go("/tunnels/exits")), kact("file-text", "Журнал", () => go("/log/exits")),
@@ -3834,7 +4002,16 @@ async function tunnelsCards(ctx) {
     kcard({ view: "list", state: d.dns === "up" ? "on" : d.dns === "off" ? "warn" : "none", name: "Шифрованный DNS", iface: "dnscrypt-proxy",
       attrs: { "data-name": "Шифрованный DNS" }, onopen: () => go("/tunnels/dns"),
       chips: [kchip("DoH", "", "lock-keyhole"), kchip(STATE_WORD[d.dns] || "—", d.dns === "up" ? "ok" : d.dns === "off" ? "warn" : "")],
-      right: [kgear("Шифрованный DNS", () => go("/tunnels/dns"))] })];
+      right: [kgear("Шифрованный DNS", () => go("/tunnels/dns"))] }),
+    kcard({ view: "list", state: d.rudirect ? "on" : "none", name: "РФ напрямую", iface: "сайты России мимо туннеля",
+      attrs: { "data-name": "РФ напрямую" }, onopen: () => go("/tunnels/rudirect"),
+      chips: [kchip(d.rudirect ? "включено" : "выключено", d.rudirect ? "ok" : "", "map-pin")],
+      right: [kgear("РФ напрямую", () => go("/tunnels/rudirect"))] }),
+    kcard({ view: "list", state: d.held ? "bad" : d.fail_block ? "on" : "none", name: "Если туннель упал", iface: "напрямую или блокировать",
+      attrs: { "data-name": "Если туннель упал" }, onopen: () => go("/tunnels/fail"),
+      chips: [kchip(d.held ? "удерживает: " + d.held : d.fail_block ? "где-то «блокировать»" : "напрямую",
+        d.held ? "bad" : d.fail_block ? "acc" : "", d.fail_block ? "shield" : "shield-off")],
+      right: [kgear("Если туннель упал", () => go("/tunnels/fail"))] })];
 
   async function add() {
     if (tab === "nodes") return go("/tunnels/exits/add");
@@ -4038,6 +4215,10 @@ route(/^\/tunnels\/xray$/, async (ctx) => {
     if (v) await quick(b, "Балансировщик: " + v, ["xray", "balancer", v]);
   }
   ctx.put(title("🛰 Xray"), logCard(r.log),
+    d.fail === "notraffic" ? h("div", { class: "card warn", "data-name": "xray-fail" },
+      h("b", {}, "▲ Через выход трафик не идёт"), " — клиенты Xray не в туннеле. Проверь ссылку выхода: она могла устареть "
+      + "или сервер выхода недоступен. «🩺 Диагностика» ниже покажет, какой выход не отвечает; устарела — добавь новую "
+      + "ссылку, старую удали и перезапусти Xray. Подробности — «📜 Журнал».") : null,
     inst ? switchRow("🇷🇺 РФ напрямую", "российские сайты мимо Xray", d.ru,
       (on) => runJob(ctx, `РФ-сайты напрямую: ${on ? "вкл" : "выкл"}`, ["xray", "ru", on ? "on" : "off"])) : null,
     inst ? [h("h2", {}, "Выходы"),
@@ -4103,6 +4284,16 @@ route(/^\/tunnels\/tun2socks$/, async (ctx) => {
       d.proxy ? btn("🗑 Удалить", (b) => quickAsk(b, "Удалить tun2socks (служба, бинарь, адрес прокси)?", "tun2socks удалён",
         ["t2s", "remove"]), "btn-danger") : null));
 });
+
+// Ноды в порядке общего выхода (основная, запасные) и их состояние у сторожа
+const exOrder = (d) => {
+  const by = Object.fromEntries((d.nodes || []).map((n) => [n.name, n]));
+  const names = (d.order || []).filter((n) => by[n]);
+  return names.concat((d.nodes || []).map((n) => n.name).filter((n) => !names.includes(n))).map((n) => by[n]);
+};
+const EX_WHY = { silent: "не отвечает", nonet: "на связи, но выхода в интернет нет", link: "интерфейс не поднят" };
+const exNodeState = (n) => (n.health === "down" ? `▲ ${EX_WHY[n.why] || "не отвечает"} с ${fmtTime(n.since)} — выпала из общего выхода`
+  : n.up ? "работает" + (n.hs ? " · рукопожатие " + agoText(n.hs) : "") : "лежит");
 
 // AWG exit-ноды: туннель вкл/выкл, кого вести (все или выбранные), выбор клиентов
 // и ноды каждому — на одном экране
@@ -4190,11 +4381,21 @@ route(/^\/tunnels\/exits$/, async (ctx) => {
           : "Туннель выключен — выбор сохранится и сработает, когда его включишь.")]
         : hint("Все клиенты идут через ноды. «Выбранные» — отметить, кого вести; остальные — напрямую.")] : null,
     h("h2", {}, "Ноды"),
-    h("div", { class: "card list" }, nodes.length ? nodes.map((n) => h("div", { class: "item", onclick: () =>
-      quickAsk(null, `Удалить ноду ${n.name}? Её клиенты перейдут на общий выход.`, `Нода ${n.name} удалена`, ["exits", "del", n.name]) },
-    h("div", { class: "dot" + (n.up ? " on" : " bad") }),
-    h("div", { class: "main" }, h("div", { class: "title" }, n.name), h("div", { class: "sub" }, n.up ? "поднята" : "лежит")),
-    h("div", { class: "side bad" }, icon("trash-2")))) : h("div", { class: "empty" }, "Нод нет")),
+    up && d.active ? hint("Общий выход сейчас: " + String(d.active).replace(/\+/g, " + ") + ". Упавшая нода выпадает, "
+      + "основная снова отвечает — выход возвращается на неё.") : null,
+    up && d.watch === false ? h("div", { class: "small warn", style: "margin:0 4px 8px" },
+      "▲ Сторож exit-нод не запущен — автопереключения нет. Выключи и включи туннель.") : null,
+    h("div", { class: "card list", "data-name": "ex-nodes" }, nodes.length ? exOrder(d).map((n, i) => h("div", { class: "item", "data-node": n.name },
+      h("div", { class: "dot" + (n.health === "down" ? " bad" : n.up ? " on" : " bad") }),
+      h("div", { class: "main" }, h("div", { class: "title" }, n.name + " ",
+        h("span", { class: "small muted" }, d.balancer === "ecmp" ? "" : i === 0 ? "· основная" : `· запасная ${i}`)),
+      h("div", { class: "sub wrap" + (n.health === "down" ? " bad" : "") }, exNodeState(n))),
+      i > 0 && d.balancer !== "ecmp" ? h("button", { class: "chip", title: "Выше по порядку", "aria-label": "Выше: " + n.name,
+        onclick: (ev) => quick(ev.currentTarget, `${n.name} — ${i === 1 ? "основная" : "запасная " + (i - 1)}`,
+          ["exits", "order", ...exOrder(d).map((x) => x.name).map((x, j, a) => (j === i - 1 ? a[i] : j === i ? a[i - 1] : x))]) }, "⬆") : null,
+      h("div", { class: "side bad", role: "button", tabindex: "0", title: "Удалить ноду", "aria-label": "Удалить: " + n.name, onclick: () =>
+        quickAsk(null, `Удалить ноду ${n.name}? Её клиенты перейдут на общий выход.`, `Нода ${n.name} удалена`, ["exits", "del", n.name]) },
+      icon("trash-2")))) : h("div", { class: "empty" }, "Нод нет")),
     btn("➕ Добавить ноду", () => go("/tunnels/exits/add"), "btn-block" + (nodes.length ? "" : " btn-primary")),
     h("div", { class: "actions", style: "margin-top:8px" },
       nodes.length ? btn("⚖️ Балансировка", balance) : null,
@@ -4333,6 +4534,154 @@ function openUrl(url) {
 const extLink = (url, text) => h("a", { href: url, onclick: (ev) => { ev.preventDefault(); openUrl(url); } }, text || url);
 
 // ── Диагностика ───────────────────────────────────────────
+// РФ напрямую: клиенты в туннеле ходят к сетям России мимо него. Список качает и проверяет awg2
+const RUD_LISTS = { direct: ["Всегда напрямую", "мимо туннеля, даже если адреса нет в сетях России"],
+  tunnel: ["Всегда через туннель", "в туннель, даже если адрес в сетях России"] };
+// Сервер не в России: «РФ напрямую» светит адрес входа российским приложениям
+const rudAbroad = (cc) => `Сервер не в России (${cc}): российские сайты и приложения увидят адрес сервера, к которому `
+  + "подключаются клиенты, — зарубежные адреса блокируют как раз за это. «РФ напрямую» — для сервера в России.";
+route(/^\/tunnels\/rudirect$/, async (ctx) => {
+  const d = (await call("rudirect", "status")) || {};
+  const on = !!d.enabled;
+  function listBox(kind) {
+    const items = d[kind] || [], [name, what] = RUD_LISTS[kind];
+    const inp = h("input", { placeholder: "1.2.3.4, 1.2.3.0/24 или bank.ru", autocapitalize: "off", autocomplete: "off",
+      "aria-label": name, style: "flex:1;min-width:0" });
+    const add = btn("➕ Добавить", (b) => {
+      const v = inp.value.trim();
+      if (!v || /\s/.test(v)) return fail(new Error("Нужен один адрес, подсеть или домен"));
+      return quick(b, "Добавлено", ["rudirect", "add", kind, v]);
+    });
+    add.style.flex = "none"; add.style.whiteSpace = "nowrap";
+    return [h("h2", {}, name + (items.length ? " · " + items.length : "")),
+      hint("Адрес, подсеть или домен (можно ссылкой) — " + what + ". Домен перечитывается раз в час: адреса сайтов меняются."),
+      items.length ? h("div", { class: "card list", "data-name": "rud-" + kind }, items.map((a) => h("div", { class: "item", onclick: (ev) =>
+        quickAsk(ev.currentTarget, `Убрать ${a} из списка «${name}»?`, "Убрано", ["rudirect", "del", kind, a]) },
+      h("div", { class: "main" }, h("div", { class: "title mono wrap" }, a)), h("div", { class: "side bad" }, icon("x"))))) : null,
+      h("div", { class: "row", style: "gap:8px;margin-top:8px" }, inp, enterTo(add, inp)),
+      items.length > 1 ? h("div", { class: "actions", style: "margin-top:8px" }, btn("🧹 Очистить", (b) => quickAsk(b,
+        `Очистить список «${name}»?`, "Список очищен", ["rudirect", "del", kind, "all"]))) : null];
+  }
+  ctx.put(title("РФ напрямую"),
+    hint("Клиенты в туннеле (WARP, Xray, tun2socks, exit-ноды) ходят к сайтам России мимо него — прямо с сервера. "
+      + "Полезно, когда сервер в России, а выход за границей: банки и госсервисы видят российский адрес, а выход не тратится на них."),
+    h("div", { class: "card", "data-name": "rudirect-status" },
+      kv("Статус", !on ? h("span", { class: "muted" }, "○ выключено") : d.active ? h("span", { class: "ok" }, "● включено")
+        : h("span", { class: "warn" }, "▲ правило не на месте")),
+      on ? kv("Сетей России", num(d.ru)) : null,
+      on ? kv("Мимо туннеля", num(d.packets) + " пакетов · " + fmtBytes(d.bytes)) : null,
+      kv("Свои", `напрямую ${(d.direct || []).length} · через туннель ${(d.tunnel || []).length}`),
+      d.updated ? kv("Список", fmtTime(d.updated) + (d.src ? " · " + d.src : "")) : null,
+      d.error ? h("div", { class: "small warn" }, "▲ " + d.error) : null,
+      d.xray_ru ? h("div", { class: "small muted" }, "У Xray своё «РФ напрямую» (по доменам) — работает вместе с этим.") : null,
+      on && d.abroad ? h("div", { class: "small warn", "data-name": "rud-abroad", style: "padding-top:6px" }, "▲ " + rudAbroad(d.abroad)
+        + " Страна определена неверно — выбери её флагом в шапке.") : null),
+    h("div", { class: "actions", style: "margin-top:8px" },
+      on ? btn("⏹ Выключить", (b) => quickAsk(b, "Выключить? Правило снимается — клиенты в туннеле снова пойдут через него ко всем "
+        + "сайтам. Свои списки сохранятся.", "РФ напрямую выключено", ["rudirect", "off"]))
+        : btn("✅ Включить", (b) => quickAsk(b, (d.abroad ? "⚠️ " + rudAbroad(d.abroad) + "\n\n" : "")
+          + "Включить? Клиенты в туннеле пойдут к сайтам России с адреса сервера, а не выхода "
+          + "туннеля. Выключить можно здесь или в боте.", "РФ напрямую включено", ["rudirect", "on"]), "btn-primary"),
+      on ? btn("🔄 Обновить список", (b) => quick(b, "Список обновлён", ["rudirect", "update"])) : null,
+      on ? btn("🛠 Починить", (b) => quick(b, "Правила на месте", ["rudirect", "repair"])) : null,
+      btn("🧭 Куда идёт адрес", () => go("/diag/route")),
+      btn("📜 Журнал", () => go("/log/rudirect"))),
+    h("h2", {}, "✈️ Telegram"),
+    hint("Если через туннель Telegram висит на «Соединение…», а с сервера работает (WARP с сервера в России выходит в "
+      + "российской точке Cloudflare), — «Напрямую»: клиенты в туннеле пойдут в Telegram с адреса сервера."),
+    h("div", { class: "card", "data-name": "rud-tg" },
+      h("div", { class: "chips rchips" }, [["off", "Через туннель"], ["on", "Напрямую"]].map(([v, l]) => {
+        const cur = !!d.tg === (v === "on");
+        return h("button", { class: cur ? "on" : null, "data-v": v, onclick: (ev) => (cur ? null
+          : quick(ev.currentTarget, v === "on" ? "Telegram напрямую" : "Telegram — через туннель", ["rudirect", "tg", v])) }, l);
+      })),
+      !on && d.tg ? h("div", { class: "small muted", style: "margin-top:6px" }, "Заработает, когда включишь «РФ напрямую».") : null),
+    listBox("direct"), listBox("tunnel"),
+    hint("Список сетей России — ipverse (данные RIPE), обновляется раз в сутки. Клиенты без туннеля и трафик самого сервера "
+      + "не трогаются."));
+});
+
+// Если туннель упал: «напрямую» (как было) или «блокировать» — на каждый туннель
+const failState = (x) => (!x.enabled ? ["○ выключен", "muted"] : x.up ? ["● работает", "ok"]
+  : x.held ? ["▲ упал — клиенты ждут его без интернета", "bad"]
+    : ["▲ не работает" + (x.mode !== "block" ? " — клиенты идут напрямую" : ""), "warn"]);
+route(/^\/tunnels\/fail$/, async (ctx) => {
+  const rows = (await call("tunnels", "fail", "list")) || [];
+  async function set(b, x, mode) {
+    if (mode === "block" && x.enabled && !x.up && !await confirmTg(`${x.label} сейчас не работает. В режиме «блокировать» его `
+      + "клиенты сразу останутся без интернета (кроме «РФ напрямую»), пока он не поднимется. Включить?")) return;
+    await quick(b, `${x.label}: ${mode === "block" ? "блокировать" : "напрямую"}`, ["tunnels", "fail", "set", x.name, mode]);
+  }
+  ctx.put(title("🪂 Если туннель упал"),
+    hint("Что делать клиентам туннеля, когда он упал: не отвечает, служба остановилась, сервер перезагрузился, а туннель "
+      + "не поднялся."),
+    h("div", { class: "card" },
+      h("div", { class: "small", style: "padding:4px 0" }, h("b", {}, "Напрямую"),
+        " — как было: клиенты идут с адреса сервера, интернет не пропадает."),
+      h("div", { class: "small", style: "padding:4px 0" }, h("b", {}, "Блокировать"),
+        " — ждут туннель без интернета (кроме «РФ напрямую»): адрес сервера не засветится. Вернётся туннель — вернётся и интернет.")),
+    rows.map((x) => {
+      const [st, cls] = failState(x);
+      return h("div", { class: "card", "data-name": "fail-" + x.name },
+        h("div", { class: "row", style: "justify-content:space-between;gap:8px;flex-wrap:wrap" }, h("b", {}, x.label),
+          h("span", { class: "small " + cls }, st)),
+        h("div", { class: "chips rchips", style: "margin-top:8px" }, [["direct", "Напрямую"], ["block", "Блокировать"]].map(([v, l]) =>
+          h("button", { class: x.mode === v ? "on" : null, "data-v": v,
+            onclick: (ev) => (x.mode === v ? null : set(ev.currentTarget, x, v)) }, l))));
+    }),
+    h("div", { class: "actions", style: "margin-top:8px" },
+      rows.some((x) => x.mode === "block") ? btn("↪️ Всем напрямую", (b) => quickAsk(b, "Всем туннелям — «напрямую», как было? "
+        + "Удержанные клиенты сразу пойдут с адреса сервера.", "Все туннели: напрямую", ["tunnels", "fail", "set", "all", "direct"])) : null,
+      btn("📜 Журнал", () => go("/log/tunfail"))),
+    hint("Выключенный руками туннель (кнопкой или «Всё напрямую») отпускает клиентов в любом режиме. Сторож раз в минуту держит "
+      + "клиентов включённого, но не поднявшегося туннеля — в том числе после перезагрузки сервера."));
+});
+
+// Куда идёт адрес: решение ядра для клиента и адреса — туннель, напрямую,
+// «РФ напрямую», удержан упавшим туннелем, отброшен «VK и Max»
+const ROUTE_KIND = { warp: ["●", "ok"], xray: ["●", "ok"], t2s: ["●", "ok"], exit: ["●", "ok"], direct: ["○", ""],
+  rudirect: ["🇷🇺", ""], held: ["▲", "bad"], drop: ["✕", "warn"], blocked: ["⛔", "bad"], none: ["▲", "warn"] };
+route(/^\/diag\/route(?:\/([^/]+))?$/, async (ctx, who) => {
+  const names = ((await call("clients", "list")) || []).map((c) => c.name);
+  who = who ? decodeURIComponent(who) : "";
+  const sel = h("select", { "aria-label": "Клиент", style: "flex:1;min-width:0" },
+    names.map((n) => h("option", { value: n, selected: n === who ? true : null }, n)));
+  const inp = h("input", { placeholder: "1.1.1.1, ya.ru или ссылка", autocapitalize: "off", autocomplete: "off",
+    "aria-label": "Адрес", style: "flex:1;min-width:0" });
+  const out = h("div", { "data-name": "route-result" });
+  const check = btn("🧭 Проверить", (b) => {
+    const v = inp.value.trim();
+    if (!v || /\s/.test(v)) return fail(new Error("Нужен один адрес, домен или ссылка"));
+    return busy(b, async () => {
+      const d = (await call("diag", "route", sel.value, v)) || {};
+      const rows = d.rows || [], kinds = rows.map((x) => x.kind);
+      const tips = [kinds.includes("held") ? "Вернуть интернет: поднять туннель или «Если туннель упал» → Напрямую." : null,
+        rows.some((x) => x.kind === "rudirect" && !/Telegram/.test(x.note || "")) ? "Пустить адрес через туннель: «РФ напрямую» → Всегда через туннель." : null,
+        rows.some((x) => x.kind === "rudirect" && /Telegram/.test(x.note || "")) ? "Telegram через туннель: «РФ напрямую» → Telegram → «Через туннель»." : null,
+        rows.some((x) => x.kind === "direct" && /не в туннеле/.test(x.note || "")) ? "Пустить клиента в туннель: карточка клиента → маршрут." : null,
+        kinds.includes("blocked") ? "Клиент заблокирован: срок или лимит трафика — карточка клиента." : null].filter(Boolean);
+      out.replaceChildren(...[h("div", { class: "card" },
+        kv("Клиент", h("span", { class: "mono" }, d.client + (d.ip ? " · " + d.ip : ""))),
+        kv("Адрес", h("span", { class: "mono wrap" }, d.input || v)),
+        rows.map((x) => { const [m, cls] = ROUTE_KIND[x.kind] || ["•", ""];
+          return h("div", { style: "padding:6px 0", "data-kind": x.kind }, h("div", { class: cls }, m + " ", h("span", { class: "mono" }, x.ip)),
+            h("div", { class: "small muted wrap" }, x.note)); })),
+      ...tips.map((t) => hint(t)),
+      h("div", { class: "actions", style: "margin-top:8px" },
+        kinds.includes("held") ? btn("🪂 Если туннель упал", () => go("/tunnels/fail")) : null,
+        kinds.includes("rudirect") ? btn("🇷🇺 РФ напрямую", () => go("/tunnels/rudirect")) : null,
+        btn("👤 Карточка клиента", () => go("/client/" + encodeURIComponent(d.client || sel.value))))]);
+    });
+  });
+  check.style.flex = "none"; check.style.whiteSpace = "nowrap";
+  ctx.put(title("🧭 Куда идёт адрес"),
+    hint("Через какой туннель клиент ходит на адрес или сайт — решение самого ядра: с «РФ напрямую», удержанием упавшего туннеля и «VK и Max». Ничего не меняет."),
+    names.length ? [h("div", { class: "row", style: "gap:8px" }, sel),
+      h("div", { class: "row", style: "gap:8px;margin-top:8px" }, inp, enterTo(check, inp)), out]
+      : h("div", { class: "card empty" }, "Клиентов нет."));
+  if (!who) sel.focus(); else inp.focus();
+});
+
 route(/^\/diag$/, async (ctx) => {
   const r = await callR(["diag", "status"]);
   ctx.put(title("🩺 Диагностика"), logCard(r.log),
@@ -4342,7 +4691,8 @@ route(/^\/diag$/, async (ctx) => {
       menuItem("🌍 Домены мимикрии: мир", "какие домены пула отвечают отсюда", () => runJob(ctx, "Домены мимикрии (мир)", ["diag", "domains", "world"])),
       menuItem("📍 Домены мимикрии: Россия", "пул для серверов в РФ", () => runJob(ctx, "Домены мимикрии (Россия)", ["diag", "domains", "ru"])),
       menuItem("🎯 Тест мимикрии", "захват первых пакетов клиента", () => go("/diag/sniff")),
-      menuItem("🔍 DPI у клиента", "проверка со стороны клиента", () => go("/diag/dpi"))),
+      menuItem("🔍 DPI у клиента", "проверка со стороны клиента", () => go("/diag/dpi")),
+      menuItem("🧭 Куда идёт адрес", "через какой туннель клиент ходит на сайт", () => go("/diag/route"))),
     h("h2", {}, "Ещё"),
     h("div", { class: "card list" },
       menuItem("📜 Журналы служб", "последние строки журнала", () => go("/diag/logs")),
@@ -5139,7 +5489,7 @@ const LOGS = { manager: "awg2 — действия", install: "Компонен�
   expire: "Сроки клиентов", warp: "WARP", "warp-health": "WARP health-check", usque: "usque (WARP MASQUE)", xray: "Xray",
   "xray-routing": "Маршруты Xray", tun2socks: "tun2socks", exits: "Exit-ноды", cascade: "Каскад", dns: "dnscrypt-proxy",
   "dns-health": "DNS health-check", wgobf: "WG + обфускатор", bot: "Telegram-бот", antiscan: "Антисканер",
-  vkblock: "VK и Max мимо VPN" };
+  vkblock: "VK и Max мимо VPN", rudirect: "РФ напрямую", tunfail: "Если туннель упал" };
 
 route(/^\/log\/([a-z0-9-]+)$/, async (ctx, name) => {
   const r = await callR(["log", name, "150"]);
@@ -5204,7 +5554,10 @@ function refreshStatus() {
 }
 
 async function webStart() {
-  try { S.me = await post("/api/me"); } catch (_) { return; }      // 401 — экран входа уже на месте
+  try { S.me = await post("/api/me"); } catch (e) {
+    if (!e.login) showLogin(e.message);       // сбой сети/API не должен оставлять вечную «Загрузку…»
+    return;                                   // 401 — экран входа уже показан в post()
+  }
   drawTop();                                                     // лента и шапка — после входа
   render();
   if (curPath() !== "/") refreshStatus();                       // обзор грузит сводку сам

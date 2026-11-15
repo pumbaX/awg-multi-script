@@ -42,12 +42,19 @@ async def show(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
     n = d.get("cascade", 0)
     lines = [f"{ui.state_icon(d.get(k, 'none'))} {label} — {ui.state_word(d.get(k, 'none'))}" for k, label, _ in names]
     lines.insert(4, f"{'🟢' if n else '▫️'} Каскад портов — {'правил: ' + str(n) if n else 'правил нет'}")
+    lines.append(f"{'🟢' if d.get('rudirect') else '▫️'} РФ напрямую — "
+                 + ("сайты России мимо туннеля" if d.get("rudirect") else "выключено"))
+    held = d.get("held") or ""
+    lines.append(("🔴" if held else "🛑" if d.get("fail_block") else "▫️") + " Если туннель упал — "
+                 + (f"удерживает клиентов: {esc(held)}" if held
+                    else "где-то «блокировать»" if d.get("fail_block") else "напрямую (как было)"))
     text = ("<b>🌐 Туннели и DNS</b>\n\nОдновременно работает только один туннель для клиентов."
             + (f"\nСейчас: <b>{esc(d['active'])}</b>" if d.get("active") else "")
             + "\n\n" + "\n".join(lines)
             + "\n\n<i>🚨 Всё напрямую — аварийно выключить туннели, настройки сохранятся</i>")
     buttons = [(f"{ui.state_icon(d.get(k, 'none'))} {label}", to) for k, label, to in names]
     buttons.insert(4, (f"{'🟢' if n else '▫️'} Каскад", "cas"))
+    buttons += [("🇷🇺 РФ напрямую", "rud"), (f"{'🔴' if held else '🪂'} Если упал", "tf")]
     await ui.render(cb, text, ui.kb(buttons, ("🚨 Всё напрямую", tun.data("panic")), ui.back()))
 
 
@@ -264,6 +271,9 @@ async def xray_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> No
     d = r.data
     inst, up, tags = d.get("installed"), d.get("up"), d.get("tags") or []
     text = "<b>🛰 Xray</b>\n" + ui.pre(r.log, 1500, tail=False)
+    if d.get("fail") == "notraffic":
+        text += ("\n⚠️ <b>Через выход трафик не идёт</b> — проверь ссылку: 🩺 Диагностика покажет, какой выход "
+                 "не отвечает. Ссылка устарела — ➕ добавь новую, старую ➖ удали, затем 🔄 перезапусти Xray.\n")
     if inst:
         text += ("\n<i>➕ Добавить выход — ссылкой vless://, vmess://, trojan://, ss://, hysteria2://\n"
                  "✅ РФ напрямую — российские сайты мимо Xray"
@@ -453,8 +463,52 @@ async def exits_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> N
         ("🎯 Выбранные", ex.data("up", "peers")) if nodes and (not up or d.get("mode") != "peers") else None,
         ("⏹ Выключить", ex.data("down")) if up else None,
         ("⚖️ Балансировка", ex.data("bal")) if nodes else None,
+        ("🪂 Порядок нод", ex.data("ord")) if len(nodes) > 1 else None,
         ("👥 Клиенты и ноды", ex.data("cl")) if nodes else None,
         ui.back("tun")))
+
+
+def _ex_node_state(n: dict) -> str:
+    if n.get("health") == "down":
+        return f"🔴 не отвечает с {ui.fmt_time(n.get('since') or 0)}"
+    return "🟢 работает" if n.get("up") else "⚪️ не поднята"
+
+
+@ex("ord")
+async def exits_order_screen(cb: CallbackQuery, state: FSMContext, arg: str = "", note: str = "") -> None:
+    d = await api.data("exits", "status", default={}) or {}
+    nodes = {n["name"]: n for n in d.get("nodes") or [] if isinstance(n, dict) and n.get("name")}
+    order = [n for n in d.get("order") or [] if n in nodes]
+    lines = ["<b>🪂 Порядок нод</b>",
+             "Общий выход — через первую живую ноду по порядку. Упала — следующая; основная снова отвечает — "
+             "выход вернётся на неё. Сторож проверяет выход в интернет через каждую ноду раз в 30 с.", ""]
+    if note:
+        lines += [note, ""]
+    for i, name in enumerate(order):
+        role = "основная" if i == 0 else f"запасная {i}"
+        lines.append(f"{i + 1}. <b>{esc(name)}</b> — {role} · {_ex_node_state(nodes[name])}")
+    if d.get("active"):
+        lines.append(f"\n➡️ Общий выход сейчас: <b>{esc(str(d['active']).replace('+', ' + '))}</b>")
+    if d.get("balancer") == "ecmp":
+        lines.append("<i>Сейчас ECMP: трафик делится между всеми живыми нодами, порядок вступит в силу "
+                     "в режиме «одна нода».</i>")
+    if d.get("up") and not d.get("watch"):
+        lines.append("▲ Сторож не запущен — автопереключения нет. Выключи и включи маршруты exit-нод.")
+    await ui.render(cb, "\n".join(lines), ui.kb(
+        [(f"⬆️ {n}", ex.data("ordup", n)) for n in order[1:]], ui.back("ex")))
+
+
+@ex("ordup")
+async def _ex_order_up(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    d = await api.data("exits", "status", default={}) or {}
+    order = [str(n) for n in d.get("order") or []]
+    if name in order and order.index(name) > 0:
+        i = order.index(name)
+        order[i - 1], order[i] = order[i], order[i - 1]
+    r = await api.call("exits", "order", *order)
+    await exits_order_screen(cb, state, note=(f"✅ {esc(name)} — " + ("основная" if order[:1] == [name] else
+                                                                     f"запасная {order.index(name)}"))
+                             if r.ok else ui.fail(r, "Порядок нод"))
 
 
 @ex("add")
@@ -518,8 +572,8 @@ async def _ex_bal(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     d = await api.data("exits", "status", default={}) or {}
     nodes = d.get("nodes") or []
     cur = "ecmp" if d.get("balancer") == "ecmp" else d.get("single") or ""
-    await ui.render(cb, "<b>⚖️ Балансировка</b>\nОдна нода — весь общий трафик через неё; "
-                        "ECMP — поровну между поднятыми нодами.",
+    await ui.render(cb, "<b>⚖️ Балансировка</b>\nОдна нода — весь общий трафик через неё (упала — через "
+                        "следующую по порядку); ECMP — поровну между живыми нодами.",
                     ui.kb([(f"{'🔘' if cur == n['name'] else '⚪️'} {n['name']}",
                             ex.data("balset", f"single|{n['name']}")) for n in nodes],
                           (f"{'🔘' if cur == 'ecmp' else '⚪️'} ECMP", ex.data("balset", "ecmp|")),
@@ -608,7 +662,7 @@ async def _cas_proto(cb: CallbackQuery, state: FSMContext, proto: str) -> None:
 @ask.on("cas_in")
 async def _cas_in(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
-    if not v.isdigit() or not 1 <= int(v) <= 65535:
+    if not v.isascii() or not v.isdigit() or not 1 <= int(v) <= 65535:
         await ask.retry(msg, state, ctx, "Порт — число 1-65535")
         return
     await ask.ask(msg, state, "cas_dst", "Публичный IPv4 сервера назначения:", "cas", **ctx.data, port=v)
@@ -628,7 +682,7 @@ async def _cas_dst(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
 @ask.on("cas_out")
 async def _cas_out(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
-    if not v.isdigit() or not 1 <= int(v) <= 65535:
+    if not v.isascii() or not v.isdigit() or not 1 <= int(v) <= 65535:
         await ask.retry(msg, state, ctx, "Порт — число 1-65535")
         return
     await _cas_comment(msg, state, dict(ctx.data, out=v))

@@ -256,6 +256,20 @@ update_channel_set() {  # stable|beta
   ok "Канал: $(update_channel_label)"
 }
 
+# awg2 поставлен файлом из беты, а канал на сервере стабильный (так по
+# умолчанию): бот и панель из стабильного разошлись бы с awg2. Сборка новее
+# стабильной — предложить бету. Только в меню: через API канал не меняется.
+update_offer_beta() {
+  local sv
+  (( AUTO_MODE )) && return 0
+  [[ "$UPDATE_CHANNEL" == stable && -z "${AWG2_UPDATE_CHANNEL:-}" ]] || return 0
+  sv=$(update_peek 2>/dev/null) || return 0
+  (( 10#$(ver_num "$VERSION") > 10#$(ver_num "$sv") )) || return 0
+  warn "awg2 $VERSION — сборка из беты, а канал обновлений стабильный ($sv): бот оттуда не совпадёт с awg2"
+  ask_yes "  Переключить канал на бету — бот и обновления из беты? [Y/n]: " y || return 0
+  update_channel_set beta
+}
+
 do_switch_channel() {
   local to=beta
   [[ "$UPDATE_CHANNEL" == beta ]] && to=stable
@@ -299,9 +313,14 @@ helpers_refresh() {
   fi
   [[ -f "$T2S_ROUTING_SCRIPT" ]] && emit_script "$T2S_ROUTING_SCRIPT" 't2s_routing_run "$@"' \
     T2S_IF T2S_TABLE T2S_ADDR "${RT_FUNCS[@]}" t2s_routing_run
-  [[ -f "$EXITS_SCRIPT" ]] && _exits_write_unit
+  # Сторож exit-нод — и у тех, кто включил ноды до его появления
+  if [[ -f "$EXITS_SCRIPT" ]]; then
+    _exits_write_unit && exits_is_up && systemctl enable --now "$EXITS_HEALTH_TIMER" &>/dev/null
+  fi
   antiscan_on && _antiscan_emit &>/dev/null
   vkblock_on && _vkblock_emit &>/dev/null
+  rudirect_on && _rudirect_emit &>/dev/null
+  tunfail_any_block && _tunfail_emit &>/dev/null
   # Маршруты Xray: с v1.2.0 перед inbound tun нет NAT (свой выход клиенту)
   [[ -f "$XRAY_ROUTING_SCRIPT" ]] && _xray_emit_routing
   # Xray 26.7+ без имени у входа tun поднимает utunN вместо xray0 — имя в

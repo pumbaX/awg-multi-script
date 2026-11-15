@@ -30,7 +30,7 @@ from .sections import wgobf
 # Команды awg2 api, открытые панели; первое слово — раздел
 ALLOWED = {"status", "version", "server", "module", "clients", "client", "mimicry", "diag", "backup",
            "tunnels", "warp", "xray", "t2s", "exits", "cascade", "dns", "wgobf", "update", "log", "bot",
-           "cert", "uninstall", "traffic", "antiscan", "vkblock", "amnezia", "country"}
+           "cert", "uninstall", "traffic", "antiscan", "vkblock", "amnezia", "country", "entry", "rudirect"}
 # backup create auto — ротация автобэкапов: «auto 1» стёр бы все, кроме одного;
 # log web — журнал входов веб-панели (адреса, введённые логины), как раздел «Веб-панель» в боте
 OWNER_ONLY = (("uninstall",), ("bot", "uninstall"), ("bot", "webapp", "port"), ("cert", "issue"),
@@ -470,7 +470,7 @@ def setup(app: web.Application, user_of: UserOf) -> None:
     async def _admin_del(request: web.Request, user: dict, body: dict) -> web.Response:
         _owner(user)
         uid = str(body.get("uid") or "")
-        if not uid.isdigit():
+        if not uid.isascii() or not uid.isdigit():
             raise _bad("uid — число")
         ok, msg = admins.remove(int(uid), removed_by=int(user["id"]))
         return web.json_response({"ok": ok, "message": msg, "error": "" if ok else msg})

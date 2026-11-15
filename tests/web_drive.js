@@ -21,6 +21,14 @@ const say = (ok, label) => console.log(`${ok ? "OK" : "FAIL"} ${label}`);
     page.on("request", (r) => { if (!r.url().startsWith(`https://127.0.0.1:${port}/`)) console.log(`ERR ${name}: внешний запрос ${r.url()}`); });
     const u = `https://127.0.0.1:${port}${base}`;
     const step = async (label, fn) => { try { await fn(); say(true, `${name}: ${label}`); } catch (e) { say(false, `${name}: ${label} — ${String(e).split("\n")[0]}`); } };
+    await step("сбой API при старте — понятная ошибка и рабочая форма входа", async () => {
+      await page.route(/\/api\/me$/, (route) => route.abort());
+      try {
+        await page.goto(u, { waitUntil: "domcontentloaded" });
+        await page.waitForSelector("form.login .bad:has-text('Нет связи с сервером')");
+        if (await page.locator("form.login button").isDisabled()) throw new Error("форма входа заблокирована");
+      } finally { await page.unroute(/\/api\/me$/); }
+    });
     await step("экран входа", async () => {
       await page.goto(u, { waitUntil: "networkidle" });
       await page.waitForSelector("form.login input[autocomplete=username]");

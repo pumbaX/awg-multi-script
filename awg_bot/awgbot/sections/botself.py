@@ -595,7 +595,7 @@ async def _set_port(target: ui.Target, port: str) -> str:
 @ask.on("app_port")
 async def _app_port_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg).lower()
-    if v != "off" and not (v.isdigit() and 0 < int(v) < 65536 and v != "80"):
+    if v != "off" and not (v.isascii() and v.isdigit() and 0 < int(v) < 65536 and v != "80"):
         await ask.retry(msg, state, ctx, "Порт — число 1-65535, кроме 80, или off")
         return
     await app_screen(msg, await _set_port(msg, v))

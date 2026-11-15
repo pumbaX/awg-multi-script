@@ -10,6 +10,7 @@ Chromium — тест пропускается.
 Запуск:  python3 tests/test_panel.py [путь/к/dist/awg2.sh]
          (python с aiogram; AWG_PANEL_SHOTS=каталог — оставить скриншоты)
 """
+import concurrent.futures
 import os
 import shutil
 import subprocess
@@ -49,9 +50,14 @@ if len(sys.argv) > 1:
     env["AWG2_SH"] = os.path.abspath(sys.argv[1])
 
 keep = os.environ.get("AWG_PANEL_SHOTS")
+# Кэш вызовов awg2 у стенда — 1 с, а не 5: сценарий ждёт его, когда меняет файлы мимо awg2
+env.setdefault("AWG_API_CACHE_TTL", "1")
 THEMES = {"lite": "light", "pro": "dark", "none": "light"}      # обе темы Telegram
-for profile in ("lite", "pro", "none"):
-    print(f"Профиль сервера: {profile}, тема {THEMES[profile]}")
+
+
+def run_profile(profile):
+    """Стенд и сценарий одного профиля; итог — строки для отчёта (печать — по порядку)."""
+    rows = []
     out = os.path.join(keep, profile) if keep else tempfile.mkdtemp(prefix="panel-shots.")
     os.makedirs(out, exist_ok=True)
     stand = subprocess.Popen([sys.executable, os.path.join(HERE, "panel_stand.py")], env=dict(env, PROFILE=profile),
@@ -63,10 +69,10 @@ for profile in ("lite", "pro", "none"):
                 ready = line.split()
                 break
         if not ready:
-            chk("стенд панели поднялся", False, stand.stdout.read()[-800:] if stand.stdout else "")
-            continue
+            rows.append(("стенд панели поднялся", False, stand.stdout.read()[-800:] if stand.stdout else ""))
+            return rows
         _, port, init, err, root = ready[:5]
-        chk("стенд панели поднялся", err == "-", err)
+        rows.append(("стенд панели поднялся", err == "-", err))
         try:
             run = subprocess.run([node, os.path.join(HERE, "panel_drive.js"), port, init, out, THEMES[profile], profile, root],
                                  env=env, capture_output=True, text=True, timeout=900)
@@ -75,20 +81,35 @@ for profile in ("lite", "pro", "none"):
             output = "сценарий не уложился в 900 с"
         log = os.path.join(out, "run.log")
         lines = open(log).read().splitlines() if os.path.exists(log) else []
-        chk("сценарий браузера отработал", bool(lines), output[-800:])
+        rows.append(("сценарий браузера отработал", bool(lines), output[-800:]))
+        # Итог (ERRORS) сценарий пишет последним: нет его — оборвался на полпути
+        rows.append(("сценарий дошёл до конца", any(ln.startswith("ERRORS") for ln in lines), output[-800:]))
         for line in lines:
             if line.startswith(("OK", "FAIL")):
                 status, _, rest = line.partition(" ")
-                chk(rest.strip(), status == "OK", rest)
+                rows.append((rest.strip(), status == "OK", rest))
             elif line.startswith("ALERTS"):
-                chk("без неожиданных окон с ошибкой", line.strip() == "ALERTS []", line[:600])
+                rows.append(("без неожиданных окон с ошибкой", line.strip() == "ALERTS []", line[:600]))
             elif line.startswith("ERRORS"):
-                chk("без ошибок в консоли страницы", line.strip() == "ERRORS []", line[:600])
+                rows.append(("без ошибок в консоли страницы", line.strip() == "ERRORS []", line[:600]))
+        return rows
     finally:
         stand.terminate()
         stand.wait(timeout=20)
         if not keep:
             shutil.rmtree(out, ignore_errors=True)
+
+
+# Профили независимы (свои песочница, порт и браузер) — идут разом;
+# AWG_PANEL_JOBS=1 — по одному, как раньше
+PROFILES = ("lite", "pro", "none")
+jobs = max(1, int(os.environ.get("AWG_PANEL_JOBS") or len(PROFILES)))
+with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+    results = list(pool.map(run_profile, PROFILES))
+for profile, rows in zip(PROFILES, results):
+    print(f"Профиль сервера: {profile}, тема {THEMES[profile]}")
+    for label, ok, detail in rows:
+        chk(label, ok, detail)
 
 print(f"\nпроверок: {checks}, провалов: {fails}")
 sys.exit(1 if fails else 0)

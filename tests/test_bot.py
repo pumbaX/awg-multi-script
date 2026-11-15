@@ -46,6 +46,13 @@ PACK = {"🖥": "111", "👥": "222", "🌐": "333", "🗑": "444", "⭐": "555"
 
 # ── Окружение бота ────────────────────────────────────────
 API = api_wrapper()
+# Каскад до сервера «работает» только с входов 203.0.113.x — остальные проверку не проходят;
+# у сервера есть IPv6, и он готов принимать клиентов
+with open(API) as f:
+    _w = f.read()
+with open(API, "w") as f:
+    f.write(_w.replace('api_main "$@"', 'entry_probe() { [[ "$1" == 203.0.113.* || "$1" == "[2a01:4f8:c0c:1234::1]:"* ]]; }\n'
+                       'public_ip6() { echo 2a01:4f8:c0c:1234::1; }\napi_main "$@"'))
 STATE = os.path.join(TMP, "botstate")
 os.makedirs(STATE)
 BOT_CONF = os.path.join(TMP, "awg-bot.conf")
@@ -62,7 +69,8 @@ sys.path.insert(0, os.path.join(HERE, "..", "awg_bot"))
 
 from awgbot import admins, api as botapi, bot as botmod, jobs, store, ui, webapp  # noqa: E402
 
-USER_NAMED = ("cl:v:", "tc:t:", "ex:pick:", "xr:delok:", "xr:delq:", "wo:v:", "adm:rm:", "diag:sn:", "mod:tag:")
+USER_NAMED = ("cl:v:", "tc:t:", "ex:pick:", "xr:delok:", "xr:delq:", "wo:v:", "adm:rm:", "diag:sn:", "mod:tag:",
+              "ent:e:", "cl:ents:", "ex:ordup:")
 
 logging.getLogger("aiogram").setLevel(logging.WARNING)
 
@@ -410,6 +418,8 @@ async def run():
     await press("cl:bpre")
     await say("p")
     await press("cl:bn:ask")
+    text, _ = screen(await say("²"))
+    chk("массовое создание: не-ASCII цифры — повторный вопрос, не исключение", "Нужно число от 1 до 200" in text, text)
     await say("25")
     await press("cl:be:none")
     text, buttons = screen(await press("cl:dsel"))
@@ -532,6 +542,9 @@ async def run():
     chk("возврат в мастер — тот же шаг с прежними ответами", "Версия протокола" in text, text)
     for step in ("proto=2.0", "dns=0"):
         await press(f"srv:w:{step}")
+    await press("srv:w:mtu=ask")
+    text, _ = screen(await say("²"))
+    chk("мастер: не-ASCII MTU — повторный вопрос, не исключение", "MTU — число 1280-1500" in text, text)
     text, buttons = screen(await press("srv:w:mtu=1280"))
     chk("мастер: подсеть — случайная или вручную", "Подсеть" in text and "srv:w:net=ask" in [d for _, d in buttons],
         [text, buttons])
@@ -589,8 +602,12 @@ async def run():
 
     await press("cas:add")
     await press("cas:p:udp")
+    text, _ = screen(await say("²"))
+    chk("каскад: не-ASCII входной порт — повторный вопрос, не исключение", "Порт — число 1-65535" in text, text)
     await say("5555")
     await say("5.6.7.8")
+    text, _ = screen(await say("²"))
+    chk("каскад: не-ASCII порт назначения — повторный вопрос, не исключение", "Порт — число 1-65535" in text, text)
     await press("cas:out:5555")
     text, _ = screen(await press("cas:save"))
     chk("мастер каскада добавляет правило", "✅" in text, text)
@@ -649,6 +666,31 @@ async def run():
     text, buttons = screen(await press(node))
     chk("удаление exit-ноды переспрашивает", "n1" in text and ("🗑 Удалить", "ex:delok:n1") in buttons
         and os.path.exists(os.path.join(awg_dir, "awg-exit-n1.conf")), [text, buttons])
+    # Порядок нод: основная и запасные, ⬆️ меняет местами; упавшая нода — с меткой
+    with open(os.path.join(awg_dir, "awg-exit-n2.conf"), "w") as f:
+        f.write("[Interface]\nPrivateKey = X\nTable = off\n\n[Peer]\nEndpoint = 1.2.3.5:51820\n")
+    _, buttons = screen(await press("ex"))
+    chk("две ноды — на экране exit-нод кнопка «Порядок нод»", ("🪂 Порядок нод", "ex:ord") in buttons, buttons)
+    text, buttons = screen(await press("ex:ord"))
+    chk("порядок: n1 основная, n2 запасная, кнопка ⬆️ только у запасной",
+        "1. <b>n1</b> — основная" in text and "2. <b>n2</b> — запасная 1" in text
+        and [d for _, d in buttons if d.startswith("ex:ordup:")] == ["ex:ordup:n2"], [text, buttons])
+    text, buttons = screen(await press("ex:ordup:n2"))
+    with open(os.path.join(awg_dir, "exits_state")) as f:
+        exs = f.read()
+    chk("⬆️ n2 — основная: в состоянии single_exit=n2, n1 запасная",
+        "✅ n2 — основная" in text and "1. <b>n2</b> — основная" in text and "single_exit=n2" in exs
+        and "order=n1" in exs, [text, exs])
+    hdir = os.path.join(ROOT, "run", "exits-health")
+    os.makedirs(hdir, exist_ok=True)
+    with open(os.path.join(hdir, "n2"), "w") as f:
+        f.write("down 3 0 %d nonet\n" % int(time.time()))
+    text, _ = screen(await press("ex:ord"))
+    chk("упавшая n2 — «🔴 не отвечает с …»", "<b>n2</b> — основная · 🔴 не отвечает с" in text, text)
+    os.remove(os.path.join(hdir, "n2"))
+    os.remove(os.path.join(awg_dir, "awg-exit-n2.conf"))
+    with open(os.path.join(awg_dir, "exits_state"), "w") as f:
+        f.write("active\nmode=all\nbalancer=single\nsingle_exit=n1\n")
 
     print("Xray: свой выход клиенту")
     with open(LINKS) as f:
@@ -902,7 +944,7 @@ async def run():
     async def warp_status(*args, **kw):
         if args[:1] == ("status",):
             return {"host": "vm1", "server": {"exists": False, "up": False},
-                    "tunnels": {"warp": warp["state"], "warp_failed": warp["failed"]}}
+                    "tunnels": {"warp": warp["state"], "warp_failed": warp["failed"], "warp_block": warp.get("block", False)}}
         if args[:2] == ("warp", "probe"):
             probes.append(args)
             return dict(warp["probe"])
@@ -953,6 +995,17 @@ async def run():
     mark = len(SESSION.sent)
     await al.tick(BOT, st5)
     chk("health-check вернул WARP — «снова работает»", any("WARP снова работает" in t for t in warp_said(mark)), warp_said(mark))
+    # «Если туннель упал → блокировать»: клиенты WARP ждут его, а не уходят напрямую
+    st5b = {"boot": "boot-B"}
+    warp.update(failed=True, state="off", block=True, probe={"up": False, "health": True, "failover": True})
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st5b)
+    rep = [m for n, m in SESSION.sent[mark:] if n == "SendMessage" and "WARP упал" in (m.text or "")]
+    cbs = [b.callback_data for row in (rep[0].reply_markup.inline_keyboard if rep else []) for b in row]
+    chk("режим «блокировать»: WARP упал — клиенты ждут без интернета, не «напрямую»; кнопки «Включить» и «Если упал»",
+        len(rep) == 1 and "ждут его без интернета" in rep[0].text and "напрямую" not in rep[0].text
+        and "warp:up" in cbs and "tf" in cbs, [warp_said(mark), cbs])
+    warp.update(block=False)
     # Без health-check бот проверяет поднятый WARP сам: не отвечает — клиенты без интернета
     st6 = {"boot": "boot-B"}
     warp.update(failed=False, state="up", probe={"up": True, "health": False, "failover": False, "ok": False})
@@ -984,6 +1037,136 @@ async def run():
     n = len(probes)
     await al.tick(BOT, st6)
     chk("WARP выключен — без проверок", len(probes) == n, probes[n:])
+    # Exit-ноды: сторож awg2 выкинул ноду из общего выхода — 🔴 один раз, вернулась — 🟢
+    ex = {"dead": "", "active": "de", "block": False}
+
+    async def exits_status(*args, **kw):
+        if args[:1] == ("status",):
+            return {"host": "vm1", "server": {"exists": False, "up": False},
+                    "tunnels": {"exits": "up", "exits_dead": ex["dead"], "exits_active": ex["active"],
+                                "exits_block": ex["block"]}}
+        return await real_data(*args, **kw)
+    al.api.data = exits_status
+    st7 = {"boot": "boot-B"}
+
+    def ex_said(mark):
+        return [t for t in said(mark) if "exit-нода" in t]
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    chk("exit-ноды живы — молчит", not ex_said(mark), ex_said(mark))
+    ex.update(dead="de:nonet", active="nl")
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    rep = [m for n_, m in SESSION.sent[mark:] if n_ == "SendMessage" and "exit-нода de" in (m.text or "")]
+    cbs = [b.callback_data for row in (rep[0].reply_markup.inline_keyboard if rep else []) for b in row]
+    chk("нода de без интернета — 🔴 с причиной, новым общим выходом и кнопкой «Exit-ноды»",
+        len(rep) == 1 and "без выхода в интернет" in rep[0].text and "Общий выход теперь: <b>nl</b>" in rep[0].text
+        and cbs == ["ex"], [ex_said(mark), cbs])
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    chk("пока нода лежит — молчит", not ex_said(mark), ex_said(mark))
+    ex.update(dead="de:nonet,nl:silent", active="", block=True)
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    chk("упала и вторая, живых нет, режим «блокировать» — только про nl: клиенты ждут без интернета",
+        len(ex_said(mark)) == 1 and "exit-нода nl не отвечает" in ex_said(mark)[0]
+        and "ждут их без интернета" in ex_said(mark)[0], ex_said(mark))
+    ex.update(dead="nl:silent", active="de", block=False)
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    chk("de вернулась — 🟢 «снова работает» с общим выходом, про nl молчит",
+        len(ex_said(mark)) == 1 and "exit-нода de снова работает" in ex_said(mark)[0]
+        and "Общий выход: <b>de</b>" in ex_said(mark)[0], ex_said(mark))
+    al.set_enabled("exits", False)
+    ex.update(dead="", active="de + nl".replace(" + ", "+"))
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    chk("уведомление «Exit-ноды» выключено — молчит, но состояние помнит",
+        not ex_said(mark) and st7.get("exits_dead") == {}, [ex_said(mark), st7])
+    al.set_enabled("exits", True)
+    # Xray: включён, а через выход трафик не идёт (ссылка устарела) — 🟠 с «Диагностикой»
+    xs = {"fail": "notraffic", "xray": "up", "block": False, "probe": {"up": True, "ok": True, "why": ""}}
+    xprobes = []
+
+    async def xray_status(*args, **kw):
+        if args[:1] == ("status",):
+            return {"host": "vm1", "server": {"exists": False, "up": False},
+                    "tunnels": {"xray": xs["xray"], "xray_fail": xs["fail"], "xray_block": xs["block"]}}
+        if args[:2] == ("xray", "probe"):
+            xprobes.append(args)
+            return dict(xs["probe"])
+        return await real_data(*args, **kw)
+    al.api.data = xray_status
+    st8 = {"boot": "boot-B"}
+
+    def xr_msgs(mark):
+        return [m for n_, m in SESSION.sent[mark:] if n_ == "SendMessage" and "Xray" in (m.text or "")]
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    chk("Xray: трафик не идёт — первая проверка молчит (перезапуск — не тревога)", not xr_msgs(mark), xr_msgs(mark))
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    rep = xr_msgs(mark)
+    cbs = [b.callback_data for row in (rep[0].reply_markup.inline_keyboard if rep else []) for b in row]
+    chk("две проверки — 🟠 «через выход трафик не идёт», клиенты напрямую, проверь ссылку; кнопки «Диагностика» и «Перезапустить»",
+        len(rep) == 1 and "через выход трафик не идёт" in rep[0].text and "напрямую, с IP сервера" in rep[0].text
+        and "Проверь ссылку выхода" in rep[0].text and "устареть" in rep[0].text and cbs == ["xr:diag", "xr:restart"]
+        and not xprobes, [[m.text for m in rep], cbs, xprobes])
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    chk("пока Xray не работает — молчит", not xr_msgs(mark), [m.text for m in xr_msgs(mark)])
+    xs.update(fail="")
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    chk("новая ссылка и перезапуск — 🟢 «Xray снова работает» с простоем, по ответу через выход",
+        any("Xray снова работает" in m.text and "Простой" in m.text for m in xr_msgs(mark)) and xprobes
+        and "xray_sent" not in st8, [[m.text for m in xr_msgs(mark)], xprobes])
+    # Работал и отвалился на ходу: маршруты на месте, а выход не отвечает — клиенты без интернета
+    xs["probe"] = {"up": True, "ok": False, "why": "000"}
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    await al.tick(BOT, st8)
+    rep = xr_msgs(mark)
+    chk("выход отвалился на ходу — бот проверил сам, две проверки: 🟠 «Xray не отвечает», клиенты без интернета",
+        len(rep) == 1 and "Xray не отвечает" in rep[0].text and "без интернета" in rep[0].text, [m.text for m in rep])
+    # Выключили руками, пока не работал: это не «снова работает»
+    xs.update(xray="off", probe={"up": False, "ok": False, "why": ""})
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    chk("Xray выключили руками, пока не работал, — без ложного «снова работает»",
+        not xr_msgs(mark) and "xray_sent" not in st8, [[m.text for m in xr_msgs(mark)], st8])
+    # «Блокировать»: клиенты ждут Xray; не запущен — своя строка
+    st9 = {"boot": "boot-B"}
+    xs.update(xray="up", fail="notraffic", block=True)
+    await al.tick(BOT, st9)
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st9)
+    rep = xr_msgs(mark)
+    chk("режим «блокировать»: клиенты Xray ждут его без интернета, а не напрямую",
+        len(rep) == 1 and "ждут его без интернета" in rep[0].text and "напрямую" not in rep[0].text, [m.text for m in rep])
+    st9 = {"boot": "boot-B"}
+    xs.update(xray="off", fail="down", block=False)
+    await al.tick(BOT, st9)
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st9)
+    rep = xr_msgs(mark)
+    chk("Xray включён, а не запущен — 🟠 «Xray не запущен»: перезапусти, не поднимется — «Диагностика»",
+        len(rep) == 1 and "Xray не запущен" in rep[0].text and "Диагностика" in rep[0].text, [m.text for m in rep])
+    # Экран Xray: трафик не идёт — что делать, прямо на экране
+    real_call = botapi.call
+
+    async def xray_call(*args, **kw):
+        if args[:2] == ("xray", "status"):
+            return botapi.Result(True, 0, {"installed": True, "up": True, "tags": ["vl1"], "fail": "notraffic"},
+                                 "  Туннель   : ▲ включён, но через выход трафик не идёт", "")
+        return await real_call(*args, **kw)
+    botapi.call = xray_call
+    try:
+        text, _ = screen(await press("xr"))
+    finally:
+        botapi.call = real_call
+    chk("экран Xray: «Через выход трафик не идёт» — проверь ссылку: Диагностика, добавь новую, старую удали",
+        "Через выход трафик не идёт" in text and "Диагностика" in text and "добавь новую" in text, text)
     al.api.data = real_data
 
     CL = {"newer": True, "sections": [{"version": "v1.2.1", "title": "2026-10-08",
@@ -1253,7 +1436,8 @@ async def run():
                "cl:lim:alice", "cl:spd:alice", "cl:tday:alice", "cl:tsrv", "ntf", "abk",
                "diag", "diag:status", "diag:dpi", "diag:logs", "diag:log:manager", "diag:sniff",
                "bk", "bk:list", "tun", "tc::warp", "warp", "warp:backend", "xr", "t2s", "ex", "cas", "dns",
-               "botm", "botm:proxy", "adm", "del", "del:all", "upd", "wo", "wo:install", "web"]
+               "botm", "botm:proxy", "adm", "del", "del:all", "upd", "wo", "wo:install", "web", "ent", "cl:ent:alice",
+               "rud", "rud:l:direct", "rud:l:tunnel", "tf", "diag:rt", "diag:rt:r"]
     broken = []
     for data in screens:
         sent = await press(data)
@@ -1723,6 +1907,8 @@ async def run():
             [st, body])
         st, body = await api_("/api/bot/invites/revoke", {})
         chk("панель: приглашения гасятся", st == 200 and body.get("revoked") == 1 and admins.pending_invites() == 0, body)
+        st, body = await api_("/api/bot/admin/del", {"uid": "²"})
+        chk("панель: не-ASCII uid — 400, не 500", st == 400 and "число" in body.get("error", ""), [st, body])
         st, body = await api_("/api/bot/admin/del", {"uid": 333})
         chk("панель: владелец отзывает доступ", st == 200 and 333 not in admins.invited_ids(), [st, body])
         st, body = await api_("/api/me", {})
@@ -1809,6 +1995,9 @@ async def run():
         st, body = await upload(b"x" * (20 * 1024 * 1024 + 1))
         chk("панель: больше 20 МБ — отказ", st == 400 and "20 МБ" in body.get("error", ""), [st, body])
 
+    await press("app:port")
+    text, _ = screen(await say("²"))
+    chk("Mini App: не-ASCII порт — повторный вопрос, не исключение", "Порт — число 1-65535" in text, text)
     text, _ = screen(await press(f"app:pset:{ports[1]}"))
     chk("смена порта перезапускает сервер", webapp.SERVER.running and webapp.SERVER.url.endswith(f":{ports[1]}/")
         and f"Порт Mini App: {ports[1]}" in text, [text[:200], webapp.SERVER.url])
@@ -2134,6 +2323,319 @@ async def run():
     chk("журнал открывается, «Назад» — на экран VK", ("◀️ Назад", "vk") in buttons, [text, buttons])
     no_hourglass("VK и Max")
     botapi.call = real_call_
+
+    print("РФ напрямую, если туннель упал, куда идёт адрес")
+    text, buttons = screen(await press("tun"))
+    chk("в «Туннелях» — «🇷🇺 РФ напрямую» и «🪂 Если упал», строки их состояния",
+        ("🇷🇺 РФ напрямую", "rud") in buttons and ("🪂 Если упал", "tf") in buttons and "РФ напрямую — выключено" in text
+        and "Если туннель упал — напрямую (как было)" in text, [text, buttons])
+    RUDST = {"enabled": False, "active": False, "ru": 0, "mine": 0, "excl": 0, "updated": 0, "src": "", "error": "",
+             "packets": 0, "bytes": 0, "direct": [], "tunnel": [], "xray_ru": False, "tg": False, "abroad": ""}
+    TF = {"warp": "direct", "xray": "direct", "t2s": "direct", "exits": "direct"}
+    TFL = {"warp": "WARP", "xray": "Xray", "t2s": "tun2socks", "exits": "Exit-ноды WG"}
+    ROUTE = {"rows": []}
+    rt_calls = []
+
+    async def rt_call(*args, **kw):
+        if args[:1] == ("rudirect",):
+            rt_calls.append((args, kw.get("timeout")))
+            a = args[1]
+            if a == "status":
+                return botapi.Result(True, data=json.loads(json.dumps(RUDST)))
+            if a == "on":
+                RUDST.update(enabled=True, active=True, ru=8673, updated=1791500000, src="ipverse", packets=12345,
+                             error="ipdeny.com: не скачался <b>")
+            if a == "off":
+                RUDST.update(enabled=False, active=False)
+            if a == "tg":
+                RUDST["tg"] = args[2] == "on"
+            if a == "add":
+                if args[3] == "bad.example":
+                    return botapi.Result(False, error="Нужен публичный IPv4, подсеть не шире /12 или домен")
+                RUDST[args[2]].append(args[3])
+            if a == "del":
+                RUDST[args[2]] = [] if args[3] == "all" else [x for x in RUDST[args[2]] if x != args[3]]
+            return botapi.Result(True)
+        if args[:2] == ("tunnels", "fail"):
+            rt_calls.append((args, kw.get("timeout")))
+            if args[2:3] == ("set",):
+                for n in (TF if args[3] == "all" else [args[3]]):
+                    TF[n] = args[4]
+                return botapi.Result(True)
+            return botapi.Result(True, data=[{"name": n, "label": TFL[n], "mode": TF[n], "enabled": n in ("warp", "xray"),
+                                              "up": n == "warp", "held": n == "xray" and TF[n] == "block"} for n in TF])
+        if args[:2] == ("diag", "route"):
+            rt_calls.append((args, kw.get("timeout")))
+            if args[3] == "gone.example":
+                return botapi.Result(False, error="Домен gone.example не разрешается в IPv4 с этого сервера")
+            return botapi.Result(True, data={"client": args[2], "input": args[3], "ip": "10.8.1.2", "rows": ROUTE["rows"]})
+        if args[:2] == ("tunnels", "status"):
+            r = await real_call_(*args, **kw)
+            if isinstance(r.data, dict):
+                r.data.update(rudirect=RUDST["enabled"], fail_block="block" in TF.values(),
+                              held="Xray" if TF["xray"] == "block" else "")
+            return r
+        return await real_call_(*args, **kw)
+    botapi.call = rt_call
+
+    text, buttons = screen(await press("rud"))
+    chk("РФ напрямую выключено: что делает, «Включить», свои списки, «Куда идёт», журнал, назад в «Туннели»",
+        "⚪️ Выключено" in text and "мимо него" in text and ("✅ Включить", "rud:on") in buttons
+        and ("📝 Напрямую: 0", "rud:l:direct") in buttons and ("📝 В туннель: 0", "rud:l:tunnel") in buttons
+        and ("🧭 Куда идёт", "diag:rt:r") in buttons and ("📜 Журнал", "diag:log:rudirect|rud") in buttons
+        and ("◀️ Назад", "tun") in buttons and not any(d in ("rud:upd", "rud:fix") for _, d in buttons), [text, buttons])
+    RUDST["abroad"] = "NL"
+    text, buttons = screen(await press("rud:on"))
+    chk("сервер не в России — в подтверждении включения предупреждение", "Сервер не в России (NL)" in text
+        and "блокируют как раз за это" in text and ("✅ Включить", "rud:onok") in buttons, [text, buttons])
+    RUDST["abroad"] = ""
+    n = len(rt_calls)
+    text, buttons = screen(await press("rud:on"))
+    chk("включение — с подтверждением, без вызова до него",
+        ("✅ Включить", "rud:onok") in buttons and ("✖️ Отмена", "rud") in buttons and "адреса сервера" in text
+        and not any(c[0][1:2] == ("on",) for c in rt_calls[n:]), [text, buttons])
+    text, buttons = screen(await press("rud:onok"))
+    chk("включено: долгий вызов, сетей РФ, счётчик, источник, ошибка экранирована, «Обновить», «Починить», «Выключить»",
+        (("rudirect", "on"), 240) in rt_calls and "🟢 Включено · сетей РФ 8 673" in text and "Мимо туннеля: 12 345" in text
+        and "(ipverse)" in text and "&lt;b&gt;" in text and ("🔄 Обновить", "rud:upd") in buttons
+        and ("🛠 Починить", "rud:fix") in buttons and ("⏹ Выключить", "rud:off") in buttons, [rt_calls[-2:], text, buttons])
+    chk("Telegram через туннель: строка и кнопка «✈️ TG напрямую», подсказка, когда она нужна",
+        "✈️ Telegram: через туннель" in text and "«Соединение…»" in text
+        and ("✈️ TG напрямую", "rud:tg:on") in buttons, [text, buttons])
+    text, buttons = screen(await press("rud:tg:on"))
+    chk("Telegram напрямую: долгий вызов, итог, кнопка вернуть в туннель, подсказка ушла",
+        (("rudirect", "tg", "on"), 240) in rt_calls and "✅ Telegram напрямую" in text
+        and "✈️ Telegram: напрямую с адреса сервера" in text and "«Соединение…»" not in text
+        and ("✈️ TG в туннель", "rud:tg:off") in buttons, [text, buttons])
+    text, buttons = screen(await press("rud:tg:off"))
+    chk("Telegram — снова через туннель", (("rudirect", "tg", "off"), 240) in rt_calls and "✅ Telegram — снова через туннель" in text
+        and ("✈️ TG напрямую", "rud:tg:on") in buttons, [text, buttons])
+    RUDST["abroad"] = "NL"
+    text, _ = screen(await press("rud"))
+    chk("включено на сервере не в России — предупреждение на экране и как поправить страну",
+        "⚠️ Сервер не в России (NL)" in text and "флагом в шапке панели" in text, text)
+    RUDST["abroad"] = ""
+    text, _ = screen(await press("rud"))
+    chk("сервер в России — без предупреждения", "не в России" not in text, text)
+    await press("rud:upd")
+    await press("rud:fix")
+    chk("обновить и починить — долгие вызовы", (("rudirect", "update"), 240) in rt_calls
+        and (("rudirect", "repair"), 240) in rt_calls, rt_calls[-3:])
+    text, buttons = screen(await press("rud:l:direct"))
+    chk("список «всегда напрямую»: что это, пусто, «Добавить», назад к РФ напрямую",
+        "Всегда напрямую" in text and "пока пусто" in text and ("➕ Добавить", "rud:a:direct") in buttons
+        and ("◀️ Назад", "rud") in buttons and not any(d.startswith("rud:x:") for _, d in buttons), [text, buttons])
+    await press("rud:a:direct")
+    text, _ = screen(await say("два слова"))
+    chk("свой адрес: с пробелом — переспрашивает, в awg2 не уходит", "⚠️" in text
+        and not any(c[0][1:2] == ("add",) for c in rt_calls), text)
+    text, _ = screen(await say("bad.example"))
+    chk("свой адрес: отказ awg2 — переспрашивает с причиной", "⚠️" in text and "публичный IPv4" in text, text)
+    text, buttons = screen(await say("https://bank.example/login"))
+    chk("свой адрес: ссылка уходит в awg2 как есть, список показан, запись можно убрать",
+        (("rudirect", "add", "direct", "https://bank.example/login"), 240) in rt_calls and "✅ Добавлено" in text
+        and ("❌ https://bank.example/login", "rud:d:d|https://bank.example/login") in buttons
+        and ("🧹 Очистить", "rud:x:direct") in buttons, [text, buttons])
+    text, buttons = screen(await press("rud:d:d|https://bank.example/login"))
+    chk("убрать запись", (("rudirect", "del", "direct", "https://bank.example/login"), 240) in rt_calls and "✅ Убрано" in text,
+        [rt_calls[-2:], text])
+    await press("rud:a:tunnel")
+    await say("77.88.8.0/24")
+    text, buttons = screen(await press("rud:x:tunnel"))
+    chk("очистить — с подтверждением", ("🧹 Очистить", "rud:xok:tunnel") in buttons and ("✖️ Отмена", "rud:l:tunnel") in buttons,
+        buttons)
+    text, buttons = screen(await press("rud:xok:tunnel"))
+    chk("очищено", (("rudirect", "del", "tunnel", "all"), 240) in rt_calls and "пока пусто" in text, text)
+    text, buttons = screen(await press("rud:off"))
+    chk("выключение — с подтверждением", ("⏹ Выключить", "rud:offok") in buttons, buttons)
+    text, buttons = screen(await press("rud:offok"))
+    chk("выключено снова", (("rudirect", "off"), None) in rt_calls and "⚪️ Выключено" in text, text)
+    text, buttons = screen(await press("diag:log:rudirect|rud"))
+    chk("журнал РФ напрямую: подпись, «Назад» — на экран РФ напрямую", "РФ напрямую" in text and ("◀️ Назад", "rud") in buttons,
+        [text, buttons])
+
+    text, buttons = screen(await press("tf"))
+    chk("если туннель упал: оба режима объяснены, четыре туннеля «напрямую», журнал, назад в «Туннели»",
+        "Напрямую" in text and "Блокировать" in text and "адрес сервера не засветится" in text
+        and [b for b in buttons if b[1].startswith("tf:t:")] == [("➡️ WARP", "tf:t:warp"), ("➡️ Xray", "tf:t:xray"),
+                                                                  ("➡️ tun2socks", "tf:t:t2s"), ("➡️ Exit-ноды WG", "tf:t:exits")]
+        and "🟢 работает" in text and "⚪️ выключен" in text and ("📜 Журнал", "diag:log:tunfail|tf") in buttons
+        and ("◀️ Назад", "tun") in buttons and not any(d == "tf:all" for _, d in buttons), [text, buttons])
+    text, buttons = screen(await press("tf:t:warp"))
+    chk("работающему WARP — «блокировать» сразу, без подтверждения",
+        (("tunnels", "fail", "set", "warp", "block"), None) in rt_calls and ("🛑 WARP", "tf:t:warp") in buttons
+        and ("↪️ Всем напрямую", "tf:all") in buttons, [text, buttons])
+    n = len(rt_calls)
+    text, buttons = screen(await press("tf:t:xray"))
+    chk("включённому, но лежащему Xray — сначала подтверждение: клиенты сразу без интернета",
+        ("🛑 Блокировать", "tf:bok:xray") in buttons and ("✖️ Отмена", "tf") in buttons and "сразу останутся без интернета" in text
+        and not any(c[0][2:3] == ("set",) for c in rt_calls[n:]), [text, buttons])
+    text, buttons = screen(await press("tf:bok:xray"))
+    chk("Xray «блокировать»: удерживает клиентов — видно в строке", (("tunnels", "fail", "set", "xray", "block"), None) in rt_calls
+        and "🔴 упал — клиенты ждут его без интернета" in text, text)
+    text, buttons = screen(await press("tun"))
+    chk("в «Туннелях» видно удержание: строка и кнопка 🔴", "удерживает клиентов: Xray" in text
+        and ("🔴 Если упал", "tf") in buttons, [text, buttons])
+    text, buttons = screen(await press("tf:t:xray"))
+    chk("удержанному — «напрямую» сразу (отпустить)", (("tunnels", "fail", "set", "xray", "direct"), None) in rt_calls, rt_calls[-2:])
+    text, buttons = screen(await press("tf:all"))
+    chk("«Всем напрямую» — как было", (("tunnels", "fail", "set", "all", "direct"), None) in rt_calls
+        and all(v == "direct" for v in TF.values()) and not any(d == "tf:all" for _, d in buttons), [TF, buttons])
+    sent = await press("tf:t:nope")
+    chk("неизвестный туннель — «кнопка устарела»", any("устарела" in a for a in alerts(sent)), alerts(sent))
+    text, buttons = screen(await press("diag:log:tunfail|tf"))
+    chk("журнал «если упал»: «Назад» — туда же", "Если туннель упал" in text and ("◀️ Назад", "tf") in buttons, [text, buttons])
+
+    text, buttons = screen(await press("diag"))
+    chk("в «Диагностике» — «🧭 Куда идёт»", ("🧭 Куда идёт", "diag:rt") in buttons, buttons)
+    text, buttons = screen(await press("diag:rt:r"))
+    chk("куда идёт адрес из РФ напрямую: список клиентов, «Назад» — в РФ напрямую",
+        ("alice", "diag:rtc:alice|r") in buttons and ("◀️ Назад", "rud") in buttons, buttons)
+    text, buttons = screen(await press("diag:rtc:alice|r"))
+    chk("вопрос адреса; «Отмена» — к списку клиентов", "ya.ru" in text and ("✖️ Отмена", "diag:rt:r") in buttons, [text, buttons])
+    text, _ = screen(await say("ya ru"))
+    chk("адрес с пробелом — переспрашивает", "⚠️" in text and not any(c[0][:2] == ("diag", "route") for c in rt_calls), text)
+    text, _ = screen(await say("gone.example"))
+    chk("домен не разрешается — переспрашивает с причиной", "⚠️" in text and "не разрешается" in text, text)
+    ROUTE["rows"] = [{"ip": "1.1.1.1", "kind": "held", "dev": "", "note": "туннель лежит, режим «блокировать» <b>"},
+                     {"ip": "77.88.8.8", "kind": "rudirect", "dev": "eth0", "note": "напрямую с сервера — сеть России"},
+                     {"ip": "8.8.8.8", "kind": "warp", "dev": "warp0", "note": "через WARP"}]
+    text, buttons = screen(await say("https://ya.ru/x"))
+    chk("итог: каждый адрес с видом и пояснением (экранировано), подсказки «Если упал» и «В туннель», ещё раз и назад",
+        (("diag", "route", "alice", "https://ya.ru/x"), None) in rt_calls and "alice</b> (10.8.1.2)" in text
+        and "🔴 <code>1.1.1.1</code>" in text and "🇷🇺 <code>77.88.8.8</code>" in text and "🟢 <code>8.8.8.8</code> — через WARP" in text
+        and "&lt;b&gt;" in text and "Если упал" in text and "В туннель" in text
+        and ("🔄 Другой адрес", "diag:rtc:alice|r") in buttons and ("◀️ Назад", "rud") in buttons, [text, buttons])
+    text, buttons = screen(await press("cl:tun:alice"))
+    chk("маршрут клиента — кнопка «🧭 Куда идёт»", ("🧭 Куда идёт", "diag:rtc:alice|t") in buttons, buttons)
+    ROUTE["rows"] = [{"ip": "149.154.167.51", "kind": "rudirect", "dev": "eth0",
+                      "note": "напрямую с сервера — Telegram («Telegram напрямую»)"}]
+    text, buttons = screen(await press("diag:rtc:alice|t"))
+    chk("из маршрута клиента: «Отмена» — обратно в маршрут", ("✖️ Отмена", "cl:tun:alice") in buttons, buttons)
+    text, buttons = screen(await say("8.8.8.8"))
+    chk("итог из маршрута клиента: «Назад» — в маршрут клиента", ("◀️ Назад", "cl:tun:alice") in buttons, buttons)
+    chk("Telegram напрямую в итоге — подсказка вернуть Telegram в туннель, а не «В туннель»",
+        "✈️ TG в туннель" in text and "→ В туннель»" not in text, text)
+    no_hourglass("РФ напрямую")
+    botapi.call = real_call_
+
+    print("Точки входа (каскад)")
+    text, buttons = screen(await press("srv"))
+    chk("в «Сервере» — кнопка «📍 Точки входа»", ("📍 Точки входа", "ent") in buttons, buttons)
+    text, buttons = screen(await press("srv:ep"))
+    chk("в «Endpoint» — про каскад и кнопка «📍 Точки входа»", ("📍 Точки входа", "ent") in buttons and "каскад" in text, [text, buttons])
+    text, buttons = screen(await press("cl:v:alice"))
+    chk("без точек входа в карточке клиента нет ни строки «Вход», ни кнопки",
+        "Вход:" not in text and not any(d == "cl:ent:alice" for _, d in buttons), [text, buttons])
+    text, buttons = screen(await press("ent"))
+    chk("экран входов: что это, «напрямую» с адресом сервера, «Добавить», назад в «Сервер»",
+        "каскад" in text and "Напрямую" in text and ("➕ Добавить", "ent:add") in buttons and ("◀️ Назад", "srv") in buttons,
+        [text, buttons])
+    await press("ent:add")
+    text, _ = screen(await say("a|b"))
+    chk("название с «|» — переспрашивает", "⚠️" in text, text)
+    text, _ = screen(await say("Каскад NL"))
+    chk("после названия — спрашивает адрес", "Вход «Каскад NL»" in text and "203.0.113.5:443" in text, text)
+    text, _ = screen(await say("abc"))
+    chk("адрес без порта — переспрашивает", "⚠️" in text, text)
+    text, buttons = screen(await say("203.0.113.5:443"))
+    chk("вход добавлен — итог awg2 и назад к списку входов",
+        "✅" in text and "Каскад NL" in text and "203.0.113.5:443" in text and ("◀️ Назад", "ent") in buttons, [text, buttons])
+    text, buttons = screen(await press("ent"))
+    chk("в списке — новый вход кнопкой и итог проверки",
+        any(t.endswith("Каскад NL") and d == "ent:e:1" for t, d in buttons) and "✅ работает" in text, [text, buttons])
+    text, buttons = screen(await press("cl:v:alice"))
+    chk("с точками входа — в карточке «Вход: напрямую» и кнопка «📍 Вход»",
+        "Вход: напрямую" in text and ("📍 Вход", "cl:ent:alice") in buttons, [text, buttons])
+    text, buttons = screen(await press("cl:ent:alice"))
+    chk("выбор входа клиента: напрямую отмечено, вход — кнопкой с номером",
+        ("🔘 Напрямую", "cl:ents:0|alice") in buttons and ("⚪️ Каскад NL", "cl:ents:1|alice") in buttons
+        and "203.0.113.5:443" in text, [text, buttons])
+    text, buttons = screen(await press("cl:ents:1|alice"))
+    chk("вход клиента сменён: новый Endpoint и кнопка «Конфиг и QR»",
+        "alice" in text and "Каскад NL" in text and "Endpoint: <code>203.0.113.5:443</code>" in text
+        and ("📄 Конфиг и QR", "cl:conf:alice") in buttons, [text, buttons])
+    text, buttons = screen(await press("cl:v:alice"))
+    chk("в карточке — вход и его адрес", "Вход: «Каскад NL» — <code>203.0.113.5:443</code>" in text, text)
+    await press("ent")
+    text, buttons = screen(await press("ent:e:1"))
+    chk("карточка входа: адрес, клиентов 1, действия",
+        "203.0.113.5:443" in text and "Клиентов: 1" in text and ("🩺 Проверить", "ent:chk:1") in buttons
+        and ("⭐ Для новых", "ent:def:1") in buttons and ("👥 Всех сюда", "ent:all:1") in buttons
+        and ("🗑 Удалить", "ent:del:1") in buttons, [text, buttons])
+    text, buttons = screen(await press("ent:def:1"))
+    chk("«Для новых» — отмечен, кнопка пропала", "⭐ да" in text and not any(d == "ent:def:1" for _, d in buttons), [text, buttons])
+    text, buttons = screen(await press("ent:e:0"))
+    chk("«напрямую»: без проверки, адреса и удаления", not any(d.startswith(("ent:chk:", "ent:del:", "ent:addr:")) for _, d in buttons)
+        and ("⭐ Для новых", "ent:def:0") in buttons, buttons)
+    await press("ent:def:0")
+    # Выбрать клиентов: отметка, «Всех», «Выдать», конфиги в чат
+    text, buttons = screen(await press("ent:pick:1"))
+    chk("выбор клиентов: alice уже на входе (📍), никто не отмечен",
+        "Никто не отмечен" in text and any(t == "⬜️ alice 📍" and d == "ent:t:1|0|alice" for t, d in buttons)
+        and ("☑️ Всех", "ent:pa:1|0|all") in buttons, [text, buttons])
+    text, buttons = screen(await press("ent:t:1|0|bob"))
+    chk("отметка клиента", "Отмечено: 1" in text and ("✅ Выдать: 1", "ent:go:1") in buttons, [text, buttons])
+    text, buttons = screen(await press("ent:go:1"))
+    chk("выдача — с подтверждением и адресом", ("✅ Выдать", "ent:gook:1") in buttons and "203.0.113.5:443" in text, [text, buttons])
+    text, buttons = screen(await press("ent:gook:1"))
+    chk("выдано: кому, Endpoint, «Конфиги» в чат", "✅" in text and "bob" in text and ("📨 Конфиги: 1", "ent:send") in buttons,
+        [text, buttons])
+    sent = await press("ent:send")
+    chk("конфиги выбранных — в чат файлами", any(n == "SendDocument" and m.document.filename == "bob_awg2.conf" for n, m in sent),
+        [n for n, _ in sent])
+    text, _ = screen(await press("ent"))
+    chk("на входе теперь двое", "клиентов 2" in text, text)
+    # Новый адрес проверку не проходит — выдача заперта
+    await press("ent:addr:1")
+    text, buttons = screen(await say("198.51.100.9:8443"))
+    chk("новый адрес не доходит — предупреждение", "✅" in text and "не дошли" in text, text)
+    await press("ent")
+    text, buttons = screen(await press("ent:e:1"))
+    chk("запертый вход: итог проверки и 🔒 на выдаче",
+        "❌" in text and "🔒" in text and ("🔒 Выбрать", "ent:lock:1") in buttons and ("🔒 Всех сюда", "ent:lock:1") in buttons,
+        [text, buttons])
+    sent = await press("ent:lock:1")
+    chk("🔒 — объяснение во всплывающем окне", any("не прошёл проверку" in a for a in alerts(sent)), alerts(sent))
+    sent = await press("ent:pick:1")
+    chk("выбор клиентов на запертом входе не открывается", any("не прошёл проверку" in a for a in alerts(sent)), alerts(sent))
+    await press("cl:ents:0|alice")
+    text, buttons = screen(await press("cl:ent:alice"))
+    chk("в карточке клиента запертый вход — 🔒, нажатие объясняет",
+        ("🔒 Каскад NL", "cl:entl") in buttons and "❌" in text, [text, buttons])
+    sent = await press("cl:entl")
+    chk("🔒 в карточке — окно с причиной", any("не прошёл проверку" in a for a in alerts(sent)), alerts(sent))
+    await press("ent")
+    text, buttons = screen(await press("ent:del:1"))
+    chk("удаление входа с клиентами — с подтверждением и предупреждением",
+        ("🗑 Удалить", "ent:delok:1") in buttons and "клиенты (1) перейдут" in text, [text, buttons])
+    text, buttons = screen(await press("ent:delok:1"))
+    chk("вход удалён", "✅" in text and "удалена" in text, text)
+    text, buttons = screen(await press("cl:v:alice"))
+    chk("после удаления последнего входа в карточке снова нет «Вход»", "Вход:" not in text, text)
+    with open(os.path.join(ROOT, "etc/amnezia/amneziawg/awg0.conf")) as f:
+        conf = f.read()
+    chk("в awg0.conf не осталось меток входа", "AWG_ENTRY" not in conf and "entry=" not in conf, conf[:300])
+    no_hourglass("точки входа")
+
+    print("IPv6 сервера — точкой входа")
+    text, buttons = screen(await press("ent"))
+    chk("у сервера есть IPv6 — в «Точках входа» адрес и кнопка «🌐 IPv6 сервера»",
+        "2a01:4f8:c0c:1234::1" in text and ("🌐 IPv6 сервера", "ent:v6") in buttons, [text, buttons])
+    text, buttons = screen(await press("ent:v6"))
+    chk("IPv6 сервера добавлен: вход «IPv6» на [IPv6]:порт AWG, проверка пройдена",
+        "✅" in text and "[2a01:4f8:c0c:1234::1]:51820" in text and "Вход работает" in text and ("◀️ Назад", "ent") in buttons,
+        [text, buttons])
+    text, buttons = screen(await press("ent"))
+    v6 = [d for t, d in buttons if t.endswith("IPv6") and d.startswith("ent:e:")]
+    chk("после добавления — вход в списке, кнопки «🌐» нет", v6 and not any(d == "ent:v6" for _, d in buttons), [text, buttons])
+    idx = v6[0].rsplit(":", 1)[-1] if v6 else "1"
+    await press(f"ent:del:{idx}")
+    text, _ = screen(await press(f"ent:delok:{idx}"))
+    with open(os.path.join(ROOT, "etc/amnezia/amneziawg/awg0.conf")) as f:
+        conf = f.read()
+    chk("вход IPv6 удаляется, меток не осталось", "удалена" in text and "AWG_ENTRY" not in conf, [text, conf[:200]])
+    no_hourglass("IPv6 сервера")
 
     print("WARP: кнопки из уведомлений")
     started, real_job_w = [], botapi.job_start

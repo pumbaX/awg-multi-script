@@ -78,6 +78,7 @@ web_code_install() {
     bash "${src%/awg_bot}/awg-bot-install.sh" --src "$src" --web-only
     return
   fi
+  update_offer_beta
   # Свой каталог (700): рядом с установщиком он ищет awg_bot/ (см. bot_install)
   mktmp installer -d || return 1
   installer+="/awg-bot-install.sh"
@@ -156,7 +157,7 @@ _web_fw_run() {  # apply|down|check
   rule=(! -i lo -p tcp --dport "$port" -m conntrack --ctstate NEW -m set ! --match-set)
   if [[ "${1:-}" == check ]]; then
     if [[ "$mode" != ip && "$mode" != vpn ]]; then
-      [[ ! -e "$WEB_NETS_FILE" ]] && ! iptables -S INPUT 2>/dev/null | grep -qE -- "--comment \"?$WEB_FW_TAG\"?( |\$)"
+      [[ ! -e "$WEB_NETS_FILE" ]] && ! grep -qE -- "--comment \"?$WEB_FW_TAG\"?( |\$)" <<< "$(iptables -S INPUT 2>/dev/null)"
       return
     fi
     nets=$(_web_fw_nets | grep .)

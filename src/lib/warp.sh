@@ -337,6 +337,8 @@ warp_up() {
 }
 
 warp_down() {
+  # Состояние — раньше маршрутов: в режиме «блокировать» rt_down иначе удержал бы клиентов
+  rm -f "$WARP_STATE"
   rt_down "$WARP_IF" "$WARP_TABLE"
   if [[ "$(warp_backend)" == usque ]]; then
     systemctl stop awg-usque.service &>/dev/null || true
@@ -414,7 +416,11 @@ warp_health_run() {
   (( n >= 3 )) || exit 0
   warp_failover
   rm -f "$WARP_HEALTH_RETRY"
-  echo "$(date '+%F %T') FAILOVER: клиенты идут напрямую, WARP вернётся сам" >> "$WARP_HEALTH_LOG"
+  if [[ "$(rt_fail_mode warp)" == block ]]; then
+    echo "$(date '+%F %T') FAILOVER: клиенты WARP удержаны (режим «блокировать»), WARP вернётся сам" >> "$WARP_HEALTH_LOG"
+  else
+    echo "$(date '+%F %T') FAILOVER: клиенты идут напрямую, WARP вернётся сам" >> "$WARP_HEALTH_LOG"
+  fi
 }
 
 _warp_health_emit() {

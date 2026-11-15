@@ -127,6 +127,8 @@ XRAY_SOCKS="127.0.0.1:10808"
 XRAY_UNIT="awg-xray.service"
 XRAY_TUN_UNIT="awg-xray-tun.service"
 XRAY_ROUTING_UNIT="awg-xray-routing.service"
+# Трафик через выход Xray не идёт — что проверить (журнал, статус, включение)
+XRAY_CHECK_HINT="проверь ссылку выхода: она могла устареть или сервер выхода недоступен — «Диагностика» покажет, какой выход не отвечает"
 XRAY_ROUTING_SCRIPT="/usr/local/bin/awg2-xray-routing.sh"
 XRAY_RUGEO_URL="https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download"
 
@@ -143,6 +145,14 @@ EXITS_PEERS="$EXITS_DIR/exits_peers.list"
 EXITS_STATE="$EXITS_DIR/exits_state"
 EXITS_UNIT="awg-exits-routing.service"
 EXITS_SCRIPT="/usr/local/bin/awg2-exits-routing.sh"
+# Сторож exit-нод: проба через ноду раз в 30 с; упала — 3 провала подряд
+# (интерфейс пропал — сразу), вернулась — 2 удачи. Состояние — в /run: после
+# перезагрузки ноды проверяются заново, а не числятся упавшими по старой памяти
+EXITS_HEALTH_DIR="/run/awg2-exits-health" EXITS_LOCK="/run/awg2-exits.lock"
+EXITS_HEALTH_LOG="/var/log/awg2-exits-health.log"
+EXITS_HEALTH_UNIT="awg2-exits-health.service" EXITS_HEALTH_TIMER="awg2-exits-health.timer"
+EXITS_HC_FAILS=3 EXITS_HC_OKS=2 EXITS_HC_TARGETS="1.1.1.1 8.8.8.8"
+EXITS_HC_URL="http://cp.cloudflare.com/generate_204"
 
 # ── Срок действия клиентов ────────────────────────────────
 EXPIRE_BIN="/usr/local/bin/awg2-expire-check"
@@ -222,6 +232,30 @@ VKBLOCK_SRC="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blackl
 # Настоящий список: ~200 записей, ~300 тыс. адресов IPv4 и три сети /29 IPv6.
 # Короче минимума — оборван, шире предела — подменён: прежний не заменяют
 VKBLOCK_MIN=50 VKBLOCK_MAX4=4194304 VKBLOCK_MAX6=4096   # 2^22 адресов IPv4; 2^12 сетей /32 IPv6
+
+# ── РФ напрямую (клиенты в туннеле — к сетям России мимо него) ──
+RUDIRECT_DIR="$STATE_DIR/rudirect"           # список РФ и состояние
+RUDIRECT_CONF="$RUDIRECT_DIR/rudirect.conf"  # ON, UPDATED, ERROR, ENTRIES, SRC
+RUDIRECT_USER="/etc/awg2/rudirect"           # свои списки (в бэкапе): direct.list, tunnel.list
+RUDIRECT_SCRIPT="/usr/local/bin/awg2-rudirect"
+RUDIRECT_LOG="/var/log/awg2-rudirect.log"
+RUDIRECT_SET="awg2-ru" RUDIRECT_TAG="awg2-rudirect"
+# Метка в старших битах: младшие заняты чужими (wg-quick — 51820)
+RUDIRECT_MARK="0x52550000/0xffff0000" RUDIRECT_PRIO=90     # приоритет раньше туннелей (100-249)
+RUDIRECT_RPF="/proc/sys/net/ipv4/conf"                # rp_filter аплинка: строгий ломает ответы
+# «Telegram напрямую» — подсети Telegram (core.telegram.org/resources/cidr.txt)
+RUDIRECT_TG_NETS="149.154.160.0/20 91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 91.108.20.0/22 91.108.56.0/22 91.105.192.0/23 185.76.151.0/24"
+RUDIRECT_UNIT="awg2-rudirect.service" RUDIRECT_TIMER="awg2-rudirect-update.timer"
+RUDIRECT_SRCS="https://raw.githubusercontent.com/ipverse/rir-ip/master/country/ru/ipv4-aggregated.txt https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone"
+# Настоящий список: ~8700 сетей, ~45 млн адресов IPv4. Короче или уже — оборван,
+# шире — подменён: прежний не заменяют. Своих записей — не больше 500
+RUDIRECT_MIN=2000 RUDIRECT_MINADDR=20000000 RUDIRECT_MAX4=134217728 RUDIRECT_USER_MAX=500
+
+# ── Если туннель упал (режим на каждый туннель: напрямую или блокировать) ──
+TUNFAIL_CONF="/etc/awg2/tunnel-fail.conf"    # warp=block, xray=direct… (нет строки — direct)
+TUNFAIL_SCRIPT="/usr/local/bin/awg2-tunfail"
+TUNFAIL_LOG="/var/log/awg2-tunfail.log"
+TUNFAIL_UNIT="awg2-tunfail.service" TUNFAIL_TIMER="awg2-tunfail.timer"
 
 # Интерфейсы, которые поднимает сам awg2: их адрес не может быть Endpoint
 # клиента, и маршрут через них — не аплинк сервера.

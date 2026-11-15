@@ -3,6 +3,7 @@
 Uses temporary files and mocked API calls only; no VPN or system commands.
 """
 import errno
+import json
 import logging
 import multiprocessing
 from pathlib import Path
@@ -100,6 +101,20 @@ class StorageTests(unittest.TestCase):
         token, _, exp = self.create()
         with patch.object(share.time, "time", return_value=exp):
             self.assertIsNone(share._lookup(token, count=True))
+
+    def test_corrupt_records_do_not_break_valid_share(self):
+        token, _, _ = self.create()
+        key = share._digest(token)
+        data = json.loads(share._file().read_text(encoding="utf-8"))
+        for i, exp in enumerate(("broken", "inf", "NaN", [], {})):
+            data[f"bad-{i}"] = {"name": "alice", "pub": "TEST-PUBLIC", "exp": exp}
+        data[key]["opens"] = "broken"
+        share._file().write_text(json.dumps(data), encoding="utf-8")
+
+        rec = share._lookup(token, count=True)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["opens"], 1)
+        self.assertEqual(set(json.loads(share._file().read_text(encoding="utf-8"))), {key})
 
     def test_two_processes_enforce_one_shared_open_limit(self):
         token, _, _ = self.create()

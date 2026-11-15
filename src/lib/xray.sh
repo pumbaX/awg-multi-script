@@ -16,6 +16,16 @@
 #                               трафик через Xray действительно идёт.
 
 xray_installed() { [[ -x "$XRAY_BIN" && -f "$XRAY_CONF" ]]; }
+# Сбой включённого Xray: down — Xray не запущен (xray0 нет); notraffic — запущен,
+# но служба маршрутов не дождалась трафика через выход (ссылка устарела, сервер
+# выхода лежит) — клиенты Xray не в туннеле. Пока маршруты ждут (при загрузке до
+# минуты) — не сбой. Пусто и 1 — сбоя нет или Xray выключен.
+xray_fail() {
+  [[ -f "$XRAY_STATE" ]] || return 1
+  if ! ip link show "$XRAY_IF" &>/dev/null && ! unit_active "$XRAY_UNIT"; then echo down; return 0; fi
+  systemctl is-failed --quiet "$XRAY_ROUTING_UNIT" 2>/dev/null && { echo notraffic; return 0; }
+  return 1
+}
 xray_state_get() { sed -n "s/^$1=//p" "$XRAY_STATE" 2>/dev/null | head -1; }
 xray_tags()      { [[ -f "$XRAY_CONF" ]] && py xray-tags "$XRAY_CONF" 2>/dev/null; }
 xray_ru_on()     { [[ -f "$XRAY_CONF" ]] && grep -q '"ruleTag": "ru-direct"' "$XRAY_CONF"; }
@@ -408,13 +418,14 @@ xray_routing_run() {
     socks_probe "$XRAY_SOCKS" >/dev/null && { rt_up "$XRAY_IF" "$XRAY_TABLE" "$XRAY_PEERS" "" "$nat"; return; }
     sleep 5
   done
-  echo "через Xray трафик не идёт — клиенты остаются на прямом маршруте" >&2
+  echo "через Xray трафик не идёт — клиенты Xray не переведены в туннель" >&2
+  echo "$XRAY_CHECK_HINT (Туннели → Xray → Диагностика)" >&2
   return 1
 }
 
 _xray_emit_routing() {
   emit_script "$XRAY_ROUTING_SCRIPT" 'xray_routing_run "$@"' XRAY_IF XRAY_TABLE XRAY_PEERS XRAY_STATE \
-    XRAY_TUN_ADDR XRAY_SOCKS socks_probe "${RT_FUNCS[@]}" xray_routing_run
+    XRAY_TUN_ADDR XRAY_SOCKS XRAY_CHECK_HINT socks_probe "${RT_FUNCS[@]}" xray_routing_run
 }
 
 _xray_write_units() {  # режим
@@ -524,7 +535,8 @@ xray_up() {
   info "Проверяю, идёт ли трафик через Xray..."
   if ! why=$(socks_probe "$XRAY_SOCKS"); then
     err "Через Xray трафик не идёт (ответ: $why) — туннель не включаю"
-    info "Клиенты остались на прямом маршруте. Логи: journalctl -u $XRAY_UNIT -n 30"
+    info "${XRAY_CHECK_HINT^}"
+    info "Клиенты остались на прямом маршруте"
     xray_down quiet
     return 1
   fi
@@ -534,13 +546,15 @@ xray_up() {
 }
 
 xray_down() {
+  # Состояние — раньше остановки: ExecStop маршрутов в режиме «блокировать»
+  # иначе удержал бы клиентов, а ConditionPathExists не даст Xray стартовать
+  rm -f "$XRAY_STATE"
   systemctl stop "$XRAY_ROUTING_UNIT" &>/dev/null || true
   systemctl disable "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
   systemctl stop "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
   systemctl reset-failed "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
   rt_down "$XRAY_IF" "$XRAY_TABLE"
   ip link del "$XRAY_IF" &>/dev/null || true
-  rm -f "$XRAY_STATE"
   [[ "${1:-}" == quiet ]] || ok "Xray выключен — клиенты идут напрямую"
 }
 
@@ -561,15 +575,19 @@ xray_uninstall() {
 
 # ── Статус и диагностика ──────────────────────────────────
 xray_status() {
-  local tags=() n total name tag
+  local tags=() n total name tag fail
   if ! xray_installed; then echo -e "  Xray      : ${D}○ не установлен${N}"; return 0; fi
   echo -e "  Версия    : $("$XRAY_BIN" version 2>/dev/null | head -1 | awk '{print $2}')"
-  if ip link show "$XRAY_IF" &>/dev/null; then
+  fail=$(xray_fail)
+  if [[ "$fail" == notraffic ]]; then
+    echo -e "  Туннель   : ${R}▲ включён, но через выход трафик не идёт${N} — клиенты Xray не в туннеле"
+    echo -e "  ${D}  ${XRAY_CHECK_HINT^}${N}"
+  elif ip link show "$XRAY_IF" &>/dev/null; then
     echo -e "  Туннель   : ${G}● включён${N} ${D}($(xray_state_get tun_mode))${N}"
     n=$(grep -c . "$XRAY_PEERS" 2>/dev/null || true); total=$(clients_name_ip | wc -l)
     echo -e "  Клиентов  : ${W}${n:-0}${N} из $total через Xray"
   elif [[ -f "$XRAY_STATE" ]]; then
-    echo -e "  Туннель   : ${R}▲ включён, но $XRAY_IF нет${N} ${D}— journalctl -u $XRAY_UNIT${N}"
+    echo -e "  Туннель   : ${R}▲ включён, но не запущен${N} — «Перезапустить»; не поднимется — «Диагностика»"
   else
     echo -e "  Туннель   : ${D}○ выключен${N}"
   fi

@@ -693,7 +693,8 @@ def same_origin(request: web.Request) -> bool:
     совпадает с адресом панели; без Origin — Sec-Fetch-Site."""
     origin = request.headers.get("Origin")
     if origin:
-        return urlsplit(origin).netloc == request.host
+        u = urlsplit(origin)
+        return u.scheme == request.scheme and u.netloc == request.host
     return request.headers.get("Sec-Fetch-Site", "same-origin") in ("same-origin", "none")
 
 

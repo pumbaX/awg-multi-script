@@ -312,6 +312,8 @@
                         min-height: 40px; display: flex; align-items: center; justify-content: center; gap: 6px; border-radius: 9px; cursor: pointer; }
   .ecard .acts button:hover { background: var(--hover); color: var(--text); }
   .ecard .acts button.bad { color: var(--red); }
+  /* Запертое действие (вход не прошёл проверку): видно, но серое — по нажатию объясняет */
+  .ecard .acts button.locked, .chips button.locked { opacity: .45; }
   @container (max-width: 290px) { .ecard .acts svg.i { display: none; } }
 
   /* Сводка: крупные цифры, подпись сверху, без карточек — разделены линиями */

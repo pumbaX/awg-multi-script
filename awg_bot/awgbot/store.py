@@ -12,13 +12,15 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import re
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 log = logging.getLogger("awgbot.store")
 
@@ -69,6 +71,26 @@ def save(path: Path, data: dict) -> bool:
         return False
 
 
+@contextmanager
+def locked(path: Path):
+    """Межпроцессная блокировка read-modify-write для бота и веб-панели."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(path) + ".lock", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def _modify(path: Path, change: Callable[[dict], bool]) -> bool:
+    """Изменить JSON под flock; False из change — записывать нечего."""
+    try:
+        with locked(path):
+            data = load(path)
+            return save(path, data) if change(data) else True
+    except OSError as e:
+        log.error("Не заблокировал %s: %s", path, e)
+        return False
+
+
 # ── Заметки ───────────────────────────────────────────────
 def notes() -> dict[str, str]:
     return {str(k): str(v) for k, v in load(NOTES).items()}
@@ -79,26 +101,30 @@ def note(name: str) -> str:
 
 
 def set_note(name: str, text: str) -> None:
-    data = notes()
     text = " ".join(text.split())[:NOTE_MAX]
-    if text:
-        data[name] = text
-    else:
-        data.pop(name, None)
-    save(NOTES, data)
+
+    def change(data: dict) -> bool:
+        if text:
+            data[name] = text
+        else:
+            data.pop(name, None)
+        return True
+
+    _modify(NOTES, change)
 
 
 def rename_note(old: str, new: str) -> None:
-    data = notes()
-    if old in data:
+    def change(data: dict) -> bool:
+        if old not in data:
+            return False
         data[new] = data.pop(old)
-        save(NOTES, data)
+        return True
+
+    _modify(NOTES, change)
 
 
 def drop_note(name: str) -> None:
-    data = notes()
-    if data.pop(name, None) is not None:
-        save(NOTES, data)
+    _modify(NOTES, lambda data: data.pop(name, None) is not None)
 
 
 def monitored(name: str) -> bool:
@@ -111,11 +137,18 @@ def strip_tag(text: str) -> str:
 
 
 def set_monitored(name: str, on: bool) -> None:
-    """Мониторинг включается маркером в заметке — как в прежних версиях."""
-    base = strip_tag(note(name))
-    if on:
-        base = f"{base[:NOTE_MAX - len(MONITOR_TAG) - 1].rstrip()} {MONITOR_TAG}".strip()
-    set_note(name, base)
+    """Мониторинг и текст заметки меняются атомарно относительно других процессов."""
+    def change(data: dict) -> bool:
+        base = strip_tag(str(data.get(name) or ""))
+        if on:
+            base = f"{base[:NOTE_MAX - len(MONITOR_TAG) - 1].rstrip()} {MONITOR_TAG}".strip()
+        if base:
+            data[name] = base
+        else:
+            data.pop(name, None)
+        return True
+
+    _modify(NOTES, change)
 
 
 # ── Настройки экранов (сортировка списка клиентов) ────────
@@ -124,9 +157,11 @@ def setting(key: str, default: str = "") -> str:
 
 
 def set_setting(key: str, value: str) -> None:
-    data = load(SETTINGS)
-    data[key] = value
-    save(SETTINGS, data)
+    def change(data: dict) -> bool:
+        data[key] = value
+        return True
+
+    _modify(SETTINGS, change)
 
 
 # ── Сообщение, которое бот поправит после своего перезапуска ──
@@ -146,12 +181,12 @@ def jobs() -> dict[str, dict[str, Any]]:
 
 
 def job_add(job_id: str, info: dict[str, Any]) -> None:
-    data = jobs()
-    data[job_id] = info
-    save(JOBS, data)
+    def change(data: dict) -> bool:
+        data[job_id] = info
+        return True
+
+    _modify(JOBS, change)
 
 
 def job_done(job_id: str) -> None:
-    data = jobs()
-    if data.pop(job_id, None) is not None:
-        save(JOBS, data)
+    _modify(JOBS, lambda data: data.pop(job_id, None) is not None)

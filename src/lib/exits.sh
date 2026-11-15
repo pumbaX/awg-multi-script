@@ -9,8 +9,17 @@
 # остановкой и запуском правила пересоздаются целиком, поэтому сдвиг номера
 # после добавления ноды ничего не ломает.
 #
-# exits_state: «active|inactive», mode=all|peers, balancer=single|ecmp, single_exit=
+# exits_state: «active|inactive», mode=all|peers, balancer=single|ecmp, single_exit=,
+# order= (запасные ноды общего выхода по порядку, через запятую)
 # exits_peers.list: «IP» — общий выход, «IP|нода» — персональная нода.
+#
+# Сторож (awg2-exits-health.timer, раз в 30 с) пробует выход в интернет через
+# каждую ноду. Упавшая выпадает: общий выход — первая живая по порядку
+# (основная → запасные; поднялась основная — общий выход возвращается на неё),
+# в ECMP — остальные живые, клиент упавшей персональной ноды идёт через общий
+# выход. Маршруты меняются в таблицах на ходу, правила клиентов не трогаются —
+# нет мгновения, когда клиент уходит напрямую. Упали все — как «Если туннель
+# упал»: «блокировать» держит клиентов, «напрямую» отпускает.
 
 exits_nodes() {
   local f n
@@ -21,9 +30,10 @@ exits_nodes() {
 }
 
 # Ноды для карточек панели: имя, поднята, адрес, рукопожатие, принято, отдано,
-# протокол (awg — есть параметры обфускации, иначе wg)
+# протокол (awg — есть параметры обфускации, иначе wg), у сторожа: up|down
+# (пусто — ещё не проверялась), с какого времени, причина
 exits_node_rows() {
-  local n f ep up hs rx tx proto dump
+  local n f ep up hs rx tx proto dump hst hsince hwhy
   while IFS= read -r n; do
     f="$EXITS_DIR/awg-exit-$n.conf"
     ep=$(sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$f" 2>/dev/null | head -1 | tr -d '\t\r')
@@ -35,7 +45,10 @@ exits_node_rows() {
       [[ -z "$dump" ]] || IFS=$'\t' read -r _ _ _ _ hs rx tx _ <<< "$dump"
     fi
     [[ "$hs" =~ ^[0-9]+$ ]] || hs=0; [[ "$rx" =~ ^[0-9]+$ ]] || rx=0; [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$up" "$ep" "$hs" "$rx" "$tx" "$proto"
+    hst="" hsince=0 hwhy=""
+    if [[ -f "$EXITS_HEALTH_DIR/$n" ]]; then read -r hst _ _ hsince hwhy <<< "$(_exits_hstate "$n")"; fi
+    [[ "$hwhy" == - ]] && hwhy=""
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$up" "$ep" "$hs" "$rx" "$tx" "$proto" "$hst" "$hsince" "$hwhy"
   done < <(exits_nodes)
 }
 
@@ -50,18 +63,19 @@ exits_state_get() { sed -n "s/^$1=//p" "$EXITS_STATE" 2>/dev/null | head -1; }
 
 # exits_state_set ключ значение ... — ключи: state mode balancer single_exit
 exits_state_set() {
-  local st mode bal single
+  local st mode bal single order
   st=$(head -1 "$EXITS_STATE" 2>/dev/null || true)
   [[ "$st" == active ]] || st=inactive
   mode=$(exits_state_get mode); bal=$(exits_state_get balancer); single=$(exits_state_get single_exit)
+  order=$(exits_state_get order)
   while (( $# >= 2 )); do
     case "$1" in
-      state) st="$2" ;; mode) mode="$2" ;; balancer) bal="$2" ;; single_exit) single="$2" ;;
+      state) st="$2" ;; mode) mode="$2" ;; balancer) bal="$2" ;; single_exit) single="$2" ;; order) order="$2" ;;
     esac
     shift 2
   done
   mkdir -p "$EXITS_DIR"
-  printf '%s\nmode=%s\nbalancer=%s\nsingle_exit=%s\n' "$st" "${mode:-all}" "${bal:-single}" "$single" \
+  printf '%s\nmode=%s\nbalancer=%s\nsingle_exit=%s\norder=%s\n' "$st" "${mode:-all}" "${bal:-single}" "$single" "$order" \
     | write_file "$EXITS_STATE" 600
 }
 
@@ -86,26 +100,237 @@ exits_rules_clear() {
 }
 
 # ── Маршрутизация (awg-exits-routing.service) ─────────────
-# Правило клиента «IP[|нода]»: своя поднятая нода — её таблица, лежащая или
-# удалённая — общий выход, а не в пустоту
-exits_peer_rule() {  # строка «ноды через пробел»
-  local line="${1//[[:space:]]/}" up=" $2 " pip pnode="" table t
+# Правило клиента «IP[|нода]»: у своей ноды — её таблица. Нода живая — маршрут
+# через неё; упала или не поднята — в её таблице общий выход (вернётся нода —
+# сторож вернёт и маршрут, правило клиента не трогая); удалена — общая таблица.
+exits_peer_rule() {  # строка «живые ноды через пробел, по порядку»
+  local line="${1//[[:space:]]/}" live=() pip pnode="" table t
+  read -r -a live <<< "${2:-}"
   pip="${line%%|*}"
   [[ "$line" == *"|"* ]] && pnode="${line#*|}"
   valid_ip "$pip" || return 0
   table="$EXITS_TABLE"
-  if [[ -n "$pnode" && "$up" == *" $pnode "* ]] && t=$(exits_table_for "$pnode") \
-     && ip route replace default dev "awg-exit-$pnode" table "$t" 2>/dev/null; then
-    table="$t"
+  if [[ -n "$pnode" ]] && t=$(exits_table_for "$pnode"); then
+    if [[ " ${live[*]} " == *" $pnode "* ]]; then
+      ip route replace default dev "awg-exit-$pnode" table "$t" 2>/dev/null && table="$t"
+    elif (( ${#live[@]} )); then
+      _exits_shared_route "$t" "${live[@]}" 2>/dev/null && table="$t"
+    else
+      table="$t"        # живых нет: в её таблице только «недоступно» (режим «блокировать»)
+    fi
+    [[ "$table" == "$t" ]] && rt_fail_route "$t"
   fi
   ip rule add from "$pip" lookup "$table" priority "$EXITS_TABLE" || true
 }
 
+# ── Сторож нод ────────────────────────────────────────────
+# Порядок нод общего выхода: основная (single_exit), запасные (order), затем
+# остальные по алфавиту. Удалённые выпадают.
+exits_order() {
+  local seen=" " n
+  for n in "$(exits_state_get single_exit)" $(tr ',' ' ' <<< "$(exits_state_get order)") $(exits_nodes); do
+    [[ -n "$n" && "$seen" != *" $n "* && -f "$EXITS_DIR/awg-exit-$n.conf" ]] || continue
+    seen+="$n "
+    echo "$n"
+  done
+}
+
+# Состояние ноды у сторожа: «up|down провалов_подряд удач_подряд с_какого причина»
+_exits_hstate() {
+  local s
+  s=$(cat "$EXITS_HEALTH_DIR/$1" 2>/dev/null)
+  echo "${s:-up 0 0 0 -}"
+}
+_exits_hset() { mkdir -p "$EXITS_HEALTH_DIR" && echo "$2 $3 $4 $5 $6" > "$EXITS_HEALTH_DIR/$1"; }
+exits_node_dead() { [[ "$(_exits_hstate "$1")" == "down "* ]]; }
+exits_dead_list() {  # → «нода:причина,…» упавших по мнению сторожа
+  local n why
+  while IFS= read -r n; do
+    exits_node_dead "$n" || continue
+    read -r _ _ _ _ why <<< "$(_exits_hstate "$n")"
+    echo "$n:$why"
+  done < <(exits_nodes) | paste -sd, -
+}
+
+# Живые ноды по порядку: интерфейс поднят и сторож не признал её упавшей
+exits_live_nodes() {
+  local n
+  while IFS= read -r n; do
+    ip link show "awg-exit-$n" &>/dev/null || continue
+    exits_node_dead "$n" && continue
+    echo "$n"
+  done < <(exits_order)
+}
+
+# Общий выход сейчас: «нода», «нода1+нода2» (ECMP) или пусто
+exits_shared_now() {
+  local live=()
+  mapfile -t live < <(exits_live_nodes)
+  (( ${#live[@]} )) || return 0
+  if [[ "$(exits_state_get balancer)" == ecmp ]] && (( ${#live[@]} > 1 )); then
+    (IFS=+; echo "${live[*]}")
+  else
+    echo "${live[0]}"
+  fi
+}
+
+# Маршрут общего выхода в таблицу: ECMP между живыми или первая живая по порядку
+_exits_shared_route() {  # таблица живые_ноды...
+  local t="$1" n args=()
+  shift
+  if [[ "$(exits_state_get balancer)" == ecmp ]] && (( $# > 1 )); then
+    for n in "$@"; do args+=(nexthop dev "awg-exit-$n" weight 1); done
+    if ip route replace default table "$t" "${args[@]}" 2>/dev/null; then
+      # Хеш по L4: соединение держится одной ноды, а не разъезжается по всем
+      sysctl -qw net.ipv4.fib_multipath_hash_policy=1 2>/dev/null || true
+      return 0
+    fi
+    echo "ядро не приняло ECMP — одна нода: $1" >&2
+  fi
+  ip route replace default dev "awg-exit-$1" table "$t" \
+    || { echo "не удалось поставить маршрут в таблицу $t" >&2; return 1; }
+}
+
+# Проба ноды. 0 — выход в интернет через неё есть; иначе в stdout причина:
+# link — интерфейс не поднят, silent — нода не отвечает (рукопожатия нет),
+# nonet — нода на связи, но выхода в интернет у неё нет
+_exits_probe() {
+  local dev="awg-exit-$1" t hs
+  ip link show "$dev" &>/dev/null || { echo link; return 1; }
+  if command -v ping &>/dev/null; then
+    for t in $EXITS_HC_TARGETS; do ping -c2 -i0.3 -W2 -I "$dev" "$t" &>/dev/null && return 0; done
+  fi
+  # ICMP режут — тогда HTTP через ноду
+  [[ "$(curl -4 -sS -o /dev/null -w '%{http_code}' --max-time 6 --interface "$dev" "$EXITS_HC_URL" 2>/dev/null)" == 204 ]] \
+    && return 0
+  hs=$(awg show "$dev" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+  if [[ "$hs" =~ ^[0-9]+$ ]] && (( hs > 0 && $(date +%s) - hs < 180 )); then echo nonet; else echo silent; fi
+  return 1
+}
+
+# Интернет у самого сервера (молчат все ноды разом — дело может быть не в них)
+_exits_server_online() {
+  local t
+  if command -v ping &>/dev/null; then
+    for t in $EXITS_HC_TARGETS; do ping -c1 -W2 "$t" &>/dev/null && return 0; done
+  fi
+  [[ "$(curl -4 -sS -o /dev/null -w '%{http_code}' --max-time 6 "$EXITS_HC_URL" 2>/dev/null)" == 204 ]]
+}
+
+_exits_hlog() { mkdir -p "$(dirname "$EXITS_HEALTH_LOG")" 2>/dev/null; echo "[$(date '+%F %T')] $*" >> "$EXITS_HEALTH_LOG"; }
+
+exits_why_text() {  # link|silent|nonet → пояснение
+  case "$1" in
+    link) echo "интерфейс не поднят" ;;
+    nonet) echo "на связи, но выхода в интернет нет" ;;
+    *) echo "не отвечает" ;;
+  esac
+}
+
+# Есть правила клиентов exit-нод (общая или персональные таблицы)
+_exits_has_rules() {
+  ip rule show 2>/dev/null | awk -v a="$EXITS_TABLE" -v lo="$EXITS_TABLE_BASE" -v hi="$EXITS_TABLE_MAX" '
+    $(NF - 1) == "lookup" && ($NF == a || ($NF >= lo && $NF <= hi)) { f = 1 } END { exit !f }'
+}
+
+# Живые ноды поменялись — маршруты на ходу. Правила клиентов не трогаем: так
+# нет мгновения, когда клиент уходит напрямую.
+exits_routing_refresh() {
+  local live=() rules n t
+  mapfile -t live < <(exits_live_nodes)
+  if ! _exits_has_rules; then
+    # Правил нет: ноды лежали в режиме «напрямую» (или маршруты ещё не ставились)
+    if (( ${#live[@]} )); then exits_routing_start; fi
+    return
+  fi
+  rules=$(ip rule show 2>/dev/null)
+  if (( ! ${#live[@]} )); then
+    if [[ "$(rt_fail_mode exits)" == block ]]; then
+      # Как при упавшем туннеле: в таблицах только «недоступно», клиенты ждут
+      for t in "$EXITS_TABLE" $(seq "$EXITS_TABLE_BASE" "$EXITS_TABLE_MAX"); do
+        [[ "$t" == "$EXITS_TABLE" ]] || grep -qE "lookup $t\$" <<< "$rules" || continue
+        ip route flush table "$t" 2>/dev/null || true
+        ip route replace unreachable default metric 4096 table "$t" 2>/dev/null || true
+      done
+    else
+      exits_rules_clear
+    fi
+    return 0
+  fi
+  for n in "${live[@]}"; do rt_fw_up "awg-exit-$n"; done
+  _exits_shared_route "$EXITS_TABLE" "${live[@]}" || return 1
+  rt_fail_route "$EXITS_TABLE"
+  # Персональные ноды: живая — своя, упавшая — общий выход
+  while IFS= read -r n; do
+    t=$(exits_table_for "$n") || continue
+    grep -qE "lookup $t\$" <<< "$rules" || continue
+    if [[ " ${live[*]} " == *" $n "* ]]; then ip route replace default dev "awg-exit-$n" table "$t" 2>/dev/null || true
+    else _exits_shared_route "$t" "${live[@]}" || true; fi
+    rt_fail_route "$t"
+  done < <(exits_nodes)
+  return 0
+}
+
+# Проход сторожа: пробы, состояние нод, при перемене — маршруты
+exits_health_run() {
+  local nodes=() res=() pids=() i n r st fails oks since why now alive=0 changed=0 before after tmp
+  mapfile -t nodes < <(exits_nodes)
+  (( ${#nodes[@]} )) || return 0
+  # Пробы — разом и без блокировки: мёртвая нода отвечает таймаутом (~10 с),
+  # смена порядка и запуск маршрутов её не ждут
+  tmp=$(mktemp -d) || return 0
+  for i in "${!nodes[@]}"; do
+    ( if r=$(_exits_probe "${nodes[$i]}"); then r=ok; fi; echo "${r:-silent}" > "$tmp/$i" ) &
+    pids+=($!)
+  done
+  wait "${pids[@]}"
+  for i in "${!nodes[@]}"; do
+    res[i]=$(cat "$tmp/$i" 2>/dev/null); res[i]="${res[i]:-silent}"
+    [[ "${res[i]}" == ok ]] && alive=1
+  done
+  rm -rf "$tmp"
+  # Молчат все разом, а у сервера нет интернета — дело не в нодах: не трогаем
+  if (( ! alive )) && ! _exits_server_online; then
+    _exits_hlog "у сервера нет выхода в интернет — ноды не переключаю"
+    return 0
+  fi
+  { flock -w 60 9; } 2>/dev/null || true
+  before=$(exits_shared_now)
+  now=$(date +%s)
+  for i in "${!nodes[@]}"; do
+    n="${nodes[$i]}"
+    read -r st fails oks since why <<< "$(_exits_hstate "$n")"
+    if [[ "${res[$i]}" == ok ]]; then
+      fails=0; oks=$((oks + 1))
+      if [[ "$st" == down ]] && (( oks >= EXITS_HC_OKS )); then
+        st=up since=$now why=- changed=1
+        _exits_hlog "нода $n снова работает"
+      fi
+    else
+      oks=0; fails=$((fails + 1)) why="${res[$i]}"
+      # Интерфейс пропал — сразу: маршрута через него уже нет
+      if [[ "$st" == up ]] && { (( fails >= EXITS_HC_FAILS )) || [[ "$why" == link ]]; }; then
+        st=down since=$now changed=1
+        _exits_hlog "нода $n: $(exits_why_text "$why") (проверок подряд: $fails)"
+      fi
+    fi
+    _exits_hset "$n" "$st" "$fails" "$oks" "$since" "$why"
+  done
+  (( changed )) || return 0
+  rt_tunnel_on "$EXITS_TABLE" || return 0
+  exits_routing_refresh
+  after=$(exits_shared_now)
+  if [[ "$after" != "$before" ]]; then
+    if [[ -n "$after" ]]; then _exits_hlog "общий выход: ${before:-нет} → $after"
+    elif [[ "$(rt_fail_mode exits)" == block ]]; then _exits_hlog "живых нод нет — клиенты удержаны (режим «блокировать»)"
+    else _exits_hlog "живых нод нет — клиенты идут напрямую"; fi
+  fi
+  return 0
+}
+
 exits_routing_start() {
-  local mode balancer single up=() n i routed="" net line args
+  local mode up=() live=() n i net line
   mode=$(exits_state_get mode); mode="${mode:-all}"
-  balancer=$(exits_state_get balancer)
-  single=$(exits_state_get single_exit)
   # При загрузке интерфейсы нод появляются не сразу
   for i in $(seq 1 20); do
     mapfile -t up < <(exits_up_nodes)
@@ -113,50 +338,73 @@ exits_routing_start() {
     sleep 0.5
   done
   (( ${#up[@]} )) || { echo "ни одна exit-нода не поднята" >&2; return 1; }
+  mapfile -t live < <(exits_live_nodes)
   net=$(server_net) || return 1
+  rt_release_held "$EXITS_TABLE"
   exits_rules_clear
-  [[ " ${up[*]} " == *" $single "* ]] || single="${up[0]}"
-  if [[ "$balancer" == ecmp ]] && (( ${#up[@]} > 1 )); then
-    args=()
-    for n in "${up[@]}"; do args+=(nexthop dev "awg-exit-$n" weight 1); done
-    if ip route replace default table "$EXITS_TABLE" "${args[@]}" 2>/dev/null; then
-      # Хеш по L4: соединение держится одной ноды, а не разъезжается по всем
-      sysctl -qw net.ipv4.fib_multipath_hash_policy=1 2>/dev/null || true
-      routed=1
-    else
-      echo "ядро не приняло ECMP — одна нода: $single" >&2
-    fi
-  fi
-  [[ -n "$routed" ]] || ip route replace default dev "awg-exit-$single" table "$EXITS_TABLE" \
-    || { echo "не удалось поставить маршрут в таблицу $EXITS_TABLE" >&2; return 1; }
   for n in "${up[@]}"; do rt_fw_up "awg-exit-$n"; done
+  if (( ${#live[@]} )); then _exits_shared_route "$EXITS_TABLE" "${live[@]}" || return 1; fi
+  # Режим «блокировать»: нода упала — клиенты в «недоступно», а не напрямую
+  rt_fail_route "$EXITS_TABLE"
+  # Живых нод нет (сторож признал все упавшими), режим «напрямую» — клиентов не ведём
+  if (( ! ${#live[@]} )) && [[ "$(rt_fail_mode exits)" != block ]]; then
+    echo "живых exit-нод нет — клиенты идут напрямую" >&2
+    return 0
+  fi
   # Клиенты WG + обфускатора — своим списком, при любом режиме клиентов AWG
   if [[ -f "$EXITS_PEERS.wgobf" ]]; then
-    while IFS= read -r line; do exits_peer_rule "$line" "${up[*]}"; done < "$EXITS_PEERS.wgobf"
+    while IFS= read -r line; do exits_peer_rule "$line" "${live[*]}"; done < "$EXITS_PEERS.wgobf"
   fi
   if [[ "$mode" == all ]]; then
     ip rule add from "$net" lookup "$EXITS_TABLE" priority "$EXITS_TABLE"
     return 0
   fi
   [[ -f "$EXITS_PEERS" ]] || return 0
-  while IFS= read -r line; do exits_peer_rule "$line" "${up[*]}"; done < "$EXITS_PEERS"
+  while IFS= read -r line; do exits_peer_rule "$line" "${live[*]}"; done < "$EXITS_PEERS"
 }
 
 exits_routing_stop() {
-  local n
-  exits_rules_clear
+  local n t rules
+  # «Блокировать» и exit-ноды включены — остановка (перезапуск, сбой), а не
+  # выключение: клиенты остаются в своих таблицах, там только «недоступно»
+  if [[ "$(rt_fail_mode exits)" == block ]] && rt_tunnel_on "$EXITS_TABLE"; then
+    rules=$(ip rule show 2>/dev/null)
+    for t in "$EXITS_TABLE" $(seq "$EXITS_TABLE_BASE" "$EXITS_TABLE_MAX"); do
+      [[ "$t" == "$EXITS_TABLE" ]] || grep -qE "lookup $t\$" <<< "$rules" || continue
+      ip route flush table "$t" 2>/dev/null || true
+      ip route replace unreachable default metric 4096 table "$t" 2>/dev/null || true
+    done
+    mkdir -p "$(dirname "$TUNFAIL_LOG")" 2>/dev/null
+    echo "[$(date '+%F %T')] exit-ноды остановлены — клиенты удержаны до их возврата (режим «блокировать»)" >> "$TUNFAIL_LOG" 2>/dev/null
+  else
+    exits_rules_clear
+  fi
   while IFS= read -r n; do rt_fw_down "awg-exit-$n"; done < <(exits_nodes)
   return 0
 }
 
+# Точка входа службы маршрутов и сторожа. Один замок: перезапуск маршрутов и
+# проход сторожа не должны переставлять таблицы одновременно.
 exits_routing_run() {
-  if [[ "${1:-}" == stop ]]; then exits_routing_stop; else exits_routing_start; fi
+  exec 9>"$EXITS_LOCK"
+  # Сторож берёт блокировку сам — после проб
+  [[ "${1:-}" == health ]] || flock -w 60 9 || true
+  case "${1:-start}" in
+    stop) exits_routing_stop ;;
+    health) exits_health_run ;;
+    refresh) exits_routing_refresh ;;
+    *) exits_routing_start ;;
+  esac
 }
 
 _exits_write_unit() {
   emit_script "$EXITS_SCRIPT" 'exits_routing_run "$@"' EXITS_DIR EXITS_STATE EXITS_PEERS EXITS_TABLE \
-    EXITS_TABLE_BASE EXITS_TABLE_MAX exits_nodes exits_up_nodes exits_state_get exits_table_for \
-    exits_rules_clear exits_peer_rule exits_routing_start exits_routing_stop exits_routing_run "${RT_FUNCS[@]}" || return 1
+    EXITS_TABLE_BASE EXITS_TABLE_MAX EXITS_HEALTH_DIR EXITS_LOCK EXITS_HEALTH_LOG EXITS_HC_FAILS EXITS_HC_OKS \
+    EXITS_HC_TARGETS EXITS_HC_URL exits_nodes exits_up_nodes exits_state_get exits_table_for \
+    exits_rules_clear exits_peer_rule exits_order _exits_hstate _exits_hset exits_node_dead exits_live_nodes \
+    exits_shared_now _exits_shared_route _exits_probe _exits_server_online _exits_hlog exits_why_text \
+    _exits_has_rules exits_routing_refresh exits_health_run \
+    exits_routing_start exits_routing_stop exits_routing_run "${RT_FUNCS[@]}" || return 1
   write_unit "$EXITS_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — маршруты клиентов через exit-ноды
@@ -171,6 +419,26 @@ ExecStop=$EXITS_SCRIPT stop
 
 [Install]
 WantedBy=multi-user.target
+EOF
+  write_unit "$EXITS_HEALTH_UNIT" <<EOF
+[Unit]
+Description=AWG Toolza — сторож exit-нод: выход в интернет через каждую, общий выход на живую
+
+[Service]
+Type=oneshot
+ExecStart=$EXITS_SCRIPT health
+EOF
+  write_unit "$EXITS_HEALTH_TIMER" <<'EOF'
+[Unit]
+Description=AWG Toolza — сторож exit-нод: проверка раз в 30 секунд
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=30
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target
 EOF
 }
 
@@ -209,15 +477,19 @@ exits_up() {  # all|peers
     exits_down quiet
     return 1
   fi
+  systemctl enable --now "$EXITS_HEALTH_TIMER" &>/dev/null || warn "Сторож exit-нод не запустился — автопереключения не будет"
   if [[ "$mode" == all ]]; then ok "Exit-ноды включены: все клиенты идут через них"
   else ok "Exit-ноды включены: клиентов в списке — $(grep -c . "$EXITS_PEERS" || true)"; fi
 }
 
 exits_down() {
+  # Состояние — раньше остановки: в режиме «блокировать» ExecStop иначе удержал бы клиентов
+  [[ -f "$EXITS_STATE" ]] && exits_state_set state inactive
+  systemctl disable --now "$EXITS_HEALTH_TIMER" &>/dev/null || true
+  rm -rf "$EXITS_HEALTH_DIR"
   systemctl disable --now "$EXITS_UNIT" &>/dev/null || true
   systemctl reset-failed "$EXITS_UNIT" &>/dev/null || true
   exits_routing_stop
-  [[ -f "$EXITS_STATE" ]] && exits_state_set state inactive
   [[ "${1:-}" == quiet ]] || ok "Exit-ноды выключены — клиенты идут напрямую"
 }
 
@@ -271,7 +543,12 @@ exits_node_add() {
 }
 
 _exits_node_line() {  # нода → строка статуса
-  local n="$1" dev="awg-exit-$1" hs now ago rx tx
+  local n="$1" dev="awg-exit-$1" hs now ago rx tx st since why
+  if exits_node_dead "$n"; then
+    read -r st _ _ since why <<< "$(_exits_hstate "$n")"
+    echo -e "${R}▲ не отвечает с $(date -d "@$since" '+%d.%m %H:%M' 2>/dev/null)${N} ${D}— $(exits_why_text "$why"), выпала из общего выхода${N}"
+    return
+  fi
   if ! ip link show "$dev" &>/dev/null; then echo -e "${R}○ лежит${N}"; return; fi
   hs=$(awg show "$dev" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
   now=$(date +%s)
@@ -318,7 +595,7 @@ exits_node_del() {  # имя
   [[ -f "$EXITS_DIR/awg-exit-$n.conf" ]] || { err "Ноды $n нет"; return 1; }
   exits_is_up && exits_routing_stop
   systemctl disable --now "awg-quick@awg-exit-$n" &>/dev/null || true
-  rm -f "$EXITS_DIR/awg-exit-$n.conf"
+  rm -f "$EXITS_DIR/awg-exit-$n.conf" "$EXITS_HEALTH_DIR/$n"
   # Клиенты этой ноды переходят на общий выход
   for f in "$EXITS_PEERS" "$EXITS_PEERS.wgobf"; do [[ -f "$f" ]] && sed -i "s/|$n\$//" "$f"; done
   [[ "$(exits_state_get single_exit)" == "$n" ]] && exits_state_set single_exit ""
@@ -344,6 +621,22 @@ exits_balancer_menu() {
     2) (( ${#up[@]} > 1 )) && exits_balance ecmp ;;
   esac
   return 0
+}
+
+# Порядок общего выхода: первая — основная, дальше запасные. Меняется на ходу,
+# без перезапуска маршрутов.
+exits_set_order() {  # нода...
+  local n seen=" " list=()
+  (( $# )) || { err "Порядок: нода [нода...]"; return 1; }
+  for n in "$@"; do
+    [[ -f "$EXITS_DIR/awg-exit-$n.conf" ]] || { err "Ноды $n нет"; return 1; }
+    [[ "$seen" == *" $n "* ]] && continue
+    seen+="$n "
+    list+=("$n")
+  done
+  exits_state_set single_exit "${list[0]}" order "$(IFS=,; echo "${list[*]:1}")"
+  ok "Порядок общего выхода: $(exits_order | paste -sd' ' | sed 's/ / → /g')"
+  if exits_is_up; then "$EXITS_SCRIPT" refresh || true; fi
 }
 
 # exits_balance single НОДА | ecmp
@@ -478,14 +771,19 @@ exits_peers_menu() {
 }
 
 exits_status() {
-  local mode bal n
+  local mode bal n now
   n=$(exits_nodes | grep -c . || true)
   echo -e "  Ноды      : ${W}$n${N} (поднято $(exits_up_nodes | grep -c . || true))"
   if exits_is_up; then
     mode=$(exits_state_get mode); bal=$(exits_state_get balancer)
     echo -e "  Маршруты  : ${G}● включены${N} — $([[ "$mode" == peers ]] && echo "выборочно, $(n=$(grep -c . "$EXITS_PEERS" 2>/dev/null); echo "${n:-0}") кл." || echo "все клиенты")"
     if [[ "$bal" == ecmp ]]; then echo -e "  Балансир  : ECMP"
-    else echo -e "  Балансир  : одна нода ($(exits_state_get single_exit))"; fi
+    else echo -e "  Балансир  : одна нода, по порядку: $(exits_order | paste -sd' ' | sed 's/ / → /g')"; fi
+    now=$(exits_shared_now)
+    if [[ -n "$now" ]]; then echo -e "  Общий выход: ${G}${now//+/ + }${N}"
+    else echo -e "  Общий выход: ${R}живых нод нет${N} — клиенты $([[ "$(rt_fail_mode exits)" == block ]] && echo "удержаны («блокировать»)" || echo "идут напрямую")"; fi
+    if unit_active "$EXITS_HEALTH_TIMER"; then echo -e "  Сторож    : ${G}●${N} проверка раз в 30 с — упавшая нода выпадает, вернувшаяся возвращается"
+    else echo -e "  Сторож    : ${Y}○ не запущен${N} — автопереключения нет"; fi
   elif unit_enabled "$EXITS_UNIT"; then
     echo -e "  Маршруты  : ${R}▲ служба не запущена${N} — journalctl -u $EXITS_UNIT"
   else

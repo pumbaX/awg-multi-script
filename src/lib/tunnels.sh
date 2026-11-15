@@ -115,7 +115,66 @@ tunnel_peers_forget() {
 # опираются только на константы и базовые помощники.
 RT_FUNCS=(valid_ip valid_cidr conf_iface_get server_net ipt_add ipt_ins ipt_del
           ipt_del_grep ipt_del_tagged rp_filter_loose rt_fw_up rt_fw_down rt_up rt_down
-          rt_rules_clear rt_rules_file SERVER_CONF AWG_IF WGOBF_IF WGOBF_STATE)
+          rt_rules_clear rt_rules_file rt_fail_name rt_fail_mode rt_fail_route rt_tunnel_on rt_table_live rt_release_held
+          SERVER_CONF AWG_IF WGOBF_IF WGOBF_STATE TUNFAIL_CONF TUNFAIL_LOG WARP_STATE XRAY_STATE
+          EXITS_STATE T2S_UNIT T2S_TABLE WARP_TABLE XRAY_TABLE EXITS_TABLE EXITS_TABLE_BASE EXITS_TABLE_MAX)
+
+# ── Если туннель упал ─────────────────────────────────────
+# Режим на туннель (TUNFAIL_CONF «warp=block»): direct — как раньше, упавший
+# туннель отпускает клиентов напрямую, с адреса сервера; block — клиенты
+# остаются в таблице туннеля, где под основным маршрутом лежит «недоступно»
+# (metric 4096): пока туннель лежит, их трафик никуда не уходит, кроме «РФ
+# напрямую» (правило 90 — раньше таблиц туннелей). Выключенный руками туннель
+# отпускает клиентов в любом режиме: его состояния к этому моменту уже нет.
+rt_fail_name() {  # таблица → warp|xray|t2s|exits
+  case "$1" in
+    "$T2S_TABLE") echo t2s ;; "$WARP_TABLE") echo warp ;; "$XRAY_TABLE") echo xray ;; *) echo exits ;;
+  esac
+}
+
+rt_fail_mode() {  # таблица|имя → direct|block
+  local n="$1"
+  [[ "$n" =~ ^[0-9]+$ ]] && n=$(rt_fail_name "$1")
+  [[ "$(sed -n "s/^$n=//p" "$TUNFAIL_CONF" 2>/dev/null | tail -1)" == block ]] && echo block || echo direct
+}
+
+# «Недоступно» под основным маршрутом — в режиме block, иначе снять.
+rt_fail_route() {  # таблица
+  if [[ "$(rt_fail_mode "$1")" == block ]]; then
+    ip route replace unreachable default metric 4096 table "$1"
+  else
+    ip route del unreachable default metric 4096 table "$1" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Туннель включён (а не выключен руками) — по его состоянию.
+rt_tunnel_on() {  # таблица
+  case "$1" in
+    "$WARP_TABLE") [[ -f "$WARP_STATE" ]] ;;
+    "$XRAY_TABLE") [[ -f "$XRAY_STATE" ]] ;;
+    "$T2S_TABLE") systemctl is-enabled --quiet "$T2S_UNIT" 2>/dev/null ;;
+    *) [[ "$(head -1 "$EXITS_STATE" 2>/dev/null)" == active ]] ;;
+  esac
+}
+
+rt_table_live() { ip route show table "$1" 2>/dev/null | grep -q ' dev '; }   # в таблице есть живой маршрут
+
+# Поднимается туннель — снять «удержание» лежащих: их правила (приоритет у
+# каждого свой) иначе перехватили бы клиентов в «недоступно».
+rt_release_held() {  # таблица, которую не трогать
+  local t
+  for t in $(ip rule show 2>/dev/null | awk '$(NF - 1) == "lookup" {print $NF}' | sort -u); do
+    [[ "$t" =~ ^[0-9]+$ && "$t" != "$1" ]] || continue
+    (( t == T2S_TABLE || t == WARP_TABLE || t == XRAY_TABLE || t == EXITS_TABLE \
+       || (t >= EXITS_TABLE_BASE && t <= EXITS_TABLE_MAX) )) || continue
+    (( $1 == EXITS_TABLE && t >= EXITS_TABLE_BASE && t <= EXITS_TABLE_MAX )) && continue
+    rt_table_live "$t" && continue
+    rt_rules_clear "$t"
+    ip route flush table "$t" 2>/dev/null || true
+  done
+  return 0
+}
 
 rt_rules_clear() {  # таблица
   local guard=0
@@ -193,6 +252,8 @@ rt_up() {  # устройство таблица peers|- [src] [nonat]
   else
     ip route replace default dev "$dev" table "$table" || return 1
   fi
+  rt_fail_route "$table"
+  rt_release_held "$table"
   rt_rules_clear "$table"
   if [[ "$peers" == - ]]; then
     ip rule add from "$net" lookup "$table" priority "$table" || return 1
@@ -203,6 +264,16 @@ rt_up() {  # устройство таблица peers|- [src] [nonat]
 }
 
 rt_down() {  # устройство таблица
+  # Режим block и туннель включён — он упал, а не выключен: клиентов не
+  # отпускаем, в таблице остаётся только «недоступно»
+  if [[ "$(rt_fail_mode "$2")" == block ]] && rt_tunnel_on "$2"; then
+    ip route flush table "$2" 2>/dev/null || true
+    ip route replace unreachable default metric 4096 table "$2" 2>/dev/null || true
+    rt_fw_down "$1"
+    mkdir -p "$(dirname "$TUNFAIL_LOG")" 2>/dev/null
+    echo "[$(date '+%F %T')] $1 упал — клиенты удержаны до его возврата (режим «блокировать»)" >> "$TUNFAIL_LOG" 2>/dev/null
+    return 0
+  fi
   rt_rules_clear "$2"
   ip route flush table "$2" 2>/dev/null || true
   rt_fw_down "$1"
@@ -245,8 +316,12 @@ tunnels_panic_reset() {
     warn "клиенты пойдут напрямую через сервер. Настройки сохранятся."
     ask_yes "  Продолжить? [Y/n]: " y || return 0
   fi
+  # Состояния — раньше остановки и маршрутов: в режиме «блокировать» rt_down
+  # и остановка служб иначе удержали бы клиентов включённого туннеля
+  rm -f "$XRAY_STATE" "$EXITS_STATE" "$WARP_STATE"
   # Автозапуск тоже снимаем: иначе после перезагрузки туннель вернётся
-  for u in "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" "$T2S_UNIT" "$EXITS_UNIT" awg-usque.service awg-warp.service; do
+  for u in "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" "$T2S_UNIT" "$EXITS_HEALTH_TIMER" "$EXITS_UNIT" \
+           awg-usque.service awg-warp.service; do
     systemctl disable --now "$u" &>/dev/null || true
     systemctl reset-failed "$u" &>/dev/null || true
   done
@@ -258,7 +333,6 @@ tunnels_panic_reset() {
     [[ -f "$dev" ]] && rt_fw_down "$(basename "$dev" .conf)"
   done
   for dev in "$XRAY_IF" "$T2S_IF" "$WARP_IF"; do ip link del "$dev" &>/dev/null || true; done
-  rm -f "$XRAY_STATE" "$EXITS_STATE" "$WARP_STATE"
   net=$(server_net 2>/dev/null) || net=""
   dev=$(uplink_iface 2>/dev/null) || dev=""
   # То же, что ставит PostUp сервера — на случай, если его правила сбиты
@@ -356,6 +430,8 @@ do_tunnels_menu() {
     echo -e "  ${C}4)${N} AWG exit-ноды       $(_tun_state exits_is_up "$EXITS_DIR"/awg-exit-*.conf)"
     echo -e "  ${C}5)${N} Каскад портов       $(cascade_state_line)"
     echo -e "  ${C}6)${N} Шифрованный DNS     $(dns_state_line)"
+    echo -e "  ${C}7)${N} РФ напрямую         $(rudirect_on && echo -e "${G}● включено${N}" || echo -e "${D}○ выключено${N}")"
+    echo -e "  ${C}8)${N} Если туннель упал   $(tunfail_any_block && echo -e "${Y}● где-то «блокировать»${N}" || echo -e "${D}○ напрямую (как было)${N}")"
     echo -e "  ${R}9)${N} Аварийный сброс ${D}— все клиенты напрямую${N}"
     echo -e "  ${W}0)${N} ← Назад"
     read_choice c "${C}  Выбор: ${N}" 0 9 0
@@ -366,6 +442,8 @@ do_tunnels_menu() {
       4) do_exits_menu || true ;;
       5) do_cascade_menu || true ;;
       6) do_dns_menu || true ;;
+      7) do_rudirect_menu || true ;;
+      8) do_tunfail_menu || true ;;
       9) tunnels_panic_reset || true; pause ;;
       0) return 0 ;;
     esac

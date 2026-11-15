@@ -110,9 +110,19 @@ _api_status() {
     fi
     _kv tunnels.warp "$(_api_tun warp_is_up "$WARP_CONF" "$USQUE_CONF")"
     _kv tunnels.warp_failed:b "$(_b warp_failed)"
+    _kv tunnels.warp_block:b "$(_b tunfail_block warp)"
     _kv tunnels.xray "$(_api_tun xray_is_up "$XRAY_CONF")"
+    # Для оповещений бота: Xray включён, а не работает (down|notraffic)
+    if [[ -f "$XRAY_STATE" ]]; then
+      _kv tunnels.xray_fail "$(xray_fail)"; _kv tunnels.xray_block:b "$(_b tunfail_block xray)"
+    fi
     _kv tunnels.tun2socks "$(_api_tun t2s_is_up "$T2S_CONF")"
     _kv tunnels.exits "$(_api_tun exits_is_up "$EXITS_DIR"/awg-exit-*.conf)"
+    # Для оповещений бота: упавшие ноды «имя:причина,…», общий выход сейчас
+    if exits_is_up; then
+      _kv tunnels.exits_dead "$(exits_dead_list)"; _kv tunnels.exits_active "$(exits_shared_now)"
+      _kv tunnels.exits_block:b "$(_b tunfail_block exits)"
+    fi
     _kv tunnels.cascade:n "$(cascade_count)"
     if dns_installed; then _kv tunnels.dns "$(dns_running && echo up || echo off)"
     else _kv tunnels.dns none; fi
@@ -139,6 +149,8 @@ _api_server() {
         # Почему нет 3.1: components | tools | module | check (не прошла проба)
         _kv proto31_why "$([[ $rc == 0 ]] || proto_why 3.1)"
         _kv reboot "$(reboot_reason)"
+        # Глобальный IPv6 сервера — для входа клиентов по IPv6 (пусто — нет)
+        _kv ipv6 "$(public_ip6)"
         if server_exists; then
           _kv up:b "$(_b iface_up)"; _kv proto "$(server_proto)"
           _kv profile "$(server_profile)"; _kv profile_label "$(profile_label)"
@@ -286,7 +298,7 @@ _api_clients_del() {
 _O_EXPIRE="" _O_MIM="" _O_DNS="" _O_MTU=""
 _api_client_opts() {
   local kv v
-  _O_EXPIRE="" _O_MIM=server _O_DNS="1.1.1.1, 1.0.0.1" _O_MTU=""
+  _O_EXPIRE="" _O_MIM=server _O_DNS="1.1.1.1, 1.0.0.1" _O_MTU="" _O_ENTRY=""
   for kv in "$@"; do
     v="${kv#*=}"
     case "${kv%%=*}" in
@@ -299,6 +311,9 @@ _api_client_opts() {
       dns) valid_dns_list "$v" || { err "dns: IPv4 через запятую"; return 1; }; _O_DNS="$v" ;;
       mtu) [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) || { err "mtu: 1280-1500"; return 1; }
            _O_MTU="$v" ;;
+      entry) [[ "$v" == direct || -n "$(py entry "$SERVER_CONF" get "$v" 2>/dev/null)" ]] \
+               || { err "Точки входа «$v» нет"; return 1; }
+             _O_ENTRY="$v" ;;
       *) err "Неизвестный параметр: ${kv%%=*}"; return 1 ;;
     esac
   done
@@ -307,7 +322,7 @@ _api_client_opts() {
 # clients bulk a,b,c | префикс:число [опции] — мимикрия генерируется один раз.
 _api_clients_bulk() {
   local spec="${1:-}" names=() parts=() n i prefix count part addr created=()
-  [[ -n "$spec" ]] || { _api_usage "clients bulk ИМЯ,ИМЯ... | ПРЕФИКС:ЧИСЛО [expire=] [mimicry=] [dns=] [mtu=]"; return; }
+  [[ -n "$spec" ]] || { _api_usage "clients bulk ИМЯ,ИМЯ... | ПРЕФИКС:ЧИСЛО [expire=] [mimicry=] [dns=] [mtu=] [entry=]"; return; }
   shift
   server_exists || { err "Сервер не создан"; return 1; }
   _api_client_opts "$@" || return 1
@@ -345,7 +360,7 @@ _api_clients_bulk() {
 
 _api_client() {
   local a="${1:-}" name="${2:-}" f
-  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue ИМЯ ..."; return; }
+  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue|entry ИМЯ ..."; return; }
   shift 2
   case "$a" in
     add)
@@ -370,6 +385,12 @@ _api_client() {
       [[ -n "${1:-}" ]] || { _api_usage "client expire ИМЯ unix-время|+30d|+12h|дата"; return; }
       client_expire_set "$name" "$(_api_ts "$1")" ;;
     unexpire) client_expire_clear "$name" ;;
+    entry)
+      [[ -n "${1:-}" ]] || { _api_usage "client entry ИМЯ ВХОД|direct"; return; }
+      client_entry_set "$name" "$1" || return 1
+      f=$(client_file "$name")
+      { _kv name "$name"; _kv endpoint "$(client_endpoint "$name")"; _kv file "$f"
+        [[ -f "$f" ]] && _kv text:f "$f"; } | api_obj ;;
     limit)
       [[ -n "${1:-}" ]] || { _api_usage "client limit ИМЯ 50G|500M|off [month|total]"; return; }
       client_limit_set "$name" "$1" "${2:-month}" ;;
@@ -384,7 +405,7 @@ _api_client() {
       client_reissue "$name" || return 1
       f=$(client_file "$name")
       { _kv name "$name"; _kv file "$f"; _kv text:f "$f"; } | api_obj ;;
-    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue ИМЯ ..." ;;
+    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue|entry ИМЯ ..." ;;
   esac
 }
 
@@ -433,7 +454,15 @@ _api_diag() {
       [[ -n "${2:-}" ]] || { _api_usage "diag sniff ИМЯ"; return; }
       sniff_client "$2" ;;
     dpi-hint) do_client_dpi_hint ;;
-    *) _api_usage "diag status|domains world|ru|sniff-list|sniff ИМЯ|dpi-hint" ;;
+    route)
+      [[ -n "${3:-}" ]] || { _api_usage "diag route КЛИЕНТ АДРЕС"; return; }
+      local rows
+      # err пишет в stdout: при отказе он в rows — вернуть его в журнал
+      if ! rows=$(diag_route "$2" "$3"); then printf '%s\n' "$rows"; return 1; fi
+      { _kv client "$2"; _kv input "$3"
+        _kv ip "$(clients_name_ip | awk -F'|' -v n="$2" '$1 == n {print $2; exit}')"
+        _kv rows:j "$(printf '%s\n' "$rows" | py json-rows ip kind dev note)"; } | api_obj ;;
+    *) _api_usage "diag status|domains world|ru|sniff-list|sniff ИМЯ|dpi-hint|route КЛИЕНТ АДРЕС" ;;
   esac
 }
 
@@ -477,6 +506,9 @@ _api_tunnels() {
         _kv cascade:n "$(cascade_count)"
         if dns_installed; then _kv dns "$(dns_running && echo up || echo off)"; else _kv dns none; fi
         _kv active "$(tunnel_conflict none)"
+        _kv rudirect:b "$(_b rudirect_on)"
+        _kv fail_block:b "$(_b tunfail_any_block)"
+        _kv held "$(for n in $TUNFAIL_NAMES; do tunfail_held "$n" && tunfail_label "$n"; done | paste -sd, -)"
         # Счётчики интерфейсов туннелей (для карточек и сводки панели): есть — поднят
         _kv ifs:j "$(for i in "$WARP_IF" "$XRAY_IF" "$T2S_IF"; do
                       [[ -r "/sys/class/net/$i/statistics/rx_bytes" ]] || continue
@@ -497,7 +529,15 @@ _api_tunnels() {
     client)
       [[ -n "${3:-}" ]] || { _api_usage "tunnels client warp|xray ИМЯ|all|none [on|off]"; return; }
       tunnel_client "$2" "$3" "${4:-}" ;;
-    *) _api_usage "tunnels status|panic|clients warp|xray|client warp|xray ИМЯ|all|none [on|off]" ;;
+    fail)
+      case "${2:-}" in
+        ""|list) tunfail_rows | api_rows name label mode enabled:b up:b held:b ;;
+        set)
+          [[ -n "${4:-}" ]] || { _api_usage "tunnels fail set warp|xray|t2s|exits|all direct|block"; return; }
+          tunfail_set "$3" "$4" ;;
+        *) _api_usage "tunnels fail [list]|set warp|xray|t2s|exits|all direct|block" ;;
+      esac ;;
+    *) _api_usage "tunnels status|panic|clients warp|xray|client warp|xray ИМЯ|all|none [on|off]|fail [list|set ...]" ;;
   esac
 }
 
@@ -570,8 +610,15 @@ _api_xray() {
         _kv clients:j "$(xray_client_outs | py json-rows name ip out)"
         # Выходы для карточек: протокол, защита, транспорт, адрес
         _kv outs:j "$({ xray_installed && py xray-outs "$XRAY_CONF" 2>/dev/null; } | py json-rows tag proto sec net host port:n)"
-        _kv ru:b "$(_b xray_ru_on)"; } | api_obj
+        _kv ru:b "$(_b xray_ru_on)"; _kv fail "$(xray_fail)"; } | api_obj
       xray_status ;;
+    # Трафик через выход работающего Xray (бот: выход отвалился на ходу).
+    # up — Xray и маршруты клиентов работают; ok — ответ через SOCKS Xray
+    probe)
+      local up=0 ok=0 why=""
+      ip link show "$XRAY_IF" &>/dev/null && unit_active "$XRAY_ROUTING_UNIT" && up=1
+      if (( up )); then why=$(socks_probe "$XRAY_SOCKS") && ok=1; fi
+      { _kv up:b "$up"; _kv ok:b "$ok"; _kv why "$why"; } | api_obj ;;
     install) xray_install update ;;
     add)
       [[ -n "${1:-}" ]] || { _api_usage "xray add ССЫЛКА"; return; }
@@ -600,7 +647,7 @@ _api_xray() {
     diag) xray_diagnose ;;
     fix) xray_fix ;;
     remove) xray_uninstall ;;
-    *) _api_usage "xray status|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|diag|fix|remove" ;;
+    *) _api_usage "xray status|probe|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|diag|fix|remove" ;;
   esac
 }
 
@@ -621,7 +668,9 @@ _api_exits() {
     status)
       { _kv up:b "$(_b exits_is_up)"; _kv mode "$(exits_state_get mode)"
         _kv balancer "$(exits_state_get balancer)"; _kv single "$(exits_state_get single_exit)"
-        _kv nodes:j "$(exits_node_rows | py json-rows name up:b endpoint hs:n rx:n tx:n proto)"; } | api_obj
+        _kv order:j "$(exits_order | py json-list)"; _kv active "$(exits_is_up && exits_shared_now)"
+        _kv watch:b "$(_b unit_active "$EXITS_HEALTH_TIMER")"; _kv block:b "$(_b tunfail_block exits)"
+        _kv nodes:j "$(exits_node_rows | py json-rows name up:b endpoint hs:n rx:n tx:n proto health since:n why)"; } | api_obj
       # Проверка выхода в интернет через каждую ноду (до 5 с на ноду) — только по
       # «exits status check», для экрана exit-нод: список клиентов, обзор и туннели
       # зовут status на каждом открытии и ждать её не должны
@@ -640,12 +689,15 @@ _api_exits() {
     balance)
       [[ -n "${1:-}" ]] || { _api_usage "exits balance single НОДА|ecmp"; return; }
       exits_balance "$1" "${2:-}" ;;
+    order)
+      [[ -n "${1:-}" ]] || { _api_usage "exits order НОДА [НОДА...]"; return; }
+      exits_set_order "$@" ;;
     mode) exits_mode "${1:-}" ;;
     client)
       # all / none без второго аргумента — все клиенты; с ним — клиент с таким именем
       [[ "${1:-}" == all || "${1:-}" == none || -n "${2:-}" ]] || { _api_usage "exits client ИМЯ off|shared|НОДА | all | none"; return; }
       exits_client "$1" "${2:-}" ;;
-    *) _api_usage "exits status [check]|add ИМЯ (stdin)|del ИМЯ|up [all|peers]|down|mode all|peers|balance single НОДА|ecmp|client ИМЯ off|shared|НОДА|all|none" ;;
+    *) _api_usage "exits status [check]|add ИМЯ (stdin)|del ИМЯ|up [all|peers]|down|mode all|peers|balance single НОДА|ecmp|order НОДА...|client ИМЯ off|shared|НОДА|all|none" ;;
   esac
 }
 
@@ -656,7 +708,7 @@ _api_cascade() {
     list)
       cascade_rules | while IFS='|' read -r p in dst out cm; do
         on=0
-        iptables-save -t nat 2>/dev/null | grep -qE -- "$(cascade_tag "$p" "$in")\"?( |$)" && on=1
+        grep -qE -- "$(cascade_tag "$p" "$in")\"?( |$)" <<< "$(iptables-save -t nat 2>/dev/null)" && on=1
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "$in" "$dst" "$out" "$cm" "$on"
       done | api_rows proto in:n dst out:n comment applied:b ;;
     add)
@@ -670,6 +722,78 @@ _api_cascade() {
     remove) cascade_uninstall quiet ;;
     diag) cascade_diagnose ;;
     *) _api_usage "cascade list|add ...|del ПРОТО ПОРТ|reapply|clear|remove|diag" ;;
+  esac
+}
+
+# РФ напрямую: клиенты в туннеле — к сетям России мимо него.
+_api_rudirect() {
+  local a="${1:-}" p b e
+  shift || true
+  case "$a" in
+    ""|status)
+      read -r p b <<< "$(rudirect_counters)"
+      { _kv enabled:b "$(_b rudirect_on)"; _kv active:b "$(_b rudirect_rules_ok)"
+        read -r -a e <<< "$(_rud_get ENTRIES)"
+        _kv ru:n "${e[0]:-0}"; _kv mine:n "${e[1]:-0}"; _kv excl:n "${e[2]:-0}"
+        _kv updated:n "$(_rud_get UPDATED)"; _kv src "$(_rud_get SRC)"; _kv error "$(_rud_get ERROR)"
+        _kv packets:n "${p:-0}"; _kv bytes:n "${b:-0}"
+        _kv direct:j "$(rudirect_list direct | py json-list)"
+        _kv tunnel:j "$(rudirect_list tunnel | py json-list)"
+        _kv xray_ru:b "$(_b xray_ru_on)"; _kv tg:b "$(_b rudirect_tg_on)"
+        _kv abroad "$(rudirect_abroad || true)"; } | api_obj ;;
+    on) rudirect_enable ;;
+    off) rudirect_disable ;;
+    update) rudirect_update ;;
+    repair) rudirect_repair ;;
+    tg) rudirect_tg_set "${1:-}" ;;
+    add)
+      [[ -n "${2:-}" ]] || { _api_usage "rudirect add direct|tunnel АДРЕС"; return; }
+      rudirect_list_add "$1" "$2" ;;
+    del)
+      [[ -n "${2:-}" ]] || { _api_usage "rudirect del direct|tunnel АДРЕС|all"; return; }
+      rudirect_list_del "$1" "$2" ;;
+    *) _api_usage "rudirect status|on|off|update|repair|tg on|off|add direct|tunnel АДРЕС|del direct|tunnel АДРЕС|all" ;;
+  esac
+}
+
+# Точки входа (каскад). Строка с пустым именем — «напрямую», первая в списке.
+# check — итог последней проверки (ok|fail|unknown, пусто — не проверялся):
+# по нему бот и панель решают, можно ли выдавать вход клиентам.
+_api_entry() {
+  local a="${1:-}"
+  shift || true
+  case "$a" in
+    ""|list)
+      server_exists || { err "Сервер не создан"; return 1; }
+      { printf '\t%s\t%s\t%s\tok\t0\n' "$(entry_direct)" "$(py entry "$SERVER_CONF" direct | grep -c . || true)" \
+          "$([[ -z "$(entry_default_get)" ]] && echo 1 || echo 0)"
+        _entry_rows_checked; } | api_rows name addr clients:n default:b check checked:n ;;
+    clients)
+      [[ -n "${2:-}" ]] || { _api_usage "entry clients ИМЯ|direct КЛИЕНТ,КЛИЕНТ..."; return; }
+      entry_assign_clients "$1" "$2" || return 1
+      cut -f1 <<< "$ENTRY_OUT" | api_list ;;
+    add)
+      [[ -n "${2:-}" ]] || { _api_usage "entry add ИМЯ ХОСТ:ПОРТ"; return; }
+      entry_add "$1" "$2" ;;
+    add-ipv6)
+      entry_add_ipv6 "${1:-}" || return 1
+      { _kv name "$ENTRY_NAME"; _kv addr "$(py entry "$SERVER_CONF" get "$ENTRY_NAME")"; } | api_obj ;;
+    set)
+      [[ -n "${2:-}" ]] || { _api_usage "entry set ИМЯ ХОСТ:ПОРТ"; return; }
+      entry_set "$1" "$2" ;;
+    del)
+      [[ -n "${1:-}" ]] || { _api_usage "entry del ИМЯ"; return; }
+      entry_del "$1" ;;
+    check)
+      [[ -n "${1:-}" ]] || { _api_usage "entry check ИМЯ"; return; }
+      entry_check "$1" ;;
+    default)
+      [[ -n "${1:-}" ]] || { _api_usage "entry default ИМЯ|direct"; return; }
+      entry_default "$1" ;;
+    all)
+      [[ -n "${1:-}" ]] || { _api_usage "entry all ИМЯ|direct"; return; }
+      entry_assign_all "$1" ;;
+    *) _api_usage "entry list|add ИМЯ ХОСТ:ПОРТ|add-ipv6 [ИМЯ]|set ИМЯ ХОСТ:ПОРТ|del ИМЯ|check ИМЯ|default ИМЯ|direct|all ИМЯ|direct|clients ИМЯ|direct A,B" ;;
   esac
 }
 
@@ -991,7 +1115,7 @@ _api_uninstall() {
 
 # ── Журналы ───────────────────────────────────────────────
 _api_log() {
-  local name="${1:-}" n="${2:-60}" file="" unit=""
+  local name="${1:-}" n="${2:-60}" file="" unit="" u units=()
   [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= 500 )) || n=60
   case "$name" in
     manager) file="$LOG_FILE" ;;         install) file="$INSTALL_LOG" ;;
@@ -999,18 +1123,21 @@ _api_log() {
     cascade) file="$CASCADE_LOG" ;;      warp-health) file="$WARP_HEALTH_LOG" ;;
     dns-health) file="$DNS_HEALTH_LOG" ;; usque) file="$USQUE_LOG" ;;
     awg) unit="awg-quick@$AWG_IF" ;;     warp) unit=awg-warp.service ;;
-    xray) unit="$XRAY_UNIT" ;;           xray-routing) unit="$XRAY_ROUTING_UNIT" ;;
+    xray) unit="$XRAY_UNIT $XRAY_ROUTING_UNIT" ;; xray-routing) unit="$XRAY_ROUTING_UNIT" ;;
     tun2socks) unit="$T2S_UNIT" ;;       exits) unit="$EXITS_UNIT" ;;
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
     bot) unit="$BOT_UNIT" ;;             web) file="$WEB_LOG" ;;
     antiscan) file="$ANTISCAN_LOG" ;;   vkblock) file="$VKBLOCK_LOG" ;;
-    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan|vkblock [строк]"; return ;;
+    rudirect) file="$RUDIRECT_LOG" ;;   tunfail) file="$TUNFAIL_LOG" ;;
+    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan|vkblock|rudirect|tunfail [строк]"; return ;;
   esac
   if [[ -n "$file" ]]; then
     [[ -f "$file" ]] || { info "Журнала $file нет"; return 0; }
     tail -n "$n" "$file"
   else
-    journalctl -u "$unit" -n "$n" --no-pager 2>/dev/null || { info "Журнал $unit недоступен"; return 0; }
+    # Несколько служб (Xray и его маршруты) — одним журналом, по времени
+    for u in $unit; do units+=(-u "$u"); done
+    journalctl "${units[@]}" -n "$n" --no-pager 2>/dev/null || { info "Журнал $unit недоступен"; return 0; }
   fi
 }
 
@@ -1089,15 +1216,16 @@ _api_readonly() {
   # server params set — правят общие файлы) сюда не попадают — в очередь.
   [[ "$a $b" != *[[:space:]]*[[:space:]]* ]] || return 1
   case "$a $b $c" in
-    "server params "|"server params check"|"bot proxy get"|"bot proxy check"|"bot proxy candidates"|"bot webapp get") return 0 ;;
+    "server params "|"server params check"|"bot proxy get"|"bot proxy check"|"bot proxy candidates"|"bot webapp get"|\
+    "tunnels fail "|"tunnels fail list") return 0 ;;
   esac
   case "$a $b" in
     "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
     "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"tunnels "|"tunnels status"|\
-    "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
+    "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray probe"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
     "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
-    "amnezia scan"|"vkblock "|"vkblock status") return 0 ;;
+    "amnezia scan"|"vkblock "|"vkblock status"|"entry "|"entry list"|"rudirect "|"rudirect status"|"diag route") return 0 ;;
   esac
   return 1
 }
@@ -1138,6 +1266,8 @@ api_dispatch() {
     t2s) _api_t2s "$@" ;;
     exits) _api_exits "$@" ;;
     cascade) _api_cascade "$@" ;;
+    entry) _api_entry "$@" ;;
+    rudirect) _api_rudirect "$@" ;;
     dns) _api_dns "$@" ;;
     wgobf) _api_wgobf "$@" ;;
     update) _api_update "$@" ;;
@@ -1153,7 +1283,7 @@ api_dispatch() {
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade dns wgobf update bot cert web antiscan vkblock amnezia country uninstall log job version"
+      echo "         exits cascade entry dns wgobf update bot cert web antiscan vkblock rudirect amnezia country uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
@@ -1198,6 +1328,8 @@ api_main() {
     expire_watchdog || true
     antiscan_watchdog || true
     vkblock_watchdog || true
+    rudirect_watchdog || true
+    tunfail_watchdog || true
     if _api_readonly "${API_ARGS[@]}"; then
       api_dispatch "${API_ARGS[@]}" || rc=$?
     else

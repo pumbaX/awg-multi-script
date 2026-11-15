@@ -158,16 +158,112 @@ do_diag_menu() {
     echo -e "  ${C}3)${N} Тест мимикрии ${D}— захват пакетов клиента${N}"
     echo -e "  ${C}4)${N} DPI со стороны клиента"
     echo -e "  ${C}5)${N} Модуль ядра и утилиты ${D}— подробный отчёт${N}"
+    echo -e "  ${C}6)${N} Куда идёт адрес ${D}— туннель, нода или напрямую для клиента${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-5]: ${N}" 0 5 0
+    read_choice c "${C}  Выбор [0-6]: ${N}" 0 6 0
     case "$c" in
       1) do_status ;;
       2) do_check_domains || true ;;
       3) do_sniff_test || true ;;
       4) do_client_dpi_hint ;;
       5) components_report || true ;;
+      6) do_diag_route || true ;;
       0) return 0 ;;
     esac
     pause
   done
+}
+
+# ── Куда идёт адрес ───────────────────────────────────────
+# Для клиента и адреса (IP, домен или ссылка): каждый IPv4 адреса — решение
+# самого ядра (ip route get от имени клиента, с меткой «РФ напрямую», если
+# адрес в её наборе) и что раньше маршрута: «VK и Max» отбрасывает, клиент
+# заблокирован. Строки «ip<TAB>вид<TAB>устройство<TAB>пояснение»; вид:
+# warp | xray | t2s | exit | direct | rudirect | held | drop | blocked | none.
+# Ничего не меняет — только читает.
+DIAG_FWD="/proc/sys/net/ipv4/ip_forward"
+diag_route() {  # клиент адрес
+  local name="${1:-}" addr="${2:-}" row cip orig host ips=() ip kind dev note out mark tun xo
+  server_exists || { err "Сервер не создан"; return 1; }
+  row=$(clients_tsv | awk -F'\t' -v n="$name" '$1 == n {print; exit}')
+  [[ -n "$row" ]] || { err "Клиента $name нет"; return 1; }
+  # Через «|»: подряд идущие табы read схлопнул бы, и пустой срок сдвинул бы колонки
+  IFS='|' read -r _ _ cip _ orig _ <<< "${row//$'\t'/|}"
+  cip="${orig:-$cip}"; cip="${cip%%,*}"; cip="${cip%%/*}"; cip="${cip//[[:space:]]/}"
+  host="${addr//[[:space:]]/}"; host="${host,,}"
+  host="${host#*://}"; host="${host%%/*}"; host="${host%%\?*}"
+  [[ "$host" == *:* && "$host" != *:*:* ]] && host="${host%%:*}"
+  if valid_ip "$host"; then ips=("$host")
+  elif valid_domain "$host"; then
+    mapfile -t ips < <(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u | head -8)
+    (( ${#ips[@]} )) || { err "Домен $host не разрешается в IPv4 с этого сервера"; return 1; }
+  else
+    err "Нужен IPv4, домен или ссылка: $addr"; return 1
+  fi
+  tun=$(tunnel_conflict none)
+  for ip in "${ips[@]}"; do
+    kind="" dev="" note="" mark=""
+    if [[ -n "$orig" ]]; then
+      kind=blocked note="клиент заблокирован (срок или лимит трафика) — его трафик не идёт никуда"
+    elif vkblock_on && ipset test "$VKBLOCK_SET" "$ip" &>/dev/null; then
+      kind=drop note="сеть VK — отбрасывается («VK и Max мимо VPN»)"
+    else
+      rudirect_on && ipset test "$RUDIRECT_SET" "$ip" &>/dev/null && mark="${RUDIRECT_MARK%%/*}"
+      if ! ip link show "$AWG_IF" &>/dev/null; then
+        kind=none note="awg0 не поднят — проверить маршрут нельзя"
+      elif ! out=$(ip -4 route get "$ip" from "$cip" iif "$AWG_IF" ${mark:+mark "$mark"} 2>&1); then
+        if [[ "$(cat "$DIAG_FWD" 2>/dev/null)" == 0 ]]; then
+          kind=none note="пересылка пакетов на сервере выключена (ip_forward) — «Сервер → Починить»"
+        elif [[ "$out" == *nreachable* || "$out" == *"No route"* ]] && tunfail_any_block; then
+          kind=held note="туннель лежит, режим «блокировать» — клиент ждёт его без интернета"
+        elif [[ "$out" == *nreachable* || "$out" == *"No route"* ]]; then
+          kind=none note="у ядра нет маршрута для клиента — «Туннели → Аварийный сброс» вернёт прямой"
+        else
+          kind=none note="ядро не ответило: ${out##*: }"
+        fi
+      else
+        dev=$(awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}' <<< "$out")
+        case "$dev" in
+          "$WARP_IF") kind=warp note="через WARP" ;;
+          "$T2S_IF") kind=t2s note="через tun2socks ($(t2s_proxy))" ;;
+          "$XRAY_IF")
+            kind=xray
+            xo=$(grep -E "^${cip//./\\.}\|" "$XRAY_PEERS" 2>/dev/null | head -1 | cut -d'|' -f2)
+            note="через Xray$([[ -n "$xo" ]] && echo ", свой выход $xo" || echo ", выход по умолчанию")"
+            xray_ru_on && note+="; внутри Xray РФ-сайты — напрямую по его правилам" ;;
+          awg-exit-*) kind=exit note="через exit-ноду ${dev#awg-exit-}"
+            [[ "$(exits_state_get balancer)" == ecmp ]] && ip route show table "$EXITS_TABLE" 2>/dev/null | grep -q nexthop \
+              && note+=" (балансировка: соединения делятся между нодами)" ;;
+          *)
+            if [[ -n "$mark" ]] && _rud_rpf_strict "$dev" \
+                 && [[ "$(ip -4 route get "$ip" from "$cip" iif "$AWG_IF" 2>/dev/null)" != *" dev $dev "* ]]; then
+              # Без метки клиент идёт в туннель: обратный путь — туда же, ответ на $dev отбросят
+              kind=none note="сеть России, но ответы отбросит строгий rp_filter на $dev — «РФ напрямую → Починить»"
+            elif [[ -n "$mark" ]] && rudirect_tg_on && _antiscan_covers <(_rud_tg_nets) "$ip"; then
+              kind=rudirect note="напрямую с сервера — Telegram («Telegram напрямую»)"
+            elif [[ -n "$mark" ]]; then kind=rudirect note="напрямую с сервера — сеть России («РФ напрямую»)"
+            elif [[ -n "$tun" ]]; then kind=direct note="напрямую с сервера — клиент не в туннеле ($tun)"
+            else kind=direct note="напрямую с сервера — туннели выключены"; fi ;;
+        esac
+      fi
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$ip" "$kind" "$dev" "$note"
+  done
+}
+
+do_diag_route() {
+  local name addr ip kind dev note
+  _pick_client || return 0
+  name="${CHOSEN%%$'\t'*}"
+  read_line addr "${C}  Адрес, домен или ссылка: ${N}"
+  [[ -n "$addr" ]] || return 0
+  echo ""
+  hdr "Куда идёт $addr у $name"
+  while IFS=$'\t' read -r ip kind dev note; do
+    case "$kind" in
+      warp|xray|t2s|exit) echo -e "  ${G}●${N} $ip — $note" ;;
+      direct|rudirect) echo -e "  ${C}●${N} $ip — $note" ;;
+      *) echo -e "  ${Y}▲${N} $ip — $note" ;;
+    esac
+  done < <(diag_route "$name" "$addr")
 }

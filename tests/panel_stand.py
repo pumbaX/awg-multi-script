@@ -28,7 +28,11 @@ API = api_wrapper()
 with open(API) as f:
     _w = f.read()
 with open(API, "w") as f:
-    f.write(_w.replace('api_main "$@"', f'[[ -f "{ROOT}/reboot.txt" ]] && reboot_reason() {{ cat "{ROOT}/reboot.txt"; }}\napi_main "$@"'))
+    # Каскад до сервера «работает» только с входов 203.0.113.x — остальные проверку не проходят;
+    # у сервера есть IPv6, и он готов принимать клиентов
+    f.write(_w.replace('api_main "$@"', f'[[ -f "{ROOT}/reboot.txt" ]] && reboot_reason() {{ cat "{ROOT}/reboot.txt"; }}\n'
+                       'entry_probe() { [[ "$1" == 203.0.113.* || "$1" == "[2a01:4f8:c0c:1234::1]:"* ]]; }\n'
+                       'public_ip6() { echo 2a01:4f8:c0c:1234::1; }\napi_main "$@"'))
 fake_acme()
 
 # Канал обновлений «отвечает»: в нём v9.9.9 (проверка — первые 4 КБ файла)

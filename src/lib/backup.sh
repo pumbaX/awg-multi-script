@@ -9,7 +9,7 @@ _backup_tunnel_paths() {
   local p
   _BACKUP_TUNNEL_PATHS=()
   for p in "$XRAY_DIR" "$EXITS_STATE" "$EXITS_PEERS" "$EXITS_PEERS.wgobf" "$CASCADE_RULES" "$T2S_CONF" "$DNS_PROXY_CONF" \
-           "$EXITS_DIR"/awg-exit-*.conf; do
+           "$EXITS_DIR"/awg-exit-*.conf "$RUDIRECT_USER"/direct.list "$RUDIRECT_USER"/tunnel.list "$TUNFAIL_CONF"; do
     [[ -e "$p" ]] && _BACKUP_TUNNEL_PATHS+=("${p#/}")
   done
   return 0
@@ -212,6 +212,18 @@ _restore_tunnels() {  # каталог бэкапа
     _dns_write_conf
     [[ -n "$names" ]] && { _dns_upstream_write "$names" || warn "Резолверы DNS из бэкапа не приняты — стоят по умолчанию"; }
   fi
+  # Свои списки «РФ напрямую» и режимы «если туннель упал» — построчно, с проверкой
+  for n in direct tunnel; do
+    [[ -f "$x$RUDIRECT_USER/$n.list" ]] || continue
+    while IFS= read -r f; do _rud_entry_norm "$f"; done < <(grep -vE '^[[:space:]]*(#|$)' "$x$RUDIRECT_USER/$n.list") \
+      | sort -u | head -n "$RUDIRECT_USER_MAX" | write_file "$RUDIRECT_USER/$n.list" 600
+  done
+  if [[ -f "$x$TUNFAIL_CONF" ]]; then
+    grep -xE '(warp|xray|t2s|exits)=block' "$x$TUNFAIL_CONF" | sort -u | write_file "$TUNFAIL_CONF" 644
+    [[ -s "$TUNFAIL_CONF" ]] || rm -f "$TUNFAIL_CONF"
+    _tunfail_units || true
+  fi
+  rudirect_on && { _rudirect_emit && "$RUDIRECT_SCRIPT" apply; } &>/dev/null
   rm -f "$XRAY_STATE"
   [[ -f "$EXITS_STATE" ]] && exits_state_set state inactive
   for n in $(exits_nodes); do systemctl enable --now "awg-quick@awg-exit-$n" &>/dev/null || warn "Нода $n не поднялась"; done

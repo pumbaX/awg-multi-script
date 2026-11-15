@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
 import os
 import shutil
@@ -60,6 +61,8 @@ SEND_MAX = 49 * 1024 * 1024                     # документ бота — 
 
 # id, подпись кнопки (полстроки в боте), полное название
 KINDS = [("iface", "awg0 упал", "awg0 упал и поднялся"), ("warp", "WARP упал", "WARP упал или не отвечает и снова работает"),
+         ("xray", "Xray не идёт", "Xray: через выход трафик не идёт и снова работает"),
+         ("exits", "Exit-ноды", "Exit-нода не отвечает и снова работает: общий выход переключается сам"),
          ("reboot", "Перезагрузка", "Сервер перезагрузился"),
          ("update", "Новая версия", "Новая версия Тулзы"), ("kernel", "Ядро без AWG", "Ядро без модуля AWG"),
          ("cert", "Сертификат", "Сертификат Mini App истекает"), ("disk", f"Диск {DISK_WARN}%", f"Диск заполнен на {DISK_WARN}%"),
@@ -74,6 +77,26 @@ SUPPORT_WDAY, SUPPORT_HOUR = 4, 12
 SUPPORT_GRACE = 3 * 86400
 SUPPORT_TEXT = ("<b>AWG Toolza</b> бесплатна и развивается на донаты.\n"
                 "Если Тулза тебе помогает — поддержи проект: так выходят новые версии.")
+
+
+EXIT_WHY = {"silent": "не отвечает", "nonet": "без выхода в интернет", "link": "лежит: интерфейс не поднят"}
+
+
+def exits_dead(raw: object) -> dict[str, str]:
+    """«nl1:silent,de1:nonet» из сводки awg2 → {нода: причина}."""
+    out: dict[str, str] = {}
+    for part in str(raw or "").split(","):
+        n, _, why = part.strip().partition(":")
+        if n:
+            out[n] = why or "silent"
+    return out
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value or default)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 # ── Настройки ─────────────────────────────────────────────
@@ -115,11 +138,11 @@ def backup_info() -> dict[str, Any]:
     (после неудачи — повтор через час)."""
     st = store.load(BACKUP_STATE)
     bk = config()["backup"]
-    last = int(st.get("last") or 0)
-    slot = int(st.get("slot") or last)
+    last = _as_int(st.get("last"))
+    slot = _as_int(st.get("slot"), last)
     nxt = None
     if bk["mode"] in BACKUP_PERIOD:
-        nxt = int(st.get("retry_at") or 0) or (slot + BACKUP_PERIOD[bk["mode"]] if slot else None)
+        nxt = _as_int(st.get("retry_at")) or (slot + BACKUP_PERIOD[bk["mode"]] if slot else None)
     return {**bk, "last": last or None, "ok": bool(st.get("ok")), "error": str(st.get("error") or ""),
             "next": nxt}
 
@@ -203,7 +226,8 @@ def update_text(d: dict[str, Any], upd: str) -> str:
 
 async def support_tick(bot: Bot, st: dict[str, Any], now: int) -> None:
     """Пятничное напоминание — владельцам: админы сервер не оплачивают."""
-    since = int(st.setdefault("support_since", now))
+    since = _as_int(st.setdefault("support_since", now), now)
+    st["support_since"] = since
     if since > now:                                 # часы уходили вперёд — отсчёт заново
         since = st["support_since"] = now
     lt = time.localtime(now)
@@ -239,7 +263,7 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
     # awg0: две проверки подряд — перезапуск из меню или бота не тревога
     s = d.get("server") or {}
     if s.get("exists") and not s.get("up"):
-        st["down"] = int(st.get("down") or 0) + 1
+        st["down"] = _as_int(st.get("down")) + 1
         if st["down"] == 1:
             st["down_since"] = now
         if st["down"] == IFACE_STRIKES and enabled("iface"):
@@ -250,13 +274,13 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
         # «Снова работает» — только если awg0 и правда поднят: сервер могли
         # удалить (сброс) — это не восстановление
         if st.get("down_sent") and s.get("exists") and s.get("up"):
-            gone = ui.fmt_dur(now - int(st.get("down_since") or now))
+            gone = ui.fmt_dur(now - _as_int(st.get("down_since"), now))
             await notify(bot, f"🟢 <b>{host}: awg0 снова работает</b>\nПростой: около {gone}")
         for k in ("down", "down_since", "down_sent"):
             st.pop(k, None)
 
     # WARP упал: включён, а туннеля нет — клиенты WARP идут напрямую, с IP
-    # сервера. Увёл их health-check (метка failover) — сразу: он уже проверил
+    # сервера (или ждут его без интернета — режим «блокировать»). Увёл их health-check (метка failover) — сразу: он уже проверил
     # трижды; иначе две проверки подряд — перезапуск из меню или бота не тревога.
     # WARP не отвечает: warp0 поднят, а Cloudflare молчит — клиенты WARP без
     # интернета. Без health-check это проверяет бот сам (с ним — health-check)
@@ -269,12 +293,19 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
             health, failover = bool(p.get("health")), bool(p.get("failover"))
             dead = not failed and p.get("up") is True and p.get("ok") is False
     if failed or dead:
-        st["warp_down"] = int(st.get("warp_down") or 0) + 1
+        st["warp_down"] = _as_int(st.get("warp_down")) + 1
         if st["warp_down"] == 1:
             st["warp_since"] = now
         need = 1 if failed and failover else IFACE_STRIKES
         if st["warp_down"] >= need and not st.get("warp_sent") and enabled("warp"):
-            if failed:
+            if failed and t.get("warp_block"):
+                # «Если туннель упал → блокировать»: клиенты ждут WARP, а не уходят напрямую
+                await notify(bot, f"🟠 <b>{host}: WARP упал</b> — клиенты WARP ждут его без интернета "
+                                  "(режим «блокировать»), IP сервера не светится.\n"
+                                  + ("Health-check вернёт его сам, когда Cloudflare снова ответит." if health
+                                     else "Туннели → WARP → ▶️ Включить."),
+                             ui.kb(("▶️ Включить WARP", "warp:up"), ("🪂 Если упал", "tf")))
+            elif failed:
                 await notify(bot, f"🟠 <b>{host}: WARP упал</b> — клиенты WARP идут напрямую, с IP сервера.\n"
                                   + ("Health-check вернёт его сам, когда Cloudflare снова ответит." if health
                                      else "Туннели → WARP → ▶️ Включить."), ui.kb(("▶️ Включить WARP", "warp:up")))
@@ -287,9 +318,43 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
             st["warp_sent"] = True
     else:
         if st.get("warp_sent") and t.get("warp") == "up":
-            gone = ui.fmt_dur(now - int(st.get("warp_since") or now))
+            gone = ui.fmt_dur(now - _as_int(st.get("warp_since"), now))
             await notify(bot, f"🟢 <b>{host}: WARP снова работает</b>\nПростой: около {gone}")
         for k in ("warp_down", "warp_since", "warp_sent"):
+            st.pop(k, None)
+
+    # Xray: включён, а не работает — выход (ссылка) больше не пускает или Xray не запущен.
+    # notraffic — служба маршрутов не дождалась трафика через выход: клиенты Xray не в
+    # туннеле (напрямую или ждут — «блокировать»); down — Xray не запущен. Работает, но
+    # выход отвалился на ходу — проверяет бот сам (через SOCKS Xray): клиенты Xray без
+    # интернета. Две проверки подряд — перезапуск из меню или бота не тревога.
+    xfail, xdead = str(t.get("xray_fail") or ""), False
+    if not xfail and t.get("xray") == "up" and enabled("xray"):
+        p = await api.data("xray", "probe", timeout=40)
+        xdead = isinstance(p, dict) and p.get("up") is True and p.get("ok") is False
+    if xfail or xdead:
+        st["xray_down"] = _as_int(st.get("xray_down")) + 1
+        if st["xray_down"] == 1:
+            st["xray_since"] = now
+        if st["xray_down"] >= IFACE_STRIKES and not st.get("xray_sent") and enabled("xray"):
+            who = ("клиенты Xray ждут его без интернета (режим «блокировать»)" if t.get("xray_block")
+                   else "клиенты Xray идут напрямую, с IP сервера")
+            check = ("Проверь ссылку выхода: она могла устареть или сервер выхода недоступен — "
+                     "«Диагностика» покажет, какой выход не отвечает. Новая ссылка — Туннели → Xray → ➕ Добавить выход.")
+            if xfail == "down":
+                text = f"🟠 <b>{host}: Xray не запущен</b> — {who}.\nПерезапусти Xray; не поднимется — «Диагностика»."
+            elif xfail:
+                text = f"🟠 <b>{host}: Xray — через выход трафик не идёт</b>, {who}.\n{check}"
+            else:
+                text = f"🟠 <b>{host}: Xray не отвечает</b> — через выход трафик не идёт, клиенты Xray без интернета.\n{check}"
+            await notify(bot, text, ui.kb(("🩺 Диагностика", "xr:diag"), ("🔄 Перезапустить", "xr:restart")))
+            st["xray_sent"] = True
+    else:
+        # «Снова работает» — только если Xray и правда работает: выключили руками — молча
+        if st.get("xray_sent") and t.get("xray") == "up":
+            gone = ui.fmt_dur(now - _as_int(st.get("xray_since"), now))
+            await notify(bot, f"🟢 <b>{host}: Xray снова работает</b>\nПростой: около {gone}")
+        for k in ("xray_down", "xray_since", "xray_sent"):
             st.pop(k, None)
 
     # Новая версия: один раз на версию
@@ -299,6 +364,30 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
             await notify(bot, update_text(d, upd),
                          ui.kb(ui.Row(("⬆️ Обновить", "upd:go"), ("📋 Что нового", "upd:notes"))))
         st["update"] = upd
+
+    # Exit-ноды: сторож awg2 признал ноду упавшей или вернувшейся — общий выход
+    # он уже переключил, здесь только сообщаем. Строка «нода:причина,…»
+    if t.get("exits") == "up":
+        dead = exits_dead(t.get("exits_dead"))
+        prev = st.get("exits_dead") if isinstance(st.get("exits_dead"), dict) else {}
+        active = str(t.get("exits_active") or "").replace("+", " + ")
+        if enabled("exits"):
+            for n, why in dead.items():
+                if n in prev:
+                    continue
+                tail = (f"Общий выход теперь: <b>{esc(active)}</b>." if active else
+                        "Живых нод не осталось — клиенты exit-нод " + ("ждут их без интернета (режим «блокировать»)."
+                                                                       if t.get("exits_block")
+                                                                       else "идут напрямую, с адреса сервера."))
+                await notify(bot, f"🔴 <b>{host}: exit-нода {esc(n)} {EXIT_WHY.get(why, EXIT_WHY['silent'])}</b>\n{tail}",
+                             ui.kb(("🚪 Exit-ноды", "ex")))
+            for n in prev:
+                if n not in dead:
+                    await notify(bot, f"🟢 <b>{host}: exit-нода {esc(n)} снова работает</b>"
+                                      + (f"\nОбщий выход: <b>{esc(active)}</b>." if active else ""))
+        st["exits_dead"] = dead
+    else:
+        st.pop("exits_dead", None)
 
     # Ядро без модуля: один раз на набор ядер
     gap = (d.get("components") or {}).get("kernel_gap") or ""
@@ -348,7 +437,35 @@ async def _backup_failed(bot: Bot, st: dict[str, Any], now: int, error: str) -> 
     return "fail"
 
 
+def _backup_lock():
+    """Неблокирующий общий замок бота и веб-панели на весь бэкап и отправку."""
+    path = Path(str(BACKUP_STATE) + ".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        raise
+    return f
+
+
 async def backup_due(bot: Bot, force: bool = False) -> str:
+    """Не даёт ручному и фоновому запуску создать и отправить дубли."""
+    try:
+        lock = _backup_lock()
+    except BlockingIOError:
+        return "busy"
+    except OSError as e:
+        log.warning("Автобэкап не запущен: блокировка %s: %s", BACKUP_STATE, e)
+        return "busy"
+    try:
+        return await _backup_due_locked(bot, force)
+    finally:
+        lock.close()
+
+
+async def _backup_due_locked(bot: Bot, force: bool = False) -> str:
     """Бэкап, если подошёл срок. "done" — сделан и дошёл до владельцев,
     "busy" — идёт другая операция (попробую на следующей проверке),
     "fail" — не удался (повтор через час), "" — срок не подошёл."""
@@ -358,13 +475,13 @@ async def backup_due(bot: Bot, force: bool = False) -> str:
     period = BACKUP_PERIOD.get(bk["mode"], 86400)
     st = store.load(BACKUP_STATE)
     now = int(time.time())
-    slot = int(st.get("slot") or st.get("last") or 0)
+    slot = _as_int(st.get("slot") or st.get("last"))
     # Часы уходили вперёд: «будущий» слот не ждём. До 300 с вперёд — законно:
     # бэкап делается на 300 с раньше слота, и следующий слот ложится чуть впереди
     if slot > now + 300:
         slot = 0
     if not force:
-        retry = int(st.get("retry_at") or 0)
+        retry = _as_int(st.get("retry_at"))
         if retry > now + BACKUP_RETRY:      # то же для повтора
             retry = 0
         if (retry and now < retry) or (not retry and now - slot < period - 300):

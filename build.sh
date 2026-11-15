@@ -13,9 +13,9 @@ cd "$(dirname "$0")"
 OUT="${1:-dist/awg2.sh}"
 
 LIBS=(
-  core const sys net conf module params mimicry server clients expire speed
+  core const sys net conf module params mimicry server clients entry expire speed
   tunnels warp dns cascade xray tun2socks exits wgobf cert
-  backup amnezia update bot web antiscan vkblock uninstall diag menu api cli
+  backup amnezia update bot web antiscan vkblock rudirect tunfail uninstall diag menu api cli
 )
 
 die() { echo "build: $*" >&2; exit 1; }

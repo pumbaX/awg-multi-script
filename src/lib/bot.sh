@@ -328,6 +328,7 @@ bot_install() {
     bash "$installer" --src "$src"
     return
   fi
+  update_offer_beta
   info "Установщик бота — канал $(update_channel_label)"
   curl -fsSL "$BOT_INSTALL_URL" -o "$installer" || { err "Не скачался установщик: $BOT_INSTALL_URL"; return 1; }
   # Бот и awg2 — из одного репозитория, иначе на бете они разъедутся

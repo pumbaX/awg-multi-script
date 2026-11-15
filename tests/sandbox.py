@@ -68,6 +68,11 @@ if [[ "$1" == is-active || "$1" == is-enabled ]]; then
   for a in "$@"; do grep -qxF -- "$a" "$ACTIVE" && exit 0; done
   exit 1
 fi
+# «Упавшие» юниты — по строке в $ACTIVE.failed
+if [[ "$1" == is-failed ]]; then
+  for a in "$@"; do grep -qxF -- "$a" "$ACTIVE.failed" 2>/dev/null && exit 0; done
+  exit 1
+fi
 exit 0''',
     "sysctl": r'''echo "sysctl $*" >> "$CALLS"; exit 0''',
     "awg": r'''case "$1" in
@@ -139,7 +144,7 @@ INSTALL_LOG="{ROOT}/install.log"; EXITS_DIR="$AWG_DIR"
 EXITS_PEERS="$EXITS_DIR/exits_peers.list"; EXITS_STATE="$EXITS_DIR/exits_state"
 for v in DNS_PERSIST_SCRIPT DNS_HEALTH_SCRIPT CASCADE_SCRIPT T2S_ROUTING_SCRIPT XRAY_ROUTING_SCRIPT \\
          EXITS_SCRIPT EXPIRE_BIN WARP_AUTOSTART_SCRIPT WARP_HEALTH_SCRIPT WGOBF_FW USQUE_UP_HOOK ANTISCAN_SCRIPT \\
-         WEB_FW_SCRIPT VKBLOCK_SCRIPT; do
+         WEB_FW_SCRIPT VKBLOCK_SCRIPT RUDIRECT_SCRIPT TUNFAIL_SCRIPT; do
   printf -v "$v" '%s' "{ROOT}/scripts/$v"
 done
 CASCADE_DIR="{ROOT}/etc/awg-cascade"; CASCADE_RULES="$CASCADE_DIR/rules.conf"; CASCADE_LOG="{ROOT}/cascade.log"
@@ -166,6 +171,10 @@ ANTISCAN_DIR="$STATE_DIR/antiscan"; ANTISCAN_CONF="$ANTISCAN_DIR/antiscan.conf";
 ANTISCAN_LOG="{ROOT}/antiscan.log"
 WARP_HEALTH_FAILS="{ROOT}/warp-fails"; WARP_HEALTH_RETRY="{ROOT}/warp-retry"; WARP_HEALTH_LOG="{ROOT}/warp-health.log"
 VKBLOCK_DIR="$STATE_DIR/vkblock"; VKBLOCK_CONF="$VKBLOCK_DIR/vkblock.conf"; VKBLOCK_LOG="{ROOT}/vkblock.log"
+RUDIRECT_DIR="$STATE_DIR/rudirect"; RUDIRECT_CONF="$RUDIRECT_DIR/rudirect.conf"; RUDIRECT_USER="{ROOT}/etc/awg2/rudirect"
+RUDIRECT_LOG="{ROOT}/rudirect.log"; TUNFAIL_CONF="{ROOT}/etc/awg2/tunnel-fail.conf"; TUNFAIL_LOG="{ROOT}/tunfail.log"
+DIAG_FWD="{ROOT}/ip_forward"; RUDIRECT_RPF="{ROOT}/rpf"
+EXITS_HEALTH_DIR="{ROOT}/run/exits-health"; EXITS_LOCK="{ROOT}/exits.lock"; EXITS_HEALTH_LOG="{ROOT}/exits-health.log"
 AMNEZIA_STATE_DIR="$STATE_DIR/amnezia"
 AUTOSTART_DROPIN="{ROOT}/etc/systemd/system/awg-quick@awg0.service.d"
 # Веб-панель: стенд (web_stand.py) передаёт свои конфиг и список адресов

@@ -21,6 +21,7 @@ awg-bot и awg2 при переустановке). Формат — тот же
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -28,6 +29,7 @@ import os
 import secrets
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -98,11 +100,33 @@ def _save(data: dict) -> bool:
         return False
 
 
+def _as_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value or default)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+@contextmanager
+def _locked():
+    """Бот и независимый процесс веб-панели изменяют один admins.json."""
+    path = Path(ADMINS_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(path) + ".lock", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def _lock_error(e: OSError) -> str:
+    log.error("Не заблокировал %s: %s", ADMINS_FILE, e)
+    return f"Не смог заблокировать {ADMINS_FILE} — проверь права и место на диске."
+
+
 def _prune_invites(data: dict) -> bool:
-    """Выкидывает просроченные приглашения. True — если что-то удалили."""
+    """Выкидывает просроченные и повреждённые приглашения."""
     now = int(time.time())
     dead = [k for k, v in data["invites"].items()
-            if not isinstance(v, dict) or int(v.get("exp") or 0) <= now]
+            if not isinstance(v, dict) or _as_int(v.get("exp")) <= now]
     for k in dead:
         data["invites"].pop(k, None)
     return bool(dead)
@@ -118,9 +142,11 @@ def invited_ids() -> set[int]:
     out: set[int] = set()
     for k in _load()["admins"]:
         try:
-            out.add(int(k))
+            uid = int(k)
         except (TypeError, ValueError):
             continue
+        if valid_uid(uid):
+            out.add(uid)
     return out
 
 
@@ -133,11 +159,13 @@ def list_invited() -> list[Admin]:
         except (TypeError, ValueError):
             continue
         v = v if isinstance(v, dict) else {}
+        if not valid_uid(uid):
+            continue
         out.append(Admin(
             uid=uid,
             username=str(v.get("username") or "")[:64],
-            added_by=int(v.get("added_by") or 0),
-            added_at=int(v.get("added_at") or 0),
+            added_by=_as_int(v.get("added_by")),
+            added_at=_as_int(v.get("added_at")),
         ))
     out.sort(key=lambda a: a.added_at)
     return out
@@ -147,30 +175,38 @@ def add(uid: int, added_by: int, username: str = "") -> tuple[bool, str]:
     """Добавляет приглашённого админа. Владельцев сюда писать не нужно."""
     if not valid_uid(uid):
         return False, "Это не похоже на Telegram ID пользователя."
-    data = _load()
-    if str(uid) in data["admins"]:
-        return False, "Этот пользователь уже админ."
-    if len(data["admins"]) >= MAX_ADMINS:
-        return False, f"Достигнут предел — {MAX_ADMINS} приглашённых админов."
-    data["admins"][str(uid)] = {
-        "username": str(username or "")[:64],
-        "added_by": int(added_by),
-        "added_at": int(time.time()),
-    }
-    _prune_invites(data)
-    if not _save(data):
-        return False, f"Не смог записать {ADMINS_FILE} — проверь права и место на диске."
+    try:
+        with _locked():
+            data = _load()
+            if str(uid) in data["admins"]:
+                return False, "Этот пользователь уже админ."
+            if len(data["admins"]) >= MAX_ADMINS:
+                return False, f"Достигнут предел — {MAX_ADMINS} приглашённых админов."
+            data["admins"][str(uid)] = {
+                "username": str(username or "")[:64],
+                "added_by": int(added_by),
+                "added_at": int(time.time()),
+            }
+            _prune_invites(data)
+            if not _save(data):
+                return False, f"Не смог записать {ADMINS_FILE} — проверь права и место на диске."
+    except OSError as e:
+        return False, _lock_error(e)
     log.info("Админ добавлен: %s (%s), пригласил %s", uid, username or "без username", added_by)
     return True, "Админ добавлен."
 
 
 def remove(uid: int, removed_by: int = 0) -> tuple[bool, str]:
-    data = _load()
-    if str(uid) not in data["admins"]:
-        return False, "Такого админа в списке нет."
-    data["admins"].pop(str(uid), None)
-    if not _save(data):
-        return False, f"Не смог записать {ADMINS_FILE} — проверь права и место на диске."
+    try:
+        with _locked():
+            data = _load()
+            if str(uid) not in data["admins"]:
+                return False, "Такого админа в списке нет."
+            data["admins"].pop(str(uid), None)
+            if not _save(data):
+                return False, f"Не смог записать {ADMINS_FILE} — проверь права и место на диске."
+    except OSError as e:
+        return False, _lock_error(e)
     log.info("Админ удалён: %s (удалил %s)", uid, removed_by)
     return True, "Доступ отозван."
 
@@ -185,75 +221,87 @@ def create_invite(created_by: int) -> tuple[str, int] | tuple[None, str]:
     Делает одноразовый токен приглашения.
     Возвращает (token, expires_at) либо (None, причина).
     """
-    data = _load()
-    _prune_invites(data)
-    if len(data["invites"]) >= MAX_INVITES:
-        return None, (f"Уже есть {MAX_INVITES} неиспользованных приглашений. "
-                      "Отзови старые или дождись, пока они сгорят.")
     token = secrets.token_urlsafe(16)   # 22 символа [A-Za-z0-9_-] — влезает в deep-link
     exp = int(time.time()) + INVITE_TTL
-    data["invites"][_hash(token)] = {"by": int(created_by), "exp": exp}
-    if not _save(data):
-        return None, f"Не смог записать {ADMINS_FILE} — проверь права и место на диске."
+    try:
+        with _locked():
+            data = _load()
+            _prune_invites(data)
+            if len(data["invites"]) >= MAX_INVITES:
+                return None, (f"Уже есть {MAX_INVITES} неиспользованных приглашений. "
+                              "Отзови старые или дождись, пока они сгорят.")
+            data["invites"][_hash(token)] = {"by": int(created_by), "exp": exp}
+            if not _save(data):
+                return None, f"Не смог записать {ADMINS_FILE} — проверь права и место на диске."
+    except OSError as e:
+        return None, _lock_error(e)
     log.info("Создано приглашение (действует до %s), автор %s", exp, created_by)
     return token, exp
 
 
 def pending_invites() -> int:
-    data = _load()
-    if _prune_invites(data):
-        _save(data)
-    return len(data["invites"])
+    try:
+        with _locked():
+            data = _load()
+            if _prune_invites(data):
+                _save(data)
+            return len(data["invites"])
+    except OSError as e:
+        _lock_error(e)
+        return len(_load()["invites"])
 
 
 def revoke_invites() -> int:
     """Гасит все неиспользованные приглашения. Возвращает, сколько погасили."""
-    data = _load()
-    _prune_invites(data)
-    n = len(data["invites"])
+    try:
+        with _locked():
+            data = _load()
+            _prune_invites(data)
+            n = len(data["invites"])
+            if n:
+                data["invites"] = {}
+                if not _save(data):
+                    return 0
+    except OSError as e:
+        _lock_error(e)
+        return 0
     if n:
-        data["invites"] = {}
-        if not _save(data):
-            return 0
         log.info("Отозвано приглашений: %s", n)
     return n
 
 
 def consume_invite(token: str, uid: int, username: str = "") -> tuple[bool, str]:
-    """
-    Активирует приглашение: проверяет токен, гасит его и заводит админа.
-    Гашение и добавление — в одной записи файла, чтобы одна ссылка не
-    сработала дважды при двух одновременных нажатиях.
-    """
+    """Проверка, гашение и выдача доступа — под общим flock процессов."""
     if not valid_uid(uid):
         return False, "Некорректный Telegram ID."
     if not token or len(token) > 64:
         return False, "Ссылка недействительна."
-    data = _load()
-    pruned = _prune_invites(data)
-    key = _hash(token)
-    inv = data["invites"].pop(key, None)
-    if inv is None:
-        # Чистку просроченных сохраняем, даже если токен не подошёл. Но только
-        # если было что чистить: /start inv_… может прислать кто угодно, и
-        # запись с fsync на каждую такую попытку — синхронная работа с диском
-        # в цикле бота по команде постороннего.
-        if pruned:
-            _save(data)
-        return False, "Ссылка недействительна или уже использована."
-    if str(uid) in data["admins"]:
-        _save(data)
-        return False, "Ты уже админ этого бота."
-    if len(data["admins"]) >= MAX_ADMINS:
-        _save(data)
-        return False, f"Достигнут предел — {MAX_ADMINS} приглашённых админов."
-    data["admins"][str(uid)] = {
-        "username": str(username or "")[:64],
-        "added_by": int(inv.get("by") or 0),
-        "added_at": int(time.time()),
-    }
-    if not _save(data):
-        return False, f"Не смог записать {ADMINS_FILE} — проверь права и место на диске."
+    try:
+        with _locked():
+            data = _load()
+            pruned = _prune_invites(data)
+            key = _hash(token)
+            inv = data["invites"].pop(key, None)
+            if inv is None:
+                # Неверный токен без истёкших записей не вызывает запись на диск.
+                if pruned:
+                    _save(data)
+                return False, "Ссылка недействительна или уже использована."
+            if str(uid) in data["admins"]:
+                _save(data)
+                return False, "Ты уже админ этого бота."
+            if len(data["admins"]) >= MAX_ADMINS:
+                _save(data)
+                return False, f"Достигнут предел — {MAX_ADMINS} приглашённых админов."
+            data["admins"][str(uid)] = {
+                "username": str(username or "")[:64],
+                "added_by": _as_int(inv.get("by")),
+                "added_at": int(time.time()),
+            }
+            if not _save(data):
+                return False, f"Не смог записать {ADMINS_FILE} — проверь права и место на диске."
+    except OSError as e:
+        return False, _lock_error(e)
     log.info("Приглашение активировано: %s (%s), пригласил %s",
              uid, username or "без username", inv.get("by"))
     return True, "Доступ выдан."

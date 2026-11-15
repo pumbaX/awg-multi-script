@@ -65,6 +65,7 @@ async def screen(target: ui.Target) -> None:
         ("🔀 Протокол", act.data("proto")) if exists else None,
         ("🎛 Параметры AWG", act.data("par")) if exists else None,
         ("🌍 Endpoint", act.data("ep")) if exists else None,
+        ("📍 Точки входа", "ent") if exists else None,
         ("🛠 Починить", act.data("repair")),
         ("🛡 Антисканер", "as"),
         ("🚫 VK и Max", "vk"),
@@ -227,7 +228,7 @@ async def _port_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
 @ask.on("srv_mtu")
 async def _mtu_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
-    if not v.isdigit() or not 1280 <= int(v) <= 1500:
+    if not v.isascii() or not v.isdigit() or not 1280 <= int(v) <= 1500:
         await ask.retry(msg, state, ctx, "MTU — число 1280-1500")
         return
     await _wizard_set(msg, state, "mtu", v)
@@ -319,9 +320,15 @@ async def wizard(target: ui.Target, state: FSMContext) -> None:
         await ui.render(target, head + "<b>UDP-порт</b>",
                         ui.kb(("🎲 Случайный", _w("port", "")), ("✏️ Ввести…", _w("port", "ask")), cancel))
     elif step == "endpoint":
+        v6 = (await api.data("server", "info", default={}) or {}).get("ipv6") or ""
         await ui.render(target, head + "<b>Адрес в конфигах клиентов</b>\nДомен вместо IP — переезд сервера "
-                                       "без перевыдачи конфигов.",
-                        ui.kb(("IP этого сервера", _w("endpoint", "")), ("✏️ Домен…", _w("endpoint", "ask")), cancel))
+                                       "без перевыдачи конфигов."
+                        + (f"\n\nУ сервера есть IPv6 <code>{esc(v6)}</code>: клиенты могут подключаться по нему. "
+                           "У кого в сети IPv6 нет — в карточке клиента вход меняется на «напрямую» (IPv4)."
+                           if v6 else ""),
+                        ui.kb(("IP этого сервера", _w("endpoint", "")),
+                              ("🌐 IPv6 сервера", _w("endpoint", "ipv6")) if v6 else None,
+                              ("✏️ Домен…", _w("endpoint", "ask")), cancel))
     else:
         await ui.render(target, head + "\n".join([
             f"Регион: {'Россия' if wiz['region'] == 'ru' else 'мир'}",
@@ -329,7 +336,8 @@ async def wizard(target: ui.Target, state: FSMContext) -> None:
             f"Версия: AWG {wiz['proto']} · MTU {wiz['mtu']}",
             f"Подсеть: {esc(wiz['net'] or 'случайная 10.x.y.0/24')}",
             f"DNS: {esc(wiz['dns'])}",
-            f"Порт: {wiz['port'] or 'случайный'} · endpoint: {esc(wiz['endpoint'] or 'IP сервера')}",
+            f"Порт: {wiz['port'] or 'случайный'} · endpoint: "
+            + esc({"": "IP сервера", "ipv6": "IPv6 сервера"}.get(wiz["endpoint"], wiz["endpoint"])),
         ]), ui.kb(ui.Row(("✅ Создать сервер", act.data("createok")), cancel)))
 
 
@@ -566,9 +574,12 @@ async def _ep(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     dom = info.get("domain")
     await ui.render(cb, f"<b>🌍 Endpoint</b>\n\nВ конфигах: <code>{esc(info.get('endpoint', ''))}</code>\n"
                         + ("Домен задан — сервер можно переносить без перевыдачи конфигов." if dom
-                           else "Сейчас IP. С доменом переезд сервера не требует новых конфигов."),
+                           else "Сейчас IP. С доменом переезд сервера не требует новых конфигов.")
+                        + "\n\n📍 Клиентам через другой сервер (каскад) — «Точки входа»: "
+                          "у них в конфиге адрес входа, смена Endpoint их не трогает.",
                     ui.kb(("✏️ Указать домен", act.data("epdom")),
                           ("🔢 Публичный IP", act.data("epset", "ip")) if dom else None,
+                          ("📍 Точки входа", "ent"),
                           ui.back("srv")))
 
 

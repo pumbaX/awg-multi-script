@@ -49,7 +49,7 @@ CACHE_TTL = float(os.environ.get("AWG_API_CACHE_TTL", 5))
 CACHED = {("status",), ("version",), ("server", "info"), ("tunnels", "status"), ("xray", "status"),
           ("exits", "status"), ("warp", "status"), ("dns", "status"), ("t2s", "status"), ("wgobf", "status"),
           ("clients", "list"), ("bot", "status"), ("cert", "status"), ("update", "status"), ("mimicry",),
-          ("traffic", "daily"), ("backup", "list")}
+          ("traffic", "daily"), ("backup", "list"), ("entry", "list")}
 _cache: dict[tuple[str, ...], tuple[float, "Result"]] = {}
 _inflight: dict[tuple[str, ...], "asyncio.Task[Result]"] = {}
 _gen = 0                            # растёт на каждой записи: чтение, начатое до неё, в кэш не ложится
@@ -61,7 +61,8 @@ READS = {("job", "status"), ("job", "list"), ("log",), ("module", "report"), ("m
          ("diag", "status"), ("diag", "sniff-list"), ("tunnels", "clients"), ("wgobf", "clients"),
          ("xray", "diag"), ("cascade", "list"), ("module", "backups"), ("backup", "inspect"),
          ("bot", "proxy", "get"), ("bot", "proxy", "candidates"), ("bot", "webapp", "get"), ("server", "params"), ("web", "status"),
-         ("traffic", "now"), ("warp", "probe"), ("antiscan", "status"), ("vkblock", "status"), ("amnezia", "status"), ("amnezia", "scan")}         # обзор панели спрашивает раз в 3 с — не запись, кэш не сбрасывает
+         ("traffic", "now"), ("warp", "probe"), ("xray", "probe"), ("antiscan", "status"), ("vkblock", "status"), ("amnezia", "status"), ("amnezia", "scan"),
+         ("rudirect", "status"), ("tunnels", "fail", "list"), ("diag", "route")}         # обзор панели спрашивает раз в 3 с — не запись, кэш не сбрасывает
 
 
 def _cacheable(key: tuple[str, ...]) -> bool:
@@ -160,8 +161,18 @@ async def _run(*args: Any, stdin: str | bytes | None = None,
             return Result(False, proc.returncode or 1,
                           error="Установленный awg2 не знает команду api — обнови AWG Toolza")
         return Result(False, proc.returncode or 1, log=tail, error="awg2 ответил не JSON")
-    return Result(bool(env.get("ok")), int(env.get("rc") or 0), env.get("data"),
-                  env.get("log") or "", env.get("error") or "")
+    if not isinstance(env, dict):
+        log.warning("awg2 api %s: JSON-ответ не является объектом", args[:2])
+        return Result(False, proc.returncode or 1, error="awg2 вернул некорректный JSON-ответ")
+    try:
+        rc = int(env.get("rc") or 0)
+    except (TypeError, ValueError, OverflowError):
+        rc = proc.returncode or 1
+    log_text = env.get("log") if isinstance(env.get("log"), str) else ""
+    error = env.get("error") if isinstance(env.get("error"), str) else ""
+    # Только JSON true означает успех: bool("false") в Python было бы True,
+    # и панель показала бы успешное изменение, которого на сервере не было.
+    return Result(env.get("ok") is True, rc, env.get("data"), log_text, error)
 
 
 async def data(*args: Any, default: Any = None, **kw: Any) -> Any:

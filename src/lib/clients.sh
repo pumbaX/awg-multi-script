@@ -23,17 +23,19 @@ share_config() {  # файл [qr]
 # Добавляет клиента в awg0.conf и в работающий интерфейс, пишет его конфиг.
 # Мимикрия берётся из I_LINES/MIMICRY. $5 — срок действия (unix-время), пусто — бессрочно.
 client_add() {
-  local name="$1" addr="$2" dns="$3" mtu="$4" expire="${5:-}" priv pub psk size
+  local name="$1" addr="$2" dns="$3" mtu="$4" expire="${5:-}" priv pub psk size ent=""
   priv=$(awg genkey) && pub=$(awg pubkey <<< "$priv") && psk=$(awg genpsk) || return 1
   size=$(stat -c%s "$SERVER_CONF")
-  printf '\n[Peer]\n# %s\n# mimicry=%s\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s\n' \
-    "$name" "$(mimicry_tag)" "$pub" "$psk" "$addr" >> "$SERVER_CONF"
+  client_new_entry
+  [[ -n "$_ENTRY_NEW" ]] && ent="# entry=$_ENTRY_NEW"$'\n'
+  printf '\n[Peer]\n# %s\n# mimicry=%s\n%sPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s\n' \
+    "$name" "$(mimicry_tag)" "$ent" "$pub" "$psk" "$addr" >> "$SERVER_CONF"
   if iface_up && ! awg set "$AWG_IF" peer "$pub" preshared-key <(printf '%s\n' "$psk") allowed-ips "$addr"; then
     truncate -s "$size" "$SERVER_CONF"
     err "Ядро не приняло пира — запись откатана"
     return 1
   fi
-  write_client_conf "$(client_file "$name")" "$priv" "$addr" "$psk" "$dns" "$mtu" || return 1
+  write_client_conf "$(client_file "$name")" "$priv" "$addr" "$psk" "$dns" "$mtu" "$_ENTRY_NEW_ADDR" || return 1
   if [[ -n "$expire" ]]; then
     expire_install
     py expire-set "$SERVER_CONF" "$name" "$expire"
@@ -126,7 +128,8 @@ client_reissue() {  # имя
   [[ -f "$TRAFFIC_DB" ]] && { py traffic-rekey "$TRAFFIC_DB" "$old" "$pub" || warn "Счётчики трафика начнутся заново"; }
   rm -f "$EXPIRE_STATE_DIR/warn1h_${old//[^A-Za-z0-9]/_}"
   mimicry_from_spec server || return 1
-  write_client_conf "$(client_file "$name")" "$priv" "$addr" "$psk" "1.1.1.1, 1.0.0.1" "$(conf_iface_get MTU)" || return 1
+  write_client_conf "$(client_file "$name")" "$priv" "$addr" "$psk" "1.1.1.1, 1.0.0.1" "$(conf_iface_get MTU)" \
+    "$(client_endpoint "$name")" || return 1
   peer_meta_set "$name" mimicry "$(mimicry_tag)" || true
   log_info "клиент перевыпущен: $name"
   ok "Новый конфиг $name: $(client_file "$name")"
@@ -560,15 +563,16 @@ do_clients_menu() {
     echo -e "  ${C}9)${N} Сменить мимикрию"
     echo -e "  ${R}10)${N} Удалить"
     echo -e "  ${C}11)${N} Перевыпустить конфиг ${D}— новый ключ; перенесённым из Amnezia — конфиг и QR${N}"
+    echo -e "  ${C}12)${N} Вход клиента ${D}— напрямую или через точку входа (каскад)${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-11]: ${N}" 0 11 0
+    read_choice c "${C}  Выбор [0-12]: ${N}" 0 12 0
     case "$c" in
       1) do_add_client || true ;;     6) do_bulk_add || true ;;
       2) do_list_clients || true ;;   7) do_expire_menu || true ;;
       3) do_show_client || true ;;    8) do_export_clients || true ;;
       4) do_show_client_qr || true ;; 9) do_change_mimicry || true ;;
       5) do_rename_client || true ;;  10) do_delete_client || true ;;
-      11) do_reissue_client || true ;;
+      11) do_reissue_client || true ;;  12) do_client_entry || true ;;
       0) return 0 ;;
     esac
     pause

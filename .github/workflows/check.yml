@@ -22,7 +22,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck openssh-client
+          sudo apt-get install -y -qq shellcheck openssh-client ipset
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install -q pyflakes -r awg_bot/requirements.txt
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
@@ -41,11 +41,6 @@ jobs:
           pyflakes awg_bot src/py
           node --check awg_bot/awgbot/webapp/app.js
 
+      # Наборы — параллельно (tests/run_all.py); упавший — с полным журналом
       - name: Тесты
-        run: |
-          set -euo pipefail
-          for t in test_toolza test_meta_menu test_regress_f2f3 test_amnezia test_cps test_net test_admins test_bot test_web test_api_lock test_share_persistence; do
-            echo "::group::$t"
-            python3 "tests/$t.py" awg2.sh
-            echo "::endgroup::"
-          done
+        run: python3 tests/run_all.py awg2.sh --skip panel

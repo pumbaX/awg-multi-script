@@ -160,6 +160,173 @@ def cmd_meta_set(conf, name, key, value):
     write_atomic(conf, head + "".join(peers))
 
 
+# ════════════════════════ Точки входа ════════════════════════
+# Клиент подключается не к серверу напрямую, а через сервер-вход (каскад,
+# проброс порта): в его конфиге Endpoint — адрес входа. Список — метки шапки
+# awg0.conf «# AWG_ENTRY=имя|хост:порт», вход для новых клиентов —
+# «# AWG_ENTRY_DEFAULT=имя», вход клиента — метка пира «# entry=имя». Всё в
+# awg0.conf — в любом бэкапе вместе с клиентами. Пустое имя — напрямую.
+ENTRY_KEY, ENTRY_DEF = "AWG_ENTRY", "AWG_ENTRY_DEFAULT"
+ENTRY_NAME = re.compile(r"[^\W_][\w .-]{0,23}")
+ENTRY_MAX = 20
+ENTRY_LINE = re.compile(r"^# (?:%s|%s)=" % (ENTRY_KEY, ENTRY_DEF))
+HOST_RE = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def entries_read(head):
+    """Шапка awg0.conf → [(имя, хост:порт)], имя входа по умолчанию."""
+    ents, default = [], ""
+    for line in head.splitlines():
+        if line.lstrip().startswith("["):
+            break
+        m = re.match(r"^# %s=(.+)\|(\S+?)\s*$" % ENTRY_KEY, line)
+        if m:
+            ents.append((m.group(1), m.group(2)))
+            continue
+        m = re.match(r"^# %s=(.*?)\s*$" % ENTRY_DEF, line)
+        if m:
+            default = m.group(1)
+    if default not in dict(ents):
+        default = ""
+    return ents, default
+
+
+def entries_write(head, ents, default):
+    lines = [l for l in head.split("\n") if not ENTRY_LINE.match(l)]
+    at = next((i for i, l in enumerate(lines) if l.lstrip().startswith("[")), len(lines))
+    lines[at:at] = (["# %s=%s|%s" % (ENTRY_KEY, n, a) for n, a in ents]
+                    + (["# %s=%s" % (ENTRY_DEF, default)] if default else []))
+    return "\n".join(lines)
+
+
+def entry_addr(v):
+    """«хост:порт» точки входа: IPv4, домен или [IPv6], порт 1-65535."""
+    v = v.strip().lower()
+    m6 = re.fullmatch(r"\[([0-9a-f:.]+)\]:(\d{1,5})", v)
+    if m6:
+        try:
+            ip = ipaddress.IPv6Address(m6.group(1))
+        except ValueError:
+            die("Неверный IPv6: %s" % _shown(m6.group(1)), 2)
+        if not ip.is_global:
+            die("IPv6 входа — глобальный адрес (не fe80::, не fd00::, не локальный)", 2)
+        if not 1 <= int(m6.group(2)) <= 65535:
+            die("Порт входа: 1-65535", 2)
+        return "[%s]:%d" % (ip.compressed, int(m6.group(2)))
+    if v.startswith("["):
+        die("Неверный IPv6-адрес входа — нужен [адрес]:порт, например [2001:db8::1]:443", 2)
+    m = re.fullmatch(r"([^\s:/]+):(\d{1,5})", v)
+    if not m:
+        die("Адрес входа — хост:порт, например 203.0.113.5:443, vpn.example.com:443 или [2001:db8::1]:443", 2)
+    host, port = m.group(1), int(m.group(2))
+    if not 1 <= port <= 65535:
+        die("Порт входа: 1-65535", 2)
+    if re.fullmatch(r"[\d.]+", host):
+        parts = host.split(".")
+        if len(parts) != 4 or any(not p or (len(p) > 1 and p[0] == "0") or int(p) > 255 for p in parts):
+            die("Неверный IPv4: %s" % host, 2)
+    elif not HOST_RE.fullmatch(host):
+        die("Неверный адрес: %s — нужен IPv4 или домен" % _shown(host), 2)
+    return "%s:%d" % (host, port)
+
+
+def cmd_entry(conf, op, *args):
+    """Точки входа. Команды, меняющие вход клиентов, печатают «клиент<TAB>адрес»
+    (пусто — напрямую) — по ним awg2 переписывает Endpoint в их конфигах."""
+    head, peers = split_peers(read(conf))
+    ents, default = entries_read(head)
+    addr = dict(ents)
+    arg = lambda i: args[i] if len(args) > i else ""  # noqa: E731
+
+    def want(name):
+        if name not in addr:
+            die("Точки входа «%s» нет" % _shown(name), 2)
+        return name
+
+    def save():
+        write_atomic(conf, entries_write(head, ents, default) + "".join(peers))
+
+    def emit(names):
+        for b in peers:
+            n = peer_name(b)
+            if n and n in names:
+                print("%s\t%s" % (n, addr.get(peer_meta(b, "entry"), "")))
+
+    on = lambda b: peer_meta(b, "entry")  # noqa: E731
+    if op == "list":
+        for n, a in ents:
+            print("%s\t%s\t%d\t%d" % (n, a, sum(1 for b in peers if on(b) == n), n == default))
+    elif op == "get":
+        print(addr.get(arg(0), ""))
+    elif op == "add":
+        name, a = arg(0).strip(), entry_addr(arg(1))
+        if not ENTRY_NAME.fullmatch(name):
+            die("Имя входа: буквы, цифры, пробел, точка, _ и -, до 24 символов", 2)
+        if name.lower() in ("direct", "напрямую") or name.lower() in (n.lower() for n in addr):
+            die("Имя «%s» занято" % name, 2)
+        if len(ents) >= ENTRY_MAX:
+            die("Точек входа уже %d — больше нельзя" % ENTRY_MAX, 2)
+        ents.append((name, a))
+        save()
+    elif op == "set":
+        name, a = want(arg(0)), entry_addr(arg(1))
+        ents[:] = [(n, a if n == name else x) for n, x in ents]
+        addr[name] = a
+        save()
+        emit({peer_name(b) for b in peers if on(b) == name})
+    elif op == "del":
+        name = want(arg(0))
+        hit = {peer_name(b) for b in peers if on(b) == name}
+        ents[:] = [(n, x) for n, x in ents if n != name]
+        del addr[name]
+        if default == name:
+            default = ""
+        peers[:] = [set_meta(b, "entry", "") if on(b) == name else b for b in peers]
+        save()
+        emit(hit)
+    elif op == "default":
+        default = want(arg(0)) if arg(0) else ""
+        save()
+    elif op == "assign":
+        client, name = arg(0), (want(arg(1)) if arg(1) else "")
+        i = find_peer(peers, name=client)
+        if i < 0:
+            die("Клиента %s нет" % _shown(client), 2)
+        peers[i] = set_meta(peers[i], "entry", name)
+        save()
+        emit({client})
+    elif op == "assign-many":
+        # Список клиентов через запятую; незнакомые имена — в stderr, остальные назначаются
+        name = want(arg(0)) if arg(0) else ""
+        names = [n for n in arg(1).split(",") if n]
+        known = {peer_name(b) for b in peers if peer_name(b)}
+        for n in names:
+            if n not in known:
+                sys.stderr.write("Клиента %s нет\n" % _shown(n))
+        hit = set(names) & known
+        if not hit:
+            die("Ни одного клиента из списка нет", 2)
+        peers[:] = [set_meta(b, "entry", name) if peer_name(b) in hit else b for b in peers]
+        save()
+        emit(hit)
+    elif op == "assign-all":
+        name = want(arg(0)) if arg(0) else ""
+        peers[:] = [set_meta(b, "entry", name) if peer_name(b) else b for b in peers]
+        save()
+        emit({peer_name(b) for b in peers if peer_name(b)})
+    elif op == "of":
+        # Адрес входа клиента (пусто — напрямую или вход удалён)
+        i = find_peer(peers, name=arg(0))
+        print(addr.get(on(peers[i]), "") if i >= 0 else "")
+    elif op == "direct":
+        # Клиенты без входа — им переписывается Endpoint при смене домена сервера
+        for b in peers:
+            if peer_name(b) and on(b) not in addr:
+                print(peer_name(b))
+    else:
+        die("entry list|get|add|set|del|default|assign|assign-many|assign-all|of|direct", 2)
+
+
 def cmd_peer_del(conf, pubkey):
     head, peers = split_peers(read(conf))
     i = find_peer(peers, pubkey=pubkey)
@@ -2217,7 +2384,8 @@ def _first_ip(value):
 def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
     """Клиенты awg0 со статистикой `awg show dump`, туннелями и трафиком за
     месяц и по лимиту — для бота."""
-    _, peers = split_peers(read(conf))
+    head, peers = split_peers(read(conf))
+    entries = dict(entries_read(head)[0])
     stats = {}
     try:
         for line in read(dump).splitlines()[1:]:
@@ -2259,6 +2427,8 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
             "endpoint": "" if s[2] in ("", "(none)") else s[2], "file": path,
             # Перенесён из Amnezia: приватный ключ только у клиента — исходное имя
             "amnezia": peer_meta(b, "amnezia") or None,
+            # Точка входа (каскад): None — напрямую или вход удалён
+            "entry": peer_meta(b, "entry") if peer_meta(b, "entry") in entries else None,
         }
         limit, period = parse_limit(peer_meta(b, "limit"))
         by = peer_meta(b, "blocked_by")
@@ -2974,7 +3144,7 @@ COMMANDS = {
     "xray-ru": cmd_xray_ru, "xray-prepare": cmd_xray_prepare,
     "pcap-analyze": cmd_pcap_analyze, "safe-untar": cmd_safe_untar,
     "cert-find": cmd_cert_find, "changelog-json": cmd_changelog_json,
-    "json-kv": cmd_json_kv, "json-rows": cmd_json_rows, "dns-check": cmd_dns_check, "json-list": cmd_json_list,
+    "entry": cmd_entry, "json-kv": cmd_json_kv, "json-rows": cmd_json_rows, "dns-check": cmd_dns_check, "json-list": cmd_json_list,
     "clients-json": cmd_clients_json, "api-envelope": cmd_api_envelope,
     "api-job-status": cmd_api_job_status, "api-jobs": cmd_api_jobs,
     "tg-targets": cmd_tg_targets,

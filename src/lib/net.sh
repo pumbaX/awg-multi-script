@@ -84,6 +84,20 @@ public_ip() {
 
 # Кэш на время одного запуска: адрес дёргается из шапки меню и генераторов.
 _PUBLIC_IP=""
+# Глобальный IPv6 сервера — для входа клиентов по IPv6: с интерфейса
+# маршрута IPv6 по умолчанию, без временных (privacy), устаревших и ULA
+# (fc00::/7) адресов. Нет — пусто. Сам IPv4 Тулзы (public_ip) не меняется.
+_PUBLIC_IP6=""
+public_ip6() {
+  local dev
+  if [[ -z "$_PUBLIC_IP6" ]]; then
+    dev=$(ip -6 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+    _PUBLIC_IP6=$(ip -6 -o addr show ${dev:+dev "$dev"} scope global 2>/dev/null \
+      | awk '!/temporary|deprecated|tentative|dadfailed/ {split($4, a, "/"); if (tolower(a[1]) !~ /^f[cd]/) {print a[1]; exit}}')
+  fi
+  echo "$_PUBLIC_IP6"
+}
+
 public_ip_cached() {
   [[ -n "$_PUBLIC_IP" ]] || _PUBLIC_IP=$(public_ip || true)
   echo "$_PUBLIC_IP"

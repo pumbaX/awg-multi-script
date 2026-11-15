@@ -492,7 +492,7 @@ _wgobf_route_refresh() {  # прежние _xray_outs и список exit-но�
     exits_reapply
   elif [[ -s "$EXITS_PEERS.wgobf" ]] && exits_is_up; then
     rules=$(ip rule show 2>/dev/null)
-    up=$(exits_up_nodes | tr '\n' ' ')
+    up=$(exits_live_nodes | tr '\n' ' ')      # живые по порядку: упавшую сторож уже вывел
     while IFS= read -r line; do
       line="${line//[[:space:]]/}"
       ip="${line%%|*}"
