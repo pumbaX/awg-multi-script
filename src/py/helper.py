@@ -1653,7 +1653,9 @@ def _ss_outbound(link):
             "settings": {"servers": [{"address": host, "port": port, "method": method, "password": password}]}}
 
 
-def cmd_xray_link(link):
+def link_outbound(link):
+    """Ссылка → outbound Xray (dict). Ошибка — die(); замечания (NOTE:,
+    UNSUPPORTED:) — в stderr."""
     link = link.strip()
     if link.startswith("vless://"):
         u = urllib.parse.urlparse(link)
@@ -1702,16 +1704,18 @@ def cmd_xray_link(link):
                                         "password": password}]},
               "streamSettings": {"network": get("type") or "tcp", "security": get("security") or "tls"}}
     elif link.startswith("ss://"):
-        print(json.dumps(_ss_outbound(link)))
-        return
+        return _ss_outbound(link)
     elif link.startswith(("hysteria2://", "hy2://")):
-        print(json.dumps(_hy2_outbound(link)))
-        return
+        return _hy2_outbound(link)
     else:
         die("поддерживаются vless://, vmess://, trojan://, ss://, hysteria2://")
     apply_transport(ob["streamSettings"], ob["streamSettings"]["network"], get)
     apply_tls(ob["streamSettings"], get, host)
-    print(json.dumps(ob))
+    return ob
+
+
+def cmd_xray_link(link):
+    print(json.dumps(link_outbound(link)))
 
 
 def cmd_xray_default(path):
@@ -1820,9 +1824,11 @@ def cmd_xray_tags(path):
         print(t)
 
 
-def cmd_xray_outs(path):
-    """Выходы для карточек панели: тег, протокол, защита, транспорт, адрес, порт (TSV)."""
+def cmd_xray_outs(path, names=""):
+    """Выходы для карточек панели: тег, протокол, защита, транспорт, адрес, порт,
+    имя (у выходов подписки — из неё) (TSV)."""
     clean = lambda v: str(v).replace("\t", " ").replace("\n", " ")  # noqa: E731
+    known = _sub_names(names) if names else {}
     for o in jload(path).get("outbounds", []):
         if not o.get("tag") or o.get("protocol") in SKIP_PROTO:
             continue
@@ -1831,7 +1837,307 @@ def cmd_xray_outs(path):
         port = srv.get("port") or 0
         print("\t".join(clean(v) for v in (o["tag"], o.get("protocol", ""), st.get("security") or "none",
                                           st.get("network") or "tcp", srv.get("address", ""),
-                                          port if isinstance(port, int) else 0)))
+                                          port if isinstance(port, int) else 0, known.get(o["tag"], ""))))
+
+
+# ── Подписка ──────────────────────────────────────────────
+# Подписка — адрес, по которому провайдер отдаёт список серверов. Форматы:
+# base64 строк-ссылок (v2rayN, 3x-ui, Marzban), те же ссылки открытым
+# текстом, JSON — массив готовых конфигов Xray (Remnawave, Marzban «v2ray-json»).
+# Clash/sing-box и веб-страница — отказ с понятной причиной.
+#
+# Подписка — чужие данные, а Xray работает от root, поэтому в конфиг идёт
+# только выход: протокол, settings, streamSettings без sockopt (метка
+# пакетов, привязка к интерфейсу, цепочки dialerProxy поменяли бы маршруты
+# сервера), mux. Адрес сервера — внешний: 127.0.0.1, частные и служебные
+# сети отбрасываются (иначе Xray ходил бы во внутренние службы сервера).
+SUB_TAG = "sub_"
+SUB_MAX = 100                                  # серверов из одной подписки
+SUB_PROTO = ("vless", "vmess", "trojan", "shadowsocks", "hysteria")
+SUB_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://")
+
+
+def _sub_name(text, n=64):
+    """Имя из подписки: без управляющих символов и обратной косой (warn печатает через echo -e)."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(text or "")).replace("\\", "/").strip()[:n]
+
+
+def _sub_link_name(link):
+    if link.startswith("vmess://"):
+        raw = link[8:]
+        try:
+            data = json.loads(base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8"))
+            return _sub_name(data.get("ps") if isinstance(data, dict) else "")
+        except (ValueError, UnicodeDecodeError):
+            return ""
+    return _sub_name(urllib.parse.unquote(link.split("#", 1)[1]) if "#" in link else "")
+
+
+def _sub_servers(ob):
+    """(адрес, порт) всех серверов выхода: vnext/servers или адрес в settings."""
+    st = ob.get("settings") if isinstance(ob.get("settings"), dict) else {}
+    lst = st.get("vnext") or st.get("servers") or [st]
+    out = []
+    for srv in lst if isinstance(lst, list) else []:
+        if isinstance(srv, dict):
+            out.append((str(srv.get("address") or ""), srv.get("port")))
+    return out
+
+
+def _sub_addr_ok(host):
+    """Внешний адрес: домен или глобальный IP. Не 127.0.0.1, не частные сети."""
+    h = (host or "").strip().strip("[]").lower().rstrip(".")
+    if not h or h == "localhost" or h.endswith(".localhost") or len(h) > 253:
+        return False
+    try:
+        return ipaddress.ip_address(h).is_global
+    except ValueError:
+        pass
+    if re.fullmatch(r"[0-9.]+", h):                 # «1.2.3» и подобное — не адрес
+        return False
+    return bool(re.fullmatch(r"[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)*", h))
+
+
+def _sub_strip(obj):
+    """Без sockopt и dialerProxy на любой глубине (xhttp extra тоже несёт streamSettings)."""
+    if isinstance(obj, dict):
+        return {k: _sub_strip(v) for k, v in obj.items() if k not in ("sockopt", "dialerProxy")}
+    if isinstance(obj, list):
+        return [_sub_strip(v) for v in obj]
+    return obj
+
+
+def _sub_clean(ob):
+    """Только выход: протокол, settings, streamSettings (без sockopt), mux. None — не годится."""
+    if not isinstance(ob, dict) or ob.get("protocol") not in SUB_PROTO or not isinstance(ob.get("settings"), dict):
+        return None
+    out = {"protocol": ob["protocol"], "settings": _sub_strip(ob["settings"])}
+    for k in ("streamSettings", "mux"):
+        if isinstance(ob.get(k), dict):
+            out[k] = _sub_strip(ob[k])
+    return out
+
+
+def _sub_b64(text):
+    t = re.sub(r"\s+", "", text)
+    if not t or not re.fullmatch(r"[A-Za-z0-9+/_=-]+", t):
+        return None
+    t = t.rstrip("=")
+    try:
+        raw = base64.urlsafe_b64decode(t.replace("+", "-").replace("/", "_") + "=" * (-len(t) % 4))
+        return raw.decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _sub_from_json(data):
+    """Массив конфигов Xray (или один конфиг) → [(имя, outbound)]."""
+    confs = data if isinstance(data, list) else [data]
+    found = []
+    for i, c in enumerate(confs, 1):
+        if not isinstance(c, dict):
+            continue
+        outs = c.get("outbounds")
+        if not isinstance(outs, list):
+            continue
+        if any(isinstance(o, dict) and "type" in o and "protocol" not in o for o in outs):
+            die("это подписка sing-box — нужна подписка ссылками (v2rayN) или JSON Xray")
+        proxies = [o for o in outs if isinstance(o, dict) and o.get("protocol") in SUB_PROTO]
+        name = _sub_name(c.get("remarks")) or "сервер %d" % i
+        for j, o in enumerate(proxies):
+            found.append((name if len(proxies) == 1 else "%s · %s" % (name, _sub_name(o.get("tag"), 20) or j + 1), o))
+    return found
+
+
+def cmd_xray_sub_parse(body, out):
+    """Тело подписки → JSON {format, items: [{name, ob}], skipped, notes}."""
+    import contextlib
+    import io
+    raw = open(body, "rb").read()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        die("ответ подписки — не текст")
+    head = text.lstrip()[:512].lower()
+    if not head:
+        die("подписка пустая")
+    if head.startswith("<") or "<html" in head:
+        die("по адресу — веб-страница, а не подписка: нужен адрес подписки (ссылка «для приложения»)")
+    if re.match(r"(proxies|proxy-groups|port|mixed-port)\s*:", head) or "\nproxies:" in text[:4096]:
+        die("это подписка Clash — нужна подписка ссылками (v2rayN) или JSON Xray")
+    pairs, skipped, notes, fmt = [], 0, [], ""
+    if head[0] in "[{":
+        try:
+            data = json.loads(text)
+        except ValueError:
+            die("ответ подписки — сломанный JSON")
+        pairs, fmt = _sub_from_json(data), "json"
+        lines = []
+    else:
+        lines = text.splitlines()
+        if not any("://" in ln for ln in lines):
+            dec = _sub_b64(text)
+            if dec is None or "://" not in dec:
+                die("ответ подписки не разобран: ни ссылок, ни base64 со ссылками")
+            lines, fmt = dec.splitlines(), "base64"
+        else:
+            fmt = "links"
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        if not ln.startswith(SUB_SCHEMES):
+            skipped += 1
+            if "://" in ln and len(notes) < 5:
+                notes.append("пропущено: %s://…" % _sub_name(ln.split("://", 1)[0], 16))
+            continue
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                ob = link_outbound(ln)
+        except SystemExit:
+            skipped += 1
+            if len(notes) < 5:
+                why = (err.getvalue().strip().splitlines() or ["не разобрана"])[-1]
+                notes.append("%s: %s" % (_sub_link_name(ln) or "ссылка", _sub_name(why, 80)))
+            continue
+        except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+            skipped += 1
+            continue
+        if "UNSUPPORTED:" in err.getvalue():
+            skipped += 1
+            continue
+        pairs.append((_sub_link_name(ln), ob))
+    items, seen = [], set()
+    for name, ob in pairs:
+        ob = _sub_clean(ob)
+        servers = _sub_servers(ob) if ob else []
+        if not ob or not servers or not all(_sub_addr_ok(h) for h, _ in servers):
+            skipped += 1
+            if ob and len(notes) < 5:
+                notes.append("%s: адрес сервера внутренний или пустой" % (name or "сервер"))
+            continue
+        key = json.dumps(ob, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(items) >= SUB_MAX:
+            notes.append("серверов больше %d — взяты первые %d" % (SUB_MAX, SUB_MAX))
+            break
+        items.append({"name": name, "ob": ob})
+    if not items:
+        die("в подписке нет серверов, которые понимает Xray" + (" (пропущено: %d)" % skipped if skipped else ""))
+    taken = set()
+    for it in items:
+        host, port = _sub_servers(it["ob"])[0]
+        base = SUB_TAG + re.sub(r"[^A-Za-z0-9]", "_", host.strip("[]"))[:40] + "_" + re.sub(r"[^0-9]", "", str(port))[:5]
+        tag, i = base, 2
+        while tag in taken:
+            tag, i = "%s_%d" % (base, i), i + 1
+        taken.add(tag)
+        it["ob"]["tag"] = it["tag"] = tag
+        it["name"] = it["name"] or "%s:%s" % (host, port)
+    jsave(out, {"format": fmt, "items": items, "skipped": skipped, "notes": notes})
+
+
+def _sub_header(text, name):
+    """Последнее значение заголовка (после редиректов — последний ответ)."""
+    blocks = re.split(r"\r?\n\r?\n", text.strip())
+    for line in (blocks[-1] if blocks else "").splitlines():
+        k, sep, v = line.partition(":")
+        if sep and k.strip().lower() == name:
+            return v.strip()
+    return ""
+
+
+def cmd_xray_sub_meta(headers):
+    """Заголовки ответа → строки КЛЮЧ=значение: трафик и срок (subscription-userinfo),
+    интервал обновления в часах (profile-update-interval), название (profile-title)."""
+    text = read(headers) if os.path.exists(headers) else ""
+    info = {}
+    for part in _sub_header(text, "subscription-userinfo").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k.strip().lower() in ("upload", "download", "total", "expire") and re.fullmatch(r"\s*\d{1,20}(\.\d+)?\s*", v):
+            info[k.strip().lower()] = int(float(v))
+    iv = _sub_header(text, "profile-update-interval")
+    hours = int(iv) if re.fullmatch(r"\d{1,4}", iv) else 0
+    title = _sub_header(text, "profile-title")
+    if title.lower().startswith("base64:"):
+        title = _sub_b64(title[7:]) or ""
+    print("UP=%d" % info.get("upload", 0))
+    print("DOWN=%d" % info.get("download", 0))
+    print("TOTAL=%d" % info.get("total", 0))
+    print("EXPIRE=%d" % info.get("expire", 0))
+    print("INTERVAL=%d" % (min(max(hours, 1), 24) if hours else 0))
+    print("TITLE=%s" % _sub_name(title, 48))
+
+
+def cmd_xray_sub_probe(parsed, out, idx=""):
+    """Конфиг для `xray run -test`: все выходы подписки или один (номер с 0)."""
+    items = jload(parsed)["items"]
+    obs = [it["ob"] for it in items] if idx == "" else [items[int(idx)]["ob"]]
+    jsave(out, {"log": {"loglevel": "none"},
+                "inbounds": [{"listen": "127.0.0.1", "port": 10808, "protocol": "socks",
+                              "tag": "probe-in", "settings": {"auth": "noauth"}}],
+                "outbounds": obs + [{"protocol": "freedom", "tag": "direct"}]})
+
+
+def cmd_xray_sub_drop(parsed, *idxs):
+    """Убрать выходы, которых этот Xray не принимает (номера с 0); печатает их имена."""
+    data = jload(parsed)
+    bad = {int(i) for i in idxs}
+    for i in sorted(bad):
+        print(_sub_name(data["items"][i]["name"], 40))
+    data["items"] = [it for i, it in enumerate(data["items"]) if i not in bad]
+    data["skipped"] = data.get("skipped", 0) + len(bad)
+    jsave(parsed, data)
+
+
+def cmd_xray_sub_apply(path, parsed, names):
+    """Выходы подписки (теги sub_…) — заменить новыми; parsed «-» — убрать все.
+    Остальные выходы не трогаются. Выход по умолчанию, ушедший из подписки, —
+    первый новый; балансировщик и замеры — по всем выходам. Печатает JSON:
+    changed, gone (ушедшие теги), count."""
+    conf = jload(path)
+    items = jload(parsed)["items"] if parsed != "-" else []
+    outs = [o for o in conf.get("outbounds") or [] if isinstance(o, dict)]
+    old = [o for o in outs if str(o.get("tag") or "").startswith(SUB_TAG)]
+    new = [it["ob"] for it in items]
+    keep = [o for o in outs if not str(o.get("tag") or "").startswith(SUB_TAG)]
+    at = next((i for i, o in enumerate(keep) if o.get("protocol") == "freedom"), len(keep))
+    keep[at:at] = new
+    conf["outbounds"] = keep
+    new_tags = [o["tag"] for o in new]
+    gone = sorted({o.get("tag") for o in old} - set(new_tags))
+    routing = conf.setdefault("routing", {})
+    rules = routing.setdefault("rules", [])
+    tags = proxy_tags(conf)
+    main = _xray_main_rule(rules)
+    if main is not None and not main.get("balancerTag") and main.get("outboundTag") not in tags and new_tags:
+        main["outboundTag"] = new_tags[0]
+    for b in routing.get("balancers") or []:
+        if isinstance(b, dict):
+            b["selector"] = list(tags)
+    if isinstance(conf.get("observatory"), dict):
+        conf["observatory"]["subjectSelector"] = list(tags)
+    changed = json.dumps(old, sort_keys=True) != json.dumps(new, sort_keys=True)
+    if changed:
+        jsave(path, conf)
+    write_atomic(names, "".join("%s\t%s\n" % (it["tag"], _sub_name(it["name"]).replace("\t", " "))
+                                for it in items), 0o600)
+    print(json.dumps({"changed": changed, "gone": gone, "count": len(new)}))
+
+
+def _sub_names(path):
+    names = {}
+    try:
+        for line in open(path, encoding="utf-8", errors="replace"):
+            tag, sep, name = line.rstrip("\n").partition("\t")
+            if sep:
+                names[tag] = name
+    except OSError:
+        pass
+    return names
 
 
 def probe_conf(outbound):
@@ -3142,6 +3448,8 @@ COMMANDS = {
     "xray-balancer": cmd_xray_balancer, "xray-balancer-get": cmd_xray_balancer_get,
     "xray-main": cmd_xray_main, "xray-main-get": cmd_xray_main_get,
     "xray-ru": cmd_xray_ru, "xray-prepare": cmd_xray_prepare,
+    "xray-sub-parse": cmd_xray_sub_parse, "xray-sub-meta": cmd_xray_sub_meta, "xray-sub-probe": cmd_xray_sub_probe,
+    "xray-sub-drop": cmd_xray_sub_drop, "xray-sub-apply": cmd_xray_sub_apply,
     "pcap-analyze": cmd_pcap_analyze, "safe-untar": cmd_safe_untar,
     "cert-find": cmd_cert_find, "changelog-json": cmd_changelog_json,
     "entry": cmd_entry, "json-kv": cmd_json_kv, "json-rows": cmd_json_rows, "dns-check": cmd_dns_check, "json-list": cmd_json_list,

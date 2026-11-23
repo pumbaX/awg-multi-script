@@ -108,6 +108,7 @@ async function post(path, body = {}, bg = false, ms = 0) {
   if (!r.ok || d.ok === false) {
     const e = new Error(d.error || `HTTP ${r.status}`);
     e.log = d.log || "";
+    e.rc = d.rc;
     throw e;
   }
   return d;
@@ -3278,6 +3279,8 @@ route(/^\/server$/, async (ctx) => {
       menuItem("🧩 Модуль ядра", "версии, обновление, откат", () => go("/server/module")),
       menuItem("🛡 Антисканер", "сети сканеров РКН и госорганов — не до портов сервера", () => go("/server/antiscan")),
       menuItem("🚫 VK и Max мимо VPN", "клиенты VPN не ходят через сервер в сети VK", () => go("/server/vkblock")),
+      menuItem("🇷🇺 РФ мимо VPN", "клиенты VPN не ходят через сервер в сети России", () => go("/server/rublock")),
+      menuItem("✉️ Почта: порт 25", "клиенты VPN не шлют почту через сервер — спам не уйдёт", () => go("/server/smtp")),
       d.exists ? menuItem("📍 Точки входа", "клиенты через другой сервер (каскад) — свой Endpoint", () => go("/server/entries")) : null,
       amzOn ? menuItem("🐳 Перенос из Amnezia", amz.migrated ? "сделан — вернуть или удалить контейнер"
         : "сервер из Docker-контейнера, клиенты без перевыдачи", () => go("/server/amnezia")) : null,
@@ -3373,6 +3376,56 @@ route(/^\/server\/vkblock$/, async (ctx) => {
       btn("📜 Журнал", () => go("/log/vkblock"))),
     hint("Сервисы VK у клиентов через VPN не откроются — в приложении VPN их пускают мимо туннеля. Список сетей VK — "
       + "C24Be/AS_Network_List, обновляется раз в сутки. Трафик самого сервера не трогается."));
+});
+
+// РФ мимо VPN: трафик клиентов VPN в сети России сервер не пускает — сразу отказ.
+// Российские сайты не видят адрес зарубежного сервера. Противоположно «РФ напрямую»
+route(/^\/server\/rublock$/, async (ctx) => {
+  const d = (await call("rublock", "status")) || {};
+  const on = !!d.enabled;
+  ctx.put(title("🇷🇺 РФ мимо VPN"),
+    hint("Клиенты VPN не ходят через сервер в сети России. Российские сайты и приложения не видят адрес сервера и не "
+      + "могут сдать его как VPN — для зарубежного сервера."),
+    h("div", { class: "card", "data-name": "rublock-status" },
+      kv("Статус", !on ? h("span", { class: "muted" }, "○ выключено") : d.active ? h("span", { class: "ok" }, "● включено")
+        : h("span", { class: "warn" }, "▲ правило не на месте")),
+      on ? kv("Сетей России", num(d.nets)) : null,
+      on ? kv("Отказано", num(d.blocked) + " пакетов") : null,
+      d.updated ? kv("Список", fmtTime(d.updated) + (d.src ? " · " + d.src : "")) : null,
+      d.error ? h("div", { class: "small warn" }, "▲ " + d.error) : null,
+      on && d.home ? h("div", { class: "small warn" }, "▲ Сервер в России: российские сайты и так видят российский адрес. "
+        + "«РФ мимо VPN» нужен зарубежному серверу; серверу в России — «РФ напрямую» (Туннели).") : null,
+      !on && d.rudirect ? h("div", { class: "small muted" }, "Сейчас включено «РФ напрямую» (Туннели) — противоположный "
+        + "режим. Сначала выключи его.") : null),
+    h("div", { class: "actions", style: "margin-top:8px" },
+      on ? btn("⏹ Выключить", (b) => quickAsk(b, "Выключить? Правило и набор снимаются — клиенты VPN снова пойдут "
+        + "в сети России через сервер.", "РФ мимо VPN выключено", ["rublock", "off"]))
+        : btn("✅ Включить", (b) => quickAsk(b, "Включить? Российские сайты и приложения у клиентов через VPN перестанут "
+          + "открываться — в приложении VPN их надо пустить мимо туннеля. Выключить можно здесь или в боте.",
+        "РФ мимо VPN включено", ["rublock", "on"]), "btn-primary"),
+      on ? btn("🔄 Обновить список", (b) => quick(b, "Список обновлён", ["rublock", "update"])) : null,
+      btn("📜 Журнал", () => go("/log/rublock"))),
+    hint("Российские сервисы у клиентов через VPN сразу получат отказ — в приложении VPN их пускают мимо туннеля. "
+      + "Список сетей России — ipverse (данные RIPE), обновляется раз в сутки. Трафик самого сервера не трогается."));
+});
+
+// Почта: порт 25 — клиенты VPN не отправляют почту через сервер напрямую почтовым
+// серверам: спам с сервера не уйдёт, хостер не заблокирует сервер
+route(/^\/server\/smtp$/, async (ctx) => {
+  const d = (await call("smtpblock", "status")) || {};
+  const on = !!d.enabled;
+  ctx.put(title("✉️ Почта: порт 25"),
+    hint("Клиенты VPN не отправляют почту через сервер на порт 25 — спам с сервера не уйдёт, хостер не заблокирует "
+      + "сервер. Почтовые приложения шлют письма через 465 и 587 — они работают."),
+    h("div", { class: "card", "data-name": "smtpblock-status" },
+      kv("Порт 25", !on ? h("span", { class: "muted" }, "○ открыт") : d.active ? h("span", { class: "ok" }, "● закрыт для клиентов")
+        : h("span", { class: "warn" }, "▲ правила не на месте")),
+      on ? kv("Отбито", num(d.dropped) + " попыток") : null),
+    h("div", { class: "actions", style: "margin-top:8px" },
+      on ? btn("🔓 Открыть порт 25", (b) => quickAsk(b, "Открыть порт 25? Клиенты VPN снова смогут слать почту через "
+        + "сервер напрямую почтовым серверам — и спам тоже.", "Порт 25 открыт", ["smtpblock", "off"]))
+        : btn("🔒 Закрыть порт 25", (b) => quick(b, "Порт 25 закрыт", ["smtpblock", "on"]), "btn-primary")),
+    hint("Соединения к самому серверу и его собственная почта не трогаются. Счётчик сбрасывается при перезагрузке."));
 });
 
 // Перенос из Amnezia (Docker): сервер AWG из контейнера приложения AmneziaVPN — в awg0
@@ -4148,9 +4201,12 @@ route(/^\/tunnels\/warp$/, async (ctx) => {
       wg && conf ? btn("🔎 Поиск endpoint", () => go("/tunnels/warp/endpoint")) : null,
       btn("🔀 Бэкенд", backend),
       btn("📜 Журнал", () => go(d.backend === "usque" ? "/log/usque" : "/log/warp")),
-      conf ? btn("🗑 Удалить", (b) => quickAsk(b, "Удалить WARP: аккаунт, профиль, службы?", "WARP удалён", ["warp", "remove"]), "btn-danger") : null),
+      conf ? btn("🗑 Удалить", (b) => quickAsk(b, "Удалить WARP: аккаунт, профиль, службы?", "WARP удалён", ["warp", "remove"]), "btn-danger") : null,
+      // Справа от «Удалить»: сканер endpoint (warpscout) Тулза ставит один раз — обновить можно здесь
+      wg && conf ? btn("🔄 Обновить скаут", () => runJob(ctx, "Обновление warpscout", ["warp", "scout-update"])) : null),
     hint(`«${conf ? "Переустановить" : "Установить"}» — зарегистрироваться в Cloudflare заново (бэкенд ${d.backend || "?"})`
-      + (wg ? " · «Импорт» — свой wgcf-profile.conf, если регистрация отсюда не проходит" : "")));
+      + (wg ? " · «Импорт» — свой wgcf-profile.conf, если регистрация отсюда не проходит" : "")
+      + (wg && conf ? ` · «Обновить скаут» — последняя версия warpscout для поиска endpoint${d.scout ? ` (сейчас ${d.scout})` : ""}` : "")));
 });
 
 route(/^\/tunnels\/warp\/key$/, async (ctx) => {
@@ -4224,15 +4280,19 @@ route(/^\/tunnels\/xray$/, async (ctx) => {
     inst ? [h("h2", {}, "Выходы"),
       h("div", { class: "card list" }, tags.length ? tags.map((t) => {
         const own = (d.clients || []).filter((c) => c.out === t).map((c) => c.name);
+        // Сервер подписки — с именем из неё, тег — строкой ниже
+        const name = ((d.outs || []).find((o) => o.tag === t) || {}).name || "";
         return h("div", { class: "item", "data-name": "xo-" + t, onclick: () => outbound(t) },
-          h("div", { class: "main" }, h("div", { class: "title" }, t, d.main === t ? " " : null, d.main === t ? pill("по умолчанию", "ok") : null),
+          h("div", { class: "main" }, h("div", { class: "title" }, name || t, d.main === t ? " " : null, d.main === t ? pill("по умолчанию", "ok") : null),
+            name ? h("div", { class: "sub" }, "📡 из подписки · " + t) : null,
             own.length ? h("div", { class: "sub" }, "свой выход: " + own.join(", ")) : null),
           h("div", { class: "side" }, icon("chevron-right")));
-      }) : h("div", { class: "empty" }, "Выходов нет — добавь ссылкой")),
+      }) : h("div", { class: "empty" }, "Выходов нет — добавь ссылкой или подпиской")),
       tags.length > 1 ? hint(d.per_client ? "Клиенту можно закрепить свой выход: Клиенты → клиент → Маршрут. "
         + "Остальные идут через выход по умолчанию или балансировщик."
         : "Свой выход клиенту — только с inbound tun в самом Xray: обнови Xray.") : null,
       btn("➕ Добавить выход", () => go("/tunnels/xray/add"), "btn-block" + (tags.length ? "" : " btn-primary")),
+      btn(d.sub ? "📡 Подписка ✅" : "📡 Подписка", () => go("/tunnels/xray/sub"), "btn-block"),
       tags.length > 1 ? btn(`⚖️ Балансировщик: ${d.balancer || "off"}`, balancer, "btn-block") : null,
       h("h2", {}, "Управление")] : null,
     inst ? null : [hint("Клиенты выходят в интернет через твой сервер VLESS, VMess, Trojan, Shadowsocks или Hysteria2 — "
@@ -4262,6 +4322,47 @@ route(/^\/tunnels\/xray\/add$/, async (ctx) => {
       if (!/^(vless|vmess|trojan|ss|hysteria2|hy2):\/\//.test(v)) return fail(new Error("Это не ссылка Xray"));
       return quick(b, "Выход добавлен", ["xray", "add", v], () => back());
     }, "btn-primary btn-block"));
+});
+
+// Подписка Xray: серверы по адресу подписки провайдера — выходы, обновляются сами.
+// Адрес — секрет (в нём ключ доступа): уходит в awg2 через stdin, на экране — только сайт
+route(/^\/tunnels\/xray\/sub$/, async (ctx) => {
+  const s = (await call("xray", "sub", "status")) || {};
+  const url = h("input", { type: "url", autocomplete: "off", autocapitalize: "off", spellcheck: "false",
+    placeholder: "https://…", "aria-label": "Адрес подписки" });
+  const here = { onBack: () => replace("/tunnels/xray/sub") };
+  const save = btn(s.set ? "✏️ Сменить адрес" : "📡 Задать подписку", async () => {
+    const v = url.value.replace(/\s+/g, "");
+    if (!/^https?:\/\//i.test(v) || v.length > 2048 || /["\\]/.test(v)) return fail(new Error("Нужен адрес подписки: https://…"));
+    let extra = [];
+    if (/^http:\/\//i.test(v)) {
+      if (!await confirmTg("Адрес по http: подписку могут подменить по дороге и подсунуть свои серверы. Лучше адрес "
+        + "https. Всё равно использовать?")) return;
+      extra = ["insecure"];
+    }
+    url.value = "";
+    await runJob(ctx, "Подписка Xray", ["xray", "sub", "set", ...extra], null, Object.assign({ stdin: v + "\n" }, here));
+  }, "btn-primary btn-block");
+  const used = (+s.up || 0) + (+s.down || 0), left = (+s.expire || 0) - Date.now() / 1000;
+  ctx.put(title("📡 Подписка Xray"),
+    hint("Серверы из подписки провайдера (3x-ui, Marzban, Remnawave…) становятся выходами Xray и обновляются сами. "
+      + "Свои выходы (ссылкой) не трогаются; клиенту можно закрепить сервер подписки, как обычный выход."),
+    h("div", { class: "card", "data-name": "xray-sub" },
+      kv("Подписка", s.set ? h("span", { class: "ok" }, "● " + s.site + (s.title ? " · " + s.title : "")) : h("span", { class: "muted" }, "○ не задана")),
+      s.set ? kv("Серверов", String(s.count || 0) + (s.skipped ? ` (пропущено ${s.skipped})` : "")) : null,
+      s.set && s.updated ? kv("Обновлена", fmtTime(s.updated) + ` · сама — раз в ${s.every || 6} ч`) : null,
+      s.set && s.total ? kv("Трафик", h("span", { class: used >= 0.9 * s.total ? "warn" : "" }, fmtBytes(used) + " из " + fmtBytes(s.total))) : null,
+      s.set && s.expire ? kv("Действует до", h("span", { class: left < 3 * 86400 ? "warn" : "" },
+        new Date(s.expire * 1000).toLocaleDateString("ru-RU") + (left <= 0 ? " — истекла" : ""))) : null,
+      s.set && s.insecure ? h("div", { class: "small warn" }, "▲ По http — подписку могут подменить по дороге") : null,
+      s.error ? h("div", { class: "small warn" }, "▲ " + s.error) : null),
+    s.set ? h("div", { class: "actions", style: "margin-top:8px" },
+      btn("🔄 Обновить сейчас", () => runJob(ctx, "Обновление подписки", ["xray", "sub", "update"], null, here)),
+      btn("🗑 Убрать", () => jobAsk(ctx, "Убрать подписку? Её серверы уйдут из выходов Xray, клиенты, закреплённые за ними, — "
+        + "на выход по умолчанию. Свои выходы останутся.", "Подписка убирается", ["xray", "sub", "off"]), "btn-danger")) : null,
+    h("h2", {}, s.set ? "Сменить адрес" : "Адрес подписки"), url, h("div", { style: "margin-top:8px" }, enterTo(save, url)),
+    hint("Ссылка «для приложения» из панели провайдера. Адрес — секрет (в нём ключ доступа): Тулза хранит его только "
+      + "на сервере, на экранах показывает только сайт."));
 });
 
 // tun2socks
@@ -4477,7 +4578,7 @@ route(/^\/tunnels\/dns$/, async (ctx) => {
       [{ label: "⏹ Выключить", value: "off" }, { label: "🗑 Удалить совсем, с dnscrypt-proxy", value: "purge", cls: "bad" }]);
     if (v) await quick(b, "DNS выключен", ["dns", "remove", ...(v === "purge" ? ["purge"] : [])]);
   }
-  ctx.put(title("🔐 Шифрованный DNS"), hint("Запросы клиентов идут через dnscrypt-proxy по DoH, DoT (853) закрыт."),
+  ctx.put(title("🔐 Шифрованный DNS"), hint("Запросы клиентов AWG и WG + обфускатора идут через dnscrypt-proxy по DoH, DoT (853) закрыт."),
     logCard(r.log),
     inst ? [h("h2", {}, "Резолверы"),
       h("div", { class: "card list" }, (d.presets || []).map((p) => h("div", { class: "item", onclick: () =>
@@ -4539,7 +4640,7 @@ const RUD_LISTS = { direct: ["Всегда напрямую", "мимо тунн
   tunnel: ["Всегда через туннель", "в туннель, даже если адрес в сетях России"] };
 // Сервер не в России: «РФ напрямую» светит адрес входа российским приложениям
 const rudAbroad = (cc) => `Сервер не в России (${cc}): российские сайты и приложения увидят адрес сервера, к которому `
-  + "подключаются клиенты, — зарубежные адреса блокируют как раз за это. «РФ напрямую» — для сервера в России.";
+  + "подключаются клиенты, — зарубежные адреса блокируют как раз за это. «РФ напрямую» — для сервера в России; зарубежному — «РФ мимо VPN» (Сервер).";
 route(/^\/tunnels\/rudirect$/, async (ctx) => {
   const d = (await call("rudirect", "status")) || {};
   const on = !!d.enabled;
@@ -4742,13 +4843,41 @@ route(/^\/diag\/dpi$/, async (ctx) => {
 const BACKUP_MAX = 20 * 1024 * 1024;
 // «20260930_035321» из метаданных бэкапа → «30.09.2026 03:53»
 const fmtStamp = (s) => { const m = /^(\d{4})(\d\d)(\d\d)_(\d\d)(\d\d)/.exec(s || ""); return m ? `${m[3]}.${m[2]}.${m[1]} ${m[4]}:${m[5]}` : s; };
-// Отправка бэкапа в чат с отметкой на экране
-function sendBackup(path, note) {
+// Отправка бэкапа в чат с отметкой на экране; enc — задан пароль бэкапов (файл зашифрован)
+function sendBackup(path, note, enc) {
   note.textContent = WEB ? "⬇️ Скачиваю…" : "📥 Отправляю в чат…";
-  return (WEB ? download({ what: "backup", path }) : post("/api/send", { what: "backup", path })).then(() => {
-    note.textContent = (WEB ? "✅ Файл скачан." : "✅ Файл — в чате с ботом.") + " В нём приватные ключи — храни как пароль.";
+  return (WEB ? download({ what: "backup", path }) : post("/api/send", { what: "backup", path })).then((r) => {
+    const locked = WEB ? enc : !!(r && r.encrypted);
+    note.textContent = (WEB ? "✅ Файл скачан." : "✅ Файл — в чате с ботом.")
+      + (locked ? " 🔐 Зашифрован паролем бэкапов." : " В нём приватные ключи — храни как пароль.");
     haptic();
   }, (e) => { note.textContent = "❌ " + e.message; });
+}
+
+// Пароль бэкапов: им awg2 шифрует файлы, которые уходят с сервера (в чат, скачиванием)
+function backupKeyCard(k, owner) {
+  const pass = h("input", { type: "password", autocomplete: "new-password", placeholder: "8–128 символов: латиница, цифры, знаки",
+    maxlength: "128", "aria-label": "Пароль бэкапов" });
+  const pass2 = h("input", { type: "password", autocomplete: "new-password", placeholder: "Ещё раз", maxlength: "128",
+    "aria-label": "Пароль бэкапов ещё раз" });
+  const save = btn(k.set ? "✏️ Сменить" : "🔐 Задать", (b) => busy(b, async () => {
+    if (!pass.value) throw new Error("Введи пароль");
+    // Ввод не виден — повтор ловит опечатку: её потом не исправить
+    if (pass.value !== pass2.value) throw new Error("Пароли не совпадают");
+    await callR(["backup", "key", "set"], { stdin: pass.value + "\n" });
+    pass.value = pass2.value = "";
+    haptic(); toast("✅ Пароль задан. Запиши его — без него зашифрованные бэкапы не открыть", 5000); render();
+  }), "btn-primary");
+  return h("div", { class: "card", "data-name": "backup-key", style: "margin-top:12px" },
+    h("div", { class: "kv" }, h("b", {}, "🔐 Пароль бэкапов"), k.set ? pill("задан", "ok") : h("span", { class: "muted small" }, "не задан")),
+    owner ? [h("div", { style: "margin-top:8px" }, pass, pass2, h("div", { style: "margin-top:8px" }, enterTo(save, pass, pass2))),
+      k.set ? btn("🗑 Убрать пароль", (b) => quickAsk(b, "Убрать пароль? Новые файлы бэкапов будут уходить с сервера без "
+        + "шифрования. Уже зашифрованные открываются только прежним паролем.", "Пароль убран", ["backup", "key", "clear"]), "btn-block") : null]
+      : null,
+    hint("Файлы бэкапов, которые уходят с сервера (в чат, автобэкап, скачивание), шифруются паролем (AES-256); бэкапы в "
+      + "~/awg_backup остаются как есть. На этом сервере зашифрованный восстанавливается без пароля, на другом — его спросят. "
+      + `На компьютере: openssl enc -d -aes-256-cbc -pbkdf2 -iter ${k.iter || 200000} -md sha256 -in ФАЙЛ.enc -out бэкап.tar.gz. `
+      + "Забудешь пароль — зашифрованные файлы не открыть." + (owner ? "" : " Задаёт пароль владелец.")));
 }
 async function uploadBackup(file) {
   if (file.size > BACKUP_MAX) throw new Error("Файл больше 20 МБ — это не бэкап awg2");
@@ -4796,7 +4925,9 @@ function autoBackupCard(a, redraw) {
 }
 
 route(/^\/backup$/, async (ctx) => {
-  const [rowsAll, alertsInfo] = await Promise.all([call("backup", "list"), post("/api/alerts").catch(() => null)]);
+  // S.me — после главной; открыли «Бэкапы» сразу — спросить, владелец ли
+  const [rowsAll, alertsInfo, key, me] = await Promise.all([call("backup", "list"), post("/api/alerts").catch(() => null),
+    call("backup", "key", "status").catch(() => null), S.me || post("/api/me").catch(() => null)]);
   const rows = (rowsAll || []).slice(0, 30);
   const autoBox = h("div");
   const drawAuto = (a) => a && autoBox.replaceChildren(autoBackupCard(a, drawAuto));
@@ -4828,29 +4959,47 @@ route(/^\/backup$/, async (ctx) => {
     h("div", { class: "actions" },
       btn("💾 Создать", () => runJob(ctx, "Бэкап", ["backup", "create"], (d) => {
         const note = h("div", { class: "small", style: "margin-top:6px" });
-        if (d && d.path) sendBackup(d.path, note);
+        if (d && d.path) sendBackup(d.path, note, !!(key && key.set));
         return h("div", { class: "card" }, kv("Файл", (d && d.path || "").split("/").pop()), kv("Размер", fmtBytes(d && d.size)), note);
       }), "btn-primary"),
-      btn("📤 Из файла", () => file.click())), file, autoBox,
+      btn("📤 Из файла", () => file.click())), file, autoBox, key ? backupKeyCard(key, !!(me && me.owner)) : null,
     h("h2", {}, "На сервере"),
     h("div", { class: "card list" }, rows.length ? rows.map((b) => h("div", { class: "item", onclick: () => pick(b) },
       h("div", { class: "ibox" }, icon(b.full ? "folder" : "file-archive")),
       h("div", { class: "main" }, h("div", { class: "title" }, fmtTime(b.time)),
         h("div", { class: "sub" }, `${b.full ? "полный, каталог" : "архив"} · ${fmtBytes(b.size)}`)),
       h("div", { class: "side" }, icon("chevron-right")))) : h("div", { class: "empty" }, "Бэкапов на сервере нет")),
-    hint("Полный бэкап лежит каталогом, рядом — его архив. Восстановить можно и из архива прежнего бота."));
+    hint("Полный бэкап лежит каталогом, рядом — его архив. Восстановить можно и из архива прежнего бота и из зашифрованного .enc."));
 });
 
 route(/^\/backup\/restore$/, async (ctx) => {
   const rs = S.restore;
   if (!rs) return replace("/backup");
-  const d = (await call("backup", "inspect", rs.path)) || {};
+  let d;
+  try {
+    // Пароль к зашифрованному — только в памяти страницы, до запуска восстановления
+    d = (await callR(["backup", "inspect", rs.path, ...(rs.pw ? ["pass"] : [])], rs.pw ? { stdin: rs.pw + "\n" } : {})).data || {};
+  } catch (e) {
+    if (e.rc !== 4) throw e;
+    const pass = h("input", { type: "password", autocomplete: "off", placeholder: "Пароль бэкапа", "aria-label": "Пароль бэкапа" });
+    const open = btn("🔓 Открыть", () => {
+      if (!pass.value) return;
+      S.restore = Object.assign({}, rs, { pw: pass.value });
+      render();
+    }, "btn-primary btn-block");
+    return ctx.put(title("♻️ Восстановление"),
+      h("div", { class: "card", "data-name": "backup-pass" }, kv("Файл", rs.name),
+        h("div", { class: "small " + (rs.pw ? "warn" : "muted"), style: "margin:6px 0" }, rs.pw ? "▲ " + e.message
+          : "🔐 Бэкап зашифрован, а пароль бэкапов этого сервера к нему не подходит. Введи пароль, которым он зашифрован."),
+        pass, h("div", { style: "margin-top:8px" }, enterTo(open, pass))),
+      btn("✖️ Отмена", () => { S.restore = null; back(); }, "btn-block"));
+  }
   const meta = Object.fromEntries((d.meta || "").split("\n").filter((l) => l.includes("="))
     .map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
   const opt = { wgobf: !!d.wgobf, tunnels: !!d.tunnels };
   ctx.put(title("♻️ Восстановление"),
-    h("div", { class: "card" },
-      kv("Файл", rs.name),
+    h("div", { class: "card", "data-name": "backup-inspect" },
+      kv("Файл", rs.name + (rs.pw ? " 🔐" : "")),
       meta.timestamp ? kv("Создан", fmtStamp(meta.timestamp)) : null,
       meta.hostname ? kv("Сервер", meta.hostname) : null,
       meta.toolza ? kv("Версия", meta.toolza) : null,
@@ -4865,8 +5014,8 @@ route(/^\/backup\/restore$/, async (ctx) => {
     btn("♻️ Восстановить", async () => {
       if (!await confirmTg("Заменить текущий сервер и клиентов данными из бэкапа?")) return;
       S.restore = null;
-      await runJob(ctx, "Восстановление из бэкапа", ["backup", "restore", rs.path, ...["wgobf", "tunnels"].filter((k) => opt[k])],
-        null, { onBack: () => replace("/backup") });
+      await runJob(ctx, "Восстановление из бэкапа", ["backup", "restore", rs.path, ...["wgobf", "tunnels"].filter((k) => opt[k]),
+        ...(rs.pw ? ["pass"] : [])], null, { onBack: () => replace("/backup"), stdin: rs.pw ? rs.pw + "\n" : undefined });
     }, "btn-danger btn-block"),
     btn("✖️ Отмена", () => { S.restore = null; back(); }, "btn-block"));
 });
@@ -5489,7 +5638,7 @@ const LOGS = { manager: "awg2 — действия", install: "Компонен�
   expire: "Сроки клиентов", warp: "WARP", "warp-health": "WARP health-check", usque: "usque (WARP MASQUE)", xray: "Xray",
   "xray-routing": "Маршруты Xray", tun2socks: "tun2socks", exits: "Exit-ноды", cascade: "Каскад", dns: "dnscrypt-proxy",
   "dns-health": "DNS health-check", wgobf: "WG + обфускатор", bot: "Telegram-бот", antiscan: "Антисканер",
-  vkblock: "VK и Max мимо VPN", rudirect: "РФ напрямую", tunfail: "Если туннель упал" };
+  vkblock: "VK и Max мимо VPN", rublock: "РФ мимо VPN", rudirect: "РФ напрямую", tunfail: "Если туннель упал" };
 
 route(/^\/log\/([a-z0-9-]+)$/, async (ctx, name) => {
   const r = await callR(["log", name, "150"]);

@@ -305,8 +305,9 @@ helpers_refresh() {
   [[ -f "$USQUE_UP_HOOK" ]] && _usque_write &>/dev/null
   if [[ -f "$DNS_PROXY_STATE" ]]; then
     _dns_emit_helpers &>/dev/null
-    # Прежние версии ставили блок DoT в FORWARD ниже ACCEPT — он не работал
-    iface_up && { dns_rules_down; dns_rules_up; }
+    # Прежние версии ставили блок DoT в FORWARD ниже ACCEPT — он не работал;
+    # перехват на wgobf0 (WG + обфускатор) — с v1.2.64
+    iface_up && { dns_rules_down; dns_rules_up; dns_ufw_allow; }
   fi
   if (( $(cascade_count) )); then
     _cascade_persist && cascade_apply_all
@@ -319,6 +320,8 @@ helpers_refresh() {
   fi
   antiscan_on && _antiscan_emit &>/dev/null
   vkblock_on && _vkblock_emit &>/dev/null
+  rublock_on && _rublock_emit &>/dev/null
+  smtpblock_on && _smtpblock_emit &>/dev/null
   rudirect_on && _rudirect_emit &>/dev/null
   tunfail_any_block && _tunfail_emit &>/dev/null
   # Маршруты Xray: с v1.2.0 перед inbound tun нет NAT (свой выход клиенту)

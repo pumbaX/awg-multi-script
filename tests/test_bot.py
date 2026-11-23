@@ -17,8 +17,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
+import tarfile
 import time
 from urllib.parse import urlencode
 
@@ -34,6 +37,7 @@ except ImportError:
 import aiohttp  # noqa: E402
 from aiogram.client.session.base import BaseSession  # noqa: E402
 from aiogram.exceptions import TelegramBadRequest  # noqa: E402
+from aiogram.fsm.storage.base import StorageKey  # noqa: E402
 from aiogram.types import (CallbackQuery, Chat, ChatMemberLeft, ChatMemberMember, ChatMemberUpdated,  # noqa: E402
                            InlineKeyboardMarkup, Message, MessageEntity, Sticker, StickerSet, Update, User)
 
@@ -1167,6 +1171,19 @@ async def run():
         botapi.call = real_call
     chk("экран Xray: «Через выход трафик не идёт» — проверь ссылку: Диагностика, добавь новую, старую удали",
         "Через выход трафик не идёт" in text and "Диагностика" in text and "добавь новую" in text, text)
+    # WARP (wg, настроен): кнопка «Обновить скаут» и версия сканера в подсказке
+    async def warp_call(*args, **kw):
+        if args[:2] == ("warp", "status"):
+            return botapi.Result(True, 0, {"backend": "wg", "configured": True, "up": True, "scout": "0.13.2"},
+                                 "  Туннель : ● WARP FRA", "")
+        return await real_call(*args, **kw)
+    botapi.call = warp_call
+    try:
+        text, buttons = screen(await press("warp"))
+    finally:
+        botapi.call = real_call
+    chk("экран WARP: «🔄 Обновить скаут» рядом с поиском endpoint, в подсказке — версия warpscout",
+        ("🔄 Обновить скаут", "warp:scout") in buttons and "сейчас 0.13.2" in text, [text, buttons])
     al.api.data = real_data
 
     CL = {"newer": True, "sections": [{"version": "v1.2.1", "title": "2026-10-08",
@@ -2323,6 +2340,263 @@ async def run():
     chk("журнал открывается, «Назад» — на экран VK", ("◀️ Назад", "vk") in buttons, [text, buttons])
     no_hourglass("VK и Max")
     botapi.call = real_call_
+
+    print("РФ мимо VPN и почта (порт 25)")
+    text, buttons = screen(await press("srv"))
+    chk("в «Сервере» — кнопки «🇷🇺 РФ мимо VPN» и «✉️ Почта: порт 25»",
+        ("🇷🇺 РФ мимо VPN", "rub") in buttons and ("✉️ Почта: порт 25", "smtp") in buttons, buttons)
+    RBST = {"enabled": False, "active": False, "nets": 0, "updated": 0, "src": "", "error": "", "blocked": 0,
+            "rudirect": True, "home": False}
+    SMST = {"enabled": False, "active": False, "dropped": 0}
+    rb_calls = []
+
+    async def rb_call(*args, **kw):
+        if args[:1] not in (("rublock",), ("smtpblock",)):
+            return await real_call_(*args, **kw)
+        rb_calls.append((args, kw.get("timeout")))
+        st = RBST if args[0] == "rublock" else SMST
+        if args[1] == "status":
+            return botapi.Result(True, data=json.loads(json.dumps(st)))
+        if args == ("rublock", "on") and RBST["rudirect"]:
+            return botapi.Result(False, error="Включено «РФ напрямую» — это противоположный режим")
+        if args == ("rublock", "on"):
+            RBST.update(enabled=True, active=True, nets=8712, updated=1791500000, src="ipverse", blocked=1234,
+                        home=True, error="Список <b> короткий")
+        if args == ("smtpblock", "on"):
+            SMST.update(enabled=True, active=True, dropped=56789)
+        if args[1] == "off":
+            st.update(enabled=False, active=False)
+        return botapi.Result(True)
+    botapi.call = rb_call
+    text, buttons = screen(await press("rub"))
+    chk("РФ мимо VPN выключено: что делает, подсказка про «РФ напрямую», «Включить», журнал, назад",
+        "⚪️ Выключено" in text and "зарубежного сервера" in text and "противоположный режим" in text
+        and ("✅ Включить", "rub:on") in buttons and ("📜 Журнал", "diag:log:rublock|rub") in buttons
+        and ("◀️ Назад", "srv") in buttons and not any(d == "rub:upd" for _, d in buttons), [text, buttons])
+    text, buttons = screen(await press("rub:on"))
+    chk("включение — с подтверждением и предупреждением про российские сайты",
+        ("✅ Включить", "rub:onok") in buttons and ("✖️ Отмена", "rub") in buttons and "перестанут" in text
+        and not any(c[0] == ("rublock", "on") for c in rb_calls), [text, buttons])
+    text, buttons = screen(await press("rub:onok"))
+    chk("при «РФ напрямую» — отказ awg2 на экране, остаётся выключено",
+        "противоположный режим" in text and "⚪️ Выключено" in text and ("✅ Включить", "rub:on") in buttons, text)
+    RBST["rudirect"] = False
+    await press("rub:on")
+    text, buttons = screen(await press("rub:onok"))
+    chk("включено: долгий вызов, сети, счётчик, источник, сервер в России — предупреждение, ошибка экранирована",
+        (("rublock", "on"), 240) in rb_calls and "🟢 Включено · сетей России 8 712" in text
+        and "Отказано: 1 234 пакетов" in text and "(ipverse)" in text and "Сервер в России" in text
+        and "&lt;b&gt;" in text and ("🔄 Обновить список", "rub:upd") in buttons and ("⏹ Выключить", "rub:off") in buttons,
+        [rb_calls[-3:], text, buttons])
+    await press("rub:upd")
+    chk("обновить список — долгий вызов", (("rublock", "update"), 240) in rb_calls, rb_calls[-3:])
+    text, buttons = screen(await press("rub:off"))
+    chk("выключение — с подтверждением", ("⏹ Выключить", "rub:offok") in buttons, buttons)
+    text, buttons = screen(await press("rub:offok"))
+    chk("выключено снова", (("rublock", "off"), 60) in rb_calls and "⚪️ Выключено" in text, [rb_calls[-3:], text])
+    text, buttons = screen(await press("diag:log:rublock|rub"))
+    chk("журнал «РФ мимо VPN» открывается, «Назад» — на его экран", ("◀️ Назад", "rub") in buttons, [text, buttons])
+    text, buttons = screen(await press("smtp"))
+    chk("почта: открыт, что делает (465 и 587 работают), «Закрыть», назад",
+        "⚪️ Открыт" in text and "465 и 587" in text and ("🔒 Закрыть порт 25", "smtp:on") in buttons
+        and ("◀️ Назад", "srv") in buttons, [text, buttons])
+    text, buttons = screen(await press("smtp:on"))
+    chk("закрыть — сразу, без подтверждения; счётчик",
+        (("smtpblock", "on"), 60) in rb_calls and "🟢 Порт 25 закрыт" in text and "Отбито: 56 789" in text
+        and ("🔓 Открыть порт 25", "smtp:off") in buttons, [text, buttons])
+    text, buttons = screen(await press("smtp:off"))
+    chk("открыть — с подтверждением", ("🔓 Открыть", "smtp:offok") in buttons and ("✖️ Отмена", "smtp") in buttons
+        and not any(c[0] == ("smtpblock", "off") for c in rb_calls), buttons)
+    text, buttons = screen(await press("smtp:offok"))
+    chk("открыт снова", (("smtpblock", "off"), 60) in rb_calls and "⚪️ Открыт" in text, [rb_calls[-3:], text])
+    no_hourglass("РФ мимо VPN и почта")
+    botapi.call = real_call_
+
+    print("Пароль бэкапов")
+    PW = "S3cret-pass!"
+    BKEY = os.path.join(ROOT, "var/lib/awg2/backup.key")
+    BOUT = os.path.join(ROOT, "var/lib/awg2/backup-out")
+    text, buttons = screen(await press("bk"))
+    chk("в «Бэкапах» — строка пароля и кнопка «🔐 Пароль» у владельца",
+        "🔓 Пароль: не задан" in text and ("🔐 Пароль", "bkp") in buttons, [text, buttons])
+    text, buttons = screen(await press("bkp", user=STRANGER))
+    chk("пароль бэкапов чужому недоступен", ("🔐 Пароль", "bkp") not in buttons and "Пароль бэкапов" not in text, text)
+    text, buttons = screen(await press("bkp"))
+    chk("экран пароля: что шифруется, команда для компьютера, «Задать»",
+        "⚪️ Пароль не задан" in text and "openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256" in text
+        and ("✏️ Задать пароль", "bkp:set") in buttons and not any(d == "bkp:clr" for _, d in buttons), [text, buttons])
+    await press("bkp:set")
+    sent = await say("short1")
+    said = LAST_SAID[0]
+    text, _ = screen(sent)
+    chk("короткий пароль — переспрашивает с причиной сразу, сообщение с паролем удалено",
+        "от 8 до 128" in text and said in SESSION.deleted and not os.path.exists(BKEY), text)
+    text, _ = screen(await say("пароль-кириллицей"))
+    chk("не латиница — причина сразу", "только латиница" in text and not os.path.exists(BKEY), text)
+    sent = await say(PW)
+    said = LAST_SAID[0]
+    text, _ = screen(sent)
+    chk("верный пароль — просит повторить, сообщение удалено, пароль ещё не записан",
+        "ещё раз" in text and said in SESSION.deleted and not os.path.exists(BKEY), text)
+    sent = await say(PW + "x")
+    said = LAST_SAID[0]
+    text, _ = screen(sent)
+    chk("повтор не совпал — заново с первого шага, ничего не записано, сообщение удалено",
+        "не совпали" in text and "Пришли пароль бэкапов" in text and said in SESSION.deleted and not os.path.exists(BKEY), text)
+    fsm = await DP.storage.get_data(key=StorageKey(bot_id=BOT.id, chat_id=OWNER.id, user_id=OWNER.id))
+    chk("первый ввод не остался в памяти бота", PW not in json.dumps(fsm, ensure_ascii=False), fsm)
+    await say(PW)
+    sent = await say(PW)
+    said = LAST_SAID[0]
+    text, buttons = screen(sent)
+    fsm = await DP.storage.get_data(key=StorageKey(bot_id=BOT.id, chat_id=OWNER.id, user_id=OWNER.id))
+    chk("пароль задан: сообщение удалено, на сервере — файл пароля, экран «задан», «Убрать», в памяти бота — нет",
+        said in SESSION.deleted and open(BKEY).read() == PW + "\n" and "✅ Пароль задан" in text
+        and "🟢 Пароль задан" in text and ("🗑 Убрать пароль", "bkp:clr") in buttons
+        and PW not in json.dumps(fsm, ensure_ascii=False), [text, buttons, fsm])
+    chk("пароля нет ни в одном сообщении бота",
+        not any(PW in (getattr(m, "text", None) or "") + (getattr(m, "caption", None) or "") for _, m in SESSION.sent), "")
+    text, _ = screen(await press("bk"))
+    chk("в «Бэкапах» — пароль задан", "🔐 Пароль: задан" in text, text)
+    mark = len(SESSION.sent)
+    await press("bk:create")
+    chk("бэкап с паролем: задача завершилась", await wait_jobs())
+    d = docs(SESSION.sent[mark:])
+    chk("бэкап с паролем — в чат зашифрованным .enc, подпись про пароль; файл выдачи убран",
+        len(d) == 1 and d[0].document.filename.endswith(".tar.gz.enc") and d[0].document.data[:8] == b"Salted__"
+        and "зашифрован" in d[0].caption and not [f for f in os.listdir(BOUT) if os.listdir(os.path.join(BOUT, f))],
+        [[(m.document.filename, m.caption) for m in d], os.listdir(BOUT) if os.path.isdir(BOUT) else ""])
+    dec = os.path.join(TMP, "bot-dec.tar.gz")
+    enc_in = os.path.join(TMP, "bot-enc.tar.gz.enc")
+    with open(enc_in, "wb") as f:
+        f.write(d[0].document.data if d else b"")
+    pr = subprocess.run(["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "200000", "-md", "sha256",
+                         "-in", enc_in, "-out", dec, "-pass", "stdin"], input=PW + "\n", text=True, capture_output=True)
+    chk("файл из чата расшифровывается паролем — это архив бэкапа", pr.returncode == 0 and tarfile.is_tarfile(dec), pr.stderr)
+    rows = await botapi.data("backup", "list", default=[])
+    idx = next((i for i, b in enumerate(rows[:20]) if b["path"].endswith(".tar.gz") and not b["full"]), 0)
+    await press("bk:list")
+    mark = len(SESSION.sent)
+    await press(f"bk:get:{idx}")
+    d = docs(SESSION.sent[mark:])
+    chk("«Скачать» из списка — тоже зашифрован", len(d) == 1 and d[0].document.data[:8] == b"Salted__"
+        and d[0].document.filename.endswith(".enc"), [(m.document.filename, m.caption) for m in d])
+    mark = len(SESSION.sent)
+    res = await al.backup_due(BOT, force=True)
+    d = [m for m in docs(SESSION.sent[mark:]) if m.chat_id == 111]
+    chk("автобэкап — зашифрован, в подписи — про пароль", res == "done" and len(d) == 1
+        and d[0].document.data[:8] == b"Salted__" and "Зашифрован паролем" in d[0].caption,
+        [res, [(m.document.filename, m.caption) for m in d]])
+    ENC = os.path.join(ROOT, "awg_backup", "awg2_backup_20990101_000000.tar.gz.enc")
+    shutil.copy(enc_in, ENC)
+    await press("bkp")
+    text, buttons = screen(await press("bkp:clr"))
+    chk("убрать пароль — с подтверждением", ("🗑 Убрать", "bkp:clrok") in buttons and os.path.exists(BKEY), buttons)
+    text, buttons = screen(await press("bkp:clrok"))
+    chk("пароль убран", "🗑 Пароль убран" in text and "⚪️ Пароль не задан" in text and not os.path.exists(BKEY), text)
+    rows = await botapi.data("backup", "list", default=[])
+    idx = next(i for i, b in enumerate(rows[:20]) if b["path"] == ENC)
+    await press("bk:list")
+    text, buttons = screen(await press(f"bk:rs:{idx}"))
+    chk("восстановление зашифрованного без своего пароля — бот спрашивает пароль", "Бэкап зашифрован" in text
+        and "удалю" in text, text)
+    sent = await say("wrong-password")
+    said = LAST_SAID[0]
+    text, _ = screen(sent)
+    chk("неверный пароль — переспрашивает «не подходит», сообщение удалено", "не подходит" in text
+        and said in SESSION.deleted and text.count("⚠️") == 1, text)
+    sent = await say("wrong-again1")
+    text, _ = screen(sent)
+    chk("второй неверный — предупреждение одно, не копятся", text.count("⚠️") == 1, text)
+    sent = await say(PW)
+    said = LAST_SAID[0]
+    text, buttons = screen(sent)
+    chk("верный пароль — экран восстановления с 🔐, сообщение удалено",
+        said in SESSION.deleted and "♻️ Восстановление" in text and "🔐" in text and ("♻️ Восстановить", "bk:go") in buttons,
+        [text, buttons])
+    started = []
+    real_job_start = botapi.job_start
+
+    async def fake_job_start(*args, stdin=None):
+        started.append((args, stdin))
+        return botapi.Result(False, 1, error="тест: задача не запускается")
+    botapi.job_start = fake_job_start
+    await press("bk:go")
+    botapi.job_start = real_job_start
+    chk("восстановление: пароль — в stdin задачи и словом «pass», не аргументом",
+        started and started[0][0][:3] == ("backup", "restore", ENC) and started[0][0][-1] == "pass"
+        and started[0][1] == PW + "\n" and PW not in started[0][0], started)
+    fsm = await DP.storage.get_data(key=StorageKey(bot_id=BOT.id, chat_id=OWNER.id, user_id=OWNER.id))
+    chk("после запуска пароль в памяти бота не остаётся", PW not in json.dumps(fsm, ensure_ascii=False), fsm)
+    os.remove(ENC)
+    no_hourglass("Пароль бэкапов")
+
+    print("Подписка Xray")
+    XS = {"set": False, "site": "", "insecure": False, "title": "", "count": 0, "skipped": 0, "updated": 0, "checked": 0,
+          "error": "", "every": 6, "next": 0, "up": 0, "down": 0, "total": 0, "expire": 0}
+    xs_jobs = []
+
+    async def xs_call(*args, **kw):
+        if args[:3] == ("xray", "sub", "status"):
+            return botapi.Result(True, data=json.loads(json.dumps(XS)))
+        if args[:2] == ("xray", "status"):
+            return botapi.Result(True, log="  Версия    : 26.3.27", data={"installed": True, "up": False, "tags": ["sub_a_443"],
+                                                                         "sub": XS["set"], "balancer": "off", "outs": []})
+        return await real_call_(*args, **kw)
+
+    async def xs_job(*args, stdin=None):
+        xs_jobs.append((args, stdin))
+        return botapi.Result(False, 1, error="тест: задача не запускается")
+    botapi.call = xs_call
+    real_job_start = botapi.job_start
+    botapi.job_start = xs_job
+    text, buttons = screen(await press("xr"))
+    chk("Xray: кнопка «📡 Подписка» и подсказка", ("📡 Подписка", "xs") in buttons and "Подписка — серверы" in text, buttons)
+    text, buttons = screen(await press("xs"))
+    chk("подписки нет: что это, «➕ Задать адрес», назад в Xray",
+        "⚪️ Подписка не задана" in text and ("➕ Задать адрес", "xs:set") in buttons and ("◀️ Назад", "xr") in buttons
+        and not any(d in ("xs:upd", "xs:off") for _, d in buttons), [text, buttons])
+    await press("xs:set")
+    TOKEN = "https://sub.example.org/sub/SECRETTOKEN42"
+    text, _ = screen(await say("не адрес"))
+    chk("не адрес — переспрашивает", "Нужен адрес подписки" in text and not xs_jobs, text)
+    sent = await say(TOKEN)
+    said = LAST_SAID[0]
+    chk("адрес подписки: сообщение удалено, в awg2 — задачей, адрес через stdin, не аргументом",
+        said in SESSION.deleted and xs_jobs and xs_jobs[-1][0] == ("xray", "sub", "set") and xs_jobs[-1][1] == TOKEN + "\n",
+        xs_jobs)
+    chk("адреса подписки нет ни в одном сообщении бота",
+        not any("SECRETTOKEN42" in (getattr(m, "text", None) or "") for _, m in SESSION.sent), "")
+    await press("xs:set")
+    xs_jobs.clear()
+    sent = await say("http://plain.example.org/sub/HTTPTOKEN")
+    text, buttons = screen(sent)
+    chk("адрес по http — сперва предупреждение, задача не запущена", "http" in text and ("⚠️ Использовать http", "xs:http") in buttons
+        and not xs_jobs and LAST_SAID[0] in SESSION.deleted, [text, buttons])
+    await press("xs:http")
+    fsm = await DP.storage.get_data(key=StorageKey(bot_id=BOT.id, chat_id=OWNER.id, user_id=OWNER.id))
+    chk("подтвердил http — задача с insecure, адрес через stdin; в памяти бота не остался",
+        xs_jobs == [(("xray", "sub", "set", "insecure"), "http://plain.example.org/sub/HTTPTOKEN\n")]
+        and "HTTPTOKEN" not in json.dumps(fsm, ensure_ascii=False), [xs_jobs, fsm])
+    XS.update(set=True, site="sub.example.org", title="Мой <VPN>", count=4, skipped=1, updated=1791500000, every=12,
+              up=5 * 2 ** 30, down=5 * 2 ** 30, total=10 * 2 ** 30, expire=int(time.time()) + 86400,
+              error="Подписка не скачалась: сервер ответил ошибкой 404")
+    text, buttons = screen(await press("xs"))
+    chk("подписка есть: сайт, название (экранировано), серверов и пропущено, обновление, трафик и срок с ⚠️, ошибка",
+        "sub.example.org" in text and "Мой &lt;VPN&gt;" in text and "серверов 4 (пропущено 1)" in text
+        and "раз в 12 ч" in text and "Трафик: 10.0 ГБ из 10.0 ГБ ⚠️" in text and "Действует до" in text and "⚠️" in text
+        and "ответил ошибкой 404" in text and "SECRETTOKEN42" not in text, text)
+    chk("кнопки: обновить, сменить адрес, балансировщик (серверов несколько), убрать",
+        [d for _, d in buttons] == ["xs:upd", "xs:set", "xr:bal", "xs:off", "xr"], buttons)
+    xs_jobs.clear()
+    await press("xs:upd")
+    text, buttons = screen(await press("xs:off"))
+    chk("убрать — с подтверждением", ("🗑 Убрать", "xs:offok") in buttons and ("xray", "sub", "off") not in [j[0] for j in xs_jobs],
+        buttons)
+    await press("xs:offok")
+    chk("обновить и убрать — задачами", [j[0] for j in xs_jobs] == [("xray", "sub", "update"), ("xray", "sub", "off")], xs_jobs)
+    botapi.call = real_call_
+    botapi.job_start = real_job_start
 
     print("РФ напрямую, если туннель упал, куда идёт адрес")
     text, buttons = screen(await press("tun"))

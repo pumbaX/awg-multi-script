@@ -207,6 +207,8 @@ diag_route() {  # клиент адрес
       kind=blocked note="клиент заблокирован (срок или лимит трафика) — его трафик не идёт никуда"
     elif vkblock_on && ipset test "$VKBLOCK_SET" "$ip" &>/dev/null; then
       kind=drop note="сеть VK — отбрасывается («VK и Max мимо VPN»)"
+    elif rublock_on && ipset test "$RUBLOCK_SET" "$ip" &>/dev/null; then
+      kind=drop note="сеть России — клиенту отказ («РФ мимо VPN»): её пускают мимо туннеля"
     else
       rudirect_on && ipset test "$RUDIRECT_SET" "$ip" &>/dev/null && mark="${RUDIRECT_MARK%%/*}"
       if ! ip link show "$AWG_IF" &>/dev/null; then

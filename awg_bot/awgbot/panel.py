@@ -30,11 +30,14 @@ from .sections import wgobf
 # Команды awg2 api, открытые панели; первое слово — раздел
 ALLOWED = {"status", "version", "server", "module", "clients", "client", "mimicry", "diag", "backup",
            "tunnels", "warp", "xray", "t2s", "exits", "cascade", "dns", "wgobf", "update", "log", "bot",
-           "cert", "uninstall", "traffic", "antiscan", "vkblock", "amnezia", "country", "entry", "rudirect"}
+           "cert", "uninstall", "traffic", "antiscan", "vkblock", "rublock", "smtpblock",
+           "amnezia", "country", "entry", "rudirect"}
 # backup create auto — ротация автобэкапов: «auto 1» стёр бы все, кроме одного;
 # log web — журнал входов веб-панели (адреса, введённые логины), как раздел «Веб-панель» в боте
 OWNER_ONLY = (("uninstall",), ("bot", "uninstall"), ("bot", "webapp", "port"), ("cert", "issue"),
               ("cert", "use"), ("cert", "remove"), ("backup", "create", "auto"), ("log", "web"),
+              # Пароль бэкапов — как и автобэкап, у владельца; выдача файла — только через /api/send и /api/download
+              ("backup", "key", "set"), ("backup", "key", "clear"), ("backup", "pack"),
               # Перенос из Amnezia подменяет сервер целиком — как и удаление Тулзы, только владельцу
               ("amnezia", "migrate"), ("amnezia", "revert"), ("amnezia", "remove"))
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
@@ -120,7 +123,8 @@ def _check(user: dict, args: list[str]) -> None:
 
 
 def _result(r: api.Result) -> web.Response:
-    return web.json_response({"ok": r.ok, "data": r.data, "log": (r.log or "")[-8000:],
+    # rc — для ответов с особым смыслом (4 у бэкапа — нужен пароль)
+    return web.json_response({"ok": r.ok, "rc": r.rc, "data": r.data, "log": (r.log or "")[-8000:],
                               "error": "" if r.ok else r.message})
 
 
@@ -332,10 +336,11 @@ def setup(app: web.Application, user_of: UserOf) -> None:
             rows = await api.data("backup", "list", default=[]) or []
             if not path or path not in {b.get("path") for b in rows}:
                 raise _bad("такого бэкапа на сервере нет")
-            data, name = await asyncio.to_thread(bk.pack, path)
-            await bot.send_document(uid, BufferedInputFile(data, filename=name),
-                                    caption="💾 В бэкапе приватные ключи — храни как пароль")
-            return web.json_response({"ok": True})
+            p = await api.pack_backup(path)
+            if not isinstance(p, api.Packed):
+                return _result(p)
+            await bot.send_document(uid, BufferedInputFile(p.data, filename=p.name), caption=bk.caption(p))
+            return web.json_response({"ok": True, "encrypted": p.encrypted})
         if what in ("wgobf", "wgobf_zip"):
             send = wgobf.send_bundle if what == "wgobf" else wgobf.send_archive
             await send(bot, uid, _name(body))
@@ -381,8 +386,10 @@ def setup(app: web.Application, user_of: UserOf) -> None:
             rows = await api.data("backup", "list", default=[]) or []
             if not path or path not in {b.get("path") for b in rows}:
                 raise _bad("такого бэкапа на сервере нет")
-            data, name = await asyncio.to_thread(bk.pack, path)
-            return _file(data, name, "application/gzip")
+            p = await api.pack_backup(path)
+            if not isinstance(p, api.Packed):
+                return _result(p)
+            return _file(p.data, p.name, "application/octet-stream" if p.encrypted else "application/gzip")
         if what in ("wgobf", "wgobf_zip"):
             r = await api.call("wgobf", "bundle", _name(body))
             if not r.ok or not isinstance(r.data, dict):

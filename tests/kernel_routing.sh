@@ -2,7 +2,7 @@
 # Маршрутизация туннелей на настоящем ядре: правила клиентов, «если туннель
 # упал» (unreachable под маршрутом), метка и правило «РФ напрямую», «куда идёт
 # адрес» — настоящими ip, ipset и iptables в отдельном сетевом пространстве.
-# Запуск: unshare -rn bash tests/kernel_routing.sh dist/awg2.sh КАТАЛОГ tunnels|rudirect|rpf|exits
+# Запуск: unshare -rn bash tests/kernel_routing.sh dist/awg2.sh КАТАЛОГ tunnels|rudirect|rpf|exits|dns|blocks
 # (или через tests/test_kernel_routing.py — он сам пропустит, если netns нет).
 # shellcheck disable=SC2034  # пути — для функций awg2, подключённых через eval
 set -u
@@ -59,6 +59,103 @@ PY
   trap 'kill $CLI $NET $SRV 2>/dev/null' EXIT
   iptables -t nat -A POSTROUTING -s 10.23.45.0/24 -o eth0 -j MASQUERADE
   reach() { nsenter -t "$CLI" -n python3 -I "$T/cl.py" "$1"; }
+elif [[ "$PART" == blocks ]]; then
+  # Ограничения клиентов: порт 25 (почта) и «РФ мимо VPN». Клиенты за awg0 и
+  # wgobf0, «интернет» — свой netns: 1.1.1.1 и российский 77.88.8.8, порты 25, 587, 443
+  for c in nsenter python3 ipset; do command -v "$c" &>/dev/null || { echo "ПРОПУСК blocks: нет $c"; exit 0; }; done
+  unshare -n sleep 600 & CA=$!; unshare -n sleep 600 & CW=$!; unshare -n sleep 600 & NET=$!; sleep 0.3
+  trap 'kill $CA $CW $NET 2>/dev/null' EXIT
+  ip link add awg0 type veth peer name c0; ip link set c0 netns "$CA"
+  ip link add wgobf0 type veth peer name w0; ip link set w0 netns "$CW"
+  ip link add eth0 type veth peer name i0; ip link set i0 netns "$NET"
+  ip addr add 10.23.45.1/24 dev awg0; ip link set awg0 up
+  ip addr add 10.66.66.1/24 dev wgobf0; ip link set wgobf0 up
+  ip addr add 203.0.113.10/24 dev eth0; ip link set eth0 up
+  nsenter -t "$CA" -n sh -c 'ip link set lo up; ip addr add 10.23.45.2/24 dev c0; ip link set c0 up; ip route add default via 10.23.45.1'
+  nsenter -t "$CW" -n sh -c 'ip link set lo up; ip addr add 10.66.66.2/24 dev w0; ip link set w0 up; ip route add default via 10.66.66.1'
+  nsenter -t "$NET" -n sh -c 'ip link set lo up; ip addr add 203.0.113.1/24 dev i0; ip link set i0 up
+    ip addr add 1.1.1.1/32 dev lo; ip addr add 77.88.8.8/32 dev lo; ip route add 10.0.0.0/8 via 203.0.113.10'
+  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+  # Как PostUp сервера: ACCEPT первым в FORWARD — правила в mangle и ip rule от него не зависят
+  iptables -I FORWARD 1 -i awg0 -j ACCEPT; iptables -I FORWARD 1 -i wgobf0 -j ACCEPT
+  cat > "$T/srv.py" <<'PY'
+import socket, sys, threading
+def serve(host, port):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((host, port)); s.listen(16)
+    while True:
+        c, _ = s.accept(); c.sendall(b"HI"); c.close()
+for spec in sys.argv[1:]:
+    h, p = spec.rsplit(":", 1)
+    threading.Thread(target=serve, args=(h, int(p)), daemon=True).start()
+threading.Event().wait()
+PY
+  cat > "$T/conn.py" <<'PY'
+import socket, sys, time
+t = time.time()
+try:
+    c = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3); r = c.recv(2); c.close()
+    print("OK" if r == b"HI" else "BAD", round(time.time() - t, 2))
+except socket.timeout:
+    print("TIMEOUT", round(time.time() - t, 2))
+except OSError as e:
+    print("ERR", round(time.time() - t, 2), e.strerror)
+PY
+  nsenter -t "$NET" -n python3 -I "$T/srv.py" 1.1.1.1:25 1.1.1.1:587 1.1.1.1:443 77.88.8.8:443 & S1=$!
+  python3 -I "$T/srv.py" 10.23.45.1:25 & S2=$!            # почта самого сервера — её не трогаем
+  trap 'kill $CA $CW $NET $S1 $S2 2>/dev/null' EXIT
+  sleep 0.5
+  cn() { nsenter -t "$1" -n python3 -I "$T/conn.py" "$2" "$3"; }
+  sh_cn() { python3 -I "$T/conn.py" "$1" "$2"; }           # сам сервер
+elif [[ "$PART" == dns ]]; then
+  # Шифрованный DNS: клиенты за awg0 и за wgobf0 (WG + обфускатор), «интернет» — свой
+  # netns: его DNS на 1.1.1.1 отвечает «LEAK», а dnscrypt сервера на 127.0.2.1 — «DNSCRYPT»
+  for c in nsenter python3; do command -v "$c" &>/dev/null || { echo "ПРОПУСК dns: нет $c"; exit 0; }; done
+  unshare -n sleep 600 & CA=$!; unshare -n sleep 600 & CW=$!; unshare -n sleep 600 & NET=$!; sleep 0.3
+  trap 'kill $CA $CW $NET 2>/dev/null' EXIT
+  ip link add awg0 type veth peer name c0; ip link set c0 netns "$CA"
+  ip link add eth0 type veth peer name i0; ip link set i0 netns "$NET"
+  ip addr add 10.23.45.1/24 dev awg0; ip link set awg0 up
+  ip addr add 203.0.113.10/24 dev eth0; ip link set eth0 up; ip route add default via 203.0.113.1
+  sysctl -qw net.ipv4.ip_forward=1
+  nsenter -t "$CA" -n sh -c 'ip link set lo up; ip addr add 10.23.45.2/24 dev c0; ip link set c0 up; ip route add default via 10.23.45.1'
+  nsenter -t "$NET" -n sh -c 'ip link set lo up; ip addr add 203.0.113.1/24 dev i0; ip link set i0 up; ip addr add 1.1.1.1/32 dev lo'
+  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+  wgobf_link() {  # wgobf0 и его клиент — заново (обфускатор подняли после DNS)
+    ip link del wgobf0 2>/dev/null
+    ip link add wgobf0 type veth peer name w0; ip link set w0 netns "$CW"
+    ip addr add 10.66.66.1/24 dev wgobf0; ip link set wgobf0 up
+    nsenter -t "$CW" -n sh -c 'ip link set lo up; ip addr add 10.66.66.2/24 dev w0; ip link set w0 up; ip route add default via 10.66.66.1'
+  }
+  wgobf_link
+  cat > "$T/dns.py" <<'PY'
+import socket, sys, threading
+host, tag = sys.argv[1], sys.argv[2].encode()
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind((host, 53))
+if len(sys.argv) > 3:          # «интернет»: ещё и DoT на 853
+    t = socket.socket(); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); t.bind((host, 853)); t.listen(8)
+    threading.Thread(target=lambda: [t.accept()[0].close() for _ in iter(int, 1)], daemon=True).start()
+while True:
+    q, a = u.recvfrom(512); u.sendto(tag + b":" + q, a)
+PY
+  cat > "$T/q.py" <<'PY'
+import socket, sys
+kind = sys.argv[1]
+try:
+    if kind == "dot":
+        socket.create_connection(("1.1.1.1", 853), timeout=2).close(); print("DOT-OPEN")
+    else:
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.settimeout(2); u.sendto(b"q", ("1.1.1.1", 53))
+        d, a = u.recvfrom(512); print(d.decode().split(":")[0], a[0])
+except OSError as e:
+    print("NO", type(e).__name__)
+PY
+  nsenter -t "$NET" -n python3 -I "$T/dns.py" 1.1.1.1 LEAK dot & S1=$!
+  python3 -I "$T/dns.py" 127.0.2.1 DNSCRYPT & S2=$!
+  trap 'kill $CA $CW $NET $S1 $S2 2>/dev/null' EXIT
+  sleep 0.5
+  q() { nsenter -t "$1" -n python3 -I "$T/q.py" "$2"; }
+  eval "$(sed -n '/^ipt_add() {/,/^}/p;/^ipt_ins() {/,/^}/p;/^ipt_del() {/,/^}/p;/^ipt_del_tagged() {/,/^}/p' "$LIB")"
+  DNS_PROXY_ADDR=127.0.2.1 DNS_PROXY_PORT=53
 else
   ip tuntap add mode tun dev awg0; ip addr add 10.23.45.1/24 dev awg0; ip link set awg0 up
   ip link add eth0 type veth peer name eth0p; ip addr add 203.0.113.10/24 dev eth0; ip link set eth0 up; ip link set eth0p up
@@ -75,11 +172,11 @@ ok "клиент WARP — в warp0" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev warp
 ok "клиент без туннеля — eth0" '[[ "$(rg 1.1.1.1 10.23.45.3)" == *"dev eth0"* ]]'
 ok "rt_table_live видит живой маршрут" 'rt_table_live 200'
 ok "_tunfail_rule_tables читает таблицу из ip rule show" '[[ "$(_tunfail_rule_tables)" == 200 ]]'
-ok "ip rule show: «lookup 200» в конце строки (на этом держатся проверки)" 'ip rule show | grep -qE "lookup 200$"'
+ok "ip rule show: «lookup 200» в конце строки (на этом держатся проверки)" 'grep -qE "lookup 200$" <<< "$(ip rule show)"'
 ip link del warp0
 ok "WARP упал (устройство пропало): маршрут ушёл сам — клиент идёт напрямую (eth0)" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev eth0"* ]]'
 rt_down warp0 200
-ok "rt_down в «напрямую» снимает правила" '! ip rule show | grep -q "lookup 200"'
+ok "rt_down в «напрямую» снимает правила" '! grep -q "lookup 200" <<< "$(ip rule show)"'
 
 echo "── РФ напрямую: метка и правило 90 ──"
 mkwarp; rt_up warp0 200 "$WARP_PEERS"
@@ -94,29 +191,29 @@ echo "── блокировать ──"
 echo "warp=block" > "$TUNFAIL_CONF"
 rt_fail_route 200
 ok "«недоступно» лежит под живым маршрутом — трафик по-прежнему в warp0" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev warp0"* ]]'
-ok "ip route show: «unreachable default metric 4096» (на этом держится tunfail_held)" 'ip route show table 200 | grep -q "^unreachable default"'
+ok "ip route show: «unreachable default metric 4096» (на этом держится tunfail_held)" 'grep -q "^unreachable default" <<< "$(ip route show table 200)"'
 ip link del warp0
 r=$(rg 1.1.1.1 10.23.45.2)
 ok "WARP упал сам (устройство пропало, rt_down ещё не было) — клиент без маршрута: $r" '[[ "$r" == *"No route to host"* || "$r" == *"nreachable"* ]]'
 ok "…а сеть России у него — напрямую" '[[ "$(rg 77.88.8.8 10.23.45.2 0x52550000)" == *"dev eth0"* ]]'
 ok "клиент без туннеля не задет" '[[ "$(rg 1.1.1.1 10.23.45.3)" == *"dev eth0"* ]]'
 rt_down warp0 200
-ok "rt_down в «блокировать»: правило осталось, таблица — «недоступно»" 'ip rule show | grep -q "lookup 200" && ! rt_table_live 200 && tunfail_held warp'
+ok "rt_down в «блокировать»: правило осталось, таблица — «недоступно»" 'grep -q "lookup 200" <<< "$(ip rule show)" && ! rt_table_live 200 && tunfail_held warp'
 mkwarp; rt_up warp0 200 "$WARP_PEERS"
 ok "WARP вернулся — клиент снова в warp0" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev warp0"* ]]'
 ok "правило клиента одно (без дублей)" '(( $(ip rule show | grep -c "lookup 200") == 1 ))'
 ip link del warp0; rt_down warp0 200
 rm -f "$WARP_STATE"; rt_down warp0 200
-ok "выключили руками (состояния нет) — отпущен напрямую" '! ip rule show | grep -q "lookup 200" && [[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev eth0"* ]]'
+ok "выключили руками (состояния нет) — отпущен напрямую" '! grep -q "lookup 200" <<< "$(ip rule show)" && [[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev eth0"* ]]'
 
 echo "── сторож после перезагрузки ──"
 touch "$WARP_STATE"; tunfail_guard_run >/dev/null
 ok "WARP включён, не поднялся — сторож удержал клиента" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"No route"* ]]'
 ip tuntap add mode tun dev tun0; ip addr add 198.18.0.1/30 dev tun0; ip link set tun0 up
 rt_up tun0 100 -
-ok "поднят tun2socks — удержание WARP снято, клиент в tun0" '! ip rule show | grep -q "lookup 200" && [[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev tun0"* ]]'
+ok "поднят tun2socks — удержание WARP снято, клиент в tun0" '! grep -q "lookup 200" <<< "$(ip rule show)" && [[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev tun0"* ]]'
 tunfail_guard_run >/dev/null
-ok "сторож при живом tun2socks WARP не держит" '! ip rule show | grep -q "lookup 200"'
+ok "сторож при живом tun2socks WARP не держит" '! grep -q "lookup 200" <<< "$(ip rule show)"'
 elif [[ "$PART" == rudirect ]]; then
 mkwarp; rt_up warp0 200 "$WARP_PEERS"
 mkdir -p "$RUDIRECT_DIR" "$RUDIRECT_USER"
@@ -162,7 +259,7 @@ echo 0 > /proc/sys/net/ipv4/ip_forward
 out=$(diag_route alice 1.1.1.1); ok "пересылка выключена — none с подсказкой: $out" '[[ "$out" == *$'"'"'\tnone\t'"'"'*ip_forward* ]]'
 echo 1 > /proc/sys/net/ipv4/ip_forward
 _rud_set ON 0; rudirect_run off
-ok "off: правила и набор сняты" '! ipset list -n awg2-ru &>/dev/null && ! iptables-save -t mangle | grep -q awg2-rudirect && ! ip rule show | grep -q fwmark'
+ok "off: правила и набор сняты" '! ipset list -n awg2-ru &>/dev/null && ! grep -q awg2-rudirect <<< "$(iptables-save -t mangle)" && ! grep -q fwmark <<< "$(ip rule show)"'
 elif [[ "$PART" == rpf ]]; then
 echo "── РФ напрямую: настоящий трафик и строгий rp_filter на аплинке ──"
 mkwarp; rt_up warp0 200 "$WARP_PEERS"
@@ -187,6 +284,71 @@ rudirect_run heal
 ok "…починен (eth0=2 сильнее all=1) — ответ есть" '[[ "$(rpf eth0)" == 2 ]] && rudirect_rules_ok && reach 77.1.1.1'
 echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 1 > /proc/sys/net/ipv4/conf/eth0/rp_filter
 out=$(diag_route bob 77.1.1.1); ok "клиент без туннеля при строгом — rudirect без подсказки (обратный путь и так eth0)" '[[ "$out" == *$'"'"'\trudirect\teth0\t'"'"'* ]]'
+elif [[ "$PART" == blocks ]]; then
+echo "── Почта: порт 25 клиентов закрыт ──"
+SMTPBLOCK_FLAG="$T/smtpblock"
+ok "до включения порт 25 у клиентов открыт" '[[ "$(cn "$CA" 1.1.1.1 25)" == OK* && "$(cn "$CW" 1.1.1.1 25)" == OK* ]]'
+touch "$SMTPBLOCK_FLAG"; smtpblock_run apply
+ok "закрыт: клиент AWG и клиент обфускатора не открывают порт 25" \
+  '[[ "$(cn "$CA" 1.1.1.1 25)" != OK* && "$(cn "$CW" 1.1.1.1 25)" != OK* ]]'
+ok "587 и 443 (почтовые приложения, сайты) работают" '[[ "$(cn "$CA" 1.1.1.1 587)" == OK* && "$(cn "$CW" 1.1.1.1 443)" == OK* ]]'
+ok "почта самого сервера (его адрес) клиенту доступна" '[[ "$(cn "$CA" 10.23.45.1 25)" == OK* ]]'
+ok "свой трафик сервера на 25 не трогается" '[[ "$(sh_cn 1.1.1.1 25)" == OK* ]]'
+ok "правила на месте (smtpblock_rules_ok), повтор apply — без дублей" \
+  'smtpblock_rules_ok && smtpblock_run apply && [[ "$(iptables -t mangle -S PREROUTING | grep -c awg2-smtpblock)" == 2 ]]'
+iptables -t mangle -D PREROUTING -i wgobf0 -p tcp --dport 25 -m addrtype ! --dst-type LOCAL -m comment --comment awg2-smtpblock -j DROP
+ok "правило сбросили — heal видит и возвращает" '! smtpblock_rules_ok && smtpblock_run heal && smtpblock_rules_ok && [[ "$(cn "$CW" 1.1.1.1 25)" != OK* ]]'
+rm -f "$SMTPBLOCK_FLAG"; smtpblock_run heal
+ok "выключили — правила сняты, порт 25 снова открыт" \
+  '! grep -q awg2-smtpblock <<< "$(iptables-save -t mangle)" && [[ "$(cn "$CA" 1.1.1.1 25)" == OK* ]]'
+
+echo "── РФ мимо VPN: клиентам отказ в сетях России ──"
+RUBLOCK_DIR="$T/rublock"; RUBLOCK_CONF="$RUBLOCK_DIR/rublock.conf"; RUBLOCK_LOG="$T/rublock.log"
+mkdir -p "$RUBLOCK_DIR"; printf '77.88.0.0/18\n5.255.255.0/24\n' > "$RUBLOCK_DIR/ru.list"
+ok "до включения сеть России у клиента открыта" '[[ "$(cn "$CA" 77.88.8.8 443)" == OK* ]]'
+_rublock_set ON 1; _rublock_apply
+r=$(cn "$CA" 77.88.8.8 443)
+ok "клиент AWG: сеть России — сразу отказ, а не ожидание: $r" '[[ "$r" == ERR* ]] && (( $(cut -d" " -f2 <<< "$r" | tr -d .) < 100 ))'
+ok "клиент обфускатора: тоже отказ" '[[ "$(cn "$CW" 77.88.8.8 443)" == ERR* ]]'
+ok "не Россия (1.1.1.1) — как обычно" '[[ "$(cn "$CA" 1.1.1.1 443)" == OK* && "$(cn "$CW" 1.1.1.1 443)" == OK* ]]'
+ok "свой трафик сервера в сеть России не трогается" '[[ "$(sh_cn 77.88.8.8 443)" == OK* ]]'
+# Клиент в туннеле (WARP: правило 200 и маршрут в warp0) — отказ раньше туннеля
+ip tuntap add mode tun dev warp0; ip addr add 172.16.0.2/32 dev warp0; ip link set warp0 up
+ip route add default dev warp0 table 200; ip rule add from 10.23.45.2 lookup 200 priority 200
+ok "клиент в туннеле (WARP) — тоже сразу отказ: правило раньше туннелей, а 1.1.1.1 уходит в туннель" \
+  '[[ "$(cn "$CA" 77.88.8.8 443)" == ERR* && "$(ip -4 route get 1.1.1.1 from 10.23.45.2 iif awg0 2>&1)" == *"dev warp0"* ]]'
+ip rule del from 10.23.45.2 lookup 200 priority 200; ip link del warp0
+ok "правила на месте (rublock_rules_ok), повтор apply — без дублей" \
+  'rublock_rules_ok && _rublock_apply && [[ "$(grep -c "fwmark 0x52420000/0xffff0000 prohibit" <<< "$(ip rule show)")" == 1 ]]'
+ip rule del fwmark 0x52420000/0xffff0000 prohibit priority 85
+# Отказ — ICMP, а их частоту ядро ограничивает (на клиента ~1 в секунду после запаса):
+# здесь важно «не открылось», мгновенность проверена на первом соединении
+ok "правило маршрутизации пропало — rublock_rules_ok видит, heal возвращает" \
+  '! rublock_rules_ok && rublock_run heal && rublock_rules_ok && [[ "$(cn "$CA" 77.88.8.8 443)" != OK* ]]'
+_rublock_set ON 0; rublock_run heal
+ok "выключили — правила и набор сняты, сеть России снова открыта" \
+  '! ipset list -n awg2-rublock &>/dev/null && ! grep -q 0x52420000 <<< "$(ip rule show)" && [[ "$(cn "$CA" 77.88.8.8 443)" == OK* ]]'
+elif [[ "$PART" == dns ]]; then
+echo "── Шифрованный DNS: перехват с awg0 и wgobf0 на настоящем трафике ──"
+ok "без перехвата DNS клиента обфускатора уходит в интернет открыто, DoT открыт" \
+  '[[ "$(q "$CW" dns)" == "LEAK 1.1.1.1" && "$(q "$CW" dot)" == DOT-OPEN ]]'
+dns_rules_down; dns_rules_up
+ok "клиент AWG: запрос на 1.1.1.1 ответил dnscrypt сервера, адрес ответа — 1.1.1.1" '[[ "$(q "$CA" dns)" == "DNSCRYPT 1.1.1.1" ]]'
+ok "клиент WG + обфускатора: то же — DNS не уходит открыто" '[[ "$(q "$CW" dns)" == "DNSCRYPT 1.1.1.1" ]]'
+ok "DoT (853) закрыт у обоих" '[[ "$(q "$CA" dot)" == NO* && "$(q "$CW" dot)" == NO* ]]'
+ok "правила перехвата на месте (dns_rules_ok)" 'dns_rules_ok'
+# Старая версия: перехват был только на awg0 — сторож увидит дыру и доставит правила
+iptables -t nat -D PREROUTING -i wgobf0 -p udp --dport 53 -j DNAT --to-destination 127.0.2.1:53 -m comment --comment awg2-dns
+ok "правила wgobf0 нет (обновление со старой версии) — dns_rules_ok это видит" '! dns_rules_ok'
+dns_rules_up
+ok "dns_rules_up доставил его — снова dnscrypt, без дублей" \
+  '[[ "$(q "$CW" dns)" == "DNSCRYPT 1.1.1.1" && "$(iptables -t nat -S PREROUTING | grep -c "wgobf0.*dport 53")" == 2 ]]'
+# Обфускатор подняли уже после DNS: правила на wgobf0 стоят без интерфейса
+ip link del wgobf0; dns_rules_down; dns_rules_up; wgobf_link
+ok "wgobf0 появился после включения DNS — перехват сразу работает" '[[ "$(q "$CW" dns)" == "DNSCRYPT 1.1.1.1" && "$(q "$CW" dot)" == NO* ]]'
+dns_rules_down
+ok "выключили DNS — правила сняты, клиенты снова ходят к своему DNS" \
+  '! grep -q awg2-dns <<< "$(iptables-save)" && [[ "$(q "$CW" dns)" == "LEAK 1.1.1.1" && "$(q "$CW" dot)" == DOT-OPEN ]]'
 elif [[ "$PART" == exits ]]; then
 echo "── Сторож exit-нод: ноды — настоящие сетевые пространства, проба — настоящий ping ──"
 command -v ping &>/dev/null || { echo "ПРОПУСК exits: нет ping"; exit 0; }
@@ -246,7 +408,7 @@ orig_online=$(declare -f _exits_server_online)
 _exits_server_online() { return 0; }          # у сервера интернет есть: молчат именно ноды
 hc 3
 ok "обе молчат, «блокировать» — клиенты удержаны: «недоступно», правила на месте" \
-  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"No route"* && "$(rg 1.1.1.1 10.23.45.3)" == *"No route"* ]] && ip rule show | grep -q "from 10.23.45.3 lookup 211"'
+  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"No route"* && "$(rg 1.1.1.1 10.23.45.3)" == *"No route"* ]] && grep -q "from 10.23.45.3 lookup 211" <<< "$(ip rule show)"'
 node_on a; hc 1
 ok "a ответила 1 раз — ещё не вернулась (нужно 2)" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"No route"* ]]'
 hc 1
@@ -272,10 +434,10 @@ node_on a; hc 2
 echo "exits=direct" > "$TUNFAIL_CONF"
 node_off a; node_off b; hc 3
 ok "обе молчат, «напрямую» — правила сняты, клиенты идут с адреса сервера" \
-  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev eth0"* ]] && ! ip rule show | grep -q "lookup 202"'
+  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev eth0"* ]] && ! grep -q "lookup 202" <<< "$(ip rule show)"'
 node_on a; hc 2
 ok "a вернулась после «напрямую» — правила клиентов снова на месте, общий выход через a" \
-  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-a"* ]] && ip rule show | grep -q "from 10.23.45.2 lookup 202"'
+  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-a"* ]] && grep -q "from 10.23.45.2 lookup 202" <<< "$(ip rule show)"'
 eval "$orig_online"                           # настоящая проверка: у сервера в тесте интернета нет
 iptables -I OUTPUT -o eth0 -j REJECT          # и не ждём таймаутов — отказ сразу
 node_off a; node_off b

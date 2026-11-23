@@ -158,7 +158,8 @@ rt_tunnel_on() {  # таблица
   esac
 }
 
-rt_table_live() { ip route show table "$1" 2>/dev/null | grep -q ' dev '; }   # в таблице есть живой маршрут
+# В таблице есть живой маршрут. Не «… | grep -q»: при pipefail ранний выход grep — SIGPIPE у ip и ложное «нет»
+rt_table_live() { grep -q ' dev ' <<< "$(ip route show table "$1" 2>/dev/null)"; }
 
 # Поднимается туннель — снять «удержание» лежащих: их правила (приоритет у
 # каждого свой) иначе перехватили бы клиентов в «недоступно».

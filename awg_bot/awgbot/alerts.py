@@ -40,7 +40,7 @@ from typing import Any
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.types import FSInputFile, InlineKeyboardMarkup
+from aiogram.types import BufferedInputFile, InlineKeyboardMarkup
 
 from . import access, api, store, ui
 from .ui import esc
@@ -494,12 +494,23 @@ async def _backup_due_locked(bot: Bot, force: bool = False) -> str:
         return await _backup_failed(bot, st, now, r.message if not r.ok else "нет файла")
     size = os.path.getsize(path)
     when = time.strftime("%d.%m.%Y %H:%M")
+    packed: api.Packed | None = None
+    if size <= SEND_MAX:
+        # В чат — файл на выдачу: с паролем бэкапов awg2 его шифрует
+        p = await api.pack_backup(path)
+        if not isinstance(p, api.Packed):
+            return await _backup_failed(bot, st, now, p.message)
+        packed, size = p, len(p.data)
     caption = (f"💾 <b>Автобэкап</b> · {when} · {ui.fmt_bytes(size)}\n"
-               "В нём приватные ключи — храни как пароль. Восстановление: Бэкапы → Из файла.")
+               + ("🔐 Зашифрован паролем бэкапов. " if packed and packed.encrypted
+                  else "В нём приватные ключи — храни как пароль. ")
+               + "Восстановление: Бэкапы → Из файла.")
     sent = 0
     for uid in sorted(access.owners()):
-        if size <= SEND_MAX:
-            sent += await _deliver(lambda u: bot.send_document(u, FSInputFile(path), caption=caption,
+        if packed is not None and size <= SEND_MAX:
+            body, name = packed.data, packed.name
+            sent += await _deliver(lambda u: bot.send_document(u, BufferedInputFile(body, filename=name),
+                                                               caption=caption,
                                                                request_timeout=BACKUP_UPLOAD_TIMEOUT), uid)
         else:
             sent += await _deliver(lambda u: bot.send_message(

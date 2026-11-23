@@ -61,8 +61,9 @@ READS = {("job", "status"), ("job", "list"), ("log",), ("module", "report"), ("m
          ("diag", "status"), ("diag", "sniff-list"), ("tunnels", "clients"), ("wgobf", "clients"),
          ("xray", "diag"), ("cascade", "list"), ("module", "backups"), ("backup", "inspect"),
          ("bot", "proxy", "get"), ("bot", "proxy", "candidates"), ("bot", "webapp", "get"), ("server", "params"), ("web", "status"),
-         ("traffic", "now"), ("warp", "probe"), ("xray", "probe"), ("antiscan", "status"), ("vkblock", "status"), ("amnezia", "status"), ("amnezia", "scan"),
-         ("rudirect", "status"), ("tunnels", "fail", "list"), ("diag", "route")}         # обзор панели спрашивает раз в 3 с — не запись, кэш не сбрасывает
+         ("traffic", "now"), ("warp", "probe"), ("xray", "probe"), ("antiscan", "status"), ("vkblock", "status"), ("rublock", "status"), ("smtpblock", "status"), ("amnezia", "status"), ("amnezia", "scan"),
+         ("rudirect", "status"), ("tunnels", "fail", "list"), ("diag", "route"), ("backup", "pack"),
+         ("backup", "key", "status"), ("xray", "sub", "status")}         # обзор панели спрашивает раз в 3 с — не запись, кэш не сбрасывает
 
 
 def _cacheable(key: tuple[str, ...]) -> bool:
@@ -179,6 +180,43 @@ async def data(*args: Any, default: Any = None, **kw: Any) -> Any:
     """Только data успешного ответа, иначе default."""
     r = await call(*args, **kw)
     return r.data if r.ok and r.data is not None else default
+
+
+@dataclass
+class Packed:
+    data: bytes
+    name: str
+    encrypted: bool
+
+
+async def pack_backup(path: str) -> Packed | Result:
+    """Бэкап из списка — на выдачу (в чат, скачиванием): awg2 собирает файл
+    (каталог — в tar.gz, с паролем бэкапов — зашифрован), здесь он читается и
+    удаляется. Ошибка — Result с причиной."""
+    r = await call("backup", "pack", path, timeout=300)
+    out = str(r.data.get("path") or "") if r.ok and isinstance(r.data, dict) else ""
+    if not out:
+        return r if not r.ok else Result(False, 1, error="awg2 не выдал файл бэкапа")
+    try:
+        data = await asyncio.to_thread(_read_drop, out)
+    except OSError as e:
+        return Result(False, 1, error=f"Файл бэкапа не прочитан: {e.strerror or e}")
+    return Packed(data, str(r.data.get("name") or os.path.basename(out)), bool(r.data.get("encrypted")))
+
+
+def _read_drop(path: str) -> bytes:
+    """Прочитать выданный файл и убрать его с каталогом выдачи (backup-out/XXXXXX)."""
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(path)
+            parent = os.path.dirname(path)
+            if os.path.basename(os.path.dirname(parent)) == "backup-out":
+                os.rmdir(parent)
+        except OSError:
+            pass
 
 
 async def job_start(*args: Any, stdin: str | bytes | None = None) -> Result:

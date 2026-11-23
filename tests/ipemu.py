@@ -54,8 +54,12 @@ def passthrough():
 if a[:2] == ["rule", "add"]:
     r = kv(a[2:])
     rules = load(RF, [])
-    rules.append({"prio": int(r.get("priority") or r.get("pref") or 32765), "from": r.get("from", "all"),
-                  "fwmark": r.get("fwmark", ""), "lookup": r.get("lookup") or r.get("table")})
+    rule = {"prio": int(r.get("priority") or r.get("pref") or 32765), "from": r.get("from", "all"),
+            "fwmark": r.get("fwmark", ""), "lookup": r.get("lookup") or r.get("table")}
+    # Действие вместо таблицы: «prohibit» — отказ (route get: Permission denied)
+    if "prohibit" in r.get("_", []):
+        rule["action"] = "prohibit"
+    rules.append(rule)
     save(RF, rules)
 elif a[:2] == ["rule", "del"]:
     r = kv(a[2:])
@@ -63,6 +67,7 @@ elif a[:2] == ["rule", "del"]:
     for i, x in enumerate(rules):
         if ((not r.get("lookup") or x["lookup"] == r["lookup"]) and (not r.get("from") or x["from"] == r["from"])
                 and (not r.get("fwmark") or x["fwmark"] == r["fwmark"])
+                and ("prohibit" not in r.get("_", []) or x.get("action") == "prohibit")
                 and (not r.get("priority") or x["prio"] == int(r["priority"]))):
             del rules[i]
             save(RF, rules)
@@ -71,7 +76,8 @@ elif a[:2] == ["rule", "del"]:
     sys.exit(2)
 elif a[:2] in (["rule", "show"], ["rule", "list"]) or a == ["rule"]:
     for x in sorted(load(RF, []), key=lambda x: x["prio"]):
-        print("%d:\tfrom %s%s lookup %s" % (x["prio"], x["from"], " fwmark " + x["fwmark"] if x["fwmark"] else "", x["lookup"]))
+        print("%d:\tfrom %s%s %s" % (x["prio"], x["from"], " fwmark " + x["fwmark"] if x["fwmark"] else "",
+                                       "prohibit" if x.get("action") == "prohibit" else "lookup %s" % x["lookup"]))
 elif a[:2] == ["route", "flush"] and "cache" in a:
     pass
 elif a[:1] == ["route"] and len(a) > 1 and a[1] in ("replace", "add", "del", "flush", "show") and "table" in a:
@@ -111,6 +117,9 @@ elif a[:2] == ["route", "get"]:
             val = x["fwmark"].split("/")[0]
             if mark.lower() != val.lower():
                 continue
+        if x.get("action") == "prohibit":
+            sys.stderr.write("RTNETLINK answers: Permission denied\n")
+            sys.exit(2)
         if x["lookup"] == "main":
             print("%s from %s via 192.0.2.1 dev eth0 iif %s" % (dst, src, r.get("iif", "")))
             sys.exit(0)

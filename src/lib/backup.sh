@@ -104,13 +104,104 @@ backup_create() {
 }
 
 _restore_list() {  # → строки «путь» (новые сверху)
-  find "$BACKUP_DIR" -maxdepth 1 \( -type d -name 'awg2_backup_*' -o -type f -name '*.tar.gz' \) \
+  find "$BACKUP_DIR" -maxdepth 1 \( -type d -name 'awg2_backup_*' -o -type f \( -name '*.tar.gz' -o -name '*.tar.gz.enc' \) \) \
     -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-
+}
+
+# ── Пароль бэкапов ────────────────────────────────────────
+# Файлы бэкапа, которые уходят с сервера (в чат бота, автобэкап, скачивание в
+# панели), шифруются: AES-256-CBC, ключ из пароля — PBKDF2-SHA256. Формат —
+# обычный «openssl enc»: файл открывается на любом компьютере с openssl. Бэкапы
+# в ~/awg_backup остаются как есть: они и так только у root. Пароль лежит на
+# сервере (иначе не зашифровать автобэкап) — защищает копии вне сервера.
+# Пароль никогда не идёт аргументом команды (его видно в ps): только файлом.
+backup_key_on() { [[ -s "$BACKUP_KEY" ]]; }
+
+_backup_openssl() {  # [-d] из в файл_пароля
+  local d=()
+  [[ "$1" == -d ]] && { d=(-d); shift; }
+  openssl enc ${d[@]+"${d[@]}"} -aes-256-cbc -pbkdf2 -iter "$BACKUP_ENC_ITER" -md sha256 -salt \
+    -in "$1" -out "$2" -pass "file:$3" 2>/dev/null
+}
+
+# Зашифрован ли файл: «openssl enc -salt» пишет в начало «Salted__»
+# (нули из заголовка gzip убираются: иначе bash ругается на них в $(...))
+backup_encrypted() { [[ -f "$1" && "$(head -c 8 "$1" 2>/dev/null | tr -d '\0')" == Salted__ ]]; }
+
+# Расшифровать и проверить: битый файл и неверный пароль — не архив
+_backup_decrypt() {  # из в файл_пароля
+  [[ -s "$3" ]] || return 1
+  if _backup_openssl -d "$1" "$2" "$3" && gzip -t "$2" 2>/dev/null; then return 0; fi
+  rm -f "$2"
+  return 1
+}
+
+# Пароль — первой строкой stdin: 8–128 символов, латиница, цифры, знаки
+# (так он одинаково вводится на любом компьютере), без пробелов по краям
+# (Telegram их обрезает).
+backup_key_set() {
+  local pw="" re='^[[:graph:]]([[:print:]]*[[:graph:]])?$' good=0
+  IFS= read -r pw || [[ -n "$pw" ]] || { err "Пароль не передан"; return 1; }
+  pw="${pw%$'\r'}"
+  # Классы символов — в локали C (только ASCII); проверка — без запуска
+  # других программ: пароль не должен попасть в их аргументы
+  ( LC_ALL=C; [[ "$pw" =~ $re ]] ) && good=1
+  if (( ${#pw} < 8 || ${#pw} > 128 )); then err "Пароль — от 8 до 128 символов"; return 1; fi
+  (( good )) || { err "В пароле — только латиница, цифры и знаки, без пробелов по краям"; return 1; }
+  need_cmds openssl:openssl || return 1
+  mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+  printf '%s\n' "$pw" | write_file "$BACKUP_KEY" 600 || { err "Пароль не записан"; return 1; }
+  log_info "бэкапы: пароль задан"
+  ok "Пароль задан: файлы бэкапов, которые уходят с сервера, теперь зашифрованы. Запиши его — без него их не открыть"
+}
+
+backup_key_clear() {
+  rm -f "$BACKUP_KEY"
+  log_info "бэкапы: пароль убран"
+  ok "Пароль убран: файлы бэкапов уходят с сервера без шифрования"
+}
+
+# Бэкап из списка — на выдачу (бот, панель): каталог полного — в tar.gz, с
+# паролем — зашифрован. Отдельный файл в BACKUP_OUT: забравший удаляет его,
+# забытые старше часа удаляются здесь же. Выдаётся только бэкап из списка —
+# иначе это чтение любого файла сервера.
+PACK_PATH="" PACK_ENC=0
+backup_pack() {  # путь
+  local src="$1" p found=0 out name
+  PACK_PATH="" PACK_ENC=0
+  while IFS= read -r p; do [[ "$p" == "$src" ]] && { found=1; break; }; done < <(_restore_list)
+  (( found )) || { err "Такого бэкапа нет: ${src##*/}"; return 1; }
+  mkdir -p "$BACKUP_OUT" && chmod 700 "$BACKUP_OUT" || return 1
+  find "$BACKUP_OUT" -mindepth 1 -maxdepth 1 -mmin +60 -exec rm -rf {} + 2>/dev/null || true
+  out=$(mktemp -d "$BACKUP_OUT/XXXXXX") || { err "Нет места для файла бэкапа"; return 1; }
+  name="${src##*/}"
+  if [[ -d "$src" ]]; then
+    name+=".tar.gz"
+    (umask 077 && tar -czf "$out/$name" -C "${src%/*}" "${src##*/}") \
+      || { rm -rf "$out"; err "Архив бэкапа не записан — проверь место на диске"; return 1; }
+  else
+    cp "$src" "$out/$name" || { rm -rf "$out"; err "Бэкап не скопирован — проверь место на диске"; return 1; }
+  fi
+  chmod 600 "$out/$name"
+  if backup_encrypted "$out/$name"; then
+    PACK_ENC=1
+  elif backup_key_on; then
+    need_cmds openssl:openssl || { rm -rf "$out"; return 1; }
+    if ! _backup_openssl "$out/$name" "$out/$name.enc" "$BACKUP_KEY"; then
+      rm -rf "$out"; err "Бэкап не зашифрован — файл не выдан"; return 1
+    fi
+    rm -f "$out/$name"
+    name+=".enc"; PACK_ENC=1
+    chmod 600 "$out/$name"
+  fi
+  PACK_PATH="$out/$name"
 }
 
 # Каталог с awg0.conf из любого бэкапа: каталог полного бэкапа, его архив,
 # авто-бэкап (пути от корня) или архив бота прежних версий (awg0.conf + clients/).
-RESTORE_SRC=""
+# Зашифрованный — пароль из файла RESTORE_PASS (присланный), затем свой; не
+# подошёл — код 4.
+RESTORE_SRC="" RESTORE_PASS=""
 _restore_prepare() {
   local src="$1" tmp d
   RESTORE_SRC=""
@@ -120,6 +211,14 @@ _restore_prepare() {
   fi
   [[ -f "$src" ]] || { err "Нет файла $src"; return 1; }
   mktmp tmp -d || return 1
+  if backup_encrypted "$src"; then
+    need_cmds openssl:openssl || return 1
+    if [[ -n "$RESTORE_PASS" ]] && _backup_decrypt "$src" "$tmp/dec.tar.gz" "$RESTORE_PASS"; then :
+    elif backup_key_on && _backup_decrypt "$src" "$tmp/dec.tar.gz" "$BACKUP_KEY"; then :
+    elif [[ -n "$RESTORE_PASS" ]]; then err "Пароль не подходит к бэкапу (или файл повреждён)"; return 4
+    else err "Бэкап зашифрован — нужен пароль"; return 4; fi
+    src="$tmp/dec.tar.gz"
+  fi
   py safe-untar "$src" "$tmp/x" || { err "Архив не распаковался"; return 1; }
   if [[ -f "$tmp/x/awg0.conf" ]]; then d="$tmp/x"
   elif [[ -f "$tmp/x$SERVER_CONF" ]]; then d="$tmp/x"; cp -a "$tmp/x$SERVER_CONF" "$d/awg0.conf"
@@ -276,6 +375,50 @@ _restore_hooks() {  # конфиг [разрешённые команды…]
   warn "Команды убраны из ${conf##*/}"
 }
 
+# Подготовить бэкап; зашифрованный без подходящего пароля — спросить его
+# (до трёх раз). Пароль — во временный файл (RESTORE_PASS), не в аргументы.
+_restore_ask_pass() {  # путь
+  local rc=0 try pw f
+  _restore_prepare "$1" || rc=$?
+  (( rc == 4 )) || return "$rc"
+  mktmp f || return 1
+  for try in 1 2 3; do
+    IFS= read -rs -p "  Пароль бэкапа (Enter — отмена): " pw; echo ""
+    [[ -n "$pw" ]] || return 1
+    printf '%s\n' "$pw" > "$f"
+    RESTORE_PASS="$f"; rc=0
+    _restore_prepare "$1" || rc=$?
+    (( rc == 4 )) || return "$rc"
+  done
+  return 4
+}
+
+do_backup_key() {
+  local c pw pw2
+  echo ""
+  hdr "Пароль бэкапов"
+  echo -e "  ${D}Файлы бэкапов, которые уходят с сервера (в Telegram, скачивание в панели),"
+  echo -e "  шифруются паролем (AES-256). Бэкапы на сервере остаются как есть. На этом сервере"
+  echo -e "  восстановление без ввода пароля; на другом — спросит его. На компьютере:"
+  echo -e "  openssl enc -d -aes-256-cbc -pbkdf2 -iter $BACKUP_ENC_ITER -md sha256 -in ФАЙЛ.enc -out бэкап.tar.gz${N}"
+  echo ""
+  if backup_key_on; then echo -e "  Пароль : ${G}● задан${N}"; else echo -e "  Пароль : ${D}○ не задан${N}"; fi
+  echo ""
+  echo -e "  ${C}1)${N} $(backup_key_on && echo "Сменить" || echo "Задать") пароль"
+  backup_key_on && echo -e "  ${C}2)${N} Убрать пароль"
+  echo -e "  ${W}0)${N} ← Назад"
+  read_choice c "${C}  Выбор: ${N}" 0 "$(backup_key_on && echo 2 || echo 1)" 0
+  case "$c" in
+    1) IFS= read -rs -p "  Новый пароль (8–128 символов): " pw; echo ""
+       [[ -n "$pw" ]] || return 0
+       # Ввод не виден: опечатка — и зашифрованные бэкапы не открыть
+       IFS= read -rs -p "  Ещё раз: " pw2; echo ""
+       [[ "$pw" == "$pw2" ]] || { err "Пароли не совпали — пароль не изменён"; return 1; }
+       printf '%s\n' "$pw" | backup_key_set ;;
+    2) backup_key_clear ;;
+  esac
+}
+
 do_restore() {
   local list=() i c src name opts=() bad
   mapfile -t list < <(_restore_list)
@@ -288,7 +431,7 @@ do_restore() {
   read_choice c "${C}  Бэкап (Enter = 1, 0 — отмена): ${N}" 0 "${#list[@]}" 1
   (( c )) || return 0
   src="${list[$((c - 1))]}"
-  _restore_prepare "$src" || return 1
+  _restore_ask_pass "$src" || return 1
   bad=$(py meta-check "$RESTORE_SRC/awg0.conf" 2>/dev/null | awk -F'\t' '{printf "%s%s (%s)", (NR > 1 ? ", " : ""), $1, $2}')
   [[ -n "$bad" ]] && warn "В бэкапе у клиентов повреждены метки: $bad — срок или лимит: клиент будет заблокирован до исправления"
   read_confirm "${R}  Текущий сервер будет заменён. Продолжить? (введи yes): ${N}" || return 0
@@ -303,7 +446,7 @@ backup_restore() {
   local src="$1" label="${1##*/}" port f bad
   shift
   command -v awg-quick &>/dev/null || { err "Нет awg-quick — сначала установи компоненты (Сервер → Установить компоненты)"; return 1; }
-  _restore_prepare "$src" || return 1
+  _restore_prepare "$src" || return $?
   src="$RESTORE_SRC"
   awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   [[ -f "$SERVER_CONF" ]] && cp -a "$SERVER_CONF" "$SERVER_CONF.pre_restore.$(date +%s)"

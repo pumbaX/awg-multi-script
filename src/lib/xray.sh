@@ -206,6 +206,7 @@ xray_del_tag() {  # тег
   n=$(_xray_peers_untag "$1")
   _xray_prepare
   ok "Выход $1 удалён"
+  [[ "$1" == sub_* ]] && xray_sub_on && info "Это сервер подписки — при её обновлении он вернётся"
   (( ${n:-0} )) && info "Его клиенты ($n) — теперь на выходе по умолчанию"
   xray_is_up && xray_restart
   return 0
@@ -402,6 +403,308 @@ xray_ru_set() {
   return 0
 }
 
+# ── Подписка ──────────────────────────────────────────────
+# Адрес подписки — секрет (в нём ключ доступа к серверам провайдера): лежит в
+# sub.conf (600), в аргументы команд и журналы не попадает — curl получает
+# его конфигом через stdin, на экранах только сайт. Серверы подписки — выходы
+# с тегами sub_…: обновление заменяет только их, свои выходы (ссылкой) не
+# трогает. Каждый сервер проверяется на самом Xray; конфиг, который Xray не
+# принял, и подписка, через новые серверы которой не пошёл трафик, —
+# откатываются к прежним выходам. Таймер раз в час смотрит срок и идёт через
+# замок API — не мешает правкам из бота и панели.
+XSUB_WHY=""
+_xsub_get() { sed -n "s/^$1=//p" "$XRAY_SUB_CONF" 2>/dev/null | tail -1; }
+# Число из sub.conf (файл мог прийти из чужого бэкапа — в арифметику только цифры)
+_xsub_num() { local v; v=$(_xsub_get "$1"); [[ "$v" =~ ^[0-9]{1,20}$ ]] && echo "$v" || echo 0; }
+
+_xsub_set() {  # КЛЮЧ=ЗНАЧЕНИЕ...
+  local kv keys=()
+  mkdir -p "$XRAY_DIR"
+  for kv in "$@"; do keys+=("${kv%%=*}"); done
+  { grep -vE "^($(IFS='|'; echo "${keys[*]}"))=" "$XRAY_SUB_CONF" 2>/dev/null
+    for kv in "$@"; do printf '%s\n' "${kv//[$'\n\r']/ }"; done; } | write_file "$XRAY_SUB_CONF" 600
+}
+
+_xsub_fail() { XSUB_WHY="$1"; err "$1"; return 1; }
+
+xray_sub_on() { [[ -n "$(_xsub_get URL)" ]]; }
+
+# Сайт подписки для показа — адрес целиком секрет
+xray_sub_site() {  # [адрес]
+  local a="${1:-$(_xsub_get URL)}"
+  a="${a#*://}"; a="${a%%[/?#]*}"; echo "${a##*@}"
+}
+
+# Адрес: https (http — только с подтверждением insecure: его могут подменить
+# по дороге), без пробелов, кавычек и обратной косой — он уходит в конфиг curl
+_xsub_url_ok() {  # адрес 0|1
+  local u="$1" site
+  if (( ${#u} > 2048 )) || [[ -z "$u" || "$u" == *[[:space:]]* || "$u" == *[[:cntrl:]]* || "$u" == *'"'* || "$u" == *'\'* ]]; then
+    _xsub_fail "Адрес подписки: без пробелов и кавычек, не длиннее 2048 знаков"; return 1
+  fi
+  case "$u" in
+    https://*) ;;
+    http://*) [[ "$2" == 1 ]] || { _xsub_fail "Подписка по http: её могут подменить по дороге — нужен https или подтверждение"; return 3; } ;;
+    *) _xsub_fail "Адрес подписки начинается с https://"; return 1 ;;
+  esac
+  site=$(xray_sub_site "$u")
+  [[ -n "${site%%:*}" && "$site" != :* ]] || { _xsub_fail "В адресе подписки нет сайта"; return 1; }
+}
+
+# Скачать подписку в каталог: body и headers. Ответ больше XRAY_SUB_MAX — отказ.
+_xsub_fetch() {  # адрес 0|1 каталог
+  local url="$1" dir="$3" proto='=https' rc size why
+  [[ "$2" == 1 ]] && proto='=https,http'
+  printf 'url = "%s"\n' "$url" \
+    | curl -K - -sS -f -L --max-redirs 3 --proto "$proto" --proto-redir "$proto" --connect-timeout 15 \
+        --max-time 60 -A "$XRAY_SUB_UA" -D "$dir/headers" -o - 2>"$dir/err" \
+    | head -c $((XRAY_SUB_MAX + 1)) > "$dir/body"
+  rc=${PIPESTATUS[1]}
+  size=$(stat -c %s "$dir/body" 2>/dev/null || echo 0)
+  (( size > XRAY_SUB_MAX )) && { _xsub_fail "Подписка больше 2 МБ — это не список серверов"; return 1; }
+  (( rc == 0 )) && return 0
+  why=$(tail -1 "$dir/err" 2>/dev/null | sed 's/^curl: ([0-9]*) //')
+  why="${why//"$url"/$(xray_sub_site "$url")}"
+  case "$rc" in
+    1) why="перенаправление на другой протокол — запрещено" ;;
+    6) why="сайт подписки не найден (DNS)" ;;
+    7) why="сайт подписки недоступен" ;;
+    22) why="сервер подписки ответил ошибкой ${why##*error: }" ;;
+    28) why="сервер подписки не ответил за 60 с" ;;
+    47) why="слишком много перенаправлений" ;;
+  esac
+  _xsub_fail "Подписка не скачалась: ${why:-curl $rc}"
+}
+
+_xsub_count() { python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["items"]))' "$1"; }
+
+# Серверы подписки, которых этот Xray не принимает, — убрать (печатает их имена).
+# Сначала все разом; не принят конфиг — по одному.
+_xsub_probe() {  # parsed.json
+  local probe n i bad=()
+  probe=$(mktemp --suffix=.json /tmp/awg2.XXXXXX) || return 1
+  if py xray-sub-probe "$1" "$probe" && xray_test "$probe" >/dev/null; then rm -f "$probe"; return 0; fi
+  n=$(_xsub_count "$1") || { rm -f "$probe"; return 1; }
+  for ((i = 0; i < n; i++)); do
+    { py xray-sub-probe "$1" "$probe" "$i" && xray_test "$probe" >/dev/null; } || bad+=("$i")
+  done
+  rm -f "$probe"
+  (( ${#bad[@]} )) && py xray-sub-drop "$1" "${bad[@]}"
+  return 0
+}
+
+_xsub_rollback() {  # каталог копий
+  local f
+  cp -a "$1/config.json" "$XRAY_CONF"
+  if [[ -f "$1/sub.list" ]]; then cp -a "$1/sub.list" "$XRAY_SUB_LIST"; else rm -f "$XRAY_SUB_LIST"; fi
+  for f in "$XRAY_PEERS" "$XRAY_PEERS.wgobf"; do [[ -f "$1/${f##*/}" ]] && cp -a "$1/${f##*/}" "$f"; done
+  return 0
+}
+
+# Туннель Xray включён (работает или должен работать)
+_xray_enabled() { [[ -f "$XRAY_STATE" ]] || xray_is_up; }
+
+# Скачать, разобрать, проверить и применить подписку; записать её сведения.
+# Работающий туннель перезапускается, только если серверы поменялись.
+_xray_sub_sync() {  # адрес 0|1
+  local d res changed gone=() n bad moved="" why meta=() f
+  XSUB_WHY=""
+  mktmp d -d || return 1
+  _xsub_fetch "$1" "$2" "$d" || return 1
+  if ! py xray-sub-parse "$d/body" "$d/parsed.json" 2>"$d/perr"; then
+    _xsub_fail "Подписка: $(tail -1 "$d/perr")"; return 1
+  fi
+  bad=$(_xsub_probe "$d/parsed.json") || { _xsub_fail "Серверы подписки не проверены"; return 1; }
+  [[ -n "$bad" ]] && warn "Этот Xray не принимает серверы: $(paste -sd, <<< "$bad" | sed 's/,/, /g')"
+  n=$(_xsub_count "$d/parsed.json") || n=0
+  (( n > 0 )) || { _xsub_fail "Ни один сервер подписки не принят этим Xray — обнови Xray (Установить / обновить)"; return 1; }
+  mkdir -p "$d/bak" && cp -a "$XRAY_CONF" "$d/bak/config.json" || return 1
+  for f in "$XRAY_SUB_LIST" "$XRAY_PEERS" "$XRAY_PEERS.wgobf"; do [[ -f "$f" ]] && cp -a "$f" "$d/bak/"; done
+  if ! res=$(py xray-sub-apply "$XRAY_CONF" "$d/parsed.json" "$XRAY_SUB_LIST"); then
+    _xsub_rollback "$d/bak"; _xsub_fail "Конфиг Xray не записан"; return 1
+  fi
+  changed=$(python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); print(int(d["changed"])); print("\n".join(d["gone"]))' "$res")
+  mapfile -t gone < <(tail -n +2 <<< "$changed" | grep .)
+  changed=$(head -1 <<< "$changed")
+  (( ${#gone[@]} )) && moved=$(_xray_peers_untag "${gone[@]}")
+  if ! _xray_prepare || ! why=$(xray_test); then
+    _xsub_rollback "$d/bak"
+    _xsub_fail "Xray не принял конфиг с подпиской — оставлены прежние выходы${why:+: $(head -1 <<< "$why")}"; return 1
+  fi
+  if (( changed )) && _xray_enabled; then
+    info "Серверы подписки поменялись — перезапускаю туннель"
+    if ! xray_restart; then
+      _xsub_rollback "$d/bak"; _xray_prepare || true
+      warn "Туннель с новыми серверами не поднялся — возвращаю прежние"
+      xray_up || true
+      _xsub_fail "Туннель с серверами подписки не поднялся (через них не идёт трафик) — оставлены прежние"; return 1
+    fi
+  fi
+  mapfile -t meta < <(py xray-sub-meta "$d/headers")
+  _xsub_set "${meta[@]}" "COUNT=$n" "SKIPPED=$(python3 -I -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("skipped", 0)))' "$d/parsed.json")" \
+    "UPDATED=$(date +%s)" "CHECKED=$(date +%s)" "ERROR="
+  ok "Подписка: серверов $n$( (( changed )) || echo ", без изменений")"
+  (( ${moved:-0} )) && info "Клиенты ушедших серверов ($moved) — на выходе по умолчанию"
+  return 0
+}
+
+# Задать подписку (сменить адрес): сразу скачивается и применяется; не вышло —
+# прежняя подписка остаётся как была.
+xray_sub_set() {  # адрес [insecure]
+  local url="$1" ins=0 rc=0
+  [[ "${2:-}" == insecure ]] && ins=1
+  xray_installed || { err "Сначала установи Xray"; return 1; }
+  _xsub_url_ok "$url" "$ins" || return $?
+  (( ins )) && warn "Подписка по http: её могут подменить по дороге"
+  _xray_sub_sync "$url" "$ins" || return 1
+  _xsub_set "URL=$url" "INSECURE=$ins"
+  _xray_sub_timer on
+  touch "$XRAY_DIR/.sub-heal" 2>/dev/null || true
+  log_info "xray: подписка $(xray_sub_site "$url")"
+  info "Обновляется сама раз в $(xray_sub_every) ч"
+  return "$rc"
+}
+
+xray_sub_every() {
+  local h; h=$(_xsub_num INTERVAL)
+  (( h >= 1 && h <= 24 )) && echo "$h" || echo "$XRAY_SUB_EVERY"
+}
+
+# Срок: прошёл интервал с удачного обновления; не чаще раза в час (и после неудачи)
+_xsub_due() {
+  local now; now=$(date +%s)
+  (( now - $(_xsub_num CHECKED) >= 3300 )) || return 1
+  (( now - $(_xsub_num UPDATED) >= $(xray_sub_every) * 3600 - 300 ))
+}
+
+xray_sub_update() {  # [auto] — auto: только если подошёл срок (таймер)
+  local url ins
+  xray_installed || { err "Xray не установлен"; return 1; }
+  if ! xray_sub_on; then [[ "${1:-}" == auto ]] && return 0; err "Подписка не задана"; return 1; fi
+  if [[ "${1:-}" == auto ]]; then
+    touch "$XRAY_DIR/.sub-heal" 2>/dev/null || true
+    _xsub_due || return 0
+  fi
+  url=$(_xsub_get URL); ins=0; [[ "$(_xsub_get INSECURE)" == 1 ]] && ins=1
+  if _xsub_url_ok "$url" "$ins" && _xray_sub_sync "$url" "$ins"; then return 0; fi
+  _xsub_set "CHECKED=$(date +%s)" "ERROR=${XSUB_WHY:-не обновилась}"
+  log_info "xray: подписка не обновилась — ${XSUB_WHY:-?}"
+  return 1
+}
+
+# Убрать подписку и её серверы. Если туннель держится только на них — отказ.
+xray_sub_off() {
+  local res changed gone=() subs=() moved=""
+  xray_installed || { err "Xray не установлен"; return 1; }
+  xray_sub_on || [[ -s "$XRAY_SUB_LIST" ]] || { info "Подписки нет"; return 0; }
+  if ! xray_tags | grep -qv '^sub_' && _xray_enabled; then
+    err "Туннель Xray работает только на серверах подписки — сначала выключи его или добавь свой выход ссылкой"
+    return 1
+  fi
+  res=$(py xray-sub-apply "$XRAY_CONF" - "$XRAY_SUB_LIST") || { err "Конфиг Xray не записан"; return 1; }
+  changed=$(python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); print(int(d["changed"])); print("\n".join(d["gone"]))' "$res")
+  mapfile -t gone < <(tail -n +2 <<< "$changed" | grep .)
+  changed=$(head -1 <<< "$changed")
+  # Клиенты на любом сервере подписки (и уже удалённом руками) — на выход по умолчанию
+  mapfile -t subs < <(cat "$XRAY_PEERS" "$XRAY_PEERS.wgobf" 2>/dev/null | awk -F'|' '$2 ~ /^sub_/ {print $2}' | sort -u)
+  (( ${#subs[@]} )) && moved=$(_xray_peers_untag "${subs[@]}")
+  _xray_prepare || true
+  rm -f "$XRAY_SUB_CONF" "$XRAY_SUB_LIST" "$XRAY_DIR/.sub-heal"
+  _xray_sub_timer off
+  log_info "xray: подписка убрана"
+  ok "Подписка убрана${gone[*]:+, её серверов: ${#gone[@]}}"
+  (( ${moved:-0} )) && info "Клиенты её серверов ($moved) — на выходе по умолчанию"
+  if (( changed )) && _xray_enabled; then info "Перезапускаю туннель"; xray_restart || true; fi
+  return 0
+}
+
+_xray_sub_timer() {  # on|off
+  if [[ "$1" == off ]]; then remove_unit "$XRAY_SUB_TIMER" "${XRAY_SUB_TIMER%.timer}.service"; return 0; fi
+  write_unit "${XRAY_SUB_TIMER%.timer}.service" <<EOF
+[Unit]
+Description=AWG Toolza — подписка Xray: обновить, если подошёл срок
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=API_LOCK_WAIT=900
+TimeoutStartSec=1200
+ExecStart=$SCRIPT_PATH api xray sub update auto
+EOF
+  write_unit "$XRAY_SUB_TIMER" <<'EOF'
+[Unit]
+Description=AWG Toolza — подписка Xray: проверка раз в час
+
+[Timer]
+OnBootSec=300
+OnUnitActiveSec=3600
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl enable --now "$XRAY_SUB_TIMER" &>/dev/null || warn "Таймер подписки не включился"
+}
+
+# Сторож: таймера нет (восстановили бэкап, Xray переустановлен) — поставить;
+# молчит больше трёх часов — перезапустить
+xray_sub_watchdog() {
+  local f="$XRAY_DIR/.sub-heal" age
+  xray_sub_on && xray_installed || return 0
+  if ! unit_enabled "$XRAY_SUB_TIMER"; then _xray_sub_timer on; touch "$f" 2>/dev/null; return 0; fi
+  [[ -f "$f" ]] || { touch "$f" 2>/dev/null; return 0; }
+  age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
+  (( age < 10800 )) && return 0
+  touch "$f"
+  timer_heal "$XRAY_SUB_TIMER"
+}
+
+xray_sub_status() {
+  local upd err tot exp
+  if ! xray_sub_on; then echo -e "  Подписка  : ${D}○ не задана${N}"; return 0; fi
+  upd=$(_xsub_num UPDATED); err=$(_xsub_get ERROR)
+  echo -e "  Подписка  : ${W}$(xray_sub_site)${N}$([[ -n "$(_xsub_get TITLE)" ]] && echo " ${D}($(_xsub_get TITLE))${N}") — серверов $(_xsub_num COUNT)"
+  (( upd )) && echo -e "  ${D}  обновлена $(date -d "@$upd" '+%d.%m %H:%M'), раз в $(xray_sub_every) ч${N}"
+  tot=$(_xsub_num TOTAL); exp=$(_xsub_num EXPIRE)
+  (( tot )) && echo -e "  ${D}  трафик $(fmt_bytes $(( $(_xsub_num UP) + $(_xsub_num DOWN) ))) из $(fmt_bytes "$tot")${N}"
+  (( exp )) && echo -e "  ${D}  действует до $(date -d "@$exp" '+%d.%m.%Y')${N}"
+  [[ -n "$err" ]] && echo -e "  ${Y}  ▲ $err${N}"
+  return 0
+}
+
+do_xray_sub_menu() {
+  local c url
+  xray_installed || { err "Сначала установи Xray"; return 1; }
+  echo ""
+  hdr "Подписка Xray"
+  echo -e "  ${D}Адрес подписки провайдера (3x-ui, Marzban, Remnawave…): её серверы становятся выходами"
+  echo -e "  Xray и обновляются сами. Свои выходы (ссылкой) не трогаются.${N}"
+  echo ""
+  xray_sub_status
+  echo ""
+  echo -e "  ${C}1)${N} $(xray_sub_on && echo "Сменить адрес" || echo "Задать адрес")"
+  xray_sub_on && echo -e "  ${C}2)${N} Обновить сейчас"
+  xray_sub_on && echo -e "  ${C}3)${N} Убрать подписку ${D}(и её серверы)${N}"
+  echo -e "  ${W}0)${N} ← Назад"
+  read_choice c "${C}  Выбор: ${N}" 0 "$(xray_sub_on && echo 3 || echo 1)" 0
+  case "$c" in
+    1) read_line url "${C}  Адрес подписки (https://…): ${N}"
+       url="${url//[[:space:]]/}"
+       [[ -n "$url" ]] || return 0
+       if [[ "$url" == http://* ]]; then
+         warn "Адрес по http: подписку могут подменить по дороге"
+         ask_yes "  Всё равно использовать? [y/N]: " n || return 0
+         xray_sub_set "$url" insecure
+       else
+         xray_sub_set "$url"
+       fi ;;
+    2) xray_sub_update ;;
+    3) read_confirm "${R}  Убрать подписку и её серверы? (введи yes): ${N}" || return 0
+       xray_sub_off ;;
+  esac
+}
+
 # ── Маршрутизация (awg-xray-routing.service) ──────────────
 xray_routing_run() {
   local i nat=""
@@ -567,7 +870,8 @@ xray_remove() {
 
 xray_uninstall() {
   xray_down quiet
-  remove_unit "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" awg-xray-rugeo.timer awg-xray-rugeo.service
+  remove_unit "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" awg-xray-rugeo.timer awg-xray-rugeo.service \
+    "$XRAY_SUB_TIMER" "${XRAY_SUB_TIMER%.timer}.service"
   rm -rf "$XRAY_DIR" "$XRAY_BIN" "$XRAY_ROUTING_SCRIPT" \
     "$XRAY_ASSET_DIR"/geoip.dat "$XRAY_ASSET_DIR"/geosite.dat "$XRAY_ASSET_DIR"/geo{ip,site}_RU.dat
   ok "Xray удалён"
@@ -599,6 +903,7 @@ xray_status() {
     echo -e "  ${D}  $name → $tag$(xray_tags | grep -qxF "$tag" || echo " (выхода нет — по умолчанию)")${N}"
   done
   xray_ru_on && echo -e "  РФ-сайты  : ${G}напрямую${N}"
+  xray_sub_on && xray_sub_status
   return 0
 }
 
@@ -660,6 +965,7 @@ do_xray_menu() {
     echo ""
     echo -e "  ${C}1)${N} Установить / обновить"
     echo -e "  ${C}2)${N} Добавить выход (ссылка)"
+    echo -e "  ${C}s)${N} Подписка $(xray_sub_on && echo -e "${G}● $(xray_sub_site)${N}" || echo -e "${D}○ нет${N}")"
     echo -e "  ${C}3)${N} Удалить выход"
     echo -e "  ${C}4)${N} Балансировщик"
     echo -e "  ${C}m)${N} Выход по умолчанию"
@@ -672,10 +978,11 @@ do_xray_menu() {
     echo -e "  ${C}r)${N} РФ-сайты напрямую $(xray_ru_on && echo -e "${G}● вкл${N}" || echo -e "${D}○ выкл${N}")"
     echo -e "  ${R}d)${N} Удалить Xray"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор: ${N}" 0 9 0 "r|d|m|o"
+    read_choice c "${C}  Выбор: ${N}" 0 9 0 "r|d|m|o|s"
     case "$c" in
       1) xray_install || true ;;
       2) xray_add_outbound || true ;;
+      s) do_xray_sub_menu || true ;;
       3) xray_del_outbound || true ;;
       4) xray_balancer_menu || true ;;
       m) xray_main_menu || true ;;

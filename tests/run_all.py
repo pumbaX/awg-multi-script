@@ -24,7 +24,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 # По убыванию длительности: долгие — первыми, короткие заполняют промежутки
 # (веб-панель — в конце: ей всё равно ждать, пока браузер занят панелью)
-SUITES = ["panel", "toolza", "bot", "regress_f2f3", "kernel_routing", "amnezia", "share_persistence",
+SUITES = ["panel", "toolza", "bot", "regress_f2f3", "kernel_routing", "amnezia", "xray_sub", "share_persistence",
           "meta_menu", "cps", "deep_robustness", "api_lock", "net", "admins", "web"]
 BROWSER = {"panel", "web"}
 

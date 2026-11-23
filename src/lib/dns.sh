@@ -1,6 +1,8 @@
 # Шифрованный DNS: dnscrypt-proxy на 127.0.2.1:53 (systemd-сокет пакета
-# Debian/Ubuntu), DNS-запросы клиентов перехватываются DNAT'ом с awg0 и уходят
-# наружу по DoH. DNS в конфигах клиентов не меняется — перехват прозрачный.
+# Debian/Ubuntu), DNS-запросы клиентов перехватываются DNAT'ом с awg0 и wgobf0
+# (WG + обфускатор) и уходят наружу по DoH. DNS в конфигах клиентов не
+# меняется — перехват прозрачный. Правила на wgobf0 ставятся и без него:
+# iptables не требует интерфейса, обфускатор поднимут — перехват уже на месте.
 #
 # DoT (853) режется в mangle PREROUTING, а не в FORWARD: PostUp сервера
 # вставляет «FORWARD -i awg0 -j ACCEPT» первым правилом при каждом подъёме
@@ -34,6 +36,9 @@ DNS_POPULAR=(
 dns_installed() { command -v dnscrypt-proxy &>/dev/null && [[ -f "$DNS_PROXY_STATE" ]]; }
 dns_running()   { unit_active "$DNS_UNIT" || unit_active "$DNS_SOCKET"; }
 
+# Интерфейсы клиентов, чей DNS перехватывается
+dns_ifaces() { echo "$AWG_IF" "$WGOBF_IF"; }
+
 dns_resolves() {
   command -v dig &>/dev/null || return 0
   timeout 4 dig "@$DNS_PROXY_ADDR" -p "$DNS_PROXY_PORT" cloudflare.com +short +tries=1 +time=2 2>/dev/null \
@@ -49,13 +54,15 @@ dns_state_line() {
 # ── Правила ───────────────────────────────────────────────
 # Работают и в служебных скриптах (emit_script).
 dns_rules_up() {
-  local p to="$DNS_PROXY_ADDR:$DNS_PROXY_PORT"
-  # DNAT в 127.0.0.0/8 ядро пропускает только с route_localnet
+  local p i to="$DNS_PROXY_ADDR:$DNS_PROXY_PORT"
+  # DNAT в 127.0.0.0/8 ядро пропускает только с route_localnet (all — для всех интерфейсов)
   sysctl -qw net.ipv4.conf.all.route_localnet=1 2>/dev/null || true
-  for p in udp tcp; do
-    ipt_add -t nat PREROUTING -i "$AWG_IF" -p "$p" --dport 53 -j DNAT --to-destination "$to" -m comment --comment "$DNS_TAG"
-    ipt_ins INPUT -i "$AWG_IF" -d "$DNS_PROXY_ADDR" -p "$p" --dport "$DNS_PROXY_PORT" -j ACCEPT -m comment --comment "$DNS_TAG"
-    ipt_add -t mangle PREROUTING -i "$AWG_IF" -p "$p" --dport 853 -j DROP -m comment --comment "$DNS_TAG"
+  for i in $(dns_ifaces); do
+    for p in udp tcp; do
+      ipt_add -t nat PREROUTING -i "$i" -p "$p" --dport 53 -j DNAT --to-destination "$to" -m comment --comment "$DNS_TAG"
+      ipt_ins INPUT -i "$i" -d "$DNS_PROXY_ADDR" -p "$p" --dport "$DNS_PROXY_PORT" -j ACCEPT -m comment --comment "$DNS_TAG"
+      ipt_add -t mangle PREROUTING -i "$i" -p "$p" --dport 853 -j DROP -m comment --comment "$DNS_TAG"
+    done
   done
 }
 
@@ -76,9 +83,25 @@ dns_rules_down() {
   fi
 }
 
+# Перехват на месте на всех интерфейсах клиентов (после обновления со старой
+# версии правил wgobf0 нет — сторож их доставит)
 dns_rules_ok() {
-  iptables -t nat -C PREROUTING -i "$AWG_IF" -p udp --dport 53 -j DNAT \
-    --to-destination "$DNS_PROXY_ADDR:$DNS_PROXY_PORT" -m comment --comment "$DNS_TAG" 2>/dev/null
+  local i
+  for i in $(dns_ifaces); do
+    iptables -t nat -C PREROUTING -i "$i" -p udp --dport 53 -j DNAT \
+      --to-destination "$DNS_PROXY_ADDR:$DNS_PROXY_PORT" -m comment --comment "$DNS_TAG" 2>/dev/null || return 1
+  done
+}
+
+# UFW: вход к dnscrypt-proxy с интерфейсов клиентов (ufw allow не дублирует)
+dns_ufw_allow() {
+  local i p
+  ufw_active || return 0
+  for i in $(dns_ifaces); do
+    for p in udp tcp; do
+      ufw allow in on "$i" to "$DNS_PROXY_ADDR" port "$DNS_PROXY_PORT" proto "$p" comment "$DNS_TAG" &>/dev/null || true
+    done
+  done
 }
 
 # Точка входа awg-dns-persist.service: ждёт awg0 и ставит правила.
@@ -109,7 +132,7 @@ dns_health_run() {
 }
 
 _dns_emit_helpers() {
-  local common=(AWG_IF DNS_TAG DNS_PROXY_ADDR DNS_PROXY_PORT ipt_add ipt_ins dns_rules_up dns_rules_ok)
+  local common=(AWG_IF WGOBF_IF DNS_TAG DNS_PROXY_ADDR DNS_PROXY_PORT ipt_add ipt_ins dns_ifaces dns_rules_up dns_rules_ok)
   emit_script "$DNS_PERSIST_SCRIPT" 'dns_persist_run' "${common[@]}" dns_persist_run || return 1
   emit_script "$DNS_HEALTH_SCRIPT" 'dns_health_run' "${common[@]}" DNS_HEALTH_LOG dns_health_run || return 1
   write_unit awg-dns-persist.service <<EOF
@@ -228,15 +251,12 @@ dns_install() {  # [force] — включить поверх стороннег�
   fi
   dns_rules_down
   dns_rules_up
-  if ufw_active; then
-    ufw allow in on "$AWG_IF" to "$DNS_PROXY_ADDR" port "$DNS_PROXY_PORT" proto udp comment "$DNS_TAG" &>/dev/null || true
-    ufw allow in on "$AWG_IF" to "$DNS_PROXY_ADDR" port "$DNS_PROXY_PORT" proto tcp comment "$DNS_TAG" &>/dev/null || true
-  fi
+  dns_ufw_allow
   echo "net.ipv4.conf.all.route_localnet=1" | write_file "$DNS_SYSCTL" 644
   _dns_emit_helpers || return 1
   printf 'enabled=true\naddr=%s\nport=%s\ninstalled_at=%s\n' "$DNS_PROXY_ADDR" "$DNS_PROXY_PORT" "$(date +%s)" \
     | write_file "$DNS_PROXY_STATE" 644
-  ok "Шифрованный DNS включён: запросы клиентов идут по DoH, DoT (853) закрыт"
+  ok "Шифрованный DNS включён: запросы клиентов (AWG и WG + обфускатор) идут по DoH, DoT (853) закрыт"
   info "Проверка с клиента: https://1.1.1.1/help → «Using DNS over HTTPS: Yes»"
   log_info "dnscrypt-proxy включён"
 }
@@ -257,7 +277,7 @@ dns_status() {
   if ! dns_running; then echo -e "  Статус    : ${D}○ служба остановлена${N}"
   elif dns_resolves; then echo -e "  Статус    : ${G}● работает${N} ${D}($DNS_PROXY_ADDR:$DNS_PROXY_PORT)${N}"
   else echo -e "  Статус    : ${Y}▲ служба запущена, но не резолвит${N}"; fi
-  if dns_rules_ok; then echo -e "  Перехват  : ${G}● DNS клиентов идёт через DoH, DoT закрыт${N}"
+  if dns_rules_ok; then echo -e "  Перехват  : ${G}● DNS клиентов AWG и WG + обфускатора — через DoH, DoT закрыт${N}"
   elif dns_installed; then echo -e "  Перехват  : ${R}▲ правил нет — Перезапустить (2)${N}"
   else echo -e "  Перехват  : ${D}○ выключен${N}"; fi
   unit_active awg-dns-healthcheck.timer && echo -e "  Health    : ${G}● раз в 2 минуты${N}"
@@ -329,14 +349,16 @@ dns_remove() {
 }
 
 dns_uninstall() {  # [purge] — удалить и пакет
-  local purge="${1:-}"
+  local purge="${1:-}" i
   remove_unit awg-dns-healthcheck.timer awg-dns-healthcheck.service awg-dns-persist.service
   rm -f "$DNS_HEALTH_SCRIPT" "$DNS_PERSIST_SCRIPT" "$DNS_SYSCTL"
   dns_rules_down
   if command -v ufw &>/dev/null; then
     ufw_delete_matching "$DNS_TAG"
-    ufw delete allow in on "$AWG_IF" to "$DNS_PROXY_ADDR" port "$DNS_PROXY_PORT" proto udp &>/dev/null || true
-    ufw delete allow in on "$AWG_IF" to "$DNS_PROXY_ADDR" port "$DNS_PROXY_PORT" proto tcp &>/dev/null || true
+    for i in $(dns_ifaces); do
+      ufw delete allow in on "$i" to "$DNS_PROXY_ADDR" port "$DNS_PROXY_PORT" proto udp &>/dev/null || true
+      ufw delete allow in on "$i" to "$DNS_PROXY_ADDR" port "$DNS_PROXY_PORT" proto tcp &>/dev/null || true
+    done
   fi
   sysctl -qw net.ipv4.conf.all.route_localnet=0 2>/dev/null || true
   systemctl disable --now "$DNS_UNIT" "$DNS_SOCKET" &>/dev/null || true

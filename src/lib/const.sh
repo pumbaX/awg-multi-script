@@ -60,6 +60,11 @@ _real_home() {
   echo "${home:-/root}"
 }
 BACKUP_DIR="$(_real_home)/awg_backup"
+# Пароль бэкапов: им шифруются файлы, которые уходят с сервера (бот, панель).
+# Число итераций в файле не хранится — расшифровка на компьютере берёт его из README
+BACKUP_KEY="$STATE_DIR/backup.key"           # пароль, первая строка; 600
+BACKUP_OUT="$STATE_DIR/backup-out"           # файлы на выдачу: забравший удаляет
+BACKUP_ENC_ITER=200000
 
 # ── Туннели ───────────────────────────────────────────────
 # Номера таблиц маршрутизации — общие для всех версий awg2.
@@ -131,6 +136,12 @@ XRAY_ROUTING_UNIT="awg-xray-routing.service"
 XRAY_CHECK_HINT="проверь ссылку выхода: она могла устареть или сервер выхода недоступен — «Диагностика» покажет, какой выход не отвечает"
 XRAY_ROUTING_SCRIPT="/usr/local/bin/awg2-xray-routing.sh"
 XRAY_RUGEO_URL="https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download"
+# Подписка Xray: адрес и состояние (адрес — секрет, в нём ключ доступа), имена серверов
+XRAY_SUB_CONF="$XRAY_DIR/sub.conf"; XRAY_SUB_LIST="$XRAY_DIR/sub.list"; XRAY_SUB_TIMER="awg-xray-sub.timer"
+# Клиент подписки представляется v2rayN: так панели (3x-ui, Marzban, Remnawave)
+# отдают список ссылками; ответ больше 2 МБ — не подписка; без заголовка
+# profile-update-interval — раз в 6 часов
+XRAY_SUB_UA="v2rayN/7.0" XRAY_SUB_MAX=2097152 XRAY_SUB_EVERY=6
 
 T2S_BIN="/usr/local/bin/tun2socks"
 T2S_DIR="/etc/tun2socks"
@@ -250,6 +261,24 @@ RUDIRECT_SRCS="https://raw.githubusercontent.com/ipverse/rir-ip/master/country/r
 # Настоящий список: ~8700 сетей, ~45 млн адресов IPv4. Короче или уже — оборван,
 # шире — подменён: прежний не заменяют. Своих записей — не больше 500
 RUDIRECT_MIN=2000 RUDIRECT_MINADDR=20000000 RUDIRECT_MAX4=134217728 RUDIRECT_USER_MAX=500
+
+# ── РФ мимо VPN (клиенты не ходят через сервер в сети России) ──
+# Список и его проверка — те же, что у «РФ напрямую» (RUDIRECT_SRCS и границы)
+RUBLOCK_DIR="$STATE_DIR/rublock"             # список и состояние
+RUBLOCK_CONF="$RUBLOCK_DIR/rublock.conf"     # ON, UPDATED, ERROR, ENTRIES, SRC
+RUBLOCK_SCRIPT="/usr/local/bin/awg2-rublock"
+RUBLOCK_LOG="/var/log/awg2-rublock.log"
+RUBLOCK_SET="awg2-rublock" RUBLOCK_TAG="awg2-rublock"
+# Метка «RB» в тех же старших битах, что у «РФ напрямую»; правило — «prohibit»
+# раньше и его, и туннелей: клиенту сразу отказ (ICMP), а не ожидание
+RUBLOCK_MARK="0x52420000/0xffff0000" RUBLOCK_PRIO=85
+RUBLOCK_UNIT="awg2-rublock.service" RUBLOCK_TIMER="awg2-rublock-update.timer"
+
+# ── Почта: исходящий SMTP (порт 25) клиентов закрыт ──
+SMTPBLOCK_FLAG="$STATE_DIR/smtpblock"        # есть файл — включено
+SMTPBLOCK_SCRIPT="/usr/local/bin/awg2-smtpblock"
+SMTPBLOCK_TAG="awg2-smtpblock"
+SMTPBLOCK_UNIT="awg2-smtpblock.service" SMTPBLOCK_TIMER="awg2-smtpblock-heal.timer"
 
 # ── Если туннель упал (режим на каждый туннель: напрямую или блокировать) ──
 TUNFAIL_CONF="/etc/awg2/tunnel-fail.conf"    # warp=block, xray=direct… (нет строки — direct)

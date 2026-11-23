@@ -36,7 +36,17 @@ _api_usage() { err "Использование: awg2 api $*"; return 2; }
 
 # stdin читается только командами, которым он нужен: иначе вызов из
 # скрипта с открытым, но пустым stdin ждал бы его конца вечно.
-_api_wants_stdin() { [[ "$1 ${2:-}" == "exits add" || "$1 ${2:-}" == "warp import" ]]; }
+_api_wants_stdin() {
+  case "$1 ${2:-}" in
+    "exits add"|"warp import") return 0 ;;
+    # Пароль бэкапа — только когда его явно передают словом «pass»
+    "backup inspect"|"backup restore") [[ " ${*:3} " == *" pass "* ]] ;;
+    "backup key") [[ "${3:-}" == set ]] ;;
+    # Адрес подписки — секрет: через stdin, не в аргументах (их видно в ps)
+    "xray sub") [[ "${3:-}" == set ]] ;;
+    *) return 1 ;;
+  esac
+}
 _api_stdin() {
   (( API_STDIN_READ )) && return 0
   API_STDIN_READ=1
@@ -480,18 +490,43 @@ _api_backup() {
           "$(stat -c %Y "$p")" "$(du -sb "$p" 2>/dev/null | cut -f1)"
       done < <(_restore_list) | api_rows path name full:b time:n size:n ;;
     inspect)
-      [[ -n "${1:-}" ]] || { _api_usage "backup inspect ПУТЬ"; return; }
-      _restore_prepare "$1" || return 1
-      { _kv clients:n "$(find "$RESTORE_SRC" -maxdepth 1 -name '*_awg[23].conf' | grep -c . || true)"
+      [[ -n "${1:-}" ]] || { _api_usage "backup inspect ПУТЬ [pass] (pass — пароль в stdin)"; return; }
+      _api_backup_pass "$@"
+      _restore_prepare "$1" || return $?
+      { _kv encrypted:b "$(_b backup_encrypted "$1")"
+        _kv clients:n "$(find "$RESTORE_SRC" -maxdepth 1 -name '*_awg[23].conf' | grep -c . || true)"
         _kv wgobf:b "$(_b test -d "$RESTORE_SRC/wgobf/etc")"
         _kv tunnels:b "$(_b test -f "$RESTORE_SRC/tunnels.tar.gz")"
         _kv warp:b "$(_b test -d "$RESTORE_SRC/warp")"
         _kv meta:f "$RESTORE_SRC/backup_meta.txt"; } | api_obj ;;
     restore)
-      [[ -n "${1:-}" ]] || { _api_usage "backup restore ПУТЬ [wgobf] [tunnels]"; return; }
+      [[ -n "${1:-}" ]] || { _api_usage "backup restore ПУТЬ [wgobf] [tunnels] [pass] (pass — пароль в stdin)"; return; }
+      _api_backup_pass "$@"
       backup_restore "$@" ;;
-    *) _api_usage "backup create [auto [ХРАНИТЬ]]|list|inspect ПУТЬ|restore ПУТЬ [wgobf] [tunnels]" ;;
+    pack)
+      [[ -n "${1:-}" ]] || { _api_usage "backup pack ПУТЬ"; return; }
+      backup_pack "$1" || return 1
+      { _kv path "$PACK_PATH"; _kv name "${PACK_PATH##*/}"; _kv size:n "$(stat -c %s "$PACK_PATH")"
+        _kv encrypted:b "$PACK_ENC"; } | api_obj ;;
+    key)
+      case "${1:-}" in
+        ""|status) { _kv set:b "$(_b backup_key_on)"; _kv iter:n "$BACKUP_ENC_ITER"; } | api_obj ;;
+        set) _api_stdin; backup_key_set < "$API_IN" ;;
+        clear) backup_key_clear ;;
+        *) _api_usage "backup key [status]|set (пароль — stdin)|clear" ;;
+      esac ;;
+    *) _api_usage "backup create [auto [ХРАНИТЬ]]|list|inspect ПУТЬ [pass]|restore ПУТЬ [wgobf] [tunnels] [pass]|pack ПУТЬ|key [status|set|clear]" ;;
   esac
+}
+
+# Пароль к зашифрованному бэкапу — первой строкой stdin, если среди слов
+# команды есть «pass» (без него stdin не читается: вызов из скрипта с
+# открытым stdin ждал бы его конца)
+_api_backup_pass() {  # слова команды
+  [[ " ${*:2} " == *" pass "* ]] || return 0
+  _api_stdin
+  [[ -s "$API_IN" ]] && RESTORE_PASS="$API_IN"
+  return 0
 }
 
 # ── Туннели ───────────────────────────────────────────────
@@ -557,7 +592,8 @@ _api_warp() {
         _kv endpoint "$([[ "$be" == wg ]] && sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$WARP_CONF" 2>/dev/null | head -1)"
         _kv hs:n "$(if [[ "$be" == wg ]]; then _n awk 'NR == 1 {print $2}' < <("$(warp_tool)" show "$WARP_IF" latest-handshakes 2>/dev/null); else echo 0; fi)"
         _kv rx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/rx_bytes")"
-        _kv tx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/tx_bytes")"; } | api_obj
+        _kv tx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/tx_bytes")"
+        _kv scout "$([[ -x "$WARPSCOUT_BIN" ]] && _warpscout_version)"; } | api_obj
       warp_status ;;
     install) if [[ "$be" == wg ]]; then warp_wg_install; else warp_usque_install; fi ;;
     up) warp_up ;;
@@ -587,11 +623,12 @@ _api_warp() {
       [[ -s "$API_IN" ]] || { err "Профиль wgcf-profile.conf передаётся через stdin"; return 1; }
       warp_import < "$API_IN" ;;
     endpoint) warp_endpoint_best "${1:-}" ;;
+    scout-update) warpscout_update ;;
     backend)
       [[ "${1:-}" =~ ^(wg|usque)$ ]] || { _api_usage "warp backend wg|usque"; return; }
       warp_set_backend "$1" ;;
     remove) warp_uninstall ;;
-    *) _api_usage "warp status|install|up|down|restart|probe [ping]|health on|off|license КЛЮЧ|import (stdin)|endpoint [СТРАНА]|backend wg|usque|remove" ;;
+    *) _api_usage "warp status|install|up|down|restart|probe [ping]|health on|off|license КЛЮЧ|import (stdin)|endpoint [СТРАНА]|scout-update|backend wg|usque|remove" ;;
   esac
 }
 
@@ -609,8 +646,9 @@ _api_xray() {
         _kv per_client:b "$(xray_installed && _b xray_tun_supported || echo 0)"
         _kv clients:j "$(xray_client_outs | py json-rows name ip out)"
         # Выходы для карточек: протокол, защита, транспорт, адрес
-        _kv outs:j "$({ xray_installed && py xray-outs "$XRAY_CONF" 2>/dev/null; } | py json-rows tag proto sec net host port:n)"
-        _kv ru:b "$(_b xray_ru_on)"; _kv fail "$(xray_fail)"; } | api_obj
+        _kv outs:j "$({ xray_installed && py xray-outs "$XRAY_CONF" "$XRAY_SUB_LIST" 2>/dev/null; } \
+                      | py json-rows tag proto sec net host port:n name)"
+        _kv ru:b "$(_b xray_ru_on)"; _kv fail "$(xray_fail)"; _kv sub:b "$(_b xray_sub_on)"; } | api_obj
       xray_status ;;
     # Трафик через выход работающего Xray (бот: выход отвалился на ходу).
     # up — Xray и маршруты клиентов работают; ok — ответ через SOCKS Xray
@@ -644,10 +682,37 @@ _api_xray() {
       [[ "${1:-}" =~ ^(on|off)$ ]] || { _api_usage "xray ru on|off"; return; }
       xray_ru_set "$1" ;;
     ru-update) xray_ru_update ;;
+    sub) _api_xray_sub "$@" ;;
     diag) xray_diagnose ;;
     fix) xray_fix ;;
     remove) xray_uninstall ;;
-    *) _api_usage "xray status|probe|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|diag|fix|remove" ;;
+    *) _api_usage "xray status|probe|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|sub …|diag|fix|remove" ;;
+  esac
+}
+
+# Подписка Xray. set — адрес первой строкой stdin; insecure — согласие на http
+_api_xray_sub() {
+  local a="${1:-status}" url=""
+  shift || true
+  case "$a" in
+    status)
+      local upd every; upd=$(_xsub_num UPDATED); every=$(xray_sub_every)
+      { _kv set:b "$(_b xray_sub_on)"; _kv site "$(xray_sub_on && xray_sub_site)"
+        _kv insecure:b "$( [[ "$(_xsub_get INSECURE)" == 1 ]] && echo 1 || echo 0)"
+        _kv title "$(_xsub_get TITLE)"; _kv count:n "$(_xsub_num COUNT)"; _kv skipped:n "$(_xsub_num SKIPPED)"
+        _kv updated:n "$upd"; _kv checked:n "$(_xsub_num CHECKED)"; _kv error "$(_xsub_get ERROR)"
+        _kv every:n "$every"; _kv next:n "$( (( upd )) && echo $(( upd + every * 3600 )) || echo 0)"
+        _kv up:n "$(_xsub_num UP)"; _kv down:n "$(_xsub_num DOWN)"; _kv total:n "$(_xsub_num TOTAL)"
+        _kv expire:n "$(_xsub_num EXPIRE)"; } | api_obj ;;
+    set)
+      _api_stdin
+      IFS= read -r url < "$API_IN" || true
+      url="${url%$'\r'}"; url="${url#"${url%%[![:space:]]*}"}"; url="${url%"${url##*[![:space:]]}"}"
+      [[ -n "$url" ]] || { err "Адрес подписки передаётся первой строкой stdin"; return 1; }
+      xray_sub_set "$url" "${1:-}" ;;
+    update) xray_sub_update "${1:-}" ;;
+    off) xray_sub_off ;;
+    *) _api_usage "xray sub [status]|set [insecure] (адрес — stdin)|update|off" ;;
   esac
 }
 
@@ -1076,6 +1141,43 @@ _api_vkblock() {
   esac
 }
 
+# ── РФ мимо VPN ───────────────────────────────────────────
+_api_rublock() {
+  local a="${1:-status}" on=0
+  shift || true
+  case "$a" in
+    status)
+      rublock_on && on=1
+      { _kv enabled:b "$on"; _kv active:b "$( (( on )) && _b rublock_rules_ok || echo 0)"
+        _kv nets:n "$(_rublock_get ENTRIES)"
+        _kv updated:n "$(_rublock_get UPDATED)"; _kv src "$(_rublock_get SRC)"; _kv error "$(_rublock_get ERROR)"
+        _kv blocked:n "$( (( on )) && rublock_blocked || echo 0)"
+        _kv rudirect:b "$(_b rudirect_on)"
+        _kv home:b "$(_b test "$(server_country)" = RU)"
+      } | api_obj ;;
+    on) rublock_enable ;;
+    off) rublock_disable ;;
+    update) rublock_update ;;
+    *) _api_usage "rublock status|on|off|update" ;;
+  esac
+}
+
+# ── Почта: порт 25 ────────────────────────────────────────
+_api_smtpblock() {
+  local a="${1:-status}" on=0
+  shift || true
+  case "$a" in
+    status)
+      smtpblock_on && on=1
+      { _kv enabled:b "$on"; _kv active:b "$( (( on )) && _b smtpblock_rules_ok || echo 0)"
+        _kv dropped:n "$( (( on )) && smtpblock_dropped || echo 0)"
+      } | api_obj ;;
+    on) smtpblock_enable ;;
+    off) smtpblock_disable ;;
+    *) _api_usage "smtpblock status|on|off" ;;
+  esac
+}
+
 # ── Перенос из Amnezia (Docker) ───────────────────────────
 # Страна сервера (флаг в шапке панели): вручную или снова по геосервисам;
 # refresh — спросить геосервисы сейчас, не дожидаясь суток
@@ -1128,8 +1230,9 @@ _api_log() {
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
     bot) unit="$BOT_UNIT" ;;             web) file="$WEB_LOG" ;;
     antiscan) file="$ANTISCAN_LOG" ;;   vkblock) file="$VKBLOCK_LOG" ;;
+    rublock) file="$RUBLOCK_LOG" ;;
     rudirect) file="$RUDIRECT_LOG" ;;   tunfail) file="$TUNFAIL_LOG" ;;
-    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan|vkblock|rudirect|tunfail [строк]"; return ;;
+    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan|vkblock|rublock|rudirect|tunfail [строк]"; return ;;
   esac
   if [[ -n "$file" ]]; then
     [[ -f "$file" ]] || { info "Журнала $file нет"; return 0; }
@@ -1217,15 +1320,15 @@ _api_readonly() {
   [[ "$a $b" != *[[:space:]]*[[:space:]]* ]] || return 1
   case "$a $b $c" in
     "server params "|"server params check"|"bot proxy get"|"bot proxy check"|"bot proxy candidates"|"bot webapp get"|\
-    "tunnels fail "|"tunnels fail list") return 0 ;;
+    "tunnels fail "|"tunnels fail list"|"backup key "|"backup key status"|"xray sub "|"xray sub status") return 0 ;;
   esac
   case "$a $b" in
     "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
-    "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"tunnels "|"tunnels status"|\
+    "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"backup pack"|"tunnels "|"tunnels status"|\
     "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray probe"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
     "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
-    "amnezia scan"|"vkblock "|"vkblock status"|"entry "|"entry list"|"rudirect "|"rudirect status"|"diag route") return 0 ;;
+    "amnezia scan"|"vkblock "|"vkblock status"|"rublock "|"rublock status"|"smtpblock "|"smtpblock status"|"entry "|"entry list"|"rudirect "|"rudirect status"|"diag route") return 0 ;;
   esac
   return 1
 }
@@ -1276,6 +1379,8 @@ api_dispatch() {
     web) _api_web "$@" ;;
     antiscan) _api_antiscan "$@" ;;
     vkblock) _api_vkblock "$@" ;;
+    rublock) _api_rublock "$@" ;;
+    smtpblock) _api_smtpblock "$@" ;;
     amnezia) _api_amnezia "$@" ;;
     country) _api_country "$@" ;;
     uninstall) _api_uninstall "$@" ;;
@@ -1283,7 +1388,7 @@ api_dispatch() {
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade entry dns wgobf update bot cert web antiscan vkblock rudirect amnezia country uninstall log job version"
+      echo "         exits cascade entry dns wgobf update bot cert web antiscan vkblock rublock smtpblock rudirect amnezia country uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
@@ -1294,7 +1399,8 @@ _api_job_prepare() {
   local dir="$API_JOBS/${1:-}"
   [[ "${1:-}" =~ ^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$ && -f "$dir/cmd" ]] || return 1
   mapfile -d '' -t API_ARGS < "$dir/cmd"
-  [[ -f "$dir/stdin" ]] && cp "$dir/stdin" "$API_IN"
+  # stdin задачи (там бывает пароль бэкапа) — один раз: прочитан и удалён
+  [[ -f "$dir/stdin" ]] && cp "$dir/stdin" "$API_IN" && rm -f "$dir/stdin"
   API_STDIN_READ=1
   API_LOG="$dir/log"
   API_RESULT="$dir/result.json"
@@ -1328,6 +1434,9 @@ api_main() {
     expire_watchdog || true
     antiscan_watchdog || true
     vkblock_watchdog || true
+    rublock_watchdog || true
+    smtpblock_watchdog || true
+    xray_sub_watchdog || true
     rudirect_watchdog || true
     tunfail_watchdog || true
     if _api_readonly "${API_ARGS[@]}"; then

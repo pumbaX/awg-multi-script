@@ -144,7 +144,7 @@ INSTALL_LOG="{ROOT}/install.log"; EXITS_DIR="$AWG_DIR"
 EXITS_PEERS="$EXITS_DIR/exits_peers.list"; EXITS_STATE="$EXITS_DIR/exits_state"
 for v in DNS_PERSIST_SCRIPT DNS_HEALTH_SCRIPT CASCADE_SCRIPT T2S_ROUTING_SCRIPT XRAY_ROUTING_SCRIPT \\
          EXITS_SCRIPT EXPIRE_BIN WARP_AUTOSTART_SCRIPT WARP_HEALTH_SCRIPT WGOBF_FW USQUE_UP_HOOK ANTISCAN_SCRIPT \\
-         WEB_FW_SCRIPT VKBLOCK_SCRIPT RUDIRECT_SCRIPT TUNFAIL_SCRIPT; do
+         WEB_FW_SCRIPT VKBLOCK_SCRIPT RUDIRECT_SCRIPT TUNFAIL_SCRIPT RUBLOCK_SCRIPT SMTPBLOCK_SCRIPT; do
   printf -v "$v" '%s' "{ROOT}/scripts/$v"
 done
 CASCADE_DIR="{ROOT}/etc/awg-cascade"; CASCADE_RULES="$CASCADE_DIR/rules.conf"; CASCADE_LOG="{ROOT}/cascade.log"
@@ -157,9 +157,11 @@ EXPIRE_STATE_DIR="{ROOT}/var/lib/awg2-expire"; EXPIRE_LOG="{ROOT}/expire.log"; B
 BOT_ADMINS="{ROOT}/admins.json"; TRAFFIC_DB="$STATE_DIR/traffic.json"
 EXPIRE_STALE=999999999      # сторож таймера в песочнице молчит; его проверка — отдельно
 BACKUP_DIR="{ROOT}/awg_backup"; MOD_BACKUP_DIR="{ROOT}/mod-backups"; UPDATE_CHANNEL_FILE="$STATE_DIR/channel"
+BACKUP_KEY="$STATE_DIR/backup.key"; BACKUP_OUT="$STATE_DIR/backup-out"
 MOD_TAG_FILE="$STATE_DIR/module_tag"; TOOLS_TAG_FILE="$STATE_DIR/tools_tag"; UPSTREAM_CACHE="$STATE_DIR/upstream_tags"; COUNTRY_CACHE="$STATE_DIR/country"; COUNTRY_MANUAL="$STATE_DIR/country_manual"
 WARP_PEERS="{ROOT}/warp.peers"; XRAY_PEERS="{ROOT}/xray.peers"; USQUE_LOG="{ROOT}/usque.log"
 XRAY_DIR="{ROOT}/etc/xray"; XRAY_CONF="$XRAY_DIR/config.json"; XRAY_STATE="$XRAY_DIR/state"
+XRAY_SUB_CONF="$XRAY_DIR/sub.conf"; XRAY_SUB_LIST="$XRAY_DIR/sub.list"
 XRAY_BIN="{ROOT}/bin/xray"; XRAY_ASSET_DIR="{ROOT}/xray-assets"
 T2S_DIR="{ROOT}/etc/tun2socks"; T2S_CONF="$T2S_DIR/proxy.txt"
 DNS_PROXY_CONF="{ROOT}/etc/dnscrypt-proxy/dnscrypt-proxy.toml"; DNS_PROXY_STATE="{ROOT}/etc/dnscrypt-proxy/awg.state"; DNS_RESOLVERS_MD="{ROOT}/var/cache/dnscrypt-proxy/public-resolvers.md"
@@ -171,6 +173,8 @@ ANTISCAN_DIR="$STATE_DIR/antiscan"; ANTISCAN_CONF="$ANTISCAN_DIR/antiscan.conf";
 ANTISCAN_LOG="{ROOT}/antiscan.log"
 WARP_HEALTH_FAILS="{ROOT}/warp-fails"; WARP_HEALTH_RETRY="{ROOT}/warp-retry"; WARP_HEALTH_LOG="{ROOT}/warp-health.log"
 VKBLOCK_DIR="$STATE_DIR/vkblock"; VKBLOCK_CONF="$VKBLOCK_DIR/vkblock.conf"; VKBLOCK_LOG="{ROOT}/vkblock.log"
+RUBLOCK_DIR="$STATE_DIR/rublock"; RUBLOCK_CONF="$RUBLOCK_DIR/rublock.conf"; RUBLOCK_LOG="{ROOT}/rublock.log"
+SMTPBLOCK_FLAG="$STATE_DIR/smtpblock"
 RUDIRECT_DIR="$STATE_DIR/rudirect"; RUDIRECT_CONF="$RUDIRECT_DIR/rudirect.conf"; RUDIRECT_USER="{ROOT}/etc/awg2/rudirect"
 RUDIRECT_LOG="{ROOT}/rudirect.log"; TUNFAIL_CONF="{ROOT}/etc/awg2/tunnel-fail.conf"; TUNFAIL_LOG="{ROOT}/tunfail.log"
 DIAG_FWD="{ROOT}/ip_forward"; RUDIRECT_RPF="{ROOT}/rpf"

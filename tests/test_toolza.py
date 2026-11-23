@@ -21,10 +21,14 @@ test_toolza.py — проверка собранного awg2 (dist/awg2.sh) б�
 """
 import base64
 import concurrent.futures
+import glob
 import hashlib
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tarfile
 import time
 import zipfile
 
@@ -668,11 +672,24 @@ def run_and_check(label, script, *args, must=(), must_not=()):
         f"rc={rc} err={err.strip()[-300:]} нет: {missing} лишнее: {present}")
 
 
-run_and_check("DNS: перехват и блок DoT в mangle", "DNS_PERSIST_SCRIPT",
+run_and_check("DNS: перехват и блок DoT в mangle — с awg0 и с wgobf0 (WG + обфускатор)", "DNS_PERSIST_SCRIPT",
               must=[r"-t nat -A PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination 127\.0\.2\.1:53 -m comment --comment awg2-dns",
                     r"-t mangle -A PREROUTING -i awg0 -p tcp --dport 853 -j DROP -m comment --comment awg2-dns",
-                    r"-t filter -I INPUT 1 -i awg0 -d 127\.0\.2\.1"])
+                    r"-t filter -I INPUT 1 -i awg0 -d 127\.0\.2\.1",
+                    r"-t nat -A PREROUTING -i wgobf0 -p udp --dport 53 -j DNAT --to-destination 127\.0\.2\.1:53 -m comment --comment awg2-dns",
+                    r"-t nat -A PREROUTING -i wgobf0 -p tcp --dport 53 -j DNAT",
+                    r"-t mangle -A PREROUTING -i wgobf0 -p udp --dport 853 -j DROP -m comment --comment awg2-dns",
+                    r"-t filter -I INPUT 1 -i wgobf0 -d 127\.0\.2\.1 -p udp --dport 53 -j ACCEPT"])
 run_and_check("DNS: health-check", "DNS_HEALTH_SCRIPT", must=[r"-t nat -A PREROUTING"])
+reset_calls()
+rc, out, _ = bash('ufw() { echo "ufw $*" >> "$CALLS"; }; ufw_active() { return 0; }; dns_ufw_allow; '
+                  'ufw_delete_matching() { :; }; command() { [[ "$2" == ufw ]] && return 0; builtin command "$@"; }; '
+                  'apt-get() { :; }; dns_uninstall')
+c = calls()
+chk("DNS и UFW: вход к dnscrypt разрешён и с wgobf0, при выключении снят с обоих интерфейсов",
+    all(f"ufw allow in on {i} to 127.0.2.1 port 53 proto {p} comment awg2-dns" in c for i in ("awg0", "wgobf0") for p in ("udp", "tcp"))
+    and all(f"ufw delete allow in on {i} to 127.0.2.1 port 53 proto {p}" in c for i in ("awg0", "wgobf0") for p in ("udp", "tcp")),
+    [l for l in c.splitlines() if l.startswith("ufw")])
 run_and_check("Каскад: только адреса сервера, туда и обратно", "CASCADE_SCRIPT",
               must=[r"-t nat -A PREROUTING -p udp --dport 443 -m addrtype --dst-type LOCAL -j DNAT --to-destination 5\.6\.7\.8:443 -m comment --comment awg-cascade:udp-443",
                     r"-I FORWARD 1 -p tcp -s 5\.6\.7\.8 --sport 443 -j ACCEPT -m comment --comment awg-cascade:tcp-8443"])
@@ -1685,6 +1702,114 @@ chk("восстановление из архива", r.get("ok") and "Восс�
 chk("restore: конфиг клиента не из бэкапа убран, остальные на месте",
     not os.path.exists(LATE) and os.path.exists(ALICE)
     and not any(c["name"] == "late" for c in api("clients", "list").get("data") or []), os.listdir(os.path.join(ROOT, "root")))
+
+print("Пароль бэкапов: файлы с сервера — зашифрованы")
+PW = "S3cret-pass!"
+BKEY = os.path.join(ROOT, "var/lib/awg2/backup.key")
+BOUT = os.path.join(ROOT, "var/lib/awg2/backup-out")
+OSSL = ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "200000", "-md", "sha256"]
+
+
+def osdec(src, dst, pw):
+    """Расшифровка командой из README — как на компьютере пользователя."""
+    return subprocess.run(OSSL + ["-in", src, "-out", dst, "-pass", "stdin"], input=pw + "\n", text=True,
+                          capture_output=True).returncode
+
+
+r = api("backup", "key")
+chk("api backup key: пароля нет, число итераций для расшифровки", r.get("ok") and r["data"] == {"set": False, "iter": 200000}, r)
+rc, out, _ = bash("_api_readonly backup key status && echo RO1; _api_readonly backup key && echo RO2; "
+                  "_api_readonly backup pack x && echo RO3; _api_readonly backup key set || echo RW; "
+                  "_api_readonly backup key clear || echo RW2")
+chk("статус пароля и выдача — без очереди api, задать и убрать — через очередь",
+    all(k in out for k in ("RO1", "RO2", "RO3", "RW", "RW2")), out)
+bad = {"short1!": "от 8 до 128", "x" * 129: "от 8 до 128", " leading-space": "без пробелов по краям",
+       "trailing-space ": "без пробелов по краям", "парольпароль": "только латиница", "tab\there12": "только латиница", "": "не передан"}
+res = {k: api("backup", "key", "set", stdin=k + "\n" if k else "") for k in bad}
+chk("плохой пароль — отказ с причиной, файла нет",
+    all(not res[k].get("ok") and bad[k] in res[k].get("log", "") for k in bad) and not os.path.exists(BKEY),
+    {k[:20]: res[k].get("log", "")[-80:] for k in bad})
+r = api("backup", "key", "set", stdin=PW + "\n")
+chk("пароль задан: файл 600, первая строка — пароль, статус «задан»",
+    r.get("ok") and open(BKEY).read() == PW + "\n" and oct(os.stat(BKEY).st_mode & 0o777) == "0o600"
+    and api("backup", "key")["data"]["set"] is True, r)
+r = api("backup", "key", "set", stdin=PW)
+chk("пароль без перевода строки в конце — тот же", r.get("ok") and open(BKEY).read() == PW + "\n", r)
+logs = "".join(open(f, errors="replace").read() for f in glob.glob(os.path.join(ROOT, "*.log")) if os.path.isfile(f))
+chk("пароля нет в журналах", PW not in logs and "S3cret" not in logs, "в журнале пароль")
+os.makedirs(BOUT, exist_ok=True)
+stale = os.path.join(BOUT, "OLD123")
+os.makedirs(stale, exist_ok=True)
+os.utime(stale, (time.time() - 7200,) * 2)
+r = api("backup", "pack", bk_path)
+d = r.get("data") or {}
+pk = d.get("path", "")
+chk("выдача архива с паролем: копия в backup-out, .enc, «Salted__», 600; забытые выдачи старше часа удалены",
+    r.get("ok") and d.get("encrypted") is True and pk.startswith(BOUT + "/") and d.get("name") == os.path.basename(bk_path) + ".enc"
+    and open(pk, "rb").read(8) == b"Salted__" and oct(os.stat(pk).st_mode & 0o777) == "0o600"
+    and d.get("size") == os.path.getsize(pk) and not os.path.exists(stale) and os.path.exists(bk_path), [r, os.listdir(BOUT)])
+dec = os.path.join(TMP, "dec.tar.gz")
+chk("файл расшифровывается командой из README — ровно исходный архив",
+    osdec(pk, dec, PW) == 0 and open(dec, "rb").read() == open(bk_path, "rb").read(), "не расшифровался")
+chk("неверный пароль — openssl отказывает", osdec(pk, dec + ".x", "wrong-password") != 0, "расшифровался")
+bk_dir = bk_path[:-len(".tar.gz")]
+r = api("backup", "pack", bk_dir)
+d = r.get("data") or {}
+chk("выдача каталога полного бэкапа: tar.gz на лету, зашифрован, внутри awg0.conf",
+    r.get("ok") and d.get("encrypted") and d.get("name") == os.path.basename(bk_dir) + ".tar.gz.enc"
+    and osdec(d["path"], dec, PW) == 0
+    and any(n.endswith("/awg0.conf") for n in tarfile.open(dec).getnames()), r)
+r = api("backup", "pack", "/etc/passwd")
+r2 = api("backup", "pack", junk)
+chk("выдать можно только бэкап из списка — не любой файл сервера",
+    not r.get("ok") and "Такого бэкапа нет" in r.get("log", "") and not r2.get("ok"), [r, r2])
+ENC = os.path.join(BKD, "awg2_backup_20990101_000000.tar.gz.enc")
+shutil.copy(pk, ENC)
+rows = api("backup", "list").get("data") or []
+chk("зашифрованный бэкап в ~/awg_backup — в списке", ENC in [b["path"] for b in rows], rows)
+r = api("backup", "inspect", ENC)
+chk("свой пароль на сервере — зашифрованный открывается без ввода", r.get("ok") and r["data"]["encrypted"] is True
+    and r["data"]["clients"] >= 2, r)
+r = api("backup", "pack", ENC)
+chk("уже зашифрованный не шифруется второй раз", r.get("ok") and r["data"]["name"] == os.path.basename(ENC)
+    and open(r["data"]["path"], "rb").read() == open(ENC, "rb").read(), r)
+r = api("backup", "key", "clear")
+chk("пароль убран", r.get("ok") and not os.path.exists(BKEY) and api("backup", "key")["data"]["set"] is False, r)
+r = api("backup", "inspect", ENC)
+chk("без пароля — код 4 «нужен пароль»", r.get("ok") is False and r.get("rc") == 4 and "нужен пароль" in r.get("log", ""), r)
+r = api("backup", "inspect", ENC, "pass", stdin="wrong-password\n")
+chk("неверный пароль — код 4 «не подходит»", r.get("rc") == 4 and "не подходит" in r.get("log", ""), r)
+r = api("backup", "inspect", ENC, stdin=PW + "\n")
+chk("без слова pass stdin не читается — пароль не взят", r.get("rc") == 4 and "нужен пароль" in r.get("log", ""), r)
+r = api("backup", "inspect", ENC, "pass", stdin=PW + "\n")
+chk("верный пароль через stdin — открывается", r.get("ok") and r["data"]["encrypted"] and r["data"]["clients"] >= 2, r)
+BROKEN = os.path.join(TMP, "broken.tar.gz.enc")
+raw = bytearray(open(ENC, "rb").read())
+raw[-40] ^= 0xFF
+open(BROKEN, "wb").write(bytes(raw))
+r = api("backup", "inspect", BROKEN, "pass", stdin=PW + "\n")
+chk("повреждённый файл — не восстанавливается, понятная причина", r.get("rc") == 4 and "повреждён" in r.get("log", ""), r)
+r = api("backup", "restore", ENC, stdin=PW + "\n")
+chk("восстановление зашифрованного без pass — отказ до замены сервера", r.get("rc") == 4 and "Восстановлено" not in r.get("log", ""), r)
+r = api("job", "start", "backup", "restore", ENC, "pass", stdin=PW + "\n")
+jid = (r.get("data") or {}).get("id", "")
+for _ in range(240):
+    st = api("job", "status", jid).get("data") or {}
+    if st.get("state") != "running":
+        break
+    time.sleep(0.5)
+jdir = os.path.join(ROOT, "var/lib/awg2/jobs", jid)
+chk("восстановление зашифрованного задачей с паролем; файл пароля задачи удалён после чтения",
+    st.get("ok") and "Восстановлено" in st.get("log", "") and os.path.isdir(jdir)
+    and not os.path.exists(os.path.join(jdir, "stdin")), [st.get("log", "")[-300:], os.listdir(jdir) if os.path.isdir(jdir) else ""])
+rc, out, _ = bash(f"_restore_ask_pass '{ENC}' <<< $'wrong-password\\n{PW}' >/dev/null 2>&1; echo \"rc=$? src=$RESTORE_SRC\"")
+chk("меню: пароль спрашивается заново, второй верный — бэкап открыт", "rc=0 src=/" in out, out)
+rc, out, _ = bash(f"_restore_ask_pass '{ENC}' <<< '' >/dev/null 2>&1; echo \"rc=$?\"")
+chk("меню: пустой ввод — отмена", "rc=1" in out, out)
+r = api("backup", "pack", bk_path)
+chk("без пароля — выдаётся как есть", r.get("ok") and r["data"]["encrypted"] is False
+    and open(r["data"]["path"], "rb").read() == open(bk_path, "rb").read(), r)
+os.remove(ENC)
 
 # Сервера ещё нет: мастер в боте и панели спрашивает server info — поддержка 3.1
 # проверяется честно (раньше был жёсткий «нет»), пробный интерфейс — один раз
@@ -3772,6 +3897,121 @@ rc, out, _ = rbash('rudirect_remove; ls "$RUDIRECT_DIR" "$RUDIRECT_SCRIPT" 2>&1'
 chk("удаление: каталог и скрипт убраны", out.count("No such file") == 2, out)
 links()
 
+print("\n── РФ мимо VPN (отказ клиентам в сетях России) и почта (порт 25) ──")
+RBMARK = "0x52420000/0xffff0000"
+RB_RULE = lambda dev: (f"PREROUTING -i {dev} -m set --match-set awg2-rublock dst -m addrtype ! --dst-type LOCAL "
+                       f"-m comment --comment awg2-rublock -j MARK --set-xmark {RBMARK}")
+RB_IP = {"prio": 85, "from": "all", "fwmark": RBMARK, "lookup": None, "action": "prohibit"}
+
+
+def rb_status():
+    return api("rublock", "status", env=RTENV).get("data") or {}
+
+
+def rb_mangle():
+    return [x for x in mangle(4) if "awg2-rublock" in x]
+
+
+rt_reset()
+links()
+open(f"{IPT_RULES}.iptables.mangle", "w").close()
+open(f"{IPT_RULES}.ip6tables.mangle", "w").close()
+with open(os.path.join(ASLISTS, "ipv4-aggregated.txt"), "w") as f:
+    f.write(ru_list())
+reset_calls()
+r = api("rublock", "on", env=RTENV)
+rb = ipset_set("awg2-rublock") or []
+chk("rublock on: список РФ (тот же источник, что «РФ напрямую»), набор awg2-rublock, метка RB для awg0 и wgobf0, "
+    "правило 85 → prohibit",
+    r.get("ok") and len(rb) == 2500 and "77.88.0.0/18" in rb and rb_mangle() == [RB_RULE("wgobf0"), RB_RULE("awg0")]
+    and RB_IP in rt_rules() and "curl https://raw.githubusercontent.com/ipverse/rir-ip/master/country/ru/ipv4-aggregated.txt" in calls(),
+    [r, rb_mangle(), rt_rules(), len(rb)])
+units = os.listdir(os.path.join(ROOT, "units"))
+svc = open(os.path.join(ROOT, "units", "awg2-rublock.service")).read()
+chk("rublock: служба при загрузке — раньше UFW, таймер раз в час включён",
+    {"awg2-rublock.service", "awg2-rublock-update.service", "awg2-rublock-update.timer"} <= set(units)
+    and "Before=network-pre.target ufw.service netfilter-persistent.service" in svc
+    and "systemctl enable --now awg2-rublock-update.timer" in calls(), units)
+with open(f"{IPT_RULES}.iptables.mangle.cnt", "w") as f:
+    f.write("9")
+d = rb_status()
+chk("api rublock status: включено, правила на месте, сетей 2500, счётчик отказов, «РФ напрямую» выключено",
+    d.get("enabled") and d.get("active") and d.get("nets") == 2500 and d.get("blocked") == 18
+    and d.get("rudirect") is False and d.get("updated", 0) > 0 and d.get("error") == "", d)
+rc, out, _ = rbash("_api_readonly rublock status && echo RO")
+chk("rublock status — чтение без очереди api", "RO" in out, out)
+r = route_get(A, "77.88.0.1", "0x52420000")
+chk("клиент к сети России с меткой RB — отказ маршрутизации (prohibit)", r[0] != 0 and "Permission denied" in r[1], r)
+r = api("rudirect", "on", env=RTENV)
+chk("«РФ напрямую» при включённом «РФ мимо VPN» — отказ с объяснением, ничего не включено",
+    r.get("ok") is False and "РФ мимо VPN" in (r.get("error") or "") + (r.get("log") or "")
+    and rud_status().get("enabled") is False and rud_mangle() == [], r)
+r = droute("alice", "77.88.0.1")
+row = ((r.get("data") or {}).get("rows") or [{}])[0]
+chk("«Куда идёт адрес»: сеть России — отказ («РФ мимо VPN»)", row.get("kind") == "drop" and "РФ мимо VPN" in row.get("note", ""), r)
+rbash(f'iptables -t mangle -D {RB_RULE("awg0")}; ip rule del fwmark {RBMARK} prohibit priority 85')
+reset_calls()
+chk("пропали метка awg0 и правило — статус неисправен, таймер возвращает без скачивания",
+    rb_status().get("active") is False and rbash('bash "$RUBLOCK_SCRIPT" heal')[0] == 0
+    and rb_mangle() == [RB_RULE("awg0"), RB_RULE("wgobf0")] and RB_IP in rt_rules() and "curl" not in calls(),
+    [rb_mangle(), rt_rules()])
+heal = os.path.join(ROOT, "var/lib/awg2/rublock/heal")
+os.utime(heal, (time.time() - 4 * 3600,) * 2)
+reset_calls()
+rbash("rublock_watchdog")
+chk("сторож: таймер молчал больше трёх часов — перезапуск", "systemctl start --no-block awg2-rublock-update.service" in calls(), calls())
+r = api("rublock", "off", env=RTENV)
+chk("api rublock off: метки и правило сняты, набор удалён",
+    r.get("ok") and rb_mangle() == [] and not any(x.get("action") for x in rt_rules()) and ipset_set("awg2-rublock") is None,
+    [r, rb_mangle(), rt_rules()])
+d = rb_status()
+chk("выключено — статус и счётчик", d.get("enabled") is False and d.get("active") is False and d.get("blocked") == 0, d)
+r = api("rudirect", "on", env=RTENV)
+chk("«РФ напрямую» включилось, когда «РФ мимо VPN» выключено", r.get("ok") and rud_status().get("enabled"), r)
+r = api("rublock", "on", env=RTENV)
+chk("«РФ мимо VPN» при включённом «РФ напрямую» — отказ, правил нет",
+    r.get("ok") is False and "РФ напрямую" in (r.get("error") or "") + (r.get("log") or "") and rb_mangle() == []
+    and rb_status().get("enabled") is False, r)
+api("rudirect", "off", env=RTENV)
+rc, out, _ = rbash('rublock_remove; ls "$RUBLOCK_DIR" "$RUBLOCK_SCRIPT" 2>&1')
+chk("rublock: удаление — каталог и скрипт убраны", out.count("No such file") == 2, out)
+
+# ── Почта: порт 25 ──
+SM_RULE = lambda dev: (f"PREROUTING -i {dev} -p tcp --dport 25 -m addrtype ! --dst-type LOCAL "
+                       "-m comment --comment awg2-smtpblock -j DROP")
+
+
+def sm_mangle(fam=4):
+    return [x for x in mangle(fam) if "awg2-smtpblock" in x]
+
+
+reset_calls()
+r = api("smtpblock", "on", env=RTENV)
+d = api("smtpblock", "status", env=RTENV).get("data") or {}
+chk("smtpblock on: DROP порта 25 в mangle PREROUTING для awg0 и wgobf0 (и IPv6), мимо адресов сервера; служба и таймер",
+    r.get("ok") and sm_mangle(4) == [SM_RULE("wgobf0"), SM_RULE("awg0")] and sm_mangle(6) == [SM_RULE("wgobf0"), SM_RULE("awg0")]
+    and d.get("enabled") and d.get("active") and "systemctl enable --now awg2-smtpblock-heal.timer" in calls()
+    and {"awg2-smtpblock.service", "awg2-smtpblock-heal.service", "awg2-smtpblock-heal.timer"} <= set(os.listdir(os.path.join(ROOT, "units"))),
+    [r, sm_mangle(4), sm_mangle(6), d])
+rc, out, _ = rbash("_api_readonly smtpblock status && echo RO")
+chk("smtpblock status — чтение без очереди api", "RO" in out, out)
+r = api("smtpblock", "on", env=RTENV)
+chk("повторное включение — без дублей", r.get("ok") and sm_mangle(4) == [SM_RULE("wgobf0"), SM_RULE("awg0")], sm_mangle(4))
+rbash(f'iptables -t mangle -D {SM_RULE("awg0")}')
+chk("правило сбросили — статус неисправен, таймер возвращает",
+    (api("smtpblock", "status", env=RTENV).get("data") or {}).get("active") is False
+    and rbash('bash "$SMTPBLOCK_SCRIPT" heal')[0] == 0 and sorted(sm_mangle(4)) == sorted([SM_RULE("wgobf0"), SM_RULE("awg0")]),
+    sm_mangle(4))
+rc, out, _ = rbash('bash "$SMTPBLOCK_SCRIPT" apply; echo "rc=$?"')
+chk("служба при загрузке ставит правила (включено)", "rc=0" in out and len(sm_mangle(4)) == 2, [out, sm_mangle(4)])
+r = api("smtpblock", "off", env=RTENV)
+d = api("smtpblock", "status", env=RTENV).get("data") or {}
+chk("smtpblock off: правила IPv4 и IPv6 сняты, статус выключен",
+    r.get("ok") and sm_mangle(4) == [] and sm_mangle(6) == [] and d.get("enabled") is False, [r, sm_mangle(4), d])
+rc, out, _ = rbash('bash "$SMTPBLOCK_SCRIPT" apply; echo "rc=$?"')
+chk("выключено — служба при загрузке ничего не ставит", "rc=0" in out and sm_mangle(4) == [], out)
+links()
+
 print("\n── Веб-панель: доступ по адресам и только через VPN ──")
 WFW = os.path.join(TMP, "awg2-web-fw")
 WNETS = os.path.join(TMP, "awg-web", "access.nets")
@@ -4299,5 +4539,69 @@ print("\n── Ctrl+C: выход от сигнала — в «awg2.sh; awg-bot
 rc, out, _ = bash("trap '_on_interrupt INT' INT; kill -INT $$; sleep 1; echo AFTER")
 chk("Ctrl+C в меню — «Прервано» и смерть от SIGINT, а не exit 130", rc == -2 and "Прервано" in out and "AFTER" not in out, (rc, out))
 chk("TERM — смерть от SIGTERM", bash("trap '_on_interrupt TERM' TERM; kill -TERM $$; echo AFTER")[0] == -15)
+
+# ── warpscout: поиск endpoint WARP и обновление сканера ──────
+print("warpscout")
+WS = os.path.join(TMP, "ws")
+os.makedirs(os.path.join(WS, "bin"), exist_ok=True)
+with open(os.path.join(WS, "bin", "warpscout"), "w") as f:
+    f.write(r"""#!/bin/bash
+# Заглушка warpscout: WS_MODE — что печатает скан; версия — из файла
+case "$1" in
+  version) cat "$WS/ver" 2>/dev/null || echo 0.13.2; exit 0 ;;
+  register) echo '{}' > "${3:-warpscout-account.json}"; exit 0 ;;
+esac
+echo "$PWD" > "$WS/cwd"; : > warpscout-report-1.txt
+n=$(( $(cat "$WS/n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$WS/n"
+case "$WS_MODE" in
+  old) printf '\033[32mENDPOINT  PING\033[0m\n162.159.193.10:2408  0.36ms\n162.159.193.10:2408\n' ;;
+  new) echo "Phase 1: probing reachable WARP ports: reachable ports [2408 500]"; echo "Phase 2: verifying tunnels (proto=awg): done"
+       echo 188.114.96.20:2408; echo "Report: warpscout-report-1.txt" ;;
+  flaky) (( n == 1 )) && { echo "Phase 2: verifying tunnels (proto=awg): done"; exit 0; }; echo 162.159.195.7:2408 ;;
+  fail) echo "Using cached WARP account" ; echo "error: account rejected by Cloudflare (401)" >&2; exit 1 ;;
+esac
+""")
+os.chmod(os.path.join(WS, "bin", "warpscout"), 0o755)
+WSPRE = (f'WS="{WS}"; export WS; WARPSCOUT_BIN="{WS}/bin/warpscout"; WARPSCOUT_DIR="{WS}/acc"; '
+         'WARPSCOUT_ACCOUNT="$WARPSCOUT_DIR/warpscout-account.json"; warp_backend() { echo wg; }; '
+         'mkdir -p "${WARP_CONF%/*}" "${WARP_PROFILE%/*}"; printf "[Peer]\nEndpoint = 1.2.3.4:2408\n" > "$WARP_CONF"; '
+         'cp "$WARP_CONF" "$WARP_PROFILE"; ')
+
+
+def ws(mode, code="warp_endpoint_best"):
+    for f in ("n", "cwd"):
+        if os.path.exists(os.path.join(WS, f)):
+            os.remove(os.path.join(WS, f))
+    return bash(WSPRE + f"export WS_MODE={mode}; {code}; echo \"rc=$?\"; grep Endpoint \"$WARP_CONF\"")
+
+
+rc, out, _ = ws("old")
+chk("warpscout 0.13: таблица и лучший адрес последней строкой — endpoint в профиле, аккаунт зарегистрирован",
+    "rc=0" in out and "Endpoint = 162.159.193.10:2408" in out and os.path.exists(os.path.join(WS, "acc", "warpscout-account.json")), out)
+rc, out, _ = ws("new")
+chk("warpscout поновее: ход скана и строка отчёта после адреса — адрес всё равно найден",
+    "rc=0" in out and "Endpoint = 188.114.96.20:2408" in out, out)
+chk("скан идёт в каталоге warpscout (не в /), его отчёты не копятся",
+    open(os.path.join(WS, "cwd")).read().strip() == os.path.join(WS, "acc")
+    and not [f for f in os.listdir(os.path.join(WS, "acc")) if f.startswith("warpscout-report")], os.listdir(os.path.join(WS, "acc")))
+rc, out, _ = ws("flaky")
+chk("первый скан пустой (сбой сети на миг) — второй, адрес применён",
+    "сканирую ещё раз" in out and "rc=0" in out and "Endpoint = 162.159.195.7:2408" in out, out)
+rc, out, _ = ws("fail")
+chk("warpscout упал — его же слова о причине, а не «UDP режут»; endpoint прежний",
+    "rc=1" in out and "account rejected by Cloudflare (401)" in out and "режут" not in out
+    and "Endpoint = 1.2.3.4:2408" in out and "Обновить скаут" in out, out)
+inst = ('curl() { local o; while (( $# )); do [[ "$1" == -o ]] && o="$2"; shift; done; '
+        'printf \'#!/bin/sh\necho 0.16.1 > "$WS/ver"\n\' > "$o"; }; ')
+rc, out, _ = ws("old", 'echo 0.13.2 > "$WS/ver"; ' + inst + "warpscout_update")
+chk("«Обновить скаут»: официальный установщик, версия было → стало", "rc=0" in out and "warpscout 0.13.2 → 0.16.1" in out, out)
+rc, out, _ = ws("old", inst + "warpscout_update")
+chk("«Обновить скаут» на последней — «уже последняя версия»", "rc=0" in out and "0.16.1 — уже последняя версия" in out, out)
+rc, out, _ = ws("old", 'curl() { return 22; }; warpscout_update')
+chk("установщик не скачался — понятная ошибка", "rc=1" in out and "Не скачался установщик warpscout" in out, out)
+rc, out, _ = bash(WSPRE + "api_main warp status")
+chk("api warp status: версия сканера (scout)", '"scout": "0.16.1"' in out, out[-300:])
+rc, out, _ = bash(WSPRE + "api_main warp")
+chk("api warp: scout-update в списке команд", "scout-update" in out, out[-300:])
 
 summary()

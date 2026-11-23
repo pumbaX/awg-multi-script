@@ -41,8 +41,10 @@ do_server_menu() {
     echo -e "  ${C}9)${N} Антисканер ${D}— $(antiscan_on && echo "включён" || echo "сети сканеров РКН")${N}"
     echo -e "  ${C}10)${N} Перенос из Amnezia ${D}— сервер из Docker-контейнера, клиенты без перевыдачи${N}"
     echo -e "  ${C}11)${N} VK и Max мимо VPN ${D}— $(vkblock_on && echo "включено" || echo "клиенты VPN не ходят в сети VK")${N}"
+    echo -e "  ${C}12)${N} РФ мимо VPN ${D}— $(rublock_on && echo "включено" || echo "клиенты VPN не ходят в сети России")${N}"
+    echo -e "  ${C}13)${N} Почта: порт 25 ${D}— $(smtpblock_on && echo "закрыт для клиентов" || echo "открыт для клиентов")${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-11]: ${N}" 0 11 0
+    read_choice c "${C}  Выбор [0-13]: ${N}" 0 13 0
     case "$c" in
       1) do_install || true ;;
       2) do_create_server || true ;;
@@ -55,6 +57,8 @@ do_server_menu() {
       9) do_antiscan_menu || true; continue ;;
       10) do_amnezia_menu || true ;;
       11) do_vkblock_menu || true; continue ;;
+      12) do_rublock_menu || true; continue ;;
+      13) do_smtpblock_menu || true; continue ;;
       0) return 0 ;;
     esac
     pause
@@ -68,11 +72,13 @@ do_backup_menu() {
     hdr "Бэкапы ${D}($BACKUP_DIR)${N}"
     echo -e "  ${C}1)${N} Создать бэкап"
     echo -e "  ${C}2)${N} Восстановить"
+    echo -e "  ${C}3)${N} Пароль бэкапов ${D}— $(backup_key_on && echo "задан" || echo "файлы с сервера без шифрования")${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-2]: ${N}" 0 2 0
+    read_choice c "${C}  Выбор [0-3]: ${N}" 0 3 0
     case "$c" in
       1) do_backup || true ;;
       2) do_restore || true ;;
+      3) do_backup_key || true ;;
       0) return 0 ;;
     esac
     pause

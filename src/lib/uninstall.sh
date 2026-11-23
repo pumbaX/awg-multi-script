@@ -162,10 +162,12 @@ uninstall_all() {
   if web_installed; then info "Веб-панель оставлена — сервера AWG в ней больше нет"; web_vpn_changed; fi
   # Антисканер и «VK и Max мимо VPN» работают через свои скрипты и без awg2,
   # но управлять ими без awg2 нечем — уходят вместе со скриптом, иначе остаются
-  if [[ "$del_self" == y ]]; then antiscan_remove; vkblock_remove
+  if [[ "$del_self" == y ]]; then antiscan_remove; vkblock_remove; rublock_remove; smtpblock_remove
   else
     if antiscan_on; then info "Антисканер оставлен и продолжит работать"; fi
     if vkblock_on; then info "VK и Max мимо VPN оставлено и продолжит работать"; fi
+    if rublock_on; then info "РФ мимо VPN оставлено и продолжит работать"; fi
+    if smtpblock_on; then info "Порт 25 для клиентов остаётся закрытым"; fi
   fi
   if [[ "$del_bot" == y ]]; then
     bot_uninstall quiet

@@ -199,6 +199,12 @@ class BackupRaceTests(unittest.IsolatedAsyncioTestCase):
             release = asyncio.Event()
 
             async def create(*args, **kwargs):
+                if args[:2] == ("backup", "pack"):
+                    # Файл на выдачу — копия: бот удаляет его после отправки
+                    out = root / "backup-out" / "x1" / "backup.tar.gz"
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    out.write_bytes(b"backup")
+                    return api.Result(True, data={"path": str(out), "name": out.name, "encrypted": False})
                 entered.set()
                 await release.wait()
                 return api.Result(True, data={"path": str(archive)})
@@ -214,7 +220,11 @@ class BackupRaceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await alerts.backup_due(Mock(), force=True), "busy")
                 release.set()
                 self.assertEqual(await first, "done")
-                self.assertEqual(call.await_count, 1)
+                made = [c.args[:2] for c in call.await_args_list]
+                self.assertEqual(made.count(("backup", "create")), 1)
+                self.assertEqual(made.count(("backup", "pack")), 1)
+                self.assertTrue(archive.exists())                          # бэкап на сервере не тронут
+                self.assertFalse((root / "backup-out" / "x1").exists())    # выдача убрана
 
 
 class AuthHardeningTests(unittest.TestCase):

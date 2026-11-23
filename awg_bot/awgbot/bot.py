@@ -20,8 +20,8 @@ from aiogram.types import BotCommand, CallbackQuery, ChatMemberUpdated, ErrorEve
 
 from . import __version__, access, admins, alerts, api, ask, icons, jobs, monitor, net, store, ui, webapp
 from .config import load_config
-from .sections import (amnezia, antiscan, backup, botself, clients, diag, entries, main as main_menu, rudirect,
-                       server, system, tunnels, vkblock, webpanel, wgobf)
+from .sections import (amnezia, antiscan, backup, botself, clients, diag, entries, main as main_menu, rublock,
+                       rudirect, server, smtpblock, system, tunnels, vkblock, webpanel, wgobf, xraysub)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("awgbot")
@@ -80,8 +80,8 @@ def build(session: BaseSession | None = None) -> tuple[Bot, Dispatcher]:
     dp.errors.register(_on_error)
     dp.include_routers(main_menu.router, ask.router, server.router, clients.router, diag.router,
                        backup.router, tunnels.router, botself.router, system.router, wgobf.router,
-                       webpanel.router, antiscan.router, vkblock.router, amnezia.router, entries.router,
-                       rudirect.router, fallback)
+                       webpanel.router, antiscan.router, vkblock.router, rublock.router, smtpblock.router,
+                       amnezia.router, entries.router, rudirect.router, xraysub.router, fallback)
     return bot, dp
 
 

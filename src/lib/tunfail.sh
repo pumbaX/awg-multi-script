@@ -113,7 +113,7 @@ tunfail_held() {  # имя
   table=$(_tunfail_table "$1")
   [[ "$(rt_fail_mode "$1")" == block ]] && rt_tunnel_on "$table" && ! rt_table_live "$table" \
     && grep -qE "lookup $table\$" <<< "$(ip rule show 2>/dev/null)" \
-    && ip route show table "$table" 2>/dev/null | grep -q '^unreachable default'
+    && grep -q '^unreachable default' <<< "$(ip route show table "$table" 2>/dev/null)"
 }
 
 # ── Установка ─────────────────────────────────────────────
