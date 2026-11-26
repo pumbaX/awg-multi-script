@@ -13,6 +13,8 @@ AWG_IF="awg0"
 CLIENT_DIR="/root"                 # клиенты: /root/<имя>_awg2.conf | _awg3.conf
 AUTOSTART_DROPIN="/etc/systemd/system/awg-quick@awg0.service.d"
 MODULES_LOAD_FILE="/etc/modules-load.d/amneziawg.conf"
+KMODS_DIR="/lib/modules"             # модули и заголовки ядер (build) — по ядру в каталоге
+DKMS_DIR="/var/lib/dkms"             # сборки DKMS и их журналы (make.log)
 SYSCTL_FORWARD_FILE="/etc/sysctl.d/99-awg2.conf"
 
 # Компоненты собираются из исходников апстрима через git + DKMS.
@@ -25,6 +27,10 @@ MOD_TAG_FILE="$STATE_DIR/module_tag"
 TOOLS_TAG_FILE="$STATE_DIR/tools_tag"
 MOD_BACKUP_DIR="/var/backups/awg-mod"
 MOD_LOG="/var/log/awg-mod-update.log"
+# Автосборка модуля под новые ядра: итог последней попытки, отметка «включена»
+# (и «жива» — для сторожа таймера), повтор неудачи с теми же ядрами — через 6 ч
+KFIX_STATE="$STATE_DIR/kernel-fix"; KFIX_ON="$STATE_DIR/kernel-fix.on"; KFIX_HEAL="$STATE_DIR/kernel-fix.heal"
+KFIX_TIMER="awg2-kernel-fix.timer" KFIX_RETRY=21600
 MOD_FALLBACK_TAG="v3.1.20260906"
 TOOLS_FALLBACK_TAG="v3.1.20260812"
 UPSTREAM_CACHE="$STATE_DIR/upstream_tags"
@@ -189,6 +195,16 @@ WGOBF_UNIT="awg-wgobf.service"
 WGOBF_CLIENTS="/root/wgobf"
 WGOBF_TAG="awg-wgobf"
 WGOBF_MTU=1380
+# Профили обфускации с MEDIA или obfuscate-bytes — форк wg-obfuscator из
+# Phobos (GPL-3.0; github.com/Ground-Zerro/Phobos): собирается из
+# закреплённого коммита, качается только его каталог src/phobos-obfuscator
+WGOBF_PH_REPO="https://github.com/Ground-Zerro/Phobos.git"
+WGOBF_PH_COMMIT="22aedefda053062dc58c036072d2da6e216d5a34"
+WGOBF_PH_SRC="src/phobos-obfuscator"
+WGOBF_PH_VERSION="1.4.1"
+WGOBF_PH_BIN="$WGOBF_LIB/phobos-obfuscator"
+WGOBF_PRESETS_MAX=8            # профилей сверх основного
+WGOBF_BUNDLE_V=3               # формат комплекта клиента: старее — пересобирается при показе
 
 # ── Telegram-бот ──────────────────────────────────────────
 BOT_CONF="/etc/awg-bot.conf"

@@ -30,7 +30,7 @@ if pre is None:
     print("ПРОПУСК: нет iproute2, ipset, iptables или сетевого пространства (unshare -rn)")
     sys.exit(0)
 bad = 0
-for part in ("tunnels", "rudirect", "rpf", "exits", "dns", "blocks"):
+for part in ("tunnels", "rudirect", "rpf", "exits", "dns", "blocks", "wgobf6", "wgobfcli"):
     tmp = tempfile.mkdtemp(prefix="awg2-kernel.")
     r = subprocess.run(pre + ["bash", os.path.join(HERE, "kernel_routing.sh"), AWG2, tmp, part],
                        capture_output=True, text=True, timeout=300)

@@ -111,6 +111,11 @@ _web_fw_nets() {  # → подсети, которым можно, по одно
   n=$(server_net 2>/dev/null) && echo "$n"
   n=$(sed -n 's/^NET=//p' "$WGOBF_STATE" 2>/dev/null | head -1)
   if valid_cidr "$n"; then echo "$n"; fi
+  # IPv6 в туннеле обфускатора — и его сеть
+  if [[ "$(sed -n 's/^IPV6=//p' "$WGOBF_STATE" 2>/dev/null | head -1)" == 1 ]]; then
+    n=$(sed -n 's/^NET6=//p' "$WGOBF_STATE" 2>/dev/null | head -1)
+    if [[ "$n" =~ ^fd[0-9a-f]{2}(:[0-9a-f]{1,4}){3}::/64$ ]]; then echo "$n"; fi
+  fi
   return 0
 }
 
@@ -253,6 +258,9 @@ web_vpn_nets() {
   n=$(server_net 2>/dev/null) && echo "$n"
   n=$(wgobf_get NET 2>/dev/null)
   if valid_cidr "$n"; then echo "$n"; fi
+  # IPv6 в туннеле обфускатора: его клиенты приходят и с адресов этой сети
+  n=$(wgobf_get NET6 2>/dev/null)
+  if [[ "$(wgobf_get IPV6 2>/dev/null)" == 1 && "$n" =~ ^fd[0-9a-f]{2}(:[0-9a-f]{1,4}){3}::/64$ ]]; then echo "$n"; fi
   return 0
 }
 

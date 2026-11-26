@@ -91,7 +91,7 @@ do_install() {
     fi
   fi
 
-  if [[ -d "/lib/modules/$running/build" ]]; then
+  if [[ -d "$KMODS_DIR/$running/build" ]]; then
     cur=$(mod_tag)
     tag=$(resolve_tag mod)
     if [[ "${cur#≈}" == "$tag" ]] && mod_built_for "$running"; then
@@ -687,8 +687,13 @@ _fixed() { REPAIR_FIXED=$((REPAIR_FIXED + 1)); ok "$1"; }
 # ufw с MANAGE_BUILTINS=yes или iptables -F, и обфускатор остаётся без NAT.
 _repair_firewall() {
   local p st on=0 what tag
-  for what in AWG обфускатора; do
+  local presets=()
+  wgobf_installed && mapfile -t presets < <(wgobf_presets)
+  for what in AWG обфускатора ${presets[@]+"${presets[@]/#/p:}"}; do
     if [[ "$what" == AWG ]]; then server_exists || continue; p=$(server_port); tag=AmneziaWG
+    elif [[ "$what" == p:* ]]; then
+      _wgobf_preset "${what#p:}" || continue
+      p="$PP_PORT"; tag=$(_wgobf_preset_tag "${what#p:}"); what="профиля ${what#p:}"
     else wgobf_installed || continue; p=$(wgobf_get PORT); tag="$WGOBF_TAG"; fi
     st=$(ufw_port_state "$p/udp")
     case "$st" in

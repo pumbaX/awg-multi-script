@@ -2,7 +2,7 @@
 # Маршрутизация туннелей на настоящем ядре: правила клиентов, «если туннель
 # упал» (unreachable под маршрутом), метка и правило «РФ напрямую», «куда идёт
 # адрес» — настоящими ip, ipset и iptables в отдельном сетевом пространстве.
-# Запуск: unshare -rn bash tests/kernel_routing.sh dist/awg2.sh КАТАЛОГ tunnels|rudirect|rpf|exits|dns|blocks
+# Запуск: unshare -rn bash tests/kernel_routing.sh dist/awg2.sh КАТАЛОГ tunnels|rudirect|rpf|exits|dns|blocks|wgobf6|wgobfcli
 # (или через tests/test_kernel_routing.py — он сам пропустит, если netns нет).
 # shellcheck disable=SC2034  # пути — для функций awg2, подключённых через eval
 set -u
@@ -154,7 +154,7 @@ PY
   trap 'kill $CA $CW $NET $S1 $S2 2>/dev/null' EXIT
   sleep 0.5
   q() { nsenter -t "$1" -n python3 -I "$T/q.py" "$2"; }
-  eval "$(sed -n '/^ipt_add() {/,/^}/p;/^ipt_ins() {/,/^}/p;/^ipt_del() {/,/^}/p;/^ipt_del_tagged() {/,/^}/p' "$LIB")"
+  eval "$(sed -n '/^ipt_add() {/,/^}/p;/^ipt_ins() {/,/^}/p;/^ipt_del() {/,/^}/p;/^ipt_del_tagged() {/,/^}/p;/^ipt_del_grep() {/,/^}/p' "$LIB")"
   DNS_PROXY_ADDR=127.0.2.1 DNS_PROXY_PORT=53
 else
   ip tuntap add mode tun dev awg0; ip addr add 10.23.45.1/24 dev awg0; ip link set awg0 up
@@ -349,6 +349,64 @@ ok "wgobf0 появился после включения DNS — перехва
 dns_rules_down
 ok "выключили DNS — правила сняты, клиенты снова ходят к своему DNS" \
   '! grep -q awg2-dns <<< "$(iptables-save)" && [[ "$(q "$CW" dns)" == "LEAK 1.1.1.1" && "$(q "$CW" dot)" == DOT-OPEN ]]'
+elif [[ "$PART" == wgobf6 ]]; then
+echo "── WG + обфускатор: правила IPv6 в туннеле — настоящие iptables и ip6tables ──"
+ip6tables -t nat -S POSTROUTING &>/dev/null || { echo "ПРОПУСК wgobf6: нет ip6tables с таблицей nat"; exit 0; }
+eval "$(sed -n '/^ipt_del_tagged() {/,/^}/p;/^ipt_del_grep() {/,/^}/p;/^ip6t_del_tagged() {/,/^}/p' "$LIB")"
+ip link add wgobf0 type veth peer name w0; ip link set wgobf0 up
+printf 'NET=10.66.66.0/24\nWG_PORT=51900\nIPV6=1\nNET6=fd12:3456:789a:1::/64\n' > "$WGOBF_STATE"
+WARP_PEERS="$T/warp.peers"; echo 10.66.66.3 > "$WARP_PEERS.wgobf"
+EXITS_PEERS="$T/exits.peers"; echo "10.66.66.200|n1" > "$EXITS_PEERS.wgobf"
+# IPv6 в ядре песочницы может быть выключен: sysctl — без него, сами правила проверяются
+sysctl() { echo "sysctl $*" >> "$T/sysctl.log"; [[ "$1" == -n ]] && echo 1; return 0; }
+ip() { if [[ "$1 $2" == "-6 route" ]]; then echo "default via fe80::1 dev eth0 proto ra"; return 0; fi; command ip "$@"; }
+err=$(wgobf_fw_run up 2>&1); rc=$?
+s6=$(ip6tables-save)
+ok "wgobf_fw_run up: без ошибок ($err)" '(( rc == 0 )) && [[ -z "$err" ]]'
+ok "NAT66 сети клиентов, вход из wgobf0, ответы по conntrack" \
+  'grep -q -- "-A POSTROUTING -s fd12:3456:789a:1::/64 ! -o wgobf0 -m comment --comment awg-wgobf -j MASQUERADE" <<< "$s6" \
+   && grep -q -- "-A FORWARD -i wgobf0 -m comment --comment awg-wgobf -j ACCEPT" <<< "$s6" \
+   && grep -qE -- "-A FORWARD -o wgobf0 -m conntrack --ctstate (RELATED,ESTABLISHED|ESTABLISHED,RELATED) -m comment --comment awg-wgobf -j ACCEPT" <<< "$s6"'
+ok "DNS и DoT по IPv6 — отказ раньше ACCEPT; клиенты в туннелях (WARP .3 → ::3, нода .200 → ::c8) — отказ ещё раньше" \
+  '[[ "$(ip6tables -S FORWARD | grep -c -- "-i wgobf0 -p .* --dport \(53\|853\) .*-j REJECT")" == 4 ]] \
+   && ip6tables -S FORWARD | sed -n 2,3p | grep -q "icmp6-adm-prohibited" \
+   && ip6tables -S FORWARD | grep -q -- "-s fd12:3456:789a:1::3/128 -i wgobf0 .*awg-wgobf-v6r -j REJECT --reject-with icmp6-adm-prohibited" \
+   && ip6tables -S FORWARD | grep -q -- "-s fd12:3456:789a:1::c8/128 " \
+   && [[ "$(ip6tables -S FORWARD | sed -n 2p)" == *"awg-wgobf-v6r"* ]]'
+ok "порт WireGuard закрыт снаружи и по IPv6, accept_ra=2 до пересылки IPv6" \
+  'ip6tables -S INPUT | grep -q -- "-p udp -m udp --dport 51900 .*-j DROP" \
+   && grep -n "accept_ra=2\|forwarding=1" "$T/sysctl.log" | head -1 | grep -q accept_ra'
+wgobf_fw_run up 2>/dev/null
+ok "повторный up — без дублей" '[[ "$(ip6tables-save | grep -c awg-wgobf)" == "$(grep -c awg-wgobf <<< "$s6")" ]]'
+rm -f "$WARP_PEERS.wgobf"; wgobf_fw6_routes
+ok "клиент ушёл из туннеля — его отказ снят, остальное на месте" \
+  '! ip6tables -S FORWARD | grep -q "fd12:3456:789a:1::3/128" && ip6tables -S FORWARD | grep -q "::c8/128" \
+   && ip6tables -t nat -S POSTROUTING | grep -q awg-wgobf'
+wgobf_fw_run down
+ok "down — ни одного правила обфускатора ни в iptables, ни в ip6tables" \
+  '! grep -q awg-wgobf <<< "$(iptables-save; ip6tables-save)"'
+sed -i '/^IPV6=/d' "$WGOBF_STATE"; wgobf_fw_run up 2>/dev/null
+ok "IPv6 в туннеле выключен — в ip6tables только закрытый порт WireGuard" \
+  '[[ "$(ip6tables-save | grep -c awg-wgobf)" == 1 ]] && [[ "$(iptables-save | grep -c awg-wgobf)" == 4 ]]'
+elif [[ "$PART" == wgobfcli ]]; then
+echo "── Клиент обфускатора на Linux: ответы на входящие (SSH) — мимо туннеля, настоящие ip rule ──"
+_wgobf_keep_script > "$T/keep.sh"
+# Аплинк — общий eth0 (203.0.113.10/24, шлюз .1). Туннель «весь интернет, кроме сервера» — маршрутами в main, как у wg-quick
+ip link add wgc type veth peer name wgc1; ip link set wgc up; ip link set wgc1 up; ip addr add 10.70.1.2/32 dev wgc
+ip route add 0.0.0.0/1 dev wgc; ip route add 128.0.0.0/1 dev wgc
+ok "без службы ответ SSH с адреса аплинка ушёл бы в туннель (сессия рвётся)" \
+  '[[ "$(ip -4 route get 198.51.100.7 from 203.0.113.10)" == *"dev wgc"* ]]'
+bash "$T/keep.sh" up
+ok "ответ с адреса аплинка — прежним шлюзом, соседям по сети — напрямую" \
+  '[[ "$(ip -4 route get 198.51.100.7 from 203.0.113.10)" == *"via 203.0.113.1 dev eth0"* ]] \
+   && r=$(ip -4 route get 203.0.113.50 from 203.0.113.10) && [[ "$r" == *"dev eth0"* && "$r" != *via* ]]'
+ok "исходящие (адрес не выбран) — по-прежнему в туннель" '[[ "$(ip -4 route get 198.51.100.7)" == *"dev wgc"* ]]'
+bash "$T/keep.sh" up
+ok "повторный up — правило одно" '[[ "$(ip -4 rule show | grep -c "lookup 51819")" == 1 ]]'
+bash "$T/keep.sh" down
+ok "down — ни правил, ни таблицы; ответ снова как без службы" \
+  '! ip -4 rule show | grep -q 51819 && [[ -z "$(ip -4 route show table 51819 2>/dev/null)" ]] \
+   && [[ "$(ip -4 route get 198.51.100.7 from 203.0.113.10)" == *"dev wgc"* ]]'
 elif [[ "$PART" == exits ]]; then
 echo "── Сторож exit-нод: ноды — настоящие сетевые пространства, проба — настоящий ping ──"
 command -v ping &>/dev/null || { echo "ПРОПУСК exits: нет ping"; exit 0; }

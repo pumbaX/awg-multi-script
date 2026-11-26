@@ -158,6 +158,8 @@ BOT_ADMINS="{ROOT}/admins.json"; TRAFFIC_DB="$STATE_DIR/traffic.json"
 EXPIRE_STALE=999999999      # сторож таймера в песочнице молчит; его проверка — отдельно
 BACKUP_DIR="{ROOT}/awg_backup"; MOD_BACKUP_DIR="{ROOT}/mod-backups"; UPDATE_CHANNEL_FILE="$STATE_DIR/channel"
 BACKUP_KEY="$STATE_DIR/backup.key"; BACKUP_OUT="$STATE_DIR/backup-out"
+MOD_LOG="{ROOT}/mod-update.log"; KMODS_DIR="{ROOT}/lib/modules"; DKMS_DIR="{ROOT}/var/lib/dkms"
+KFIX_STATE="$STATE_DIR/kernel-fix"; KFIX_ON="$STATE_DIR/kernel-fix.on"; KFIX_HEAL="$STATE_DIR/kernel-fix.heal"
 MOD_TAG_FILE="$STATE_DIR/module_tag"; TOOLS_TAG_FILE="$STATE_DIR/tools_tag"; UPSTREAM_CACHE="$STATE_DIR/upstream_tags"; COUNTRY_CACHE="$STATE_DIR/country"; COUNTRY_MANUAL="$STATE_DIR/country_manual"
 WARP_PEERS="{ROOT}/warp.peers"; XRAY_PEERS="{ROOT}/xray.peers"; USQUE_LOG="{ROOT}/usque.log"
 XRAY_DIR="{ROOT}/etc/xray"; XRAY_CONF="$XRAY_DIR/config.json"; XRAY_STATE="$XRAY_DIR/state"

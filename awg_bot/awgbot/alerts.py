@@ -12,7 +12,10 @@
   cert    сертификат Mini App скоро истечёт — значит, продление не сработало;
   disk    диск заполнен на DISK_WARN% (повтор — только после спада ниже DISK_OK%);
   update  вышла новая версия AWG Toolza — одной строкой, «Обновить» и «Что нового»;
-  kernel  установлено ядро без модуля AWG — после перезагрузки VPN не поднимется;
+  kernel  новое ядро: модуль AWG к нему собран — пора перезагрузиться; ядро без
+          модуля — после перезагрузки VPN не поднимется. Модуль под новые ядра
+          awg2 собирает сам (таймер): о ядре без модуля — только если автосборка
+          не справилась (с её причиной) или молчит KERNEL_FIX_WAIT;
   support по пятницам — напоминание поддержать проект, только владельцам.
 
 Каждое событие — один раз, пока не сменится (новая версия, другое ядро).
@@ -58,13 +61,14 @@ BOOT_ID = Path(os.environ.get("AWG_BOOT_ID", "/proc/sys/kernel/random/boot_id"))
 CERT_FULL = Path(os.environ.get("AWG_CERT_FULL", "/etc/awg2/cert/fullchain.pem"))
 DISK_PATH = os.environ.get("AWG_DISK_PATH", "/")
 SEND_MAX = 49 * 1024 * 1024                     # документ бота — до 50 МБ
+KERNEL_FIX_WAIT = 3 * 3600                      # автосборка модуля молчит — сообщить о ядре без модуля
 
 # id, подпись кнопки (полстроки в боте), полное название
 KINDS = [("iface", "awg0 упал", "awg0 упал и поднялся"), ("warp", "WARP упал", "WARP упал или не отвечает и снова работает"),
          ("xray", "Xray не идёт", "Xray: через выход трафик не идёт и снова работает"),
          ("exits", "Exit-ноды", "Exit-нода не отвечает и снова работает: общий выход переключается сам"),
          ("reboot", "Перезагрузка", "Сервер перезагрузился"),
-         ("update", "Новая версия", "Новая версия Тулзы"), ("kernel", "Ядро без AWG", "Ядро без модуля AWG"),
+         ("update", "Новая версия", "Новая версия Тулзы"), ("kernel", "Новое ядро", "Новое ядро: модуль AWG и перезагрузка"),
          ("cert", "Сертификат", "Сертификат Mini App истекает"), ("disk", f"Диск {DISK_WARN}%", f"Диск заполнен на {DISK_WARN}%"),
          ("support", "Поддержка", "Пятница: поддержать проект")]
 KIND_IDS = {k for k, _, _ in KINDS}
@@ -389,13 +393,37 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
     else:
         st.pop("exits_dead", None)
 
-    # Ядро без модуля: один раз на набор ядер
-    gap = (d.get("components") or {}).get("kernel_gap") or ""
-    if gap and gap != st.get("kernel") and enabled("kernel"):
-        await notify(bot, f"⚠️ <b>{host}: ядро {esc(gap)} без модуля AWG</b>\n"
-                          "Сервер загрузится в него после перезагрузки — и VPN не поднимется. "
-                          "Пересобери модуль заранее.", ui.kb(("🧱 Пересобрать", "mod:rebuild")))
-    st["kernel"] = gap
+    # Ядро без модуля: один раз на набор ядер. С автосборкой awg2 (таймер
+    # собирает модуль под новые ядра сам) — только если она не справилась или
+    # молчит дольше KERNEL_FIX_WAIT; без неё (старый awg2) — сразу, как раньше
+    comp = d.get("components") or {}
+    gap = comp.get("kernel_gap") or ""
+    if gap:
+        seen = st.get("kernel_seen") if isinstance(st.get("kernel_seen"), dict) else {}
+        if seen.get("gap") != gap:
+            seen = {"gap": gap, "at": now}
+        st["kernel_seen"] = seen
+        due = (not comp.get("kernel_auto") or comp.get("kernel_fix") == "fail"
+               or now - _as_int(seen.get("at")) >= KERNEL_FIX_WAIT)
+        if due and gap != st.get("kernel"):
+            why = str(comp.get("kernel_fix_why") or "")
+            if enabled("kernel"):
+                await notify(bot, f"⚠️ <b>{host}: ядро {esc(gap)} без модуля AWG</b>\n"
+                                  + (f"Автосборка не справилась: {esc(why)}\n" if why else "")
+                                  + "Сервер загрузится в него после перезагрузки — и VPN не поднимется. "
+                                  + ("Пересобери модуль или обнови его." if why else "Пересобери модуль заранее."),
+                             ui.kb(("🧱 Пересобрать", "mod:rebuild"), ("🧩 Модуль ядра", "mod")))
+            st["kernel"] = gap
+    else:
+        st["kernel"] = ""
+        st.pop("kernel_seen", None)
+    # Модуль под новое ядро готов — одно напоминание перезагрузиться, на каждое ядро
+    new = str(comp.get("kernel_new") or "")
+    if new and new != st.get("kernel_new") and enabled("kernel"):
+        await notify(bot, f"🔄 <b>{host}: новое ядро {esc(new)} — модуль AWG к нему готов</b>\n"
+                          "Перезагрузи сервер, когда удобно: VPN поднимется уже на новом ядре.",
+                     ui.kb(("♻️ Перезагрузить", "srv:reboot")))
+    st["kernel_new"] = new
 
     # Диск
     pct = disk_pct()

@@ -20,7 +20,7 @@ from typing import Any, Callable
 from aiogram.types import BufferedInputFile, FSInputFile
 from aiohttp import web
 
-from . import __version__, access, admins, alerts, api, icons, media, share, store
+from . import __version__, access, admins, alerts, api, icons, instlink, media, share, store
 from .sections import backup as bk
 from .sections import botself
 from .sections import clients as cls
@@ -429,6 +429,27 @@ def setup(app: web.Application, user_of: UserOf) -> None:
     async def _wgobf_mon(request: web.Request, user: dict, body: dict) -> web.Response:
         store.set_monitored(store.WGOBF + _name(body), bool(body.get("on")))
         return web.json_response({"ok": True})
+
+    # Одноразовая ссылка установки для AWG Manager (Keenetic): адрес — тот, по
+    # которому открыта панель
+    @route("/api/wgobf/install-link")
+    async def _wgobf_install_link(request: web.Request, user: dict, body: dict) -> web.Response:
+        name = _name(body)
+        rows = await api.data("wgobf", "clients", default=[]) or []
+        row = next((c for c in rows if isinstance(c, dict) and c.get("name") == name), None)
+        if not row or not row.get("pub"):
+            return web.json_response({"error": f"Клиента {name} нет"}, status=404)
+        if not share.host_ok(request.host):
+            return web.json_response({"error": "Адрес сервера не распознан"}, status=400)
+        by = f"web:{user.get('first_name', '')}" if user.get("web") else f"tg:{user.get('id')}"
+        token, rid, exp = instlink.create(name, row["pub"], by)
+        return web.json_response({"ok": True, "url": f"https://{request.host}{instlink.PATH}{token}", "id": rid,
+                                  "exp": exp, "ttl": instlink.TTL})
+
+    @route("/api/wgobf/install-link/revoke")
+    async def _wgobf_install_revoke(request: web.Request, user: dict, body: dict) -> web.Response:
+        # Уже сработала или истекла — не ошибка: отзывать нечего
+        return web.json_response({"ok": True, "revoked": instlink.revoke(str(body.get("id") or "")[:16])})
 
     # ── Бот: админы, оформление, сервер панели ──
     @route("/api/bot/info")

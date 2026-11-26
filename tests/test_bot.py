@@ -1538,6 +1538,11 @@ async def run():
     chk("«Через WARP» — адреса клиентов обфускатора в списке WARP, экран: выбрано, WARP выключен",
         os.path.exists(wl) and open(wl).read().split() == ["10.77.1.2"] and ("🔘 Через WARP", "wo:rs:*|w") in buttons
         and "через WARP</b> — WARP выключен, пока напрямую" in text, [text, buttons])
+    chk("WARP выключен — кнопка «Включить WARP» прямо на экране выхода", ("▶️ Включить WARP", "wo:ton:*") in buttons, buttons)
+    text, buttons = screen(await press("wo:ton:*"))
+    chk("работают exit-ноды — сначала вопрос: одновременно один туннель, выключить их и включить WARP",
+        "Сейчас работает <b>exit-ноды</b>" in text and "одновременно — только один туннель" in text
+        and ("✅ Переключить", "wo:tsw:*") in buttons and any(d == "wo:rt:*" for _, d in buttons), [text, buttons])
     text, buttons = screen(await press("wo"))
     chk("главный экран: «через WARP — WARP выключен, пока напрямую»",
         "через WARP</b> — WARP выключен, пока напрямую" in text, text)
@@ -1636,6 +1641,70 @@ async def run():
     await press("wo:ren:clus2")
     text, _ = screen(await say("clus"))
     chk("и обратно — карточка clus", "<b>🛡 clus</b>" in text and store.monitored("wgobf:clus"), text)
+
+    # Профили обфускации, профиль клиента, IPv6, ссылка установки
+    from awgbot import instlink
+    from awgbot.sections import wgobf as wgobfmod
+    with open(ACTIVE, "a") as f:
+        f.write("awg-wgobf.service\n")
+    text, buttons = screen(await press("wo"))
+    chk("обфускатор: кнопки «Профили» и «IPv6»", ("🎛 Профили (1)", "wo:pl") in buttons and ("⬜️ IPv6", "wo:v6:on") in buttons,
+        buttons)
+    text, buttons = screen(await press("wo:pl"))
+    chk("профили: основной в списке, кнопка «Новый профиль»", "основной" in text and "45888/udp · STUN" in text
+        and any(d == "wo:pv:main" for _, d in buttons) and ("➕ Новый профиль", "wo:pa") in buttons, [text, buttons])
+    text, buttons = screen(await press("wo:pv:main"))
+    datas = [d for _, d in buttons]
+    chk("основной профиль: маскировка → NONE (без MEDIA), max-dummy, idle, ключ; без obfuscate-bytes и удаления",
+        "wo:pm:main|NONE" in datas and "wo:pm:main|MEDIA" not in datas and "wo:pd:main" in datas and "wo:pi:main" in datas
+        and "wo:pk:main" in datas and "wo:pob:main" not in datas and "wo:pdel:main" not in datas
+        and "max-dummy: 4" in text, [text, buttons])
+    await press("wo:pd:main")
+    text, _ = screen(await say("016"))
+    chk("max-dummy: ведущий ноль — повторный вопрос", "без ведущих нулей" in text, text)
+    text, buttons = screen(await say("40"))
+    with open(os.path.join(ROOT, "etc/awg-wgobf/state")) as f:
+        wst = f.read()
+    chk("max-dummy основного сохранён — экран профиля", "max-dummy: 40" in text and "DUMMY=40" in wst, [text, wst])
+    await press("wo:pi:main")
+    text, _ = screen(await say("5"))
+    chk("idle-timeout 5 — отказ awg2, вопрос заново", "10-86400" in text, text)
+    text, buttons = screen(await press("wo:cp:clus"))
+    chk("профиль клиента: список профилей, текущий отмечен", "Сейчас: <b>основной</b>" in text
+        and ("🔘 основной", "wo:cps:clus|0") in buttons, [text, buttons])
+    await press("wo:cps:clus|7")                      # устаревшая кнопка — без изменений
+    text, buttons = screen(await press("wo:v:clus"))
+    chk("карточка: профиль, «Ссылка установки» и «Профиль»", "Профиль: основной" in text
+        and ("🔗 Ссылка установки", "wo:il:clus") in buttons and ("🎛 Профиль", "wo:cp:clus") in buttons, [text, buttons])
+    text, buttons = screen(await press("wo:il:clus"))
+    chk("ссылка установки без Mini App и открытой веб-панели — объяснение", "Включи Mini App" in text, text)
+    real_base = wgobfmod.install_base
+
+    async def fake_base():
+        return "https://vpn.example:8443/"
+    wgobfmod.install_base = fake_base
+    try:
+        text, buttons = screen(await press("wo:il:clus"))
+    finally:
+        wgobfmod.install_base = real_base
+    m = re.search(r"<code>https://vpn\.example:8443/api/install/([A-Za-z0-9_-]{32})</code>", text)
+    rid = next((d.split("|")[1] for _, d in buttons if d.startswith("wo:ilx:clus|")), "")
+    chk("ссылка установки — только для AWG Manager (без curl | bash): ссылка, срок и «Отозвать»",
+        m and "AWG Manager" in text and "Ссылка установки Phobos" in text and "один раз" in text
+        and "curl" not in text and "sudo bash" not in text
+        and instlink._peek(m.group(1)) and instlink._peek(m.group(1))["pub"] == "CPUB=" and rid, [text, buttons])
+    if m:
+        await press(f"wo:ilx:clus|{rid}")
+        chk("ссылка установки отозвана", instlink._peek(m.group(1)) is None)
+    text, buttons = screen(await press("wo:v6:on"))
+    chk("IPv6: у сервера нет IPv6 — причина, без кнопки включения", "нет IPv6" in text
+        and not any(d == "wo:v6ok:on" for _, d in buttons), [text, buttons])
+    text, buttons = screen(await press("wo:pa"))
+    text, _ = screen(await say("main"))
+    chk("новый профиль: имя main — повторный вопрос", "заняты" in text, text)
+    text, buttons = screen(await say("media"))
+    chk("новый профиль: выбор маскировки MEDIA, STUN, NONE", ("🎭 MEDIA", "wo:pam:media|MEDIA") in buttons
+        and ("🎭 STUN", "wo:pam:media|STUN") in buttons and "минута-две" in text, [text, buttons])
 
     text, buttons = screen(await press("wo:install"))
     chk("установка обфускатора: DNS по умолчанию Cloudflare", "DNS клиентов: Cloudflare" in text, text)
@@ -2597,6 +2666,106 @@ async def run():
     chk("обновить и убрать — задачами", [j[0] for j in xs_jobs] == [("xray", "sub", "update"), ("xray", "sub", "off")], xs_jobs)
     botapi.call = real_call_
     botapi.job_start = real_job_start
+
+    print("Xray: проверка выходов (observatory)")
+    chk("кэш: смена настроек проверки — запись (кэш сбрасывается), get — чтение",
+        botapi._writes(("xray", "observatory", "interval", "30s")) and botapi._writes(("xray", "observatory", "url", "x"))
+        and not botapi._writes(("xray", "observatory", "get")))
+    OBS = {"balancer": "leastPing", "obs": {"on": True, "probeUrl": "https://www.google.com/generate_204",
+                                            "probeInterval": "1m", "enableConcurrency": False}}
+    obs_calls = []
+
+    async def obs_call(*args, **kw):
+        if args[:2] == ("xray", "status"):
+            return botapi.Result(True, data={"installed": True, "tags": ["a", "b"], "balancer": OBS["balancer"],
+                                             "obs": OBS["obs"]})
+        if args[:2] == ("xray", "observatory"):
+            obs_calls.append(args[2:])
+            return botapi.Result(True, log="  √ готово")
+        return await real_call_(*args, **kw)
+    botapi.call = obs_call
+    try:
+        text, buttons = screen(await press("xr:obs"))
+        chk("проверка выходов: URL, интервал, параллельно — кнопками",
+            "generate_204" in text and "Интервал: <b>1m</b>" in text and ("🔗 URL проверки", "xr:obsurl") in buttons
+            and ("⏱ Интервал", "xr:obsint") in buttons and ("⬜️ Параллельно", "xr:obsconc:on") in buttons, [text, buttons])
+        await press("xr:obsintset:30s")
+        await press("xr:obsintset:7s")
+        await press("xr:obsurlset:2")
+        await press("xr:obsurlset:9")
+        await press("xr:obsconc:on")
+        chk("интервал, URL из списка и параллельность — в awg2; чужие значения из старых кнопок — нет",
+            obs_calls == [("interval", "30s"), ("url", "http://cp.cloudflare.com/generate_204"), ("concurrency", "on")],
+            obs_calls)
+        await press("xr:obsurlask")
+        await say("ftp://bad")
+        text, _ = screen(await say("https://probe.example.org/204"))
+        chk("свой URL: не http(s) — повторный вопрос, http(s) — в awg2",
+            obs_calls[-1] == ("url", "https://probe.example.org/204"), [obs_calls, text])
+        OBS["balancer"] = "random"
+        text, buttons = screen(await press("xr:obs"))
+        chk("без leastPing/leastLoad — пояснение вместо настроек", "только при" in text
+            and not any(d == "xr:obsint" for _, d in buttons), text)
+    finally:
+        botapi.call = real_call_
+
+    print("Новое ядро: автосборка модуля и перезагрузка")
+    KC = {"kernel_gap": "", "kernel_new": "", "kernel_auto": True, "kernel_fix": "", "kernel_fix_why": ""}
+    k_real_data = al.api.data
+
+    async def k_data(*args, **kw):
+        if args[:1] == ("status",):
+            return {"version": "v1.2.66", "host": "vm1", "components": dict(KC), "server": {"exists": True, "up": True}}
+        return await k_real_data(*args, **kw)
+    al.api.data = k_data
+    kst = {}
+
+    def kmsgs(mark):
+        return [(m.text, [b.callback_data for row in (m.reply_markup.inline_keyboard if m.reply_markup else []) for b in row])
+                for n, m in SESSION.sent[mark:] if n == "SendMessage" and m.chat_id == 111 and "ядро" in (m.text or "")]
+
+    async def ktick():
+        mark = len(SESSION.sent)
+        await al.tick(BOT, kst)
+        return kmsgs(mark)
+    KC.update(kernel_gap="6.8.0-149-generic")
+    got = await ktick()
+    chk("ядро без модуля, автосборка включена — сразу не пишет: awg2 соберёт сам", not got, got)
+    KC.update(kernel_gap="", kernel_new="6.8.0-149-generic")
+    got = await ktick()
+    chk("модуль собран — одно напоминание перезагрузиться, с кнопкой «Перезагрузить»",
+        len(got) == 1 and "новое ядро 6.8.0-149-generic — модуль AWG к нему готов" in got[0][0]
+        and "Перезагрузи сервер, когда удобно" in got[0][0] and got[0][1] == ["srv:reboot"], got)
+    got = await ktick()
+    chk("повторно о том же ядре — молчит", not got, got)
+    text, buttons = screen(await press("srv:reboot"))
+    chk("кнопка ведёт к подтверждению перезагрузки, без перезагрузки сразу", ("♻️ Перезагрузить", "srv:rebootok") in buttons, buttons)
+    KC.update(kernel_new="")
+    got = await ktick()
+    chk("перезагрузились в новое ядро — молчит", not got and kst.get("kernel_new") == "", got)
+    KC.update(kernel_gap="6.8.0-150-generic", kernel_fix="fail",
+              kernel_fix_why="6.8.0-150-generic: сборка не удалась — socket.c:42:5: error: <b>implicit</b>")
+    got = await ktick()
+    chk("автосборка не справилась — сразу, с причиной (экранирована) и кнопками «Пересобрать» и «Модуль ядра»",
+        len(got) == 1 and "ядро 6.8.0-150-generic без модуля AWG" in got[0][0] and "Автосборка не справилась" in got[0][0]
+        and "&lt;b&gt;implicit" in got[0][0] and got[0][1] == ["mod:rebuild", "mod"], got)
+    got = await ktick()
+    chk("о том же ядре — один раз", not got, got)
+    KC.update(kernel_gap="6.8.0-151-generic", kernel_fix="", kernel_fix_why="")
+    await ktick()
+    kst["kernel_seen"]["at"] -= 4 * 3600
+    got = await ktick()
+    chk("автосборка молчит больше трёх часов — сообщает и без её отчёта", len(got) == 1 and "6.8.0-151-generic" in got[0][0]
+        and "Пересобери модуль заранее" in got[0][0], got)
+    KC.update(kernel_gap="6.8.0-152-generic", kernel_auto=False)
+    got = await ktick()
+    chk("старый awg2 без автосборки — сразу, как раньше", len(got) == 1 and "6.8.0-152-generic" in got[0][0], got)
+    KC.update(kernel_gap="", kernel_new="6.8.0-152-generic")
+    al.set_enabled("kernel", False)
+    got = await ktick()
+    chk("уведомление выключено — молчит", not got, got)
+    al.set_enabled("kernel", True)
+    al.api.data = k_real_data
 
     print("РФ напрямую, если туннель упал, куда идёт адрес")
     text, buttons = screen(await press("tun"))

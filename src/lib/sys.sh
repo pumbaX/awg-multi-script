@@ -92,18 +92,18 @@ headers_candidates() {
 # Ставит заголовки под ядро $1. 0 — каталог build для него появился.
 ensure_headers() {
   local k="$1" pkg
-  [[ -d "/lib/modules/$k/build" ]] && return 0
+  [[ -d "$KMODS_DIR/$k/build" ]] && return 0
   while read -r pkg; do
     apt_install "$pkg" >/dev/null 2>&1 || continue
-    [[ -d "/lib/modules/$k/build" ]] && return 0
+    [[ -d "$KMODS_DIR/$k/build" ]] && return 0
   done < <(headers_candidates "$k")
-  [[ -d "/lib/modules/$k/build" ]]
+  [[ -d "$KMODS_DIR/$k/build" ]]
 }
 
 # Установленные ядра (есть vmlinuz), от старых к новым — по версии, не по алфавиту.
 installed_kernels() {
   local k
-  for k in /lib/modules/*/; do
+  for k in "$KMODS_DIR"/*/; do
     k=${k%/}; k=${k##*/}
     [[ -e "/boot/vmlinuz-$k" ]] && echo "$k"
   done | sort -V
@@ -206,6 +206,15 @@ ipt_del_grep() {
   done < <(iptables-save -t "$t" 2>/dev/null | grep -E -- "^-A .*${re}" || true)
 }
 
+# То же для ip6tables; ip6tables нет — нечего и снимать.
+ip6t_del_tagged() {
+  local t="$1" re="--comment \"?${2}" rule
+  command -v ip6tables &>/dev/null || return 0
+  while IFS= read -r rule; do
+    printf '%s\n' "${rule/#-A /-D }" | xargs ip6tables -t "$t" 2>/dev/null || true
+  done < <(ip6tables-save -t "$t" 2>/dev/null | grep -E -- "^-A .*${re}" || true)
+}
+
 # ── UFW ───────────────────────────────────────────────────
 # LC_ALL=C: ufw переводит вывод («Состояние: активен») — на русской локали
 # Тулза считала бы его выключенным и не открывала бы ни один порт.
@@ -218,12 +227,15 @@ ufw_allow() {  # порт/протокол комментарий
 
 # Порт в UFW одним вызовом ufw (он на Python — каждый вызов ~0,1-0,3 с):
 # off — UFW нет или выключен, open — разрешающее правило на порт есть, closed — нет
-ufw_port_state() {  # порт/протокол, как пишет ufw status: 51820/udp
+# Второй аргумент — уже полученный вывод ufw_status_text: несколько портов — один вызов ufw.
+ufw_port_state() {  # порт/протокол, как пишет ufw status: 51820/udp [вывод ufw status]
   local out
-  command -v ufw &>/dev/null && out=$(LC_ALL=C ufw status 2>/dev/null) \
-    && grep -qiE '^Status:[[:space:]]*active' <<< "$out" || { echo off; return 0; }
+  if (( $# > 1 )); then out="$2"; else out=$(ufw_status_text); fi
+  grep -qiE '^Status:[[:space:]]*active' <<< "$out" || { echo off; return 0; }
   if grep -qE "^$1[[:space:]]+ALLOW" <<< "$out"; then echo open; else echo closed; fi
 }
+
+ufw_status_text() { command -v ufw &>/dev/null && LC_ALL=C ufw status 2>/dev/null; return 0; }
 
 # Открыть порт службы с сообщением; UFW выключен — молча ничего.
 ufw_open() {  # порт/протокол комментарий

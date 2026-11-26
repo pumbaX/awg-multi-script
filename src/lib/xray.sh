@@ -302,18 +302,87 @@ xray_balancer() {  # стратегия
   return 0
 }
 
+# Observatory (leastPing|leastLoad): URL / интервал / параллельная проверка выходов.
+xray_obs_on() {
+  local b
+  b=$(py xray-balancer-get "$XRAY_CONF" 2>/dev/null) || return 1
+  [[ "$b" == leastPing || "$b" == leastLoad ]]
+}
+
+xray_observatory() {  # url|interval|concurrency значение
+  local field="${1:-}" value="${2:-}"
+  [[ "$field" =~ ^(url|interval|concurrency)$ && -n "$value" ]] \
+    || { err "observatory: url URL | interval 10s|15s|30s|1m|2m | concurrency on|off"; return 1; }
+  xray_installed || { err "Xray не установлен"; return 1; }
+  py xray-observatory-set "$XRAY_CONF" "$field" "$value" >/dev/null || return 1
+  case "$field" in
+    url) ok "URL проверки: $value" ;;
+    interval) ok "Интервал проверки: $value" ;;
+    concurrency) ok "Параллельная проверка: $value" ;;
+  esac
+  xray_is_up && xray_restart
+  return 0
+}
+
+xray_observatory_menu() {
+  local c url interval conc=0 urls ivals line
+  xray_obs_on || { warn "Проверка выходов — только при leastPing или leastLoad"; return 0; }
+  line=$(py xray-observatory-get "$XRAY_CONF" shell 2>/dev/null) || return 1
+  IFS=$'\t' read -r url interval conc <<< "$line"
+  echo -e "  URL проверки: ${W}${url:-?}${N}"
+  echo -e "  Интервал    : ${W}${interval:-?}${N}"
+  echo -e "  Параллельно : ${W}$( (( conc )) && echo вкл || echo выкл)${N}"
+  echo -e "  ${C}1)${N} URL проверки ${D}— Google / Gstatic / Cloudflare / свой${N}"
+  echo -e "  ${C}2)${N} Интервал ${D}— 10s / 15s / 30s / 1m / 2m${N}"
+  echo -e "  ${C}3)${N} Параллельная проверка выходов ${D}— переключить${N}"
+  read_choice c "${C}  Выбор [1-3] (0 — назад): ${N}" 0 3 0
+  case "$c" in
+    1)
+      urls=("https://www.google.com/generate_204" "https://www.gstatic.com/generate_204"
+            "http://cp.cloudflare.com/generate_204")
+      echo -e "  ${C}1)${N} Google ${D}— ${urls[0]}${N}"
+      echo -e "  ${C}2)${N} Gstatic ${D}— ${urls[1]}${N}"
+      echo -e "  ${C}3)${N} Cloudflare ${D}— ${urls[2]}${N}"
+      echo -e "  ${C}4)${N} Свой URL"
+      read_choice c "${C}  URL [1-4] (0 — отмена): ${N}" 0 4 0
+      (( c )) || return 0
+      if (( c == 4 )); then
+        read_line url "${C}  http(s)://… : ${N}"
+        [[ -n "$url" ]] || return 0
+      else
+        url="${urls[$((c - 1))]}"
+      fi
+      xray_observatory url "$url" || true ;;
+    2)
+      ivals=(10s 15s 30s 1m 2m)
+      echo -e "  ${C}1)${N} 10s  ${C}2)${N} 15s  ${C}3)${N} 30s  ${C}4)${N} 1m  ${C}5)${N} 2m"
+      read_choice c "${C}  Интервал [1-5] (0 — отмена): ${N}" 0 5 0
+      (( c )) || return 0
+      xray_observatory interval "${ivals[$((c - 1))]}" || true ;;
+    3)
+      if (( conc )); then xray_observatory concurrency off || true
+      else xray_observatory concurrency on || true; fi ;;
+  esac
+}
+
 xray_balancer_menu() {
-  local c s=(random roundRobin leastPing leastLoad off) n
+  local c s=(random roundRobin leastPing leastLoad off) n bal max=5
   n=$(xray_tags | grep -c . || true)
   (( n >= 2 )) || { warn "Для балансировки нужно минимум 2 выхода"; return 0; }
-  echo -e "  Сейчас: ${W}$(py xray-balancer-get "$XRAY_CONF")${N}"
+  bal=$(py xray-balancer-get "$XRAY_CONF")
+  echo -e "  Сейчас: ${W}$bal${N}"
   echo -e "  ${C}1)${N} random ${D}— случайный выход${N}"
   echo -e "  ${C}2)${N} roundRobin ${D}— по очереди${N}"
   echo -e "  ${C}3)${N} leastPing ${D}— самый быстрый${N}"
   echo -e "  ${C}4)${N} leastLoad ${D}— наименее загружен${N}"
   echo -e "  ${C}5)${N} Выключить ${D}— первый выход${N}"
-  read_choice c "${C}  Выбор [1-5] (0 — отмена): ${N}" 0 5 0
+  if [[ "$bal" == leastPing || "$bal" == leastLoad ]]; then
+    echo -e "  ${C}6)${N} Проверка выходов ${D}— URL / интервал / параллельно${N}"
+    max=6
+  fi
+  read_choice c "${C}  Выбор [1-$max] (0 — отмена): ${N}" 0 "$max" 0
   (( c )) || return 0
+  if (( c == 6 )); then xray_observatory_menu; return; fi
   xray_balancer "${s[$((c - 1))]}"
 }
 
@@ -879,7 +948,7 @@ xray_uninstall() {
 
 # ── Статус и диагностика ──────────────────────────────────
 xray_status() {
-  local tags=() n total name tag fail
+  local tags=() n total name tag fail obs_line
   if ! xray_installed; then echo -e "  Xray      : ${D}○ не установлен${N}"; return 0; fi
   echo -e "  Версия    : $("$XRAY_BIN" version 2>/dev/null | head -1 | awk '{print $2}')"
   fail=$(xray_fail)
@@ -898,6 +967,10 @@ xray_status() {
   mapfile -t tags < <(xray_tags)
   echo -e "  Выходы    : ${W}${tags[*]:-нет}${N}"
   echo -e "  Балансир  : $(py xray-balancer-get "$XRAY_CONF" 2>/dev/null || echo off)"
+  if xray_obs_on; then
+    obs_line=$(py xray-observatory-get "$XRAY_CONF" line 2>/dev/null) || true
+    [[ -n "$obs_line" ]] && echo -e "  Проверка  : ${W}$obs_line${N}"
+  fi
   (( ${#tags[@]} )) && echo -e "  По умолч. : ${W}$(py xray-main-get "$XRAY_CONF" 2>/dev/null | sed 's/^balancer$/балансировщик/')${N}"
   xray_client_outs | while IFS='|' read -r name _ tag; do
     echo -e "  ${D}  $name → $tag$(xray_tags | grep -qxF "$tag" || echo " (выхода нет — по умолчанию)")${N}"

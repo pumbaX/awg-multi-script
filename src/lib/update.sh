@@ -295,6 +295,8 @@ helpers_refresh() {
   # Исходник модуля в DKMS поставила прежняя версия: без правки автосборка
   # DKMS при обновлении ядра (Ubuntu 7.0.0-38) упала бы
   _mod_src_patch "$MOD_SRC_DIR"
+  # Автосборка модуля под новые ядра — и у тех, у кого модуль стоял до неё
+  kfix_install &>/dev/null || true
   if [[ -f "$WARP_AUTOSTART_SCRIPT" ]]; then
     emit_script "$WARP_AUTOSTART_SCRIPT" 'warp_wg_bringup' \
       WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_awg_params warp_wg_bringup

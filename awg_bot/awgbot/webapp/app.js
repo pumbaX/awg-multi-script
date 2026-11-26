@@ -1731,6 +1731,41 @@ const wgobfRouteOpts = (d) => {
 };
 const wgobfPick = (d, cur, apply) => h("div", { class: "chips rchips" }, wgobfRouteOpts(d).map(([v, l]) => h("button", {
   class: v === cur ? "on" : null, "data-v": v, title: l, onclick: (ev) => (v === cur ? null : apply(ev.currentTarget, v)) }, l)));
+// Туннель выхода выключен (настроен) — кнопка «Включить» прямо под выбором
+const wgobfOnBtn = (ctx, route, d, all) => {
+  const k = wgobfSplit(route)[0];
+  return WG_TUN[k] && d[k] === "off" ? btn("▶️ Включить " + TUN_NAME[k], (b) => wgobfTunnelOn(ctx, b, k, all), "btn-block") : null;
+};
+// Выход выбран: туннель маршрута выключен — включить его отсюда же. Одновременно
+// работает только один туннель: другой — спросить и выключить (как на экране «Туннели»)
+async function wgobfRouteGo(ctx, b, who, v, d) {
+  const k = wgobfSplit(v)[0], all = who === "all";
+  const ok = await busy(b, async () => {
+    if (v.indexOf("xray") === 0 && d.xray === "up") toast("Перенастраиваю Xray…", 4000);
+    await callR(["wgobf", "route", who, v]);
+    haptic(); toast(`${all ? "Клиенты обфускатора" : "Выход " + who}: ${wgobfRouteLabel(v)}`); return true;
+  });
+  if (!ok || !WG_TUN[k] || d[k] !== "off") return ok && render();
+  return wgobfTunnelOn(ctx, b, k, all);
+}
+async function wgobfTunnelOn(ctx, b, k, all) {
+  const [t, e] = await Promise.all([call("tunnels", "status").catch(() => null),
+    k === "exits" ? call("exits", "status").catch(() => null) : null]);
+  const other = Object.keys(TUN_DOWN).filter((x) => x !== k && (t || {})[x] === "up");
+  const name = TUN_NAME[k], was = other.map((x) => TUN_NAME[x]).join(", ");
+  // Exit-ноды — в их режиме, как на экране «Туннели»: «все» уводит и клиентов AWG
+  const mode = (e || {}).mode === "peers" ? "peers" : "all";
+  const now = `${name} ${k === "exits" ? "выключены" : "выключен"} — ${all ? "клиенты пока идут" : "клиент пока идёт"} напрямую.`
+    + (k === "exits" && mode === "all" ? " Режим exit-нод «все клиенты»: через них пойдут и клиенты AWG." : "");
+  if (!await confirmTg(other.length ? `${now} Сейчас работает ${was}, а одновременно — только один туннель. Выключить ${was} `
+    + `и включить ${name}? Кто идёт через ${was}, пойдёт напрямую, пока его не включат.` : `${now} Включить ${name}?`)) return render();
+  if (!await busy(b, async () => { for (const x of other) await callR(TUN_DOWN[x]); return true; })) return render();
+  if (k !== "exits") return runJob(ctx, "Включение " + name, [k, "up"]);
+  return busy(b, async () => {
+    const r = await callR(["exits", "up", mode]);
+    haptic(); toast("✅ " + outcome(r.log, "Exit-ноды включены"), 3500); render();
+  });
+}
 
 // Схема: клиенты → сервер → выходы. Клиентов много — показаны самые активные.
 // opt — та же схема для WG + обфускатора: свой узел (hub), куда ведут нажатия
@@ -4254,10 +4289,16 @@ route(/^\/tunnels\/warp\/endpoint$/, async (ctx) => {
 // Xray
 const BALANCERS = [["random", "случайный выход"], ["roundRobin", "по очереди"], ["leastPing", "наименьший пинг"],
   ["leastLoad", "наименьшая нагрузка"], ["off", "выключить"]];
+const OBS_URLS = [["Google", "https://www.google.com/generate_204"],
+  ["Gstatic", "https://www.gstatic.com/generate_204"],
+  ["Cloudflare", "http://cp.cloudflare.com/generate_204"]];
+const OBS_INTERVALS = ["10s", "15s", "30s", "1m", "2m"];
 
 route(/^\/tunnels\/xray$/, async (ctx) => {
   const r = await callR(["xray", "status"]);
   const d = r.data || {}, inst = d.installed, tags = d.tags || [];
+  const obs = d.obs && typeof d.obs === "object" ? d.obs : {};
+  const obsOn = obs.on && (d.balancer === "leastPing" || d.balancer === "leastLoad");
   async function outbound(t) {
     const v = await sheet("Выход " + t, [
       ...(d.main !== t ? [{ label: "⭐ Сделать выходом по умолчанию", value: "main" }] : []),
@@ -4294,6 +4335,8 @@ route(/^\/tunnels\/xray$/, async (ctx) => {
       btn("➕ Добавить выход", () => go("/tunnels/xray/add"), "btn-block" + (tags.length ? "" : " btn-primary")),
       btn(d.sub ? "📡 Подписка ✅" : "📡 Подписка", () => go("/tunnels/xray/sub"), "btn-block"),
       tags.length > 1 ? btn(`⚖️ Балансировщик: ${d.balancer || "off"}`, balancer, "btn-block") : null,
+      obsOn ? btn(`🔭 Проверка: ${obs.probeInterval || "1m"}`
+        + (obs.enableConcurrency ? " · параллельно" : ""), () => go("/tunnels/xray/observatory"), "btn-block") : null,
       h("h2", {}, "Управление")] : null,
     inst ? null : [hint("Клиенты выходят в интернет через твой сервер VLESS, VMess, Trojan, Shadowsocks или Hysteria2 — "
       + "выходы добавляются ссылками. Можно несколько, с балансировкой."),
@@ -4321,6 +4364,58 @@ route(/^\/tunnels\/xray\/add$/, async (ctx) => {
       const v = link.value.trim();
       if (!/^(vless|vmess|trojan|ss|hysteria2|hy2):\/\//.test(v)) return fail(new Error("Это не ссылка Xray"));
       return quick(b, "Выход добавлен", ["xray", "add", v], () => back());
+    }, "btn-primary btn-block"));
+});
+
+// Проверка выходов (observatory): URL / интервал / параллельно при leastPing или leastLoad
+route(/^\/tunnels\/xray\/observatory$/, async (ctx) => {
+  const r = await callR(["xray", "status"]);
+  const d = r.data || {}, obs = d.obs && typeof d.obs === "object" ? d.obs : {};
+  if (d.balancer !== "leastPing" && d.balancer !== "leastLoad") {
+    ctx.put(title("🔭 Проверка выходов"),
+      hint("Только при балансировщике leastPing или leastLoad."),
+      btn("⚖️ К балансировщику", () => go("/tunnels/xray"), "btn-block"));
+    return;
+  }
+  async function pickUrl(b) {
+    const v = await sheet("🔗 URL проверки выходов", [
+      ...OBS_URLS.map(([n, u]) => ({ label: `${obs.probeUrl === u ? "🔘" : "⚪️"} ${n} — ${u}`, value: u })),
+      { label: "✏️ Свой URL…", value: "custom" }]);
+    if (!v) return;
+    if (v === "custom") return go("/tunnels/xray/observatory/url");
+    await quick(b, "URL проверки: " + v, ["xray", "observatory", "url", v]);
+  }
+  async function pickInterval(b) {
+    const v = await sheet("⏱ Интервал проверки", OBS_INTERVALS.map((i) =>
+      ({ label: `${obs.probeInterval === i ? "🔘" : "⚪️"} ${i}`, value: i })));
+    if (v) await quick(b, "Интервал: " + v, ["xray", "observatory", "interval", v]);
+  }
+  ctx.put(title("🔭 Проверка выходов"),
+    hint("Для leastPing / leastLoad. Слишком частый интервал — лишний трафик."),
+    h("div", { class: "card list" },
+      h("div", { class: "item", onclick: (e) => pickUrl(e.currentTarget) },
+        h("div", { class: "main" }, h("div", { class: "title" }, "URL проверки"),
+          h("div", { class: "sub" }, obs.probeUrl || "—")),
+        h("div", { class: "side" }, icon("chevron-right"))),
+      h("div", { class: "item", onclick: (e) => pickInterval(e.currentTarget) },
+        h("div", { class: "main" }, h("div", { class: "title" }, "Интервал"),
+          h("div", { class: "sub" }, obs.probeInterval || "1m")),
+        h("div", { class: "side" }, icon("chevron-right")))),
+    // Ошибка awg2 — исключением: переключатель остаётся как был (quick её проглотил бы)
+    switchRow("Параллельная проверка", "все выходы сразу", !!obs.enableConcurrency,
+      async (on) => { await call("xray", "observatory", "concurrency", on ? "on" : "off"); toast("Параллельно: " + (on ? "вкл" : "выкл")); }));
+});
+
+route(/^\/tunnels\/xray\/observatory\/url$/, async (ctx) => {
+  const url = h("input", { placeholder: "https://www.google.com/generate_204", autocapitalize: "off",
+    autocomplete: "off", inputmode: "url" });
+  ctx.put(title("✏️ Свой URL проверки"),
+    hint("http:// или https://, без пробелов."),
+    h("label", {}, "URL"), url,
+    btn("Сохранить", (b) => {
+      const v = url.value.trim();
+      if (!/^https?:\/\/\S{3,500}$/.test(v)) return fail(new Error("Нужен http(s)://… без пробелов"));
+      return quick(b, "URL проверки: " + v, ["xray", "observatory", "url", v], () => go("/tunnels/xray/observatory"));
     }, "btn-primary btn-block"));
 });
 
@@ -5150,6 +5245,8 @@ route(/^\/update$/, async (ctx) => {
 // ── WG + обфускатор ───────────────────────────────────────
 const WGOBF_DNS = [["Cloudflare", "1.1.1.1, 1.0.0.1"], ["Google", "8.8.8.8, 8.8.4.4"], ["Quad9", "9.9.9.9, 149.112.112.112"]];
 const wgobfOnline = (c) => c.ago != null && c.ago < 180;
+const wgobfPresetLabel = (p) => (p === "main" ? "основной" : p);
+const WGOBF_MASKS = [["MEDIA", "MEDIA · видеопоток"], ["STUN", "STUN · звонок"], ["NONE", "NONE · XOR"]];
 const wgobfSeen = (c) => (c.ago == null ? pill("не подключался") : wgobfOnline(c) ? pill("онлайн · " + fmtDur(c.ago), "ok")
   : pill(fmtDur(c.ago) + " назад"));
 const sendWgobf = (b, name, what) => busy(b, () => deliver({ what, name },
@@ -5204,7 +5301,7 @@ route(/^\/wgobf$/, async (ctx) => {
         d.endpoint || "", " ", icon("copy"))],
       acts: [act("refresh-cw", "Рестарт", (b) => quickAsk(b, "Перезапустить обфускатор? Его клиенты на несколько секунд потеряют "
         + "связь и переподключатся сами.", "Перезапущено", ["wgobf", "restart"])),
-        act("key", "Ключ", (b) => quickAsk(b, "Сменить ключ обфускатора? Все клиенты отключатся, пока не получат новый комплект.",
+        act("key", "Ключ", (b) => quickAsk(b, "Сменить ключ основного профиля? Его клиенты отключатся, пока не получат новый комплект.",
           "Ключ сменён", ["wgobf", "rotate-key"])),
         act("file-text", "Журнал", () => go("/log/wgobf"))] }),
     statGrid([
@@ -5215,13 +5312,31 @@ route(/^\/wgobf$/, async (ctx) => {
     segText([["STUN", "STUN · видеозвонок"], ["NONE", "NONE · только XOR"]], d.masking, (v) => (v !== d.masking ? mask(v) : null)),
     h("div", { style: "margin-top:10px" }, switchRow("Чистый WG", "пускать и обычный WireGuard без обфускатора (iOS) — его DPI видит",
       d.clean, (on) => call("wgobf", "clean", on ? "1" : "0"))),
+    // IPv6 в туннеле: WireGuard перезапускается — кнопкой с вопросом, а не переключателем
+    h("div", { class: "card", "data-name": "wgobf-ipv6" }, kv("IPv6 в туннеле", d.ipv6 ? pill("включён", "ok") : pill("выключен")),
+      h("div", { class: "muted small" }, d.ipv6 ? `Клиентам — адрес из ${d.net6} и сайты по IPv6 через сервер; клиентам в туннелях — только IPv4.`
+        : d.ipv6_why || "Клиентам — адрес IPv6 и сайты по IPv6 через сервер."),
+      d.ipv6 || !d.ipv6_why ? btn(d.ipv6 ? "Выключить IPv6" : "Включить IPv6", (b) => quickAsk(b, d.ipv6
+        ? "Выключить IPv6 в туннеле? WireGuard перезапустится, комплекты клиентов перевыпустятся."
+        : "Включить IPv6 в туннеле? Клиенты получат адрес IPv6; прежние комплекты (только IPv4) продолжат работать. "
+          + "WireGuard перезапустится — клиенты на несколько секунд потеряют связь.",
+      d.ipv6 ? "IPv6 выключен" : "IPv6 включён", ["wgobf", "ipv6", d.ipv6 ? "off" : "on"]), "btn-block") : null),
+    // Профили обфускации: свой порт, ключ и маскировка (MEDIA — форк Phobos)
+    h("h2", { "data-name": "wgobf-presets" }, "Профили обфускации"),
+    hint("Профиль — свой порт, ключ и маскировка; все ведут в тот же WireGuard. MEDIA — под видеопоток (обфускатор Phobos). "
+      + "Клиенту профиль — в его карточке; ⭐ — профиль новых клиентов."),
+    (d.presets || []).map((p) => ecard({ state: p.running ? "on" : "bad", name: wgobfPresetLabel(p.name) + (p.name === d.default ? " ⭐" : ""),
+      attrs: { "data-name": "preset-" + p.name }, onopen: () => go("/wgobf/preset/" + encodeURIComponent(p.name)),
+      right: pill(p.running ? "работает" : "остановлен", p.running ? "ok" : "bad"),
+      meta: [tag(p.masking, "accent", "drama"), p.obfb ? tag("obfuscate-bytes " + p.obfb) : null,
+        tag(p.engine === "phobos" ? "Phobos" : "ClusterM")].filter(Boolean),
+      lines: [`${p.port}/udp · клиентов: ${p.clients}` + (p.ufw === "closed" ? " · порт закрыт в UFW" : "")] })),
+    btn("➕ Новый профиль", () => go("/wgobf/preset-add"), "btn-block"),
     // Выход всех клиентов (и новых): напрямую или через туннель — тот же, что у клиентов AWG;
     // своему клиенту — в его карточке
     h("label", { "data-name": "wgobf-route" }, "Выход клиентов"),
-    wgobfPick(d, route, (b, v) => {
-      if (v.indexOf("xray") === 0) toast("Перенастраиваю Xray…", 4000);
-      return quick(b, "Клиенты обфускатора — " + wgobfRouteLabel(v), ["wgobf", "route", "all", v]);
-    }),
+    wgobfPick(d, route, (b, v) => wgobfRouteGo(ctx, b, "all", v, d)),
+    wgobfOnBtn(ctx, route, d, true),
     hint((idle ? idle + " — клиенты пока идут напрямую и уйдут туда, когда он включится. "
       : rk === "warp" ? "Через WARP — сайты видят адрес Cloudflare, а не сервера. "
         : rk !== "direct" ? "Сайты видят адрес выхода, а не сервера. " : "")
@@ -5234,6 +5349,7 @@ route(/^\/wgobf$/, async (ctx) => {
       return ecard({ state: wgobfOnline(c) ? "on" : "", name: c.name, attrs: { "data-name": c.name },
         onopen: () => go(`/wgobf/client/${enc}`), right: wgobfSeen(c),
         lines: [c.ip + (c.rx || c.tx ? ` · ↓ ${fmtBytes(c.rx)} ↑ ${fmtBytes(c.tx)}` : "")
+          + (c.preset && c.preset !== "main" ? " · профиль " + c.preset : "")
           + ((c.route || "direct") !== "direct" ? " · " + wgobfRouteLabel(c.route) : "")],
         acts: [act("file-text", "Комплект", () => go(`/wgobf/client/${enc}`)), act(WEB ? "download" : "send", TO("В чат", "Файл"), (b) => sendWgobf(b, c.name, "wgobf")),
           act("trash-2", "Удалить", (b) => quickAsk(b, `Удалить клиента ${c.name}?`, "Клиент удалён", ["wgobf", "del", c.name]), "bad")] });
@@ -5262,29 +5378,124 @@ route(/^\/wgobf\/add$/, async (ctx) => {
     }, "btn-primary btn-block"));
 });
 
+route(/^\/wgobf\/preset\/([^/]+)$/, async (ctx, name) => {
+  const d = (await callR(["wgobf", "status"])).data || {};
+  const p = (d.presets || []).find((x) => x.name === name);
+  if (!p) throw new Error(`Профиля ${name} нет`);
+  const main = name === "main", back = () => backWith((q) => (/^\/wgobf\/preset\//.test(q) ? "/wgobf" : null));
+  const num = (v, min, max, nm) => h("input", { type: "number", min, max, value: String(v), "data-name": nm });
+  const dummy = num(p.dummy, 0, 1024, "preset-dummy"), idle = num(p.idle, 10, 86400, "preset-idle");
+  const obfb = main ? null : num(p.obfb, 0, 1500, "preset-obfb");
+  const toPreset = () => btn("🎛 Профиль " + wgobfPresetLabel(name), () => replace("/wgobf/preset/" + encodeURIComponent(name)),
+    "btn-primary btn-block");
+  ctx.put(title("Профиль " + wgobfPresetLabel(name), p.name === d.default ? pill("⭐ для новых", "accent") : null),
+    h("div", { class: "card", "data-name": "preset-info" },
+      kv("Служба", pill(p.running ? "работает" : "остановлен", p.running ? "ok" : "bad")),
+      kv("Вход", `${(d.endpoint || "").replace(/:\d+$/, "")}:${p.port}/udp`),
+      kv("Обфускатор", p.engine === "phobos" ? "Phobos " + (d.ph_version || "") : "ClusterM"),
+      kv("Клиентов", String(p.clients || 0)),
+      p.ufw === "closed" ? h("div", { class: "small warn" }, "Порт закрыт в UFW — Сервер → Проверить и починить") : null),
+    h("label", {}, "Маскировка"),
+    segText(main ? WGOBF_MASKS.slice(1) : WGOBF_MASKS, p.masking, (v) => {
+      if (v === p.masking) return null;
+      if (main) return quick(null, "Маскировка " + v, ["wgobf", "preset", "set", "main", "masking=" + v]);
+      return jobAsk(ctx, `Маскировка ${v}? Прежние комплекты клиентов профиля перестанут работать — им нужны новые.`
+        + (v === "MEDIA" ? " Первый раз сервер соберёт обфускатор Phobos — минута-две." : ""),
+      `Профиль ${name}: ${v}`, ["wgobf", "preset", "set", name, "masking=" + v], toPreset);
+    }),
+    hint(main ? "Сервер понимает и STUN, и NONE: прежние комплекты продолжат работать."
+      : "MEDIA — под видеопоток RTP (обфускатор Phobos); на Keenetic — вкладка «Phobos» в AWG Manager."),
+    h("label", {}, "max-dummy — до скольки байт мусора в пакет (0-1024)"), dummy,
+    h("label", {}, "idle-timeout — через сколько секунд тишины забыть клиента (10-86400)"), idle,
+    main ? null : [h("label", {}, "obfuscate-bytes — шифровать только начало пакета: 0 — весь (у MEDIA — 16), или 4-1500"), obfb],
+    btn("Сохранить", (b) => {
+      const vals = [["dummy", dummy, p.dummy], ["idle", idle, p.idle]].concat(main ? [] : [["obfb", obfb, p.obfb]]);
+      const changed = vals.filter(([, el, was]) => el.value.trim() !== String(was));
+      if (!changed.length) return toast("Ничего не изменилось");
+      if (changed.some(([, el]) => !/^(0|[1-9]\d{0,4})$/.test(el.value.trim()))) return fail(new Error("Нужны целые числа без ведущих нулей"));
+      const args = ["wgobf", "preset", "set", name].concat(changed.map(([k, el]) => `${k}=${el.value.trim()}`));
+      // obfuscate-bytes может перевести профиль на обфускатор Phobos (сборка) — задачей
+      if (changed.some(([k]) => k === "obfb")) return runJob(ctx, `Профиль ${name}`, args, toPreset);
+      return quick(b, "Сохранено", args);
+    }, "btn-primary btn-block"),
+    p.name === d.default ? null : btn("⭐ Для новых клиентов", (b) => quick(b, "Новые клиенты: " + wgobfPresetLabel(name),
+      ["wgobf", "preset", "default", name]), "btn-block"),
+    btn("🔑 Сменить ключ", (b) => quickAsk(b, "Сменить ключ профиля? Его клиенты отключатся, пока не получат новый комплект.",
+      "Ключ сменён", ["wgobf", "preset", "key", name]), "btn-block"),
+    main ? null : btn("🗑 Удалить профиль", (b) => quickAsk(b, `Удалить профиль ${name}? Его клиенты перейдут на основной, `
+      + "их прежние комплекты перестанут работать.", "Профиль удалён", ["wgobf", "preset", "del", name], back), "btn-danger btn-block"));
+});
+
+route(/^\/wgobf\/preset-add$/, async (ctx) => {
+  const f = { masking: "MEDIA" };
+  const name = h("input", { placeholder: "media", maxlength: 16, autocapitalize: "off", autocomplete: "off", "data-name": "preset-name" });
+  const port = h("input", { type: "number", min: 443, max: 65535, placeholder: "случайный" });
+  const box = h("div");
+  const draw = () => box.replaceChildren(h("label", {}, "Маскировка"),
+    segText(WGOBF_MASKS, f.masking, (v) => { f.masking = v; draw(); }),
+    hint(f.masking === "MEDIA" ? "Под видеопоток RTP — обфускатор Phobos: первый раз сервер соберёт его (минута-две). "
+      + "Клиентам — приложение Phobos или AWG Manager (вкладка «Phobos»)." : f.masking === "STUN" ? "Под видеозвонок." : "Только XOR, без маскировки."));
+  draw();
+  ctx.put(title("Новый профиль"), hint("Свой порт и ключ, все профили ведут в тот же WireGuard. Клиенту профиль — в его карточке."),
+    h("label", {}, "Имя — латиница, цифры и _, до 16"), name, box,
+    h("label", {}, "UDP-порт — 443 или 1024-65535"), port,
+    btn("Создать", () => {
+      const n = name.value.trim(), pv = port.value.trim();
+      if (!/^[A-Za-z0-9_]{1,16}$/.test(n) || n === "main" || n === "all") return fail(new Error("Имя: латиница, цифры и _, до 16; main и all заняты"));
+      if (pv && !awgPortOk(pv)) return fail(new Error("Порт — 443 или число 1024-65535"));
+      return runJob(ctx, "Профиль " + n, ["wgobf", "preset", "add", n, "masking=" + f.masking].concat(pv ? ["port=" + (+pv)] : []),
+        () => btn("🎛 Профиль " + n, () => replace("/wgobf/preset/" + encodeURIComponent(n)), "btn-primary btn-block"));
+    }, "btn-primary btn-block"));
+});
+
 route(/^\/wgobf\/client\/([^/]+)$/, async (ctx, name) => {
   // Комплект не собрался — статус и мониторинг всё равно на экране, ошибка — плашкой
   const [d, rows, ws] = await Promise.all([post("/api/wgobf/bundle", { name }).catch((e) => ({ error: e.message })),
     call("wgobf", "clients").catch(() => []), call("wgobf", "status").catch(() => null)]);
   const c = (rows || []).find((x) => x.name === name);
   if (d.error && !c) throw new Error(d.error);
+  const presets = (ws && ws.presets) || [], cur = (c && c.preset) || "main";
+  // Ссылка установки для AWG Manager (Keenetic) — по кнопке: одноразовая, на сутки
+  const linkBox = h("div", { "data-name": "wgobf-install-link" });
+  const showLink = (r) => {
+    const until = new Date(r.exp * 1000).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+    linkBox.replaceChildren(h("div", { class: "card" },
+      h("div", { class: "small" }, "Keenetic настроит туннель сам, без файлов: AWG Manager → Новый туннель → «Phobos» → "
+        + "верхнее поле «Ссылка установки Phobos» — эта ссылка целиком."),
+      h("div", { class: "muted small", style: "margin-top:4px" }, `Срабатывает один раз, действует до ${until}. Ссылка — это доступ к VPN.`),
+      h("div", { class: "mono small", "data-name": "install-url", style: "overflow-wrap:anywhere;margin-top:6px" }, r.url),
+      copyBtn("Скопировать ссылку", r.url),
+      btn("🚫 Отозвать", (b) => busy(b, async () => {
+        const x = await post("/api/wgobf/install-link/revoke", { id: r.id }); haptic();
+        toast(x.revoked ? "Ссылка отозвана" : "Ссылка уже не действует: сработала или истекла"); linkBox.replaceChildren();
+      }), "btn-block")));
+  };
   ctx.put(title(name, pill("обфускатор", "accent")),
-    c ? h("div", { class: "card", "data-name": "wgobf-status" }, kv("Статус", wgobfSeen(c)), kv("Адрес", c.ip),
+    c ? h("div", { class: "card", "data-name": "wgobf-status" }, kv("Статус", wgobfSeen(c)),
+      kv("Адрес", c.ip + (c.ip6 ? ", " + c.ip6 : "")),
       kv("Трафик с запуска", `↓ ${fmtBytes(c.rx)} · ↑ ${fmtBytes(c.tx)}`),
+      kv("Профиль", wgobfPresetLabel(cur)),
       kv("Выход", wgobfRouteText(c.route, ws))) : null,
+    // Профиль клиента: только комплект — прежний работает, пока жив его профиль
+    c && presets.length > 1 ? h("div", { class: "card rcard", "data-name": "wgobf-client-preset" }, h("div", { class: "eyebrow" }, "профиль"),
+      segText(presets.map((p) => [p.name, wgobfPresetLabel(p.name)]), cur, (v) => (v === cur ? null : busy(null, async () => {
+        await call("wgobf", "assign", name, v); haptic(); toast(`Профиль ${wgobfPresetLabel(v)} — новый комплект готов`); render();
+      }))),
+      hint("Клиент получит новый комплект; прежний работает, пока есть его профиль.")) : null,
     // Свой выход клиенту — прямо здесь: настроенные туннели, их выходы и ноды
     c && ws ? h("div", { class: "card rcard", "data-name": "wgobf-client-route" }, h("div", { class: "eyebrow" }, "маршрут"),
-      wgobfPick(ws, c.route || "direct", (b, v) => busy(b, async () => {
-        if (v.indexOf("xray") === 0) toast("Перенастраиваю Xray…", 4000);
-        await call("wgobf", "route", name, v); haptic(); toast(`Выход ${name}: ${wgobfRouteLabel(v)}`); render();
-      })),
-      wgobfIdle(c.route, ws) ? hint(wgobfIdle(c.route, ws) + " — клиент пока идёт напрямую.") : null) : null,
+      wgobfPick(ws, c.route || "direct", (b, v) => wgobfRouteGo(ctx, b, name, v, ws)),
+      wgobfIdle(c.route, ws) ? hint(wgobfIdle(c.route, ws) + " — клиент пока идёт напрямую.") : null,
+      wgobfOnBtn(ctx, c.route, ws, false)) : null,
     d.error ? h("div", { class: "card warn small" }, "Комплект клиента не собрался: " + d.error) : null,
     switchRow("Мониторинг", "сообщу в чат, когда клиент пропал (5 минут без связи) и когда вернулся", !!d.mon,
       (on) => post("/api/wgobf/mon", { name, on })),
     h("div", { class: "pair" },
       btn(TO("✉️ Всё в чат", "⬇️ Файл .conf"), (b) => sendWgobf(b, name, "wgobf"), "btn-primary"),
       btn("📦 Архив Linux", (b) => sendWgobf(b, name, "wgobf_zip"))),
+    c ? btn("🔗 Ссылка установки", (b) => busy(b, async () => showLink(await post("/api/wgobf/install-link", { name }))),
+      "btn-block") : null,
+    linkBox,
     // Ссылка phobos:// — длинный base64: на экране начало, целиком — копированием
     d.link ? [h("h2", {}, "Ссылка для Keenetic"),
       h("div", { class: "card" }, h("div", { class: "mono small", style: "overflow-wrap:anywhere" },

@@ -107,7 +107,17 @@ if PROFILE != "none":
     os.makedirs(os.path.join(ROOT, "etc/awg-wgobf"), exist_ok=True)
     with open(os.path.join(ROOT, "etc/awg-wgobf/state"), "w") as f:
         f.write("PORT=41000\nENDPOINT=203.0.113.10\nMASKING=STUN\nALLOW_CLEAN=1\nNET=10.66.66.0/24\nKEY=s3cretObfKey\n"
-                "SERVER_PUB=SRVPUBKEYxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=\nWG_PORT=51900\nMTU=1380\nDNS=1.1.1.1, 1.0.0.1\n")
+                "SERVER_PUB=SRVPUBKEYxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=\nWG_PORT=51900\nMTU=1380\nDNS=1.1.1.1, 1.0.0.1\n"
+                # Профиль MEDIA (форк Phobos «собран»)
+                "P_media=41010|MediaKeyMediaKeyMediaKeyMediaKe|MEDIA|0|4|300\n")
+    # Службы профилей обфускатора: restart — «работает» (как настоящий systemd)
+    with open(os.path.join(BIN, "systemctl"), "w") as f:
+        f.write('#!/usr/bin/env bash\necho "systemctl $*" >> "$CALLS"\n'
+                'if [[ "$1" == restart && "$2" == awg-wgobf-p-* ]]; then grep -qxF -- "$2" "$ACTIVE" || echo "$2" >> "$ACTIVE"; fi\n'
+                'if [[ "$1" == is-active || "$1" == is-enabled ]]; then\n'
+                '  for a in "$@"; do grep -qxF -- "$a" "$ACTIVE" && exit 0; done; exit 1\nfi\n'
+                'if [[ "$1" == is-failed ]]; then\n'
+                '  for a in "$@"; do grep -qxF -- "$a" "$ACTIVE.failed" 2>/dev/null && exit 0; done; exit 1\nfi\nexit 0\n')
     os.makedirs(os.path.join(ROOT, "etc/wireguard"), exist_ok=True)
     # Клиент обфускатора ob1 — в сети: на обзоре своя схема wgobf0 → напрямую
     with open(os.path.join(ROOT, "etc/wireguard/wgobf0.conf"), "w") as f:
@@ -117,7 +127,7 @@ if PROFILE != "none":
         f.write(f"SRVPRIV=\tSRVPUB=\t51900\toff\nOBPUB=\t(none)\t127.0.0.1:40000\t10.66.66.2/32\t-30"
                 f"\t3145728\t1048576\t25\n")
     with open(ACTIVE, "a") as f:
-        f.write("awg-wgobf.service\n")
+        f.write("awg-wgobf.service\nawg-wgobf-p-media.service\n")
     with open(LINKS, "a") as f:
         f.write("wgobf0\n")
 

@@ -92,7 +92,7 @@ kernel_gap() {
     [[ "$(printf '%s\n%s\n' "$running" "$k" | sort -V | head -1)" == "$running" ]] || continue
     mod_built_for "$k" && continue
     [[ "$k" == "$running" ]] && mod_loaded && continue
-    if [[ -d "/lib/modules/$k/build" ]]; then echo "$k"; else echo "$k нет-заголовков"; fi
+    if [[ -d "$KMODS_DIR/$k/build" ]]; then echo "$k"; else echo "$k нет-заголовков"; fi
   done
 }
 
@@ -286,7 +286,7 @@ components_report() {
     s="${R}✗ не собран${N}"
     [[ -n "$(kernel_gap | awk -v k="$k" '$1 == k')" ]] && s="${R}✗ не собран — пункт 5${N}"
     mod_built_for "$k" && s="${G}✓ собран${N}"
-    [[ -d "/lib/modules/$k/build" ]] || s+=" ${D}(нет заголовков)${N}"
+    [[ -d "$KMODS_DIR/$k/build" ]] || s+=" ${D}(нет заголовков)${N}"
     [[ "$k" == "$running" ]] && s+=" ${D}← работает${N}"
     [[ "$k" == "$newest" && "$k" != "$running" ]] && s+=" ${Y}← загрузится после ребута${N}"
     echo -e "  DKMS $k: $s"
@@ -307,6 +307,13 @@ components_report() {
   secure_boot_on && echo -e "  Secure Boot    : ${Y}включён — неподписанный DKMS-модуль не загрузится${N}"
   if grep -qs "^$MOD_NAME" "$MODULES_LOAD_FILE"; then s="${G}настроена${N}"; else s="${Y}нет${N}"; fi
   echo -e "  Автозагрузка   : $s"
+  if kfix_on; then
+    s="${G}включена${N} ${D}— новое ядро без модуля собирается само, раз в 30 минут проверка${N}"
+    kfix_failed && s="${R}не справилась${N}: $(_kfix_get WHY) ${D}— повтор через 6 ч или пункт 5${N}"
+  else
+    s="${D}нет${N}"
+  fi
+  echo -e "  Автосборка     : $s"
   s=$(reboot_reason)
   [[ -n "$s" ]] && { echo ""; warn "$s"; }
   return 0
@@ -330,9 +337,9 @@ _git_clone_tag() {
 # из тех, для которых заголовки есть.
 build_kernel() {
   local k
-  [[ -d "/lib/modules/$(uname -r)/build" ]] && { uname -r; return 0; }
+  [[ -d "$KMODS_DIR/$(uname -r)/build" ]] && { uname -r; return 0; }
   for k in $(installed_kernels | sort -Vr); do
-    [[ -d "/lib/modules/$k/build" ]] && { echo "$k"; return 0; }
+    [[ -d "$KMODS_DIR/$k/build" ]] && { echo "$k"; return 0; }
   done
   return 1
 }
@@ -361,7 +368,7 @@ _mod_dkms_install_all() {
   _mod_src_patch "$MOD_SRC_DIR"
   dkms add -m "$MOD_NAME" -v "$MOD_DKMS_VER" >/dev/null 2>&1 || true
   for k in $(installed_kernels); do
-    [[ -d "/lib/modules/$k/build" ]] || continue
+    [[ -d "$KMODS_DIR/$k/build" ]] || continue
     if dkms install -m "$MOD_NAME" -v "$MOD_DKMS_VER" -k "$k" --force; then
       built=$((built + 1))
     else
@@ -428,6 +435,7 @@ mod_install_tag() {
   _PROTO_PROBE=()
   mod_log "установлен $tag"
   ok "Модуль $tag собран и установлен"
+  kfix_install &>/dev/null || true
 }
 
 _tools_build_install() { make -C "$1" -j"$(nproc)" && make -C "$1" install; }
@@ -557,7 +565,7 @@ mod_rebuild_all() {
   local k _
   components_deps || return 1
   while read -r k _; do
-    [[ -n "$k" && ! -d "/lib/modules/$k/build" ]] || continue
+    [[ -n "$k" && ! -d "$KMODS_DIR/$k/build" ]] || continue
     run_step "Заголовки ядра $k" ensure_headers "$k" || warn "Заголовков для $k в репозитории нет"
   done < <(kernel_gap)
   run_step "Сборка DKMS под все ядра" _mod_dkms_install_all || return 1
@@ -567,6 +575,170 @@ mod_rebuild_all() {
     return 1
   fi
   ok "Модуль собран под все ядра"
+}
+
+# ── Автосборка под новые ядра ─────────────────────────────
+# Ubuntu сама ставит новые ядра (unattended-upgrades). DKMS собирает модуль
+# под них при установке, но если не вышло (нет заголовков, сборка упала) —
+# после перезагрузки сервер остался бы без VPN. Таймер раз в 30 минут (через
+# замок API) смотрит ядра без модуля: ставит им заголовки и собирает. Итог —
+# в KFIX_STATE: бот сообщит «модуль готов — перезагрузи» или причину. Тот же
+# набор ядер после неудачи — не чаще раза в 6 часов: сборка — минуты
+# процессора. Идёт установка пакетов (dpkg, dkms) — проход пропускается, без
+# ожидания замка apt. Сервер уже загрузился в ядро без модуля — после сборки
+# ремонт загружает модуль и поднимает awg0. Сам сервер не перезагружается.
+_kfix_get() { sed -n "s/^$1=//p" "$KFIX_STATE" 2>/dev/null | tail -1; }
+_kfix_num() { local v; v=$(_kfix_get "$1"); [[ "$v" =~ ^[0-9]{1,20}$ ]] && echo "$v" || echo 0; }
+_kfix_set() {  # КЛЮЧ=ЗНАЧЕНИЕ...
+  local kv keys=()
+  mkdir -p "$STATE_DIR"
+  for kv in "$@"; do keys+=("${kv%%=*}"); done
+  { grep -vE "^($(IFS='|'; echo "${keys[*]}"))=" "$KFIX_STATE" 2>/dev/null
+    for kv in "$@"; do printf '%s\n' "${kv//[$'\n\r']/ }"; done; } | write_file "$KFIX_STATE" 600
+}
+
+kfix_on() { [[ -f "$KFIX_ON" ]]; }
+
+# Ядра без модуля одной строкой «k1 k2» (без пометок о заголовках)
+_kfix_kernels() { kernel_gap | awk '{print $1}' | paste -sd' ' -; }
+
+# Первая ошибка из журнала сборки DKMS под ядро (путь к исходнику — без каталогов)
+_kfix_build_why() {  # ядро
+  local f
+  for f in "$DKMS_DIR/$MOD_NAME/$MOD_DKMS_VER/$1/$(uname -m)/log/make.log" \
+           "$DKMS_DIR/$MOD_NAME/$MOD_DKMS_VER/build/make.log"; do
+    [[ -f "$f" ]] || continue
+    grep -m1 -E '(error|Error)' "$f" | sed -E 's#^/[^ :]*/([^/ :]+:[0-9]+)#\1#' | tr -d '\r' | cut -c1-160
+    return 0
+  done
+}
+
+# Последняя автосборка не справилась с теми же ядрами, что и сейчас без модуля
+kfix_failed() {
+  [[ "$(_kfix_get RESULT)" == fail ]] || return 1
+  local ks; ks=$(_kfix_kernels)
+  [[ -n "$ks" && "$(_kfix_get GAP)" == "$ks" ]]
+}
+
+# Новое ядро, в которое сервер загрузится после перезагрузки, — и модуль под него
+# уже собран: остаётся перезагрузиться
+kernel_ready_new() {
+  local running newest
+  running=$(uname -r); newest=$(installed_kernels | tail -1)
+  [[ -n "$newest" && "$newest" != "$running" ]] || return 0
+  [[ "$(printf '%s\n%s\n' "$running" "$newest" | sort -V | tail -1)" == "$newest" ]] || return 0
+  mod_built_for "$newest" && echo "$newest"
+  return 0
+}
+
+mod_autofix() {  # [force] — force: не ждать 6 часов после неудачи
+  local ks left k nohdr why="" e now running
+  command -v dkms &>/dev/null && [[ -d "$MOD_SRC_DIR" ]] || return 0
+  mkdir -p "$STATE_DIR" && touch "$KFIX_HEAL" 2>/dev/null
+  ks=$(_kfix_kernels)
+  if [[ -z "$ks" ]]; then
+    [[ "$(_kfix_get RESULT)" == fail ]] && _kfix_set "RESULT=" "GAP=" "WHY="
+    return 0
+  fi
+  now=$(date +%s)
+  if [[ "${1:-}" != force && "$(_kfix_get RESULT)" == fail && "$(_kfix_get GAP)" == "$ks" ]] \
+     && (( now - $(_kfix_num AT) < KFIX_RETRY )); then
+    info "Ядро $ks без модуля: прошлая сборка не удалась ($(_kfix_get WHY)) — повтор позже"
+    return 0
+  fi
+  if pgrep -x dpkg &>/dev/null || pgrep -x dkms &>/dev/null; then
+    info "Идёт установка пакетов — соберу модуль при следующей проверке"
+    return 0
+  fi
+  mod_log "=== автосборка: ядра без модуля: $ks"
+  info "Ядро без модуля AWG: $ks — собираю"
+  _mod_src_patch "$MOD_SRC_DIR"
+  dkms add -m "$MOD_NAME" -v "$MOD_DKMS_VER" >/dev/null 2>&1 || true
+  while read -r k nohdr; do
+    [[ -n "$k" ]] || continue
+    if [[ -n "$nohdr" ]]; then
+      if ensure_headers "$k"; then
+        mod_log "$k: заголовки поставлены"
+      else
+        why+="${why:+; }$k: заголовки ядра не поставились (linux-headers-$k)"
+        mod_log "$k: заголовки не поставились"; continue
+      fi
+    fi
+    if dkms install -m "$MOD_NAME" -v "$MOD_DKMS_VER" -k "$k" --force >>"$MOD_LOG" 2>&1; then
+      mod_log "$k: модуль собран"
+    else
+      e=$(_kfix_build_why "$k")
+      why+="${why:+; }$k: сборка не удалась${e:+ — $e}"
+      mod_log "$k: сборка не удалась${e:+ — $e}"
+    fi
+  done < <(kernel_gap)
+  left=$(_kfix_kernels)
+  if [[ -n "$left" ]]; then
+    _kfix_set "RESULT=fail" "GAP=$left" "WHY=${why:-модуль не собрался}" "AT=$now"
+    log_info "модуль: автосборка под $left не удалась — ${why:-?}"
+    err "Модуль не собран под ядро $left: ${why:-причина в $MOD_LOG}"
+    return 1
+  fi
+  _kfix_set "RESULT=ok" "GAP=" "WHY=" "AT=$now" "BUILT=$ks"
+  log_info "модуль: собран под новые ядра $ks"
+  ok "Модуль AWG собран под ядро $ks"
+  running=$(uname -r)
+  # Сервер уже работает на этом ядре без модуля (перезагрузился раньше сборки)
+  if [[ " $ks " == *" $running "* ]] && ! mod_loaded; then
+    info "Сервер работает на этом ядре без модуля — загружаю модуль и поднимаю awg0"
+    do_repair >>"$MOD_LOG" 2>&1 || true
+    if mod_loaded; then ok "Модуль загружен"; else err "Модуль не загрузился — dmesg | tail -20"; fi
+    if server_exists; then if iface_up; then ok "awg0 поднят"; else err "awg0 не поднялся — Сервер → Починить"; fi; fi
+  fi
+  return 0
+}
+
+# Таймер автосборки. Ставится вместе с модулем (и обновлением Тулзы у тех,
+# у кого модуль уже есть); без DKMS и исходников модуля — не нужен.
+kfix_install() {
+  command -v dkms &>/dev/null && [[ -d "$MOD_SRC_DIR" ]] || return 0
+  write_unit "${KFIX_TIMER%.timer}.service" <<EOF || return 1
+[Unit]
+Description=AWG Toolza — модуль AWG под новые ядра
+After=network-online.target
+
+[Service]
+Type=oneshot
+Nice=10
+Environment=API_LOCK_WAIT=600
+TimeoutStartSec=3600
+ExecStart=$SCRIPT_PATH api module autofix
+EOF
+  write_unit "$KFIX_TIMER" <<'EOF' || return 1
+[Unit]
+Description=AWG Toolza — проверка: модуль AWG под все ядра, раз в 30 минут
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=1800
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl enable --now "$KFIX_TIMER" &>/dev/null || { warn "Таймер автосборки модуля не включился"; return 1; }
+  mkdir -p "$STATE_DIR" && touch "$KFIX_ON" "$KFIX_HEAL"
+}
+
+kfix_remove() {
+  remove_unit "$KFIX_TIMER" "${KFIX_TIMER%.timer}.service"
+  rm -f "$KFIX_ON" "$KFIX_HEAL" "$KFIX_STATE"
+}
+
+# Таймер молчит дольше трёх часов (сброшен, заглох) — перезапустить
+kfix_watchdog() {
+  local age
+  kfix_on || return 0
+  [[ -f "$KFIX_HEAL" ]] || { touch "$KFIX_HEAL" 2>/dev/null; return 0; }
+  age=$(( $(date +%s) - $(stat -c %Y "$KFIX_HEAL" 2>/dev/null || echo 0) ))
+  (( age < 10800 )) && return 0
+  touch "$KFIX_HEAL"
+  timer_heal "$KFIX_TIMER"
 }
 
 mod_backups() { ls -1t "$MOD_BACKUP_DIR"/src-*.tar.gz 2>/dev/null || true; }

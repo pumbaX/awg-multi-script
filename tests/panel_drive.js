@@ -1825,10 +1825,17 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       // Сводку обфускатора бот держит в кэше — профиль WARP появился мимо awg2
       await page.waitForTimeout(CACHE_WAIT);
       await nav("/wgobf", R + ".rchips button[data-v=warp]");
+      // Туннель выхода выключен — сразу вопрос «включить?»; работают exit-ноды — «выключить их и включить WARP».
+      // Здесь — «Нет»: выход сохранён, туннели как были
+      await page.evaluate(() => { window.Telegram.WebApp.showConfirm = (t, cb) => { window.__log.push("confirm:" + t); cb(false); }; });
       await page.click(".rchips button[data-v=warp]");
       await page.waitForSelector(".toast >> text=через WARP");
+      await page.waitForFunction(() => window.__log.some((l) => l.startsWith("confirm:WARP выключен — клиенты пока идут напрямую. "
+        + "Сейчас работает Exit-ноды WG, а одновременно — только один туннель.")));
       await page.waitForSelector(R + ".rchips button[data-v=warp].on");
       await page.waitForSelector("text=WARP выключен — клиенты пока идут напрямую");
+      await page.waitForSelector("button:has-text('Включить WARP')");
+      if (!await page.locator(R + ".rchips button[data-v=exits]").count()) throw new Error("exit-ноды пропали после «Нет»");
       await page.waitForSelector("[data-name=ob1] >> text=через WARP");
       await nav("/wgobf/client/ob1", "[data-name=wgobf-status]");
       await page.waitForSelector("[data-name=wgobf-status] >> text=WARP выключен — пока напрямую");
@@ -1849,7 +1856,10 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       await page.waitForSelector(".toast >> text=напрямую");
       await page.waitForSelector(R + ".rchips button[data-v=direct].on");
       await nav("/wgobf/client/ob1", R + "[data-name=wgobf-client-route] button[data-v=direct].on");
-    } finally { fs.unlinkSync(warpConf); }
+    } finally {
+      fs.unlinkSync(warpConf);
+      await page.evaluate(() => { window.Telegram.WebApp.showConfirm = (t, cb) => { window.__log.push("confirm:" + t); cb(true); }; });
+    }
   });
   await step("обфускатор: клиент и комплект", async () => {
     await nav("/wgobf/add", "input");
@@ -1886,6 +1896,81 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/wgobf", "[data-name=kn2]");
     if (await page.locator("[data-name=kn1]").count()) throw new Error("старое имя осталось в списке");
     await rename("kn2", "kn1");
+  });
+  await step("обфускатор: ссылка установки — только для AWG Manager: браузер видит подсказку, curl скрипта не получает, архив — один раз", async () => {
+    const make = async () => {
+      await nav("/wgobf/client/kn1", "text=Ссылка для Keenetic");
+      await page.click("button:has-text('Ссылка установки')");
+      await page.waitForSelector("[data-name=install-url]");
+      const url = (await page.textContent("[data-name=install-url]")).trim();
+      if (!new RegExp("^https://127\\.0\\.0\\.1:" + port + "/api/install/[A-Za-z0-9_-]{32}$").test(url)) throw new Error("ссылка: " + url);
+      const box = await page.textContent("[data-name=wgobf-install-link]");
+      if (/curl|sudo bash/.test(box) || !box.includes("Ссылка установки Phobos")) throw new Error("карточка ссылки: " + box);
+      return url;
+    };
+    const url = await make();
+    await shot("51d-wgobf-install-link");
+    const p2 = await ctx.newPage();
+    await p2.goto(url);
+    await p2.waitForSelector("text=Установка клиента kn1");
+    if (await p2.locator("text=PrivateKey").count()) throw new Error("конфиг в браузере");
+    await p2.close();
+    const curl = { headers: { "User-Agent": "curl/8.5.0" } };
+    let r = await ctx.request.get(url, curl);
+    if (r.status() !== 404 || (await r.text()).includes("#!/bin/bash")) throw new Error("curl получил скрипт: " + r.status());
+    // AWG Manager: …/package.tar.gz; предпросмотр Telegram ссылку не тратит
+    r = await ctx.request.get(url + "/package.tar.gz", { headers: { "User-Agent": "TelegramBot (like TwitterBot)" } });
+    if (r.status() !== 404) throw new Error("предпросмотр получил архив: " + r.status());
+    r = await ctx.request.get(url + "/package.tar.gz", { headers: { "User-Agent": "Go-http-client/1.1" } });
+    const tar = require("zlib").gunzipSync(await r.body()).toString("latin1");
+    if (r.status() !== 200 || tar.slice(0, 8) !== "kn1.conf" || !tar.includes("[instance]") || !tar.includes("idle-timeout = ")
+      || tar.includes("#!/bin/bash")) throw new Error("архив: " + r.status() + " " + tar.slice(0, 120));
+    r = await ctx.request.get(url + "/package.tar.gz", { headers: { "User-Agent": "Go-http-client/1.1" } });
+    if (r.status() !== 404) throw new Error("архив отдан второй раз: " + r.status());
+    // Уже сработала — «Отозвать» не ошибка («HTTP 200»), а честное «уже не действует»
+    await page.click("[data-name=wgobf-install-link] button:has-text('Отозвать')");
+    await page.waitForSelector(".toast >> text=Ссылка уже не действует");
+    if (await page.locator("text=HTTP 200").count()) throw new Error("ошибка HTTP 200 при отзыве");
+    // Отозвать живую
+    const url3 = await make();
+    await page.click("[data-name=wgobf-install-link] button:has-text('Отозвать')");
+    await page.waitForSelector(".toast >> text=Ссылка отозвана");
+    r = await ctx.request.get(url3 + "/package.tar.gz", { headers: { "User-Agent": "Go-http-client/1.1" } });
+    if (r.status() !== 404) throw new Error("отозванная ссылка работает");
+  });
+  await step("обфускатор: профили — список, IPv6 без IPv6 у сервера, max-dummy основного, профиль клиента, новый профиль", async () => {
+    await nav("/wgobf", "[data-name=preset-media]");
+    await page.waitForSelector("[data-name=preset-main]");
+    await page.waitForSelector("[data-name=wgobf-ipv6] >> text=нет IPv6");
+    if (await page.locator("[data-name=wgobf-ipv6] button").count()) throw new Error("кнопка IPv6 без IPv6 у сервера");
+    await shot("52-wgobf-presets");
+    await nav("/wgobf/preset/main", "[data-name=preset-dummy]");
+    await page.fill("[data-name=preset-dummy]", "40");
+    await page.click("button:has-text('Сохранить')");
+    await page.waitForSelector(".toast >> text=max-dummy 40");
+    await nav("/wgobf/preset/main", "[data-name=preset-dummy]");
+    if (await page.inputValue("[data-name=preset-dummy]") !== "40") throw new Error("max-dummy не сохранился");
+    await nav("/wgobf/client/kn1", "[data-name=wgobf-client-preset]");
+    await page.click("[data-name=wgobf-client-preset] button:has-text('media')");
+    await page.waitForSelector(".toast >> text=новый комплект готов");
+    await page.waitForSelector("[data-name=wgobf-status] >> text=media");
+    await page.waitForSelector("pre >> text=masking = MEDIA");
+    await page.waitForSelector("pre >> text=obfuscate-bytes = 16");
+    await shot("52b-wgobf-client-preset");
+    await nav("/wgobf", "[data-name=kn1]");
+    await page.waitForSelector("[data-name=kn1] >> text=профиль media");
+    await nav("/wgobf/preset-add", "[data-name=preset-name]");
+    await page.fill("[data-name=preset-name]", "stun2");
+    await page.click(".seg button:has-text('STUN')");
+    await page.click("button:has-text('Создать')");
+    await page.waitForSelector("button:has-text('Профиль stun2')", { timeout: 60000 });
+    await page.click("button:has-text('Профиль stun2')");
+    await page.waitForSelector("[data-name=preset-info] >> text=ClusterM");
+    await page.click("button:has-text('Удалить профиль')");
+    await page.waitForSelector(".toast >> text=Профиль stun2 удалён");
+    await nav("/wgobf", "[data-name=preset-main]");
+    if (await page.locator("[data-name=preset-stun2]").count()) throw new Error("удалённый профиль в списке");
+    await nav("/wgobf/client/kn1", "text=Ссылка для Keenetic");
   });
   await step("обфускатор: удалить клиента", async () => {
     await page.click("button:has-text('Удалить клиента')");
@@ -2166,7 +2251,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
         + "/server/vkblock /server/entries /tunnels/rudirect /tunnels/fail /diag/route /diag/route/alice "
         + "/server/params /server/proto /tunnels /tunnels/cascade /tunnels/cascade/add /tunnels/dns /tunnels/dns/manual /tunnels/exits "
         + "/tunnels/exits/add /tunnels/tun2socks /tunnels/warp /tunnels/warp/clients /tunnels/warp/endpoint /tunnels/warp/import "
-        + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /update /wgobf /wgobf/add /wgobf/client/ob1").split(" ");
+        + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /tunnels/xray/observatory /tunnels/xray/observatory/url /update /wgobf /wgobf/add /wgobf/client/ob1 /wgobf/preset/main /wgobf/preset/media /wgobf/preset-add").split(" ");
       const bad = [];
       for (const [skin, w, hgt] of [["toolza", 390, 844], ["cards", 390, 844], ["toolza", 320, 640]]) {
         const c = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: w, height: hgt } });

@@ -32,7 +32,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.types import MenuButtonDefault, MenuButtonWebApp, WebAppInfo
 from aiohttp import web
 
-from . import __version__, access, api, assets, panel, share
+from . import __version__, access, api, assets, instlink, panel, share
 from .config import CONF_PATH, _read_file
 
 log = logging.getLogger("awgbot.webapp")
@@ -157,6 +157,7 @@ class MiniApp:
             app.router.add_post("/api/status", self._status)
             panel.setup(app, self._user)
             share.setup(app)
+            instlink.setup(app)
             self.runner = web.AppRunner(app, access_log=None)
             await self.runner.setup()
             await web.TCPSite(self.runner, "0.0.0.0", port, ssl_context=self.ctx).start()
@@ -237,7 +238,7 @@ class MiniApp:
         """Как у веб-панели, но рамку не запрещаем: Telegram Web открывает Mini App
         во фрейме; скрипт Telegram — с telegram.org."""
         resp.headers["Server"] = "awg"
-        if share.is_share_path(request.path):
+        if share.is_share_path(request.path) or instlink.is_path(request.path):
             return                      # у ссылок на конфиг свои, строже: без фрейма и без кэша
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["Referrer-Policy"] = "no-referrer"

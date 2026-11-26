@@ -269,6 +269,11 @@ async def _warp_rm_ok(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
 # ── Xray ──────────────────────────────────────────────────
 BALANCERS = [("random", "случайный выход"), ("roundRobin", "по очереди"), ("leastPing", "наименьший пинг"),
              ("leastLoad", "наименьшая нагрузка"), ("off", "выключить")]
+# Проверка выходов (observatory) при leastPing/leastLoad
+OBS_URLS = [("Google", "https://www.google.com/generate_204"),
+            ("Gstatic", "https://www.gstatic.com/generate_204"),
+            ("Cloudflare", "http://cp.cloudflare.com/generate_204")]
+OBS_INTERVALS = ["10s", "15s", "30s", "1m", "2m"]
 
 
 @xr()
@@ -295,6 +300,7 @@ async def xray_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> No
         (f"📡 Подписка{' ✅' if d.get('sub') else ''}", "xs") if inst else None,
         ("➖ Удалить выход", xr.data("del")) if tags else None,
         ("⚖️ Балансировщик", xr.data("bal")) if len(tags) > 1 else None,
+        ("🔭 Проверка выходов", xr.data("obs")) if (d.get("balancer") or "") in ("leastPing", "leastLoad") else None,
         ("▶️ Включить", xr.data("up")) if inst and tags and not up else None,
         ("⏹ Выключить", xr.data("down")) if up else None,
         ("🔄 Перезапустить", xr.data("restart")) if up else None,
@@ -354,14 +360,105 @@ async def _xr_del_ok(cb: CallbackQuery, state: FSMContext, idx: str) -> None:
 
 @xr("bal")
 async def _xr_bal(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    d = await api.data("xray", "status", default={}) or {}
+    bal = d.get("balancer") or "off"
+    rows = [(k, xr.data("balset", k)) for k, _ in BALANCERS]
+    if bal in ("leastPing", "leastLoad"):
+        rows.append(("🔭 Проверка выходов", xr.data("obs")))
     await ui.render(cb, "<b>⚖️ Балансировщик выходов</b>\n\n"
-                        + "\n".join(f"• <b>{k}</b> — {label}" for k, label in BALANCERS),
-                    ui.kb([(k, xr.data("balset", k)) for k, _ in BALANCERS], ui.back("xr")))
+                        + "\n".join(f"• <b>{k}</b> — {label}" for k, label in BALANCERS)
+                        + (f"\n\nСейчас: <b>{esc(bal)}</b>. 🔭 — URL и интервал проверки выходов."
+                           if bal in ("leastPing", "leastLoad") else ""),
+                    ui.kb(rows, ui.back("xr")))
 
 
 @xr("balset")
 async def _xr_bal_set(cb: CallbackQuery, state: FSMContext, v: str) -> None:
     await quick(cb, f"Балансировщик: {v}", "xr", "xray", "balancer", v)
+
+
+@xr("obs")
+async def _xr_obs(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    d = await api.data("xray", "status", default={}) or {}
+    if (d.get("balancer") or "") not in ("leastPing", "leastLoad"):
+        await ui.render(cb, "Проверка выходов — только при <b>leastPing</b> или <b>leastLoad</b>.",
+                        ui.kb(ui.back(xr.data("bal"))))
+        return
+    o = d.get("obs") if isinstance(d.get("obs"), dict) else {}
+    url, interval = o.get("probeUrl") or "?", o.get("probeInterval") or "?"
+    conc = "вкл" if o.get("enableConcurrency") else "выкл"
+    await ui.render(cb, "<b>🔭 Проверка выходов</b>\n\n"
+                        f"URL: <code>{esc(url)}</code>\n"
+                        f"Интервал: <b>{esc(interval)}</b>\n"
+                        f"Параллельно: <b>{conc}</b>\n\n"
+                        "<i>Для leastPing / leastLoad. Свой URL — http(s)://…</i>",
+                    ui.kb(
+                        ("🔗 URL проверки", xr.data("obsurl")),
+                        ("⏱ Интервал", xr.data("obsint")),
+                        (f"{'✅' if o.get('enableConcurrency') else '⬜️'} Параллельно",
+                         xr.data("obsconc", "off" if o.get("enableConcurrency") else "on")),
+                        ui.back(xr.data("bal"))))
+
+
+@xr("obsurl")
+async def _xr_obs_url(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    await ui.render(cb, "<b>🔗 URL проверки</b>\nАдрес, по которому Xray проверяет выходы.\n"
+                        + "\n".join(f"• <b>{esc(n)}</b> — <code>{esc(u)}</code>" for n, u in OBS_URLS),
+                    ui.kb([(name, xr.data("obsurlset", str(i))) for i, (name, _) in enumerate(OBS_URLS)],
+                          ("✏️ Свой URL", xr.data("obsurlask")),
+                          ui.back(xr.data("obs"))))
+
+
+@xr("obsurlset")
+async def _xr_obs_url_set(cb: CallbackQuery, state: FSMContext, idx: str) -> None:
+    try:
+        url = OBS_URLS[int(idx)][1]
+    except (ValueError, IndexError):
+        await _xr_obs_url(cb, state, "")
+        return
+    await quick(cb, f"URL проверки: {url}", xr.data("obs"), "xray", "observatory", "url", url)
+
+
+@xr("obsurlask")
+async def _xr_obs_url_ask(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    await ask.ask(cb, state, "xr_obs_url",
+                  "Свой URL проверки — <code>http://</code> или <code>https://</code>, без пробелов.",
+                  xr.data("obs"))
+
+
+@ask.on("xr_obs_url")
+async def _xr_obs_url_custom(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
+    url = ask.text_of(msg).strip()
+    if not re.match(r"^https?://\S{3,500}$", url):
+        await ask.retry(msg, state, ctx, "Нужен http(s)://… без пробелов")
+        return
+    await quick(msg, f"URL проверки: {url}", xr.data("obs"), "xray", "observatory", "url", url)
+
+
+@xr("obsint")
+async def _xr_obs_int(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    o = (await api.data("xray", "status", default={}) or {}).get("obs")
+    cur = o.get("probeInterval") if isinstance(o, dict) else ""
+    await ui.render(cb, f"<b>⏱ Интервал проверки</b>\nСейчас: <b>{esc(cur or '?')}</b>",
+                    ui.kb([(f"{'🔘' if v == cur else '⚪️'} {v}", xr.data("obsintset", v))
+                           for v in OBS_INTERVALS],
+                          ui.back(xr.data("obs"))))
+
+
+@xr("obsintset")
+async def _xr_obs_int_set(cb: CallbackQuery, state: FSMContext, v: str) -> None:
+    if v not in OBS_INTERVALS:
+        await _xr_obs_int(cb, state, "")
+        return
+    await quick(cb, f"Интервал: {v}", xr.data("obs"), "xray", "observatory", "interval", v)
+
+
+@xr("obsconc")
+async def _xr_obs_conc(cb: CallbackQuery, state: FSMContext, v: str) -> None:
+    if v not in ("on", "off"):
+        await _xr_obs(cb, state, "")
+        return
+    await quick(cb, f"Параллельная проверка: {v}", xr.data("obs"), "xray", "observatory", "concurrency", v)
 
 
 @xr("up")

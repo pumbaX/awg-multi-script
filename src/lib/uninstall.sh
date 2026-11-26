@@ -140,6 +140,7 @@ uninstall_all() {
   info "Туннели..."
   tunnels_remove_all
   info "Модуль ядра и утилиты..."
+  kfix_remove
   if command -v dkms &>/dev/null; then
     for v in $(dkms status "$MOD_NAME" 2>/dev/null | sed -n "s#^$MOD_NAME/\([^,:]*\).*#\1#p" | sort -u); do
       dkms remove -m "$MOD_NAME" -v "$v" --all &>/dev/null || true

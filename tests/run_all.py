@@ -24,8 +24,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 # По убыванию длительности: долгие — первыми, короткие заполняют промежутки
 # (веб-панель — в конце: ей всё равно ждать, пока браузер занят панелью)
-SUITES = ["panel", "toolza", "bot", "regress_f2f3", "kernel_routing", "amnezia", "xray_sub", "share_persistence",
-          "meta_menu", "cps", "deep_robustness", "api_lock", "net", "admins", "web"]
+SUITES = ["panel", "toolza", "bot", "regress_f2f3", "kernel_routing", "amnezia", "xray_sub", "kernel_fix", "share_persistence",
+          "meta_menu", "cps", "deep_robustness", "api_lock", "net", "admins", "wgobf", "web"]
 BROWSER = {"panel", "web"}
 
 ap = argparse.ArgumentParser(description="Все тесты параллельно")

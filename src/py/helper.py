@@ -2209,6 +2209,65 @@ def cmd_xray_tun_probe(out):
                 "outbounds": [{"protocol": "freedom", "tag": "direct"}]})
 
 
+# Observatory (leastPing / leastLoad): URL и интервал проверки выходов.
+# Значения по умолчанию — как ставила Тулза раньше; свои — через
+# xray-observatory-set и не сбрасываются при смене стратегии на least*.
+XRAY_OBS_URL = "https://www.google.com/generate_204"
+XRAY_OBS_INTERVAL = "1m"
+# Допустимые интервалы: ввод → нормализованная строка для Xray
+XRAY_OBS_INTERVALS = {
+    "10": "10s", "10s": "10s",
+    "15": "15s", "15s": "15s",
+    "30": "30s", "30s": "30s",
+    "60": "1m", "60s": "1m", "1m": "1m",
+    "120": "2m", "120s": "2m", "2m": "2m",
+}
+
+
+def _obs_url_ok(url):
+    if not isinstance(url, str) or not (8 <= len(url) <= 512) or any(c.isspace() for c in url):
+        return False
+    p = urllib.parse.urlparse(url)
+    return p.scheme in ("http", "https") and bool(p.netloc) and not p.netloc.startswith(".")
+
+
+def _obs_interval_norm(raw):
+    return XRAY_OBS_INTERVALS.get(str(raw).strip().lower())
+
+
+def _obs_concurrency_norm(raw):
+    v = str(raw).strip().lower()
+    if v in ("1", "on", "true", "yes"):
+        return True
+    if v in ("0", "off", "false", "no"):
+        return False
+    return None
+
+
+def _observatory(tags, prev=None):
+    """Блок observatory для leastPing/leastLoad. prev — прежние настройки
+    (чтобы смена стратегии не затирала URL/интервал/concurrency)."""
+    prev = prev if isinstance(prev, dict) else {}
+    url = prev.get("probeUrl") if _obs_url_ok(prev.get("probeUrl")) else XRAY_OBS_URL
+    interval = _obs_interval_norm(prev.get("probeInterval")) or XRAY_OBS_INTERVAL
+    out = {"subjectSelector": list(tags), "probeUrl": url, "probeInterval": interval}
+    if prev.get("enableConcurrency") is True:
+        out["enableConcurrency"] = True
+    return out
+
+
+def _obs_info(conf):
+    """Сводка observatory для API/UI: on — блок есть (leastPing/leastLoad)."""
+    obs = conf.get("observatory") if isinstance(conf, dict) else None
+    if not isinstance(obs, dict):
+        return {"on": False, "probeUrl": XRAY_OBS_URL, "probeInterval": XRAY_OBS_INTERVAL,
+                "enableConcurrency": False}
+    return {"on": True,
+            "probeUrl": obs.get("probeUrl") if _obs_url_ok(obs.get("probeUrl")) else XRAY_OBS_URL,
+            "probeInterval": _obs_interval_norm(obs.get("probeInterval")) or XRAY_OBS_INTERVAL,
+            "enableConcurrency": obs.get("enableConcurrency") is True}
+
+
 def cmd_xray_balancer(path, strategy):
     if strategy not in ("random", "roundRobin", "leastPing", "leastLoad", "off"):
         die("стратегия: random|roundRobin|leastPing|leastLoad|off")
@@ -2235,9 +2294,7 @@ def cmd_xray_balancer(path, strategy):
         rule["balancerTag"] = "balancer"
         # leastPing/leastLoad выбирают по замерам observatory
         if strategy in ("leastPing", "leastLoad"):
-            conf["observatory"] = {"subjectSelector": tags,
-                                   "probeUrl": "https://www.google.com/generate_204",
-                                   "probeInterval": "1m"}
+            conf["observatory"] = _observatory(tags, conf.get("observatory"))
         else:
             conf.pop("observatory", None)
     jsave(path, conf)
@@ -2246,6 +2303,58 @@ def cmd_xray_balancer(path, strategy):
 def cmd_xray_balancer_get(path):
     b = jload(path).get("routing", {}).get("balancers") or []
     print(b[0].get("strategy", {}).get("type", "random") if b else "off")
+
+
+def cmd_xray_observatory_get(path, fmt="json"):
+    """json — для API; shell — url<TAB>interval<TAB>0|1; line — одна строка статуса."""
+    info = _obs_info(jload(path))
+    if fmt == "shell":
+        print("%s\t%s\t%d" % (info["probeUrl"], info["probeInterval"],
+                              1 if info["enableConcurrency"] else 0))
+        return
+    if fmt == "line":
+        host = info["probeUrl"].split("://", 1)[-1][:40]
+        extra = " · параллельно" if info["enableConcurrency"] else ""
+        print("%s · %s%s" % (info["probeInterval"], host, extra))
+        return
+    if fmt != "json":
+        die("формат: json|shell|line")
+    print(json.dumps(info, ensure_ascii=False))
+
+
+def cmd_xray_observatory_set(path, field, value):
+    """Правка observatory: url | interval | concurrency. Только при leastPing/leastLoad."""
+    conf = jload(path)
+    bal = (conf.get("routing") or {}).get("balancers") or []
+    strategy = (bal[0].get("strategy") or {}).get("type") if bal else "off"
+    if strategy not in ("leastPing", "leastLoad"):
+        die("observatory — только при leastPing или leastLoad")
+    tags = proxy_tags(conf)
+    if len(tags) < 2:
+        die("нужно минимум 2 proxy-outbound")
+    obs = _observatory(tags, conf.get("observatory"))
+    if field == "url":
+        if not _obs_url_ok(value):
+            die("url: http(s)://… без пробелов, до 512 символов")
+        obs["probeUrl"] = value
+    elif field == "interval":
+        norm = _obs_interval_norm(value)
+        if not norm:
+            die("interval: 10s|15s|30s|1m|2m")
+        obs["probeInterval"] = norm
+    elif field == "concurrency":
+        on = _obs_concurrency_norm(value)
+        if on is None:
+            die("concurrency: on|off")
+        if on:
+            obs["enableConcurrency"] = True
+        else:
+            obs.pop("enableConcurrency", None)
+    else:
+        die("поле: url|interval|concurrency")
+    conf["observatory"] = obs
+    jsave(path, conf)
+    print(json.dumps(_obs_info(conf), ensure_ascii=False))
 
 
 XRAY_CLIENT_RULE = "client-out"
@@ -3446,6 +3555,7 @@ COMMANDS = {
     "xray-probe-tag": cmd_xray_probe_tag, "xray-tun-probe": cmd_xray_tun_probe, "xray-compat": cmd_xray_compat,
     "xray-test-copy": cmd_xray_test_copy,
     "xray-balancer": cmd_xray_balancer, "xray-balancer-get": cmd_xray_balancer_get,
+    "xray-observatory-get": cmd_xray_observatory_get, "xray-observatory-set": cmd_xray_observatory_set,
     "xray-main": cmd_xray_main, "xray-main-get": cmd_xray_main_get,
     "xray-ru": cmd_xray_ru, "xray-prepare": cmd_xray_prepare,
     "xray-sub-parse": cmd_xray_sub_parse, "xray-sub-meta": cmd_xray_sub_meta, "xray-sub-probe": cmd_xray_sub_probe,

@@ -296,6 +296,56 @@ chk("Xray: два выхода, балансировщик, РФ напряму�
     and [r.get("ruleTag") for r in rules if str(r.get("ruleTag")).startswith("ru-direct")] == ["ru-direct", "ru-direct-ip"]
     and rules[-1].get("balancerTag") == "balancer"
     and all(i.get("protocol") != "tun" for i in xc["inbounds"]), err or out[:300])
+obs = xc.get("observatory") or {}
+chk("Xray: leastPing ставит observatory по умолчанию",
+    obs.get("probeUrl") == "https://www.google.com/generate_204"
+    and obs.get("probeInterval") == "1m" and "enableConcurrency" not in obs
+    and set(obs.get("subjectSelector") or []) == {o["tag"] for o in xc["outbounds"] if o["protocol"] == "vless"},
+    obs)
+
+# Observatory: URL / интервал / concurrency; смена стратегии least* не затирает
+rc, out, err = bash(f'''
+py xray-observatory-set "{XC}" url "https://www.gstatic.com/generate_204"
+py xray-observatory-set "{XC}" interval 30s
+py xray-observatory-set "{XC}" concurrency on
+py xray-observatory-get "{XC}"
+''')
+og = json.loads(out.strip().splitlines()[-1]) if rc == 0 else {}
+chk("Xray: observatory url/interval/concurrency",
+    rc == 0 and og.get("on") is True and og.get("probeUrl") == "https://www.gstatic.com/generate_204"
+    and og.get("probeInterval") == "30s" and og.get("enableConcurrency") is True, err or out)
+rc, out, _ = bash(f'''
+py xray-balancer "{XC}" leastLoad
+py xray-observatory-get "{XC}"
+cat "{XC}"
+''')
+lines = out.strip().splitlines()
+og2 = json.loads(lines[0]) if lines else {}
+xc2 = json.loads("\n".join(lines[1:])) if len(lines) > 1 else {}
+chk("Xray: смена leastPing→leastLoad сохраняет observatory",
+    og2.get("probeUrl") == "https://www.gstatic.com/generate_204"
+    and og2.get("probeInterval") == "30s" and og2.get("enableConcurrency") is True
+    and (xc2.get("observatory") or {}).get("probeUrl") == "https://www.gstatic.com/generate_204",
+    [og2, (xc2.get("observatory") or {})])
+rc, out, err = bash(f'''
+py xray-observatory-set "{XC}" url "not-a-url" ; echo rc_url=$?
+py xray-observatory-set "{XC}" interval 7s ; echo rc_int=$?
+py xray-observatory-set "{XC}" concurrency maybe ; echo rc_c=$?
+py xray-balancer "{XC}" random
+py xray-observatory-set "{XC}" interval 1m ; echo rc_off=$?
+''')
+chk("Xray: observatory — отказ на плохой URL/интервал/concurrency и без least*",
+    "rc_url=1" in out and "rc_int=1" in out and "rc_c=1" in out and "rc_off=1" in out, err or out)
+# После random observatory сброшен: снова leastPing — дефолты
+rc, out, _ = bash(f'''
+py xray-balancer "{XC}" leastPing
+py xray-observatory-get "{XC}"
+''')
+og3 = json.loads(out.strip().splitlines()[-1]) if rc == 0 else {}
+chk("Xray: снова leastPing — observatory снова по умолчанию (после random)",
+    og3.get("on") is True and og3.get("probeUrl") == "https://www.google.com/generate_204"
+    and og3.get("probeInterval") == "1m" and og3.get("enableConcurrency") is False, out)
+
 rc, out, _ = bash(f'py xray-del "{XC}" proxy_two_example_com; py xray-prepare "{XC}" native; cat "{XC}"')
 xc = json.loads(out)
 chk("Xray: удаление выхода чинит балансировщик", not xc["routing"].get("balancers")
@@ -647,7 +697,7 @@ WARP_CONF="{TMP}/warp0.conf"
 _dns_emit_helpers && _cascade_persist && _exits_write_unit && expire_install >/dev/null
 emit_script "$T2S_ROUTING_SCRIPT" 't2s_routing_run "$@"' T2S_IF T2S_TABLE T2S_ADDR "${{RT_FUNCS[@]}}" t2s_routing_run
 _xray_emit_routing
-emit_script "$WGOBF_FW" 'wgobf_fw_run "$@"' WGOBF_STATE WGOBF_TAG WGOBF_IF ipt_del_grep ipt_del_tagged wgobf_get wgobf_fw_run
+_wgobf_emit_fw
 emit_script "$WARP_AUTOSTART_SCRIPT" 'warp_wg_bringup' WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${{RT_FUNCS[@]}}" warp_awg_params warp_wg_bringup
 _warp_health_emit
 emit_script "$USQUE_UP_HOOK" 'usque_on_connect' WARP_IF WARP_TABLE WARP_PEERS USQUE_LOG "${{RT_FUNCS[@]}}" usque_on_connect
@@ -4207,6 +4257,20 @@ chk("«все клиенты AWG» и синхронизация списка WA
 rc, out, _ = bash('_wgobf_sync() { :; }; wgobf_write_bundle() { :; }; wgobf_add_client wc >/dev/null 2>&1; cat "$WARP_PEERS.wgobf"; '
                   'wgobf_delete_client wa >/dev/null 2>&1; echo "--"; cat "$WARP_PEERS.wgobf"')
 chk("новый клиент — туда же, куда все (WARP); удалённый — из списка", out.split() == ["10.66.66.2", "10.66.66.4", "--", "10.66.66.4"], out)
+OFFER = ('xray_installed() { :; }; xray_is_up() { return 1; }; t2s_is_up() { return 1; }; exits_is_up() { return 1; }; '
+         'warp_down() { echo DOWN-warp; }; xray_up() { echo UP-xray; }; exits_up() { echo "UP-exits $1"; }; '
+         'exits_nodes() { echo n1; }; ')
+rc, out, _ = bash(OFFER + 'warp_is_up() { :; }; tunnel_conflict() { echo WARP; }; ask_yes() { echo "Q:$1"; }; '
+                  '_wgobf_route_offer_on xray:out1')
+rc2, out2, _ = bash(OFFER + 'warp_is_up() { return 1; }; tunnel_conflict() { :; }; ask_yes() { echo "Q:$1"; }; _wgobf_route_offer_on xray')
+rc3, out3, _ = bash(OFFER + 'warp_is_up() { :; }; tunnel_conflict() { echo WARP; }; ask_yes() { return 1; }; _wgobf_route_offer_on xray; '
+                    'xray_is_up() { :; }; _wgobf_route_offer_on xray; _wgobf_route_offer_on direct; echo END')
+rc4, out4, _ = bash(OFFER + 'warp_is_up() { return 1; }; tunnel_conflict() { :; }; ask_yes() { :; }; exits_state_get() { echo peers; }; '
+                    '_wgobf_route_offer_on exits:n1')
+chk("меню awg2: выход через выключенный Xray — включить сразу; работает WARP — спросить, выключить его, затем включить Xray",
+    "Сейчас работает WARP" in out and out.index("DOWN-warp") < out.index("UP-xray")
+    and "Xray выключен — включить сейчас?" in out2 and "UP-xray" in out2 and "DOWN" not in out2
+    and out3.split() == ["END"] and "UP-exits peers" in out4 and "все клиенты" not in out4, [out, out2, out3, out4])
 rc, out, _ = bash('_wgobf_routes_clear; [[ -e "$WARP_PEERS.wgobf" ]] && echo LEFT || echo GONE')
 chk("удаление или новая установка обфускатора — список выходов прежних клиентов убран", out.strip() == "GONE", out)
 os.remove(os.path.join(ROOT, "etc/wireguard/warp0.conf"))

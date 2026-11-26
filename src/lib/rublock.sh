@@ -221,6 +221,11 @@ rublock_enable() {
     err "Включено «РФ напрямую» — это противоположный режим: там сети России идут мимо туннеля прямо с сервера. Сначала выключи его"
     return 1
   fi
+  # Список сетей России — только IPv4: с IPv6 в туннеле клиенты ходили бы туда через сервер
+  if wgobf_installed && [[ "$(wgobf_get IPV6)" == 1 ]]; then
+    err "У WG + обфускатора включён IPv6 в туннеле, а «РФ мимо VPN» работает только для IPv4. Сначала выключи IPv6 (Обфускатор → Настройки)"
+    return 1
+  fi
   need_cmds ipset:ipset flock:util-linux || return 1
   _rublock_set ON 1
   _rublock_emit || { _rublock_set ON 0; err "Не удалось записать службу"; return 1; }
